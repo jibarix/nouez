@@ -13,6 +13,7 @@ socket, which speaks JSON-RPC over WebSocket. Standard library only.
 """
 
 import base64
+import glob
 import json
 import os
 import queue
@@ -26,7 +27,7 @@ import threading
 import time
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 POLL_SECONDS = 1.5
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 RECENT_SAVED_THREADS = 50  # how far back to look for unloaded bridge consultants
@@ -85,7 +86,8 @@ class CodexClient:
         try:
             self._handshake()
             threading.Thread(target=self._reader, daemon=True).start()
-            self.request("initialize", {"clientInfo": {"name": "nouez", "version": SERVER_VERSION}})
+            # userAgent carries the daemon's version and codexHome its install root.
+            self.info = self.request("initialize", {"clientInfo": {"name": "nouez", "version": SERVER_VERSION}})
             self.notify("initialized")
         except Exception:
             self.close()
@@ -406,17 +408,70 @@ def take_watch(tid):
         return False
 
 
-def open_terminal(cwd, thread_id):
+def version_of(text):
+    m = re.search(r"(\d+\.\d+\.\d+[^\s;)]*)", text or "")
+    return m.group(1) if m else None
+
+
+def codex_version(exe):
+    try:
+        out = subprocess.run([shutil.which(exe) or exe, "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return version_of(out.stdout)
+
+
+def viewer_codex(info):
+    """The `codex` to open a viewer with, plus a warning to show if it may not match the daemon.
+    Codex auto-updates its managed daemon apart from the codex on PATH, and a viewer whose
+    version differs can refuse to attach ("incompatible feature set") and offer to restart the
+    shared daemon. So run the daemon's own binary when it can be found."""
+    info = info or {}
+    version = version_of((info.get("userAgent") or "").split("/", 1)[-1])
+    home = info.get("codexHome")
+    if version and home:
+        exe = "codex.exe" if os.name == "nt" else "codex"
+        pattern = os.path.join(glob.escape(home), "packages", "app-server-daemon", "releases",
+                               glob.escape(version) + "-*", "bin", exe)
+        for path in sorted(glob.glob(pattern)):
+            if codex_version(path) == version:
+                return path, ""
+    on_path = codex_version("codex")
+    if version and on_path and on_path != version:
+        return "codex", (f" Warning: the codex CLI on PATH is {on_path} but the daemon is {version}, so the "
+                         "window may ask to restart the daemon. Choose Cancel (restarting interrupts running "
+                         f"consultants) and update the codex CLI to {version}.")
+    return "codex", ""
+
+
+def viewer_running(thread_id):
+    """Whether some `codex resume <id>` is already showing the session, whether open_terminal
+    started it or the user did. Errs toward False, so a failed check still opens a window."""
+    if not re.fullmatch(r"[0-9A-Za-z-]+", thread_id):
+        return False
+    run = {"capture_output": True, "text": True, "timeout": 20}
+    try:
+        if os.name == "nt":
+            ps = ("@(Get-CimInstance Win32_Process -Filter \"Name='codex.exe'\" | Where-Object "
+                  f"{{ $_.CommandLine -like '* resume {thread_id}*' }}).Count")
+            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], **run).stdout
+            return out.strip().isdigit() and int(out.strip()) > 0
+        return bool(subprocess.run(["pgrep", "-f", f"codex[^ ]* resume {thread_id}"], **run).stdout.split())
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def open_terminal(cwd, thread_id, codex="codex"):
     """Open `codex resume <id>` beside Claude Code: a split pane when Claude Code runs in
     Windows Terminal or tmux, otherwise a new terminal window. Returns a description of what opened."""
     cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
-    resume = ["codex", "resume", thread_id]
+    resume = [codex, "resume", thread_id]
     kwargs = {"cwd": cwd, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     tmux = shutil.which("tmux") if os.environ.get("TMUX") else None
     if tmux:
         argv, how = [tmux, "split-window", "-h", "-c", cwd, shlex.join(resume)], "a tmux split pane"
     elif os.name == "nt":
-        # codex is usually an npm .cmd shim, so run it through cmd; /k keeps errors on screen.
+        # codex on PATH is usually an npm .cmd shim, so run it through cmd; /k keeps errors on screen.
         wt = shutil.which("wt")
         if wt and os.environ.get("WT_SESSION"):
             # -w 0 is the most recently used Windows Terminal window, normally Claude Code's own.
@@ -442,6 +497,15 @@ def open_terminal(cwd, thread_id):
     return how
 
 
+def show_viewer(thread, info):
+    """Open a terminal showing the session unless one already does. Returns a sentence."""
+    tid, name = thread["id"], short_name(thread)
+    if viewer_running(tid):
+        return f"{name} is already open in a terminal; no new one was opened."
+    codex, warning = viewer_codex(info)
+    return f"Opened {name} in {open_terminal(thread.get('cwd'), tid, codex)}.{warning}"
+
+
 def end_process(pid, code):
     """Windows: terminate a process with a chosen exit code."""
     import ctypes
@@ -459,9 +523,10 @@ def close_terminals(thread_id):
     run = {"capture_output": True, "text": True, "timeout": 20}
     try:
         if os.name == "nt":
-            # Only the cmd windows open_terminal started. Each output line: the cmd pid, then its children.
+            # Only the cmd windows open_terminal started, running codex by name or by full path.
+            # Each output line: the cmd pid, then its children.
             ps = ("Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object "
-                  f"{{ $_.CommandLine -like '*/k codex resume {thread_id}' }} | ForEach-Object {{ "
+                  f"{{ $_.CommandLine -like '*/k *codex* resume {thread_id}' }} | ForEach-Object {{ "
                   "$p = $_.ProcessId; "
                   "$k = @(Get-CimInstance Win32_Process -Filter \"ParentProcessId=$p\" | ForEach-Object { $_.ProcessId }); "
                   "\"$p $k\" }")
@@ -482,14 +547,36 @@ def close_terminals(thread_id):
         return 0
 
 
-def list_consultants(args, cancel=None):
-    client = CodexClient()
+def repo_root(path):
+    """The git work tree containing `path`, or `path` itself outside a repo."""
+    path = os.path.abspath(path)
     try:
-        threads = load_consultants(client, bool(args.get("include_all")))
-    finally:
-        client.close()
-    if not threads:
-        return "No Codex sessions. Start one with StartConsultant, or open Codex in a terminal."
+        out = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            return os.path.abspath(out.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return path
+
+
+def in_repo(thread, root):
+    cwd = thread.get("cwd")
+    if not cwd:
+        return False
+    a, b = os.path.normcase(os.path.abspath(cwd)), os.path.normcase(root)
+    try:
+        return os.path.commonpath([a, b]) == b
+    except ValueError:  # different drives
+        return False
+
+
+def repo_consultants(client, cwd):
+    root = repo_root(cwd)
+    return root, [t for t in load_consultants(client) if in_repo(t, root)]
+
+
+def format_threads(threads):
     lines = []
     for t in threads:
         lines.append(
@@ -501,7 +588,24 @@ def list_consultants(args, cancel=None):
             f"    started by: {'StartConsultant' if is_bridge(t) else 'user'}"
             + (f"\n    title: {t['name']}" if t.get("name") else "")
         )
-    return f"{len(threads)} Codex session(s):\n" + "\n".join(lines)
+    return "\n".join(lines)
+
+
+def list_consultants(args, cancel=None):
+    client = CodexClient()
+    try:
+        if args.get("cwd"):
+            root, threads = repo_consultants(client, args["cwd"])
+        else:
+            root, threads = None, load_consultants(client, bool(args.get("include_all")))
+    finally:
+        client.close()
+    if not threads:
+        where = f" in {root}" if root else ""
+        return f"No Codex sessions{where}. Start one with StartConsultant, or open Codex in a terminal."
+    if root:
+        return f"{len(threads)} Codex session(s) in {root}:\n" + format_threads(threads)
+    return f"{len(threads)} Codex session(s):\n" + format_threads(threads)
 
 
 def start_consultant(args, cancel=None):
@@ -518,6 +622,15 @@ def start_consultant(args, cancel=None):
 
     client = CodexClient()
     try:
+        if not args.get("new"):
+            # Reuse before starting: a consultant already in this repo keeps its context, and a
+            # duplicate splits the conversation across sessions.
+            root, existing = repo_consultants(client, cwd)
+            if existing:
+                return (f"Not started: {len(existing)} Codex session(s) already work in {root}:\n"
+                        + format_threads(existing)
+                        + "\nSend to one of these with SendConsultantMessage. If none fits, call "
+                        "StartConsultant again with new=true.")
         thread = client.request("thread/start", params)["thread"]
         if args.get("title"):
             client.request("thread/name/set", {"threadId": thread["id"], "name": args["title"]})
@@ -572,7 +685,7 @@ def send_consultant_message(args, cancel=None):
         watching = ""
         if take_watch(tid):
             try:
-                watching = f" Opened it in {open_terminal(thread.get('cwd'), tid)}."
+                watching = " " + show_viewer(thread, client.info)
             except (BridgeError, OSError) as e:
                 watching = f" Could not open a terminal: {e}"
         if not wait:
@@ -624,6 +737,7 @@ def watch_consultant(args, cancel=None):
     try:
         thread = resolve(client, target)
         has_turns = bool(latest_turn(client, thread["id"]))
+        info = client.info
     finally:
         client.close()
     tid, name = thread["id"], short_name(thread)
@@ -638,7 +752,7 @@ def watch_consultant(args, cancel=None):
             client.close()
         if not (has_turns and take_watch(tid)):
             return f"{name} has no messages yet; a terminal window will open when you send the first one."
-    return f"Opened {name} in {open_terminal(thread.get('cwd'), tid)}."
+    return show_viewer(thread, info)
 
 
 def stop_consultant(args, cancel=None):
@@ -664,6 +778,13 @@ def stop_consultant(args, cancel=None):
 
 # --- MCP stdio server --------------------------------------------------------
 
+INSTRUCTIONS = (
+    "Before starting a Codex consultant, call ListConsultants with cwd set to your working "
+    "directory. If a session already works in this repo, send to it with SendConsultantMessage "
+    "instead of starting another; it keeps its earlier context. Start a new one (StartConsultant "
+    "with new=true) only when none fits or the user asks for a fresh one."
+)
+
 TO_SCHEMA = {"type": "string", "description": "Consultant name, thread id, or unique id prefix/suffix."}
 
 TOOLS = [
@@ -673,7 +794,9 @@ TOOLS = [
             "Start a new Codex session (consultant) in the background, with no terminal needed. "
             "It runs on the local Codex app-server daemon in a read-only sandbox and never asks for "
             "approvals: it can read files and run read-only commands for auditing, validation and "
-            "research, but cannot edit anything. Returns the name to pass to SendConsultantMessage."
+            "research, but cannot edit anything. Returns the name to pass to SendConsultantMessage. "
+            "Call ListConsultants with your cwd first: if sessions already work in this repo, this "
+            "tool lists them and starts nothing unless new=true."
         ),
         "inputSchema": {
             "type": "object",
@@ -683,6 +806,7 @@ TOOLS = [
                 "title": {"type": "string", "description": "Optional session title shown in Codex."},
                 "instructions": {"type": "string", "description": "Optional standing instructions for the consultant's role."},
                 "watch": {"type": "boolean", "description": "Open the session in a terminal window when its first message is sent, so the user can watch it work. Default false."},
+                "new": {"type": "boolean", "description": "Start a new session even though sessions already work in this repo. Default false. Use only when none of the listed ones fits, or the user asked for another."},
             },
         },
     },
@@ -691,15 +815,20 @@ TOOLS = [
         "description": (
             "List Codex sessions (consultants) on this machine: sessions loaded on the local Codex "
             "app-server daemon plus recent StartConsultant sessions it has unloaded. Each row gives "
-            "the name to pass to the other tools, the working directory, model, status, and who started it."
+            "the name to pass to the other tools, the working directory, model, status, and who started it. "
+            "Pass cwd to see only the sessions working in that repo; do this before StartConsultant."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "cwd": {
+                    "type": "string",
+                    "description": "Only list sessions whose working directory is in the same git repo as this path (or under it, outside a repo).",
+                },
                 "include_all": {
                     "type": "boolean",
-                    "description": "Also show Codex-internal threads (subagents, guardian reviews). Default false.",
-                }
+                    "description": "Also show Codex-internal threads (subagents, guardian reviews). Default false. Ignored with cwd.",
+                },
             },
         },
     },
@@ -790,6 +919,7 @@ def handle(msg, cancel):
             "protocolVersion": params.get("protocolVersion", "2025-06-18"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "instructions": INSTRUCTIONS,
         })
     elif method == "ping":
         respond(msg_id, {})
