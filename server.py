@@ -1,7 +1,7 @@
 """nouez: MCP server that lets Claude Code talk to Codex sessions.
 
 Tools
-  StartConsultant        start a background Codex session (no terminal needed)
+  StartConsultant        reuse the repo's Codex session, or start one, shown in a pane
   ListConsultants        Codex sessions on the local app-server daemon
   SendConsultantMessage  send a message into one of them and return its reply
   GetConsultantReply     read (or wait for) a reply sent with wait=false
@@ -25,9 +25,11 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 POLL_SECONDS = 1.5
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 RECENT_SAVED_THREADS = 50  # how far back to look for unloaded bridge consultants
@@ -42,8 +44,14 @@ _stdout_lock = threading.Lock()
 _send_locks = {}  # thread id -> lock, so concurrent sends can't both start a turn
 _send_locks_guard = threading.Lock()
 _watch_pending = set()  # consultants to open in a terminal once their first turn starts
+_unwatched = set()  # StartConsultant sessions started with watch=false: no automatic pane
 _cancel_events = {}  # MCP request id -> Event set by notifications/cancelled
 _cancel_guard = threading.Lock()
+_client_caps = {}  # capabilities Claude Code advertised in initialize
+_client_roots = None  # Claude Code's workspace folders (roots/list), or None until fetched
+_client_requests = {}  # id of a request we sent to Claude Code -> [Event, response]
+_client_guard = threading.Lock()
+_client_ids = iter(range(1, 1 << 62))
 
 
 def log(*args):
@@ -61,6 +69,65 @@ class Cancelled(Exception):
 def check_cancel(cancel):
     if cancel is not None and cancel.is_set():
         raise Cancelled()
+
+
+def flag(args, key, default=False):
+    """A boolean argument. Accepts JSON booleans and the strings "true"/"false"; anything else is
+    an error rather than truthy, so "false" can't turn into an unlimited wait."""
+    value = args.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise BridgeError(f"`{key}` must be true or false, not {value!r}.")
+
+
+def number(args, key, default):
+    value = args.get(key, default)
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        return float(value)
+    except (TypeError, ValueError):
+        raise BridgeError(f"`{key}` must be a number of seconds, not {value!r}.") from None
+
+
+def target(args):
+    """The consultant to address. `name` is accepted too: StartConsultant returns a name, and
+    callers sometimes pass it under that key."""
+    value = args.get("to") or args.get("name") or ""
+    if not value:
+        raise BridgeError("`to` is required: the consultant name StartConsultant returned, or its thread id.")
+    return value
+
+
+def kill_tree(proc):
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if proc.poll() is None:
+        proc.kill()
+
+
+def run_text(argv, timeout=20):
+    """A command's stdout, or "" if it fails or times out. Unlike subprocess.run, this can't hang:
+    on Windows, run() kills only the direct child at the timeout and then waits for the pipes to
+    close, which never happens while a grandchild (git's cmd shim, an npm .cmd shim) holds them."""
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return ""
+    try:
+        return proc.communicate(timeout=timeout)[0] or ""
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)  # abandon the pipe readers rather than wait on them
+        return ""
 
 
 # --- Codex app-server client -------------------------------------------------
@@ -94,10 +161,23 @@ class CodexClient:
             raise
 
     def _handshake(self):
-        # A hung proxy would block the reads below forever; kill it after the timeout.
-        timed_out = threading.Event()
-        timer = threading.Timer(self.timeout, lambda: (timed_out.set(), self.close()))
-        timer.start()
+        # Read the upgrade response on a side thread and wait with a deadline. Killing a hung
+        # proxy doesn't reliably unblock a read: a grandchild can keep the pipe open.
+        result = {}
+
+        def read_header():
+            try:
+                header = b""
+                while not header.endswith(b"\r\n\r\n"):
+                    c = self.proc.stdout.read(1)
+                    if not c:
+                        result["eof"] = True
+                        return
+                    header += c
+                result["header"] = header
+            except (OSError, ValueError):
+                result["eof"] = True
+
         try:
             key = base64.b64encode(os.urandom(16)).decode()
             self.proc.stdin.write(
@@ -108,21 +188,20 @@ class CodexClient:
                 ).encode()
             )
             self.proc.stdin.flush()
-            header = b""
-            while not header.endswith(b"\r\n\r\n"):
-                c = self.proc.stdout.read(1)
-                if not c and timed_out.is_set():
-                    raise OSError
-                if not c:
-                    raise BridgeError(
-                        "Codex app-server daemon is not reachable. Start it with "
-                        "`codex app-server daemon start`, or open a Codex session."
-                    )
-                header += c
         except OSError:
+            result["eof"] = True
+        if not result:
+            reader = threading.Thread(target=read_header, daemon=True)
+            reader.start()
+            reader.join(self.timeout)
+        if result.get("eof"):
+            raise BridgeError(
+                "Codex app-server daemon is not reachable. Start it with "
+                "`codex app-server daemon start`, or open a Codex session."
+            )
+        if "header" not in result:
             raise BridgeError(f"Codex app-server proxy did not respond within {self.timeout}s.")
-        finally:
-            timer.cancel()
+        header = result["header"]
         if b" 101 " not in header.split(b"\r\n", 1)[0]:
             raise BridgeError(f"WebSocket upgrade refused: {header[:200]!r}")
 
@@ -205,11 +284,7 @@ class CodexClient:
         raise BridgeError(f"{method} timed out after {self.timeout}s.")
 
     def close(self):
-        if self.proc.poll() is None:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.proc.pid)], capture_output=True)
-            else:
-                self.proc.kill()
+        kill_tree(self.proc)
 
 
 # --- Consultant logic --------------------------------------------------------
@@ -356,8 +431,9 @@ def turn_reply(turn):
 
 def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None):
     """Poll until the turn finishes. Returns the finished turn, or None on timeout.
+    timeout=None waits until the turn ends (still cancellable).
     With `text` (the message we sent), follow an interrupted turn into its continuation."""
-    deadline = time.time() + timeout
+    deadline = None if timeout is None else time.time() + timeout
     grace = None  # an interrupted turn's continuation may take a moment to be listed
     while True:
         turn = find_turn(client, tid, turn_id)
@@ -373,7 +449,7 @@ def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None):
                 continue
         if turn and turn.get("status") != "inProgress":
             return turn
-        if time.time() >= deadline:
+        if deadline is not None and time.time() >= deadline:
             return None
         check_cancel(cancel)
         time.sleep(POLL_SECONDS)
@@ -399,6 +475,13 @@ def set_watch(tid, on=True):
         (_watch_pending.add if on else _watch_pending.discard)(tid)
 
 
+def wants_pane(thread):
+    """StartConsultant sessions are shown beside Claude Code unless started with watch=false.
+    Sessions the user opened already have their own terminal."""
+    with _send_locks_guard:
+        return is_bridge(thread) and thread["id"] not in _unwatched
+
+
 def take_watch(tid):
     """Atomically claim a pending watch request, so only one sender opens the window."""
     with _send_locks_guard:
@@ -414,11 +497,7 @@ def version_of(text):
 
 
 def codex_version(exe):
-    try:
-        out = subprocess.run([shutil.which(exe) or exe, "--version"], capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return version_of(out.stdout)
+    return version_of(run_text([shutil.which(exe) or exe, "--version"], timeout=10))
 
 
 def viewer_codex(info):
@@ -449,16 +528,12 @@ def viewer_running(thread_id):
     started it or the user did. Errs toward False, so a failed check still opens a window."""
     if not re.fullmatch(r"[0-9A-Za-z-]+", thread_id):
         return False
-    run = {"capture_output": True, "text": True, "timeout": 20}
-    try:
-        if os.name == "nt":
-            ps = ("@(Get-CimInstance Win32_Process -Filter \"Name='codex.exe'\" | Where-Object "
-                  f"{{ $_.CommandLine -like '* resume {thread_id}*' }}).Count")
-            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], **run).stdout
-            return out.strip().isdigit() and int(out.strip()) > 0
-        return bool(subprocess.run(["pgrep", "-f", f"codex[^ ]* resume {thread_id}"], **run).stdout.split())
-    except (OSError, subprocess.SubprocessError):
-        return False
+    if os.name == "nt":
+        ps = ("@(Get-CimInstance Win32_Process -Filter \"Name='codex.exe'\" | Where-Object "
+              f"{{ $_.CommandLine -like '* resume {thread_id}*' }}).Count")
+        out = run_text(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps]).strip()
+        return out.isdigit() and int(out) > 0
+    return bool(run_text(["pgrep", "-f", f"codex[^ ]* resume {thread_id}"]).split())
 
 
 def open_terminal(cwd, thread_id, codex="codex"):
@@ -497,11 +572,12 @@ def open_terminal(cwd, thread_id, codex="codex"):
     return how
 
 
-def show_viewer(thread, info):
-    """Open a terminal showing the session unless one already does. Returns a sentence."""
+def show_viewer(thread, info, quiet=False):
+    """Open a terminal showing the session unless one already does. Returns a sentence
+    ("" with quiet=True when it was already open)."""
     tid, name = thread["id"], short_name(thread)
     if viewer_running(tid):
-        return f"{name} is already open in a terminal; no new one was opened."
+        return "" if quiet else f"{name} is already open in a terminal; no new one was opened."
     codex, warning = viewer_codex(info)
     return f"Opened {name} in {open_terminal(thread.get('cwd'), tid, codex)}.{warning}"
 
@@ -520,60 +596,75 @@ def close_terminals(thread_id):
     """Best effort: end `codex resume <id>` processes so their windows close. Returns how many."""
     if not re.fullmatch(r"[0-9A-Za-z-]+", thread_id):
         return 0
-    run = {"capture_output": True, "text": True, "timeout": 20}
-    try:
-        if os.name == "nt":
-            # Only the cmd windows open_terminal started, running codex by name or by full path.
-            # Each output line: the cmd pid, then its children.
-            ps = ("Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object "
-                  f"{{ $_.CommandLine -like '*/k *codex* resume {thread_id}' }} | ForEach-Object {{ "
-                  "$p = $_.ProcessId; "
-                  "$k = @(Get-CimInstance Win32_Process -Filter \"ParentProcessId=$p\" | ForEach-Object { $_.ProcessId }); "
-                  "\"$p $k\" }")
-            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], **run).stdout
-            shells = [line.split() for line in out.splitlines() if line.strip()]
-            for pids in shells:
-                for child in pids[1:]:
-                    subprocess.run(["taskkill", "/PID", child, "/T", "/F"], **run)
-                # Windows Terminal closes a pane by itself only on a clean exit, so end cmd with code 0.
-                end_process(int(pids[0]), 0)
-            return len(shells)
-        pattern = f"codex[^ ]* resume {thread_id}"
-        pids = subprocess.run(["pgrep", "-f", pattern], **run).stdout.split()
-        if pids:
-            subprocess.run(["pkill", "-f", pattern], **run)
-        return len(pids)
-    except (OSError, subprocess.SubprocessError):
-        return 0
+    if os.name == "nt":
+        # Only the cmd windows open_terminal started, running codex by name or by full path.
+        # Each output line: the cmd pid, then its children.
+        ps = ("Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object "
+              f"{{ $_.CommandLine -like '*/k *codex* resume {thread_id}' }} | ForEach-Object {{ "
+              "$p = $_.ProcessId; "
+              "$k = @(Get-CimInstance Win32_Process -Filter \"ParentProcessId=$p\" | ForEach-Object { $_.ProcessId }); "
+              "\"$p $k\" }")
+        out = run_text(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
+        shells = [line.split() for line in out.splitlines() if line.strip()]
+        for pids in shells:
+            for child in pids[1:]:
+                run_text(["taskkill", "/PID", child, "/T", "/F"])
+            # Windows Terminal closes a pane by itself only on a clean exit, so end cmd with code 0.
+            end_process(int(pids[0]), 0)
+        return len(shells)
+    pattern = f"codex[^ ]* resume {thread_id}"
+    pids = run_text(["pgrep", "-f", pattern]).split()
+    if pids:
+        run_text(["pkill", "-f", pattern])
+    return len(pids)
 
 
-def repo_root(path):
-    """The git work tree containing `path`, or `path` itself outside a repo."""
-    path = os.path.abspath(path)
-    try:
-        out = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
-                             capture_output=True, text=True, timeout=10)
-        if out.returncode == 0 and out.stdout.strip():
-            return os.path.abspath(out.stdout.strip())
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return path
+def git_root(path):
+    """The git work tree containing `path`, or None. Looks for `.git` (a directory, or a file in
+    worktrees and submodules) instead of running git, which can hang."""
+    current = os.path.abspath(path)
+    while True:
+        if os.path.exists(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
 
 
-def in_repo(thread, root):
-    cwd = thread.get("cwd")
-    if not cwd:
-        return False
-    a, b = os.path.normcase(os.path.abspath(cwd)), os.path.normcase(root)
+def is_under(path, root):
+    a, b = os.path.normcase(os.path.abspath(path)), os.path.normcase(os.path.abspath(root))
     try:
         return os.path.commonpath([a, b]) == b
     except ValueError:  # different drives
         return False
 
 
+def repo_root(path):
+    """Where consultants for `path` are looked for: its git work tree. Outside git, the Claude Code
+    workspace folder (MCP root) that contains it, so a subfolder finds the consultant started at
+    the project's top; failing that, `path` itself."""
+    path = os.path.abspath(path)
+    found = git_root(path)
+    if found:
+        return found
+    containing = [r for r in client_roots() if is_under(path, r)]
+    return max(containing, key=len) if containing else path  # innermost, if roots nest
+
+
+def in_repo(thread, root):
+    cwd = thread.get("cwd")
+    return bool(cwd) and is_under(cwd, root)
+
+
 def repo_consultants(client, cwd):
     root = repo_root(cwd)
     return root, [t for t in load_consultants(client) if in_repo(t, root)]
+
+
+def default_cwd():
+    roots = client_roots()
+    return roots[0] if roots else os.getcwd()
 
 
 def format_threads(threads):
@@ -592,12 +683,13 @@ def format_threads(threads):
 
 
 def list_consultants(args, cancel=None):
+    include_all = flag(args, "include_all")
     client = CodexClient()
     try:
         if args.get("cwd"):
             root, threads = repo_consultants(client, args["cwd"])
         else:
-            root, threads = None, load_consultants(client, bool(args.get("include_all")))
+            root, threads = None, load_consultants(client, include_all)
     finally:
         client.close()
     if not threads:
@@ -609,7 +701,7 @@ def list_consultants(args, cancel=None):
 
 
 def start_consultant(args, cancel=None):
-    cwd = os.path.abspath(args.get("cwd") or os.getcwd())
+    cwd = os.path.abspath(args.get("cwd") or default_cwd())
     if not os.path.isdir(cwd):
         raise BridgeError(f"cwd is not a directory: {cwd}")
     # Consultants audit, validate and research; they never edit. No terminal is attached to
@@ -620,49 +712,76 @@ def start_consultant(args, cancel=None):
     if args.get("instructions"):
         params["developerInstructions"] = args["instructions"]
 
+    watch, new = flag(args, "watch", True), flag(args, "new")
+    existing, has_turns = [], False
     client = CodexClient()
     try:
-        if not args.get("new"):
+        if not new:
             # Reuse before starting: a consultant already in this repo keeps its context, and a
-            # duplicate splits the conversation across sessions.
+            # duplicate splits the conversation across sessions. Prefer our own, most recent first.
             root, existing = repo_consultants(client, cwd)
-            if existing:
-                return (f"Not started: {len(existing)} Codex session(s) already work in {root}:\n"
-                        + format_threads(existing)
-                        + "\nSend to one of these with SendConsultantMessage. If none fits, call "
-                        "StartConsultant again with new=true.")
-        thread = client.request("thread/start", params)["thread"]
-        if args.get("title"):
-            client.request("thread/name/set", {"threadId": thread["id"], "name": args["title"]})
+            existing.sort(key=lambda t: (is_bridge(t), t.get("updatedAt") or 0), reverse=True)
+        if existing:
+            thread = existing[0]
+            has_turns = bool(latest_turn(client, thread["id"]))
+            info = client.info
+        else:
+            thread = client.request("thread/start", params)["thread"]
+            if args.get("title"):
+                client.request("thread/name/set", {"threadId": thread["id"], "name": args["title"]})
     finally:
         client.close()
-    watch = bool(args.get("watch"))
-    if watch:
-        set_watch(thread["id"])
+
+    name = short_name(thread)
+    if not existing:
+        if not watch:
+            with _send_locks_guard:
+                _unwatched.add(thread["id"])
+        return (
+            f"Started {name}\n"
+            f"    id: {thread['id']}\n"
+            f"    cwd: {thread.get('cwd')}\n"
+            f"    model: {thread.get('model')} ({thread.get('modelProvider')})\n"
+            f"    sandbox: {SANDBOX}\n"
+            + ("A pane showing it opens beside Claude Code when you send its first message.\n" if watch else "")
+            + "Send it work with SendConsultantMessage."
+        )
+
+    if not is_bridge(thread):
+        pane = "It runs in the user's own Codex terminal."
+    elif not watch:
+        pane = ""
+    elif not has_turns:
+        pane = "A pane showing it opens beside Claude Code when you send its first message."
+    else:
+        try:
+            pane = show_viewer(thread, info)
+        except (BridgeError, OSError) as e:
+            pane = f"Could not open a terminal: {e}"
+    others = existing[1:]
     return (
-        f"Started {short_name(thread)}\n"
-        f"    id: {thread['id']}\n"
-        f"    cwd: {thread.get('cwd')}\n"
-        f"    model: {thread.get('model')} ({thread.get('modelProvider')})\n"
-        f"    sandbox: {SANDBOX}\n"
-        + ("A terminal window will open when you send its first message.\n" if watch else "")
+        f"Using {name}, which already works in {root}; nothing new was started.\n"
+        + format_threads([thread]) + "\n"
+        + (pane + "\n" if pane else "")
         + "Send it work with SendConsultantMessage."
+        + (f"\nOther sessions in this repo:\n{format_threads(others)}" if others else "")
+        + "\nOnly if the user asks for a separate consultant, call StartConsultant with new=true."
     )
 
 
 def send_consultant_message(args, cancel=None):
-    target = args.get("to") or ""
+    to = target(args)
     message = args.get("message") or ""
-    if not target or not message:
-        raise BridgeError("Both `to` and `message` are required.")
-    wait = args.get("wait", True)
-    timeout = float(args.get("timeout_seconds", 600))
+    if not message:
+        raise BridgeError("`message` is required.")
+    wait = flag(args, "wait", True)
+    timeout = None if flag(args, "until_done") else number(args, "timeout_seconds", 600)
     sender = args.get("from") or "Claude Code"
     text = f"[Message from {sender} via the consultants bridge]\n\n{message}"
 
     client = CodexClient()
     try:
-        thread = resolve(client, target)
+        thread = resolve(client, to)
         tid, name = thread["id"], short_name(thread)
         with send_lock(tid):
             # Last point a cancellation can still stop the message from being delivered.
@@ -682,12 +801,15 @@ def send_consultant_message(args, cancel=None):
                 deadline = time.time() + 10
                 while not find_turn(client, tid, turn_id) and time.time() < deadline:
                     time.sleep(0.2)
-        watching = ""
-        if take_watch(tid):
-            try:
-                watching = " " + show_viewer(thread, client.info)
-            except (BridgeError, OSError) as e:
-                watching = f" Could not open a terminal: {e}"
+            # Codex can only show a session once it has a turn, so the pane opens here. Inside
+            # the lock, so concurrent sends can't open two.
+            watching = ""
+            if take_watch(tid) or wants_pane(thread):
+                try:
+                    shown = show_viewer(thread, client.info, quiet=True)
+                    watching = f" {shown}" if shown else ""
+                except (BridgeError, OSError) as e:
+                    watching = f" Could not open a terminal: {e}"
         if not wait:
             return (f"Delivered to {name} ({mode}, turn {turn_id}).{watching} Not waiting; "
                     "read the reply later with GetConsultantReply.")
@@ -695,19 +817,18 @@ def send_consultant_message(args, cancel=None):
         if turn:
             return format_turn(name, turn) + (f"\n\n({watching.strip()})" if watching else "")
         return (f"Delivered to {name} ({mode}), but no reply within {timeout:.0f}s. Turn {turn_id} is "
-                "still running; read it later with GetConsultantReply.")
+                "still running; this is not a reply. Call GetConsultantReply with until_done=true to "
+                "be told when it finishes.")
     finally:
         client.close()
 
 
 def get_consultant_reply(args, cancel=None):
-    target = args.get("to") or ""
-    if not target:
-        raise BridgeError("`to` is required.")
-    timeout = float(args.get("timeout_seconds", 0))
+    to = target(args)
+    timeout = None if flag(args, "until_done") else number(args, "timeout_seconds", 0)
     client = CodexClient()
     try:
-        thread = resolve(client, target)
+        thread = resolve(client, to)
         tid, name = thread["id"], short_name(thread)
         turn_id = args.get("turn_id")
         turn = find_turn(client, tid, turn_id, REPLY_LOOKBACK) if turn_id else latest_turn(client, tid)
@@ -716,9 +837,10 @@ def get_consultant_reply(args, cancel=None):
                 return f"{name} has no turn {turn_id} among its {REPLY_LOOKBACK} most recent turns."
             return f"{name} has no messages yet."
         if turn.get("status") == "inProgress":
-            done = wait_for_turn(client, tid, turn["id"], timeout, cancel) if timeout > 0 else None
+            done = wait_for_turn(client, tid, turn["id"], timeout, cancel) if timeout is None or timeout > 0 else None
             if not done:
-                return f"{name} is still working on turn {turn['id']}."
+                return (f"{name} is still working on turn {turn['id']}; this is not a reply. "
+                        "Call again with until_done=true to be told when it finishes.")
             turn = done
         out = format_turn(name, turn)
         latest = latest_turn(client, tid)
@@ -730,12 +852,10 @@ def get_consultant_reply(args, cancel=None):
 
 
 def watch_consultant(args, cancel=None):
-    target = args.get("to") or ""
-    if not target:
-        raise BridgeError("`to` is required.")
+    to = target(args)
     client = CodexClient()
     try:
-        thread = resolve(client, target)
+        thread = resolve(client, to)
         has_turns = bool(latest_turn(client, thread["id"]))
         info = client.info
     finally:
@@ -756,12 +876,10 @@ def watch_consultant(args, cancel=None):
 
 
 def stop_consultant(args, cancel=None):
-    target = args.get("to") or ""
-    if not target:
-        raise BridgeError("`to` is required.")
+    to = target(args)
     client = CodexClient()
     try:
-        thread = resolve(client, target)
+        thread = resolve(client, to)
         name = short_name(thread)
         if not is_bridge(thread):
             raise BridgeError(f"{name} was not started by StartConsultant. Close it from its own terminal.")
@@ -769,6 +887,8 @@ def stop_consultant(args, cancel=None):
     finally:
         client.close()
     set_watch(thread["id"], False)
+    with _send_locks_guard:
+        _unwatched.discard(thread["id"])
     closed = close_terminals(thread["id"])
     return (f"Stopped {name} (archived)."
             + (f" Closed {closed} terminal window(s) showing it." if closed else "")
@@ -779,10 +899,15 @@ def stop_consultant(args, cancel=None):
 # --- MCP stdio server --------------------------------------------------------
 
 INSTRUCTIONS = (
-    "Before starting a Codex consultant, call ListConsultants with cwd set to your working "
-    "directory. If a session already works in this repo, send to it with SendConsultantMessage "
-    "instead of starting another; it keeps its earlier context. Start a new one (StartConsultant "
-    "with new=true) only when none fits or the user asks for a fresh one."
+    "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your "
+    "working directory, even if you don't remember one being open (earlier context may have been "
+    "compacted). It searches first: if a session already works in this repo it returns that one, "
+    "keeping its earlier context, and starts nothing; otherwise it starts one. Either way the "
+    "session is shown in a pane beside Claude Code, and you talk to it with SendConsultantMessage, "
+    "passing the name it returns as `to`. Pass new=true only when the user asks for a separate consultant. "
+    "For a long task, send with wait=false, then call GetConsultantReply with until_done=true; it "
+    "returns only when Codex finishes. A reply that says 'still working' is not a reply: call "
+    "GetConsultantReply with until_done=true again rather than treating it as done."
 )
 
 TO_SCHEMA = {"type": "string", "description": "Consultant name, thread id, or unique id prefix/suffix."}
@@ -794,19 +919,21 @@ TOOLS = [
             "Start a new Codex session (consultant) in the background, with no terminal needed. "
             "It runs on the local Codex app-server daemon in a read-only sandbox and never asks for "
             "approvals: it can read files and run read-only commands for auditing, validation and "
-            "research, but cannot edit anything. Returns the name to pass to SendConsultantMessage. "
-            "Call ListConsultants with your cwd first: if sessions already work in this repo, this "
-            "tool lists them and starts nothing unless new=true."
+            "research, but cannot edit anything. Returns the consultant's name: pass it as `to` to the other tools. "
+            "Searches first, so call it whenever you need a consultant: if a session already works "
+            "in this repo it returns that one and starts nothing (unless new=true); if none is "
+            "found, it starts one. The session is shown in a pane beside Claude Code (Windows "
+            "Terminal or tmux split, otherwise a new window) once it has its first message."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "cwd": {"type": "string", "description": "Absolute path of the project Codex should work in. Pass your working directory; defaults to the bridge server's own."},
+                "cwd": {"type": "string", "description": "Absolute path of the project Codex should work in. Pass your working directory. Default: Claude Code's workspace folder."},
                 "model": {"type": "string", "description": "Codex model. Default: the user's Codex config."},
                 "title": {"type": "string", "description": "Optional session title shown in Codex."},
                 "instructions": {"type": "string", "description": "Optional standing instructions for the consultant's role."},
-                "watch": {"type": "boolean", "description": "Open the session in a terminal window when its first message is sent, so the user can watch it work. Default false."},
-                "new": {"type": "boolean", "description": "Start a new session even though sessions already work in this repo. Default false. Use only when none of the listed ones fits, or the user asked for another."},
+                "watch": {"type": "boolean", "description": "Show the session in a pane beside Claude Code so the user can watch it work. Default true; pass false only if the user doesn't want a pane."},
+                "new": {"type": "boolean", "description": "Start a new session even though one already works in this repo. Default false. Use only when the user asked for a separate consultant."},
             },
         },
     },
@@ -823,7 +950,7 @@ TOOLS = [
             "properties": {
                 "cwd": {
                     "type": "string",
-                    "description": "Only list sessions whose working directory is in the same git repo as this path (or under it, outside a repo).",
+                    "description": "Only list sessions whose working directory is in the same git repo as this path. Outside git: under the Claude Code workspace folder that contains it, or under the path itself.",
                 },
                 "include_all": {
                     "type": "boolean",
@@ -847,6 +974,7 @@ TOOLS = [
                 "from": {"type": "string", "description": "Sender label shown to Codex, e.g. your session name. Default 'Claude Code'."},
                 "wait": {"type": "boolean", "description": "Wait for the reply. Default true. With false, read it later with GetConsultantReply."},
                 "timeout_seconds": {"type": "number", "description": "Max seconds to wait for the reply. Default 600."},
+                "until_done": {"type": "boolean", "description": "Wait until the turn ends, with no time limit (overrides timeout_seconds). Default false."},
             },
             "required": ["to", "message"],
         },
@@ -856,7 +984,9 @@ TOOLS = [
         "description": (
             "Read a consultant's reply without sending anything: the latest turn, or a specific turn id "
             "returned by SendConsultantMessage (searched among the 100 most recent turns). Use after "
-            "sending with wait=false or after a timeout."
+            "sending with wait=false or after a timeout. For long turns pass until_done=true: the call "
+            "returns only when the turn ends, so a client that runs long calls in the background is "
+            "notified exactly when the reply is ready."
         ),
         "inputSchema": {
             "type": "object",
@@ -864,6 +994,7 @@ TOOLS = [
                 "to": TO_SCHEMA,
                 "turn_id": {"type": "string", "description": "Turn id to read. Default: the latest turn."},
                 "timeout_seconds": {"type": "number", "description": "If the turn is still running, wait up to this long. Default 0 (don't wait)."},
+                "until_done": {"type": "boolean", "description": "If the turn is still running, wait until it ends, with no time limit (overrides timeout_seconds). Default false."},
             },
             "required": ["to"],
         },
@@ -899,22 +1030,65 @@ HANDLERS = {
 }
 
 
+def write_message(out):
+    with _stdout_lock:
+        sys.stdout.write(json.dumps(out) + "\n")
+        sys.stdout.flush()
+
+
 def respond(msg_id, result=None, error=None):
     out = {"jsonrpc": "2.0", "id": msg_id}
     if error is not None:
         out["error"] = error
     else:
         out["result"] = result
-    with _stdout_lock:
-        sys.stdout.write(json.dumps(out) + "\n")
-        sys.stdout.flush()
+    write_message(out)
+
+
+def client_request(method, params, timeout=5):
+    """Send a request to Claude Code and wait for its result (None on error or timeout). Never
+    call this from main(): main() is the loop that reads the response."""
+    with _client_guard:
+        req_id = f"nouez-{next(_client_ids)}"
+        waiter = _client_requests[req_id] = [threading.Event(), None]
+    write_message({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+    waiter[0].wait(timeout)
+    with _client_guard:
+        _client_requests.pop(req_id, None)
+    response = waiter[1] or {}
+    return response.get("result")
+
+
+def path_from_uri(uri):
+    parsed = urllib.parse.urlparse(uri)
+    if parsed.scheme != "file":
+        return None
+    return os.path.abspath(urllib.request.url2pathname(parsed.path))
+
+
+def refresh_roots():
+    """Ask Claude Code for its workspace folders. An unanswered request counts as no roots, so a
+    client that never replies costs one timeout, not one per tool call."""
+    global _client_roots
+    result = client_request("roots/list", {})
+    roots = [path_from_uri(r.get("uri", "")) for r in (result or {}).get("roots", [])]
+    _client_roots = [r for r in roots if r]
+
+
+def client_roots():
+    if _client_roots is None and "roots" in _client_caps:
+        refresh_roots()
+    return _client_roots or []
 
 
 def handle(msg, cancel):
     method, msg_id, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
     if msg_id is None:
-        return  # notification
+        if method in ("notifications/initialized", "notifications/roots/list_changed") and "roots" in _client_caps:
+            refresh_roots()
+        return
     if method == "initialize":
+        _client_caps.update(params.get("capabilities") or {})
         respond(msg_id, {
             "protocolVersion": params.get("protocolVersion", "2025-06-18"),
             "capabilities": {"tools": {}},
@@ -959,6 +1133,13 @@ def main():
             msg = json.loads(line)
         except ValueError:
             respond(None, error={"code": -32700, "message": "Parse error"})
+            continue
+        if "method" not in msg:  # a response to a request we sent (roots/list)
+            with _client_guard:
+                waiter = _client_requests.get(msg.get("id"))
+            if waiter:
+                waiter[1] = msg
+                waiter[0].set()
             continue
         if msg.get("method") == "notifications/cancelled":
             with _cancel_guard:

@@ -80,7 +80,7 @@ Claude calls `StartConsultant` to create a background Codex session in your proj
 
 **The consultant is always read-only.** It can read your files and run read-only commands for auditing, validation and research, but it can't change anything. It never stops to ask for approvals, because no terminal is attached to answer them. Claude does all the writing. There is no option to give a consultant write access.
 
-**3. Watch or join in (optional).** A background consultant is an ordinary Codex session. To see it work, ask Claude to start it with `watch: true`, or ask it to *"open the consultant in a terminal"* later (`WatchConsultant`). Either way, `codex resume <id>` opens next to Claude Code: as a split pane in the same tab when Claude Code runs in Windows Terminal or tmux, otherwise in a new terminal window. You can read along there or type into the session yourself. Codex can't open a session before its first message, so with `watch: true` the window appears when Claude sends that message. Without a split, Windows uses a new Windows Terminal window (falling back to a console window), macOS uses Terminal, and Linux uses `x-terminal-emulator`, `gnome-terminal` or `xterm`. Windows Terminal splits the active tab of the window you used most recently, and its command line can't target a particular tab, so stay on Claude Code's tab until the pane opens. If a terminal already shows the session, no second one opens. The window runs the Codex daemon's own `codex` binary, so it always matches the daemon's version.
+**3. Watch or join in (optional).** A background consultant is an ordinary Codex session. A consultant started by `StartConsultant` is shown automatically (pass `watch: false` to skip that); for a session you opened yourself, ask Claude to *"open the consultant in a terminal"* (`WatchConsultant`). Either way, `codex resume <id>` opens next to Claude Code: as a split pane in the same tab when Claude Code runs in Windows Terminal or tmux, otherwise in a new terminal window. You can read along there or type into the session yourself. Codex can't open a session before its first message, so the pane appears when Claude sends that message, and reappears on the next message if you close it. Without a split, Windows uses a new Windows Terminal window (falling back to a console window), macOS uses Terminal, and Linux uses `x-terminal-emulator`, `gnome-terminal` or `xterm`. Windows Terminal splits the active tab of the window you used most recently, and its command line can't target a particular tab, so stay on Claude Code's tab until the pane opens. If a terminal already shows the session, no second one opens. The window runs the Codex daemon's own `codex` binary, so it always matches the daemon's version.
 
 ### Reusing a consultant
 
@@ -92,7 +92,7 @@ A consultant keeps its whole conversation until you stop it, so you can keep goi
 
 > Open the consultant so I can watch.
 
-This works from a new Claude Code session too: consultants that went idle still appear in the list, and the next message reloads them. Reuse is the default. The bridge tells Claude to list the consultants for its repo before starting one, and `StartConsultant` won't start another while one already works in the same git repo; it lists the existing ones instead. When you want a clean slate, ask for a new one, and Claude passes `new: true`:
+This works from a new Claude Code session too: consultants that went idle still appear in the list, and the next message reloads them. Reuse is the default. `StartConsultant` searches first: if a consultant already works in the same project, it returns that one and starts nothing; if none is found, it starts one. The project is the git repo; outside git, it's the Claude Code workspace folder (the folder you launched Claude Code in), so a subfolder finds the consultant started at the top. When you want a clean slate, ask for a new one, and Claude passes `new: true`:
 
 > Start a new Codex consultant I can watch.
 
@@ -107,7 +107,7 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 ### Tips
 
 - **Give Codex context.** Codex can read the files in its own working directory, so start it in the same repo. Tell Claude to include the specific file, diff or question in the message.
-- **Give Claude standing instructions.** A line in your project's `CLAUDE.md` makes the workflow automatic, for example: *"Before committing non-trivial changes, ask the Codex consultant to review the diff and address its findings. Reuse the existing consultant for this repo if there is one; otherwise start one with watch on."*
+- **Give Claude standing instructions.** A line in your project's `CLAUDE.md` makes the workflow automatic, for example: *"Before committing non-trivial changes, ask the Codex consultant to review the diff and address its findings. Reuse the existing consultant for this repo if there is one; otherwise start one."*
 - **Give the consultant a role.** `StartConsultant` takes `instructions`, for example *"You are a skeptical senior reviewer. Look for bugs and missing tests; don't rewrite code."*
 - **Run several consultants.** Start several, for example in different repos or with different models. `ListConsultants` shows each one's name and working directory so Claude can pick the right one.
 - **Long tasks.** By default Claude waits up to 10 minutes for a reply. For long jobs, ask Claude to send with `wait: false` and keep working. It can read the answer later with `GetConsultantReply`.
@@ -118,7 +118,7 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 
 | Tool | What it does |
 |---|---|
-| `StartConsultant` | Starts a background Codex session in a project directory (always read-only; never asks for approvals). If sessions already work in that git repo, lists them and starts nothing unless `new: true`. |
+| `StartConsultant` | Starts a background Codex session in a project directory (always read-only; never asks for approvals). If a session already works in that project, returns it and starts nothing unless `new: true`. |
 | `ListConsultants` | Lists Codex sessions loaded on the local daemon, plus recent `StartConsultant` sessions it has unloaded, with each one's name, working directory, model, status and who started it. With `cwd`, only the sessions in that repo. |
 | `SendConsultantMessage` | Sends a message into a session and, by default, waits for and returns the reply. If the session is idle the message starts a new turn; if it's busy it steers the running turn. Unloaded sessions are reloaded first. |
 | `GetConsultantReply` | Reads a reply without sending anything: the latest turn, or a specific turn id. Use it after sending with `wait: false` or after a timeout. |
@@ -129,26 +129,31 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `cwd` | the bridge server's working directory | Absolute path of the project Codex works in |
+| `cwd` | Claude Code's workspace folder | Absolute path of the project Codex works in |
 | `model` | your Codex config | Codex model |
 | `title` | | Session title shown in Codex |
 | `instructions` | | Standing instructions for the consultant's role |
-| `watch` | `false` | Open the session in a terminal window when its first message is sent |
-| `new` | `false` | Start a new session even though sessions already work in this git repo |
+| `watch` | `true` | Show the session in a pane beside Claude Code once it has its first message, and again on later messages if the pane was closed |
+| `new` | `false` | Start a new session even though one already works in this project |
 
 `SendConsultantMessage` arguments:
 
 | Argument | Required | Default | Meaning |
 |---|---|---|---|
-| `to` | yes | | Session name from `ListConsultants` (e.g. `codex-myproject-a1b2c3`), full thread id, or unique id prefix/suffix |
+| `to` | yes | | Session name from `ListConsultants` (e.g. `codex-myproject-a1b2c3`), full thread id, or unique id prefix/suffix. `name` is accepted as an alias. |
 | `message` | yes | | The text to send |
 | `from` | no | `Claude Code` | Sender label shown to Codex |
 | `wait` | no | `true` | Wait for the reply |
 | `timeout_seconds` | no | `600` | Maximum time to wait for the reply |
+| `until_done` | no | `false` | Wait until the turn ends, with no time limit (overrides `timeout_seconds`) |
 
-`GetConsultantReply` takes `to`, an optional `turn_id` (default: the latest turn; looked up among the 100 most recent turns), and an optional `timeout_seconds` (default `0`, which returns at once if the turn is still running).
+`GetConsultantReply` takes `to`, an optional `turn_id` (default: the latest turn; looked up among the 100 most recent turns), an optional `timeout_seconds` (default `0`, which returns at once if the turn is still running), and an optional `until_done` (default `false`; when `true` it waits until the turn ends, with no time limit).
 
-`WatchConsultant` and `StopConsultant` take only `to`. `ListConsultants` takes an optional `cwd` to list only the sessions whose working directory is in that path's git repo (or under the path, outside a repo), and an optional `include_all` (default `false`, ignored with `cwd`) to also show Codex-internal threads such as subagents.
+For a long review, send with `wait: false`, then call `GetConsultantReply` with `until_done: true`. Claude Code runs a long call in the background and notifies Claude when it returns, which now happens only when Codex finishes. A "still working" result is never a reply.
+
+`WatchConsultant` and `StopConsultant` take only `to`. `ListConsultants` takes an optional `cwd` to list only the sessions whose working directory is in that path's git repo (outside a repo: under the Claude Code workspace folder that contains the path, or under the path itself), and an optional `include_all` (default `false`, ignored with `cwd`) to also show Codex-internal threads such as subagents.
+
+Boolean arguments take `true`/`false` (or the strings `"true"`/`"false"`); any other value is an error rather than a guess.
 
 ## Troubleshooting
 
@@ -158,9 +163,9 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 | `Codex app-server daemon is not reachable` | Open a Codex session, or run `codex app-server daemon start`. |
 | `No Codex sessions` | Ask Claude to start a consultant, or open Codex in a terminal. |
 | `'x' is ambiguous` | Use the full name or thread id from `ListConsultants`. |
-| `no reply within 600s` | Codex is still working. Ask Claude to read it later with `GetConsultantReply`, or to wait longer with `timeout_seconds`. |
+| `` `x` must be true or false `` | A boolean argument got some other value. Pass `true` or `false`. |
+| `no reply within 600s` | Codex is still working. Ask Claude to wait with `GetConsultantReply` and `until_done: true`; it returns when the reply is ready. |
 | `was not started by StartConsultant` | That's a session you opened yourself. Close it from its own terminal. |
-| `Not started: ... already work in` | A consultant already works in this repo. Send to it, or ask for a new one (`new: true`). |
 | The terminal window opens but shows an error | Make sure `codex` is on the `PATH` of new terminals, and that the session has had its first message. |
 | The terminal window asks to restart the daemon ("incompatible feature set") | The window's `codex` is a different version from the daemon. Choose **Cancel**: restarting interrupts running consultants, and running without the daemon shows a separate copy of the session. The bridge normally avoids this by using the daemon's own binary; if it warned that it couldn't find it, update the Codex CLI to the daemon's version. |
 | Anything else after updating Codex | Compare your versions with the [Tested with](#tested-with) table. The Codex app-server protocol may have changed. |
