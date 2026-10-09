@@ -4,7 +4,7 @@ Tools
   StartConsultant        reuse the repo's consultant, or start a read-only one, shown in a pane
   ListConsultants        Codex sessions on the local app-server daemon
   SendConsultantMessage  send a message into one of them and return its reply
-  GetConsultantReply     read (or wait for) a reply sent with wait=false
+  GetConsultantReply     read (or wait for) a reply sent with wait=0
   WatchConsultant        open a session in a terminal window
   StopConsultant         archive a session that StartConsultant started
 
@@ -18,6 +18,7 @@ import json
 import math
 import os
 import queue
+import reprlib
 import re
 import shlex
 import shutil
@@ -31,7 +32,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.3.2"
+SERVER_VERSION = "0.4.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -39,9 +40,10 @@ POLL_SECONDS = 1.5
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 RECENT_SAVED_THREADS = 50  # how far back to look for unloaded bridge consultants
 REPLY_LOOKBACK = 100  # how many recent turns GetConsultantReply searches for a turn id
-MAX_WAIT_SECONDS = 4 * 60 * 60  # ceiling on any wait, until_done included, so a hung turn can't pin a call
+MAX_WAIT_SECONDS = 4 * 60 * 60  # ceiling on any wait, wait="done" included, so a hung turn can't pin a call
 MAX_REPLY_CHARS = 60_000  # longer replies are cut here; the full text is saved to a file
 PARTIAL_CHARS = 4_000  # how much of a still-running turn's output a timeout shows (the most recent part)
+PROGRESS_SECONDS = 10  # least time between two progress notifications for one call
 BRIDGE_SOURCE = "nouez"  # threadSource tag on sessions started by StartConsultant
 SANDBOX = "read-only"
 # How Codex 0.160.1 reports a session whose history isn't written yet: before the first
@@ -90,23 +92,25 @@ def flag(args, key, default=False):
     raise BridgeError(f"`{key}` must be true or false, not {value!r}.")
 
 
-def number(args, key, default):
-    """A non-negative number of seconds, capped at MAX_WAIT_SECONDS."""
-    value = args.get(key, default)
+def wait_seconds(args, default):
+    """How long to wait for a turn: `wait` is a number of seconds (0 = don't wait) or "done" (until
+    the turn ends), capped at MAX_WAIT_SECONDS. The options it replaced are refused, not guessed at."""
+    for old, new in (("until_done", 'wait="done"'), ("timeout_seconds", "wait=<seconds>")):
+        if old in args:
+            raise BridgeError(f"`{old}` was replaced by `wait` in nouez 0.4: pass {new}.")
+    value = args.get("wait", default)
+    if isinstance(value, str) and value.strip().lower() == "done":
+        return MAX_WAIT_SECONDS
     try:
         if isinstance(value, bool):
             raise ValueError
         seconds = float(value)
         if not math.isfinite(seconds) or seconds < 0:
             raise ValueError
-    except (TypeError, ValueError):
-        raise BridgeError(f"`{key}` must be a number of seconds, 0 or more, not {value!r}.") from None
+    except (TypeError, ValueError, OverflowError):
+        raise BridgeError(f"`wait` must be a number of seconds, 0 or more (0 = don't wait), or \"done\", "
+                          f"not {reprlib.repr(value)}.") from None
     return min(seconds, MAX_WAIT_SECONDS)
-
-
-def wait_seconds(args, default):
-    """How long to wait for a turn: until_done means up to MAX_WAIT_SECONDS."""
-    return MAX_WAIT_SECONDS if flag(args, "until_done") else number(args, "timeout_seconds", default)
 
 
 def target(args):
@@ -286,8 +290,8 @@ class CodexClient:
         rid = self.next_id
         self.next_id += 1
         self._send_frame(json.dumps({"id": rid, "method": method, "params": params}).encode())
-        deadline = time.time() + self.timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
             try:
                 msg = self.q.get(timeout=0.5)
             except queue.Empty:
@@ -453,27 +457,30 @@ def turn_reply(turn):
     return "\n\n".join(finals or [m.get("text", "") for m in messages[-1:]])
 
 
-def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None):
+def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None, on_poll=None):
     """Poll until the turn finishes. Returns (done, turn_id, turn): on timeout, done is False and
     turn is the last snapshot seen (or None). With `text` (the message we sent), follow an
-    interrupted turn into its continuation; turn_id is then the continuation's id."""
-    deadline = time.time() + timeout
+    interrupted turn into its continuation; turn_id is then the continuation's id. on_poll(turn_id,
+    turn) is called with each snapshot of a turn still running."""
+    deadline = time.monotonic() + timeout
     grace = None  # an interrupted turn's continuation may take a moment to be listed
     while True:
         turn = find_turn(client, tid, turn_id)
+        if on_poll and turn and turn.get("status") == "inProgress":
+            on_poll(turn_id, turn)
         if turn and turn.get("status") == "interrupted" and text:
             nxt = continuation(client, tid, turn_id, text)
             if nxt:
                 turn_id, grace = nxt["id"], None
                 continue
-            grace = grace or time.time() + 5
-            if time.time() < grace:
+            grace = grace or time.monotonic() + 5
+            if time.monotonic() < grace:
                 check_cancel(cancel)
                 time.sleep(0.5)
                 continue
         if turn and turn.get("status") != "inProgress":
             return True, turn_id, turn
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             return False, turn_id, turn
         check_cancel(cancel)
         time.sleep(POLL_SECONDS)
@@ -516,6 +523,19 @@ def still_working(name, turn_id, turn, advice):
         out += ("\n\nOutput so far (a snapshot of the running turn; it may change and is not "
                 f"the final answer):\n{partial}")
     return out
+
+
+def progress_reporter(progress, name):
+    """An on_poll for wait_for_turn that reports the wait as MCP progress, or None without a token."""
+    if not progress:
+        return None
+    started = time.monotonic()
+
+    def report(turn_id, turn):
+        latest = partial_output(turn).strip().splitlines()[-1:]
+        note = f": {latest[0][:150]}" if latest else ""
+        progress(f"{name} is working on turn {turn_id} (waited {time.monotonic() - started:.0f}s){note}")
+    return report
 
 
 def format_turn(name, turn):
@@ -748,7 +768,7 @@ def format_threads(threads):
     return "\n".join(lines)
 
 
-def list_consultants(args, cancel=None):
+def list_consultants(args, cancel=None, progress=None):
     include_all = flag(args, "include_all")
     client = CodexClient()
     try:
@@ -766,7 +786,7 @@ def list_consultants(args, cancel=None):
     return f"{len(threads)} Codex session(s):\n" + format_threads(threads)
 
 
-def start_consultant(args, cancel=None):
+def start_consultant(args, cancel=None, progress=None):
     cwd = os.path.abspath(args.get("cwd") or default_cwd())
     if not os.path.isdir(cwd):
         raise BridgeError(f"cwd is not a directory: {cwd}")
@@ -806,7 +826,8 @@ def start_consultant(args, cancel=None):
     with _send_locks_guard:
         (_unwatched.discard if watch else _unwatched.add)(thread["id"])
     user_note = (f"\nThe user's own Codex sessions in this repo were not used (they keep the user's "
-                 f"permissions); message one only if the user asks you to:\n{format_threads(users)}"
+                 f"permissions). Message one only if the user asks you to, with "
+                 f"allow_user_session=true:\n{format_threads(users)}"
                  if users else "")
     if not existing:
         return (
@@ -843,13 +864,13 @@ def start_consultant(args, cancel=None):
     )
 
 
-def send_consultant_message(args, cancel=None):
+def send_consultant_message(args, cancel=None, progress=None):
     to = target(args)
     message = args.get("message") or ""
     if not message:
         raise BridgeError("`message` is required.")
-    wait = flag(args, "wait", True)
     timeout = wait_seconds(args, 600)
+    allow_user = flag(args, "allow_user_session")
     sender = args.get("from") or "Claude Code"
     text = f"[Message from {sender} via the consultants bridge]\n\n{message}"
 
@@ -857,6 +878,13 @@ def send_consultant_message(args, cancel=None):
     try:
         thread = resolve(client, to)
         tid, name = thread["id"], short_name(thread)
+        if not (is_bridge(thread) or allow_user):
+            # Our consultants are read-only; a session the user opened has the user's permissions.
+            raise BridgeError(
+                f"{name} is a Codex session the user opened, not a read-only consultant: it keeps the "
+                "user's own permissions and may be able to edit files. Nothing was sent. Only if the "
+                "user asked you to message this session, send again with allow_user_session=true; "
+                "otherwise use StartConsultant.")
         with send_lock(tid):
             # Last point a cancellation can still stop the message from being delivered.
             check_cancel(cancel)
@@ -872,9 +900,9 @@ def send_consultant_message(args, cancel=None):
                 # turns/list lags turn/start. Hold the lock until the turn is listed, or a
                 # concurrent send would see the session idle and its turn/start would
                 # interrupt this one.
-                deadline = time.time() + 10
+                deadline = time.monotonic() + 10
                 try:
-                    while not find_turn(client, tid, turn_id) and time.time() < deadline:
+                    while not find_turn(client, tid, turn_id) and time.monotonic() < deadline:
                         time.sleep(0.2)
                 except (BridgeError, OSError):
                     pass  # delivered already; the wait below reports a lasting failure as such
@@ -887,11 +915,12 @@ def send_consultant_message(args, cancel=None):
                     watching = f" {shown}" if shown else ""
                 except (BridgeError, OSError) as e:
                     watching = f" Could not open a terminal: {e}"
-        if not wait:
-            return (f"Delivered to {name} ({mode}, turn {turn_id}).{watching} Not waiting; "
-                    "read the reply later with GetConsultantReply.")
+        if not timeout:
+            return (f"Delivered to {name} ({mode}, turn {turn_id}).{watching} Not waiting; read the "
+                    f"reply with GetConsultantReply (turn_id {turn_id}, wait=\"done\").")
         try:
-            done, turn_id, turn = wait_for_turn(client, tid, turn_id, timeout, cancel, text)
+            done, turn_id, turn = wait_for_turn(client, tid, turn_id, timeout, cancel, text,
+                                                progress_reporter(progress, name))
         except (BridgeError, OSError) as e:
             # The message is already in the session; a plain error would invite a resend.
             raise BridgeError(f"Delivered to {name} ({mode}, turn {turn_id}), but waiting for the reply "
@@ -902,12 +931,12 @@ def send_consultant_message(args, cancel=None):
         return still_working(
             name, turn_id, turn,
             f"Delivered ({mode}), but no reply within {timeout:.0f}s. Don't send the message again. "
-            f"Call GetConsultantReply with turn_id {turn_id} and until_done=true to be told when it finishes.")
+            f"Call GetConsultantReply with turn_id {turn_id} and wait=\"done\" to be told when it finishes.")
     finally:
         client.close()
 
 
-def get_consultant_reply(args, cancel=None):
+def get_consultant_reply(args, cancel=None, progress=None):
     to = target(args)
     timeout = wait_seconds(args, 0)
     client = CodexClient()
@@ -923,11 +952,12 @@ def get_consultant_reply(args, cancel=None):
         if turn.get("status") == "inProgress":
             done = False
             if timeout > 0:
-                done, _, last = wait_for_turn(client, tid, turn["id"], timeout, cancel)
+                done, _, last = wait_for_turn(client, tid, turn["id"], timeout, cancel,
+                                              on_poll=progress_reporter(progress, name))
                 turn = last or turn  # the newest snapshot, for the partial output
             if not done:
                 return still_working(name, turn["id"], turn,
-                                     f"Call again with turn_id {turn['id']} and until_done=true to be "
+                                     f"Call again with turn_id {turn['id']} and wait=\"done\" to be "
                                      "told when it finishes.")
         out = format_turn(name, turn)
         latest = latest_turn(client, tid)
@@ -939,7 +969,7 @@ def get_consultant_reply(args, cancel=None):
         client.close()
 
 
-def watch_consultant(args, cancel=None):
+def watch_consultant(args, cancel=None, progress=None):
     to = target(args)
     client = CodexClient()
     try:
@@ -963,7 +993,7 @@ def watch_consultant(args, cancel=None):
     return show_viewer(thread, info)
 
 
-def stop_consultant(args, cancel=None):
+def stop_consultant(args, cancel=None, progress=None):
     to = target(args)
     client = CodexClient()
     try:
@@ -992,14 +1022,24 @@ INSTRUCTIONS = (
     "compacted). It reuses a consultant it started earlier in this repo, keeping its context, or "
     "starts a new read-only one; it never picks a Codex session the user opened. Talk to it with "
     "SendConsultantMessage, passing the name it returns as `to`. Pass new=true only when the user "
-    "asks for a separate consultant. Message a session the user opened only when the user asks you to. "
-    "For a long task, send with wait=false, then call GetConsultantReply with the returned turn_id "
-    "and until_done=true; it returns when the turn ends, or with an error or after 4 hours. A "
-    "result that says 'still working' is not a reply, even if it shows output so far: call "
-    "GetConsultantReply with until_done=true again rather than treating it as done."
+    "asks for a separate consultant. Message a session the user opened only when the user asks you "
+    "to, with allow_user_session=true. For a long task, send with wait=0, then call "
+    "GetConsultantReply with the returned turn_id and wait=\"done\"; it returns when the turn ends, "
+    "or with an error or after 4 hours. A result that says 'still working' is not a reply, even if "
+    "it shows output so far: call GetConsultantReply with wait=\"done\" again rather than treating "
+    "it as done."
 )
 
 TO_SCHEMA = {"type": "string", "description": "Consultant name, thread id, or unique id prefix/suffix."}
+
+
+def wait_schema(default):
+    return {"anyOf": [{"type": "number", "minimum": 0, "maximum": MAX_WAIT_SECONDS},
+                      {"type": "string", "enum": ["done"]}],
+            "description": (f"How long to wait for the reply: a number of seconds (0 = don't wait), or "
+                            f"\"done\" to wait until the turn ends, up to 4 hours. Default {default}. "
+                            "If the turn is still running when the wait ends, the result shows its "
+                            "output so far, which is not the reply.")}
 EXACT_TO_SCHEMA = {"type": "string", "description": "Consultant name or full thread id (exact match only)."}
 
 TOOLS = [
@@ -1057,8 +1097,8 @@ TOOLS = [
             "Send a message into a Codex session and, by default, wait for and return its reply. "
             "The message appears in that session as a new user turn (or steers the running turn if busy). "
             "Address it by the name from ListConsultants, the thread id, or a unique id prefix/suffix. "
-            "A session the user opened keeps the user's own permissions and may be able to edit files: "
-            "message one only when the user asks you to. May open the session's pane beside Claude Code."
+            "Sessions the user opened are refused unless allow_user_session=true: they keep the user's "
+            "own permissions and may be able to edit files. May open the session's pane beside Claude Code."
         ),
         "inputSchema": {
             "type": "object",
@@ -1066,9 +1106,8 @@ TOOLS = [
                 "to": TO_SCHEMA,
                 "message": {"type": "string", "description": "The message to send."},
                 "from": {"type": "string", "description": "Sender label shown to Codex, e.g. your session name. Default 'Claude Code'."},
-                "wait": {"type": "boolean", "description": "Wait for the reply. Default true. With false, return once the message is delivered (timeout_seconds and until_done are then ignored) and read the reply later with GetConsultantReply."},
-                "timeout_seconds": {"type": "number", "minimum": 0, "description": "Max seconds to wait for the reply after delivery. Default 600, at most 14400. On timeout the result shows the output so far, which is not the reply."},
-                "until_done": {"type": "boolean", "description": "Wait until the turn ends, up to 4 hours (overrides timeout_seconds). Default false."},
+                "wait": wait_schema(600),
+                "allow_user_session": {"type": "boolean", "description": "Allow sending to a Codex session the user opened (not started by StartConsultant). Default false. Set it only when the user asked you to message that session."},
             },
             "required": ["to", "message"],
         },
@@ -1079,7 +1118,7 @@ TOOLS = [
         "description": (
             "Read a consultant's reply without sending anything: the latest turn, or a specific turn id "
             "returned by SendConsultantMessage (searched among the 100 most recent turns). Use after "
-            "sending with wait=false or after a timeout. For long turns pass until_done=true: the call "
+            "sending with wait=0 or after a timeout. For long turns pass wait=\"done\": the call "
             "returns when the turn ends (polled every 1.5 s), or with an error or after 4 hours, so a "
             "client that runs long calls in the background is notified soon after the reply is ready. "
             "While the turn runs, the result shows its output so far, which is not the reply."
@@ -1089,8 +1128,7 @@ TOOLS = [
             "properties": {
                 "to": TO_SCHEMA,
                 "turn_id": {"type": "string", "description": "Turn id to read. Default: the latest turn."},
-                "timeout_seconds": {"type": "number", "minimum": 0, "description": "If the turn is still running, wait up to this long. Default 0 (don't wait), at most 14400."},
-                "until_done": {"type": "boolean", "description": "If the turn is still running, wait until it ends, up to 4 hours (overrides timeout_seconds). Default false."},
+                "wait": wait_schema(0),
             },
             "required": ["to"],
         },
@@ -1144,6 +1182,36 @@ def respond(msg_id, result=None, error=None):
     else:
         out["result"] = result
     write_message(out)
+
+
+class Progress:
+    """notifications/progress for one tools/call whose request carried a progressToken. At most one
+    every PROGRESS_SECONDS, none once the call is cancelled; `progress` only ever increases. A
+    failed write stops the notifications, never the wait."""
+
+    def __init__(self, token, cancel):
+        self.token, self.cancel, self.count, self.last = token, cancel, 0, None
+        self.broken = False
+
+    def __call__(self, message):
+        now = time.monotonic()
+        if self.broken or self.cancel.is_set() or (
+                self.last is not None and now - self.last < PROGRESS_SECONDS):
+            return
+        self.last, self.count = now, self.count + 1
+        try:
+            write_message({"jsonrpc": "2.0", "method": "notifications/progress", "params": {
+                "progressToken": self.token, "progress": self.count, "message": message}})
+        except Exception:
+            self.broken = True
+
+
+def progress_for(params, cancel):
+    meta = params.get("_meta")
+    token = meta.get("progressToken") if isinstance(meta, dict) else None
+    if isinstance(token, (str, int)) and not isinstance(token, bool):
+        return Progress(token, cancel)
+    return None
 
 
 def client_request(method, params, timeout=5):
@@ -1232,7 +1300,7 @@ def dispatch(msg, cancel):
             invalid_params(msg_id, "arguments must be an object.")
             return
         try:
-            text, is_error = handler(arguments, cancel), False
+            text, is_error = handler(arguments, cancel, progress_for(params, cancel)), False
         except Cancelled:
             return  # the client cancelled the request and expects no response
         except BridgeError as e:

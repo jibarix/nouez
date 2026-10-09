@@ -6,6 +6,21 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-09
+
+Breaking: `SendConsultantMessage` and `GetConsultantReply` take a single `wait` argument instead of `wait`, `timeout_seconds` and `until_done`.
+
+### Changed
+- `wait` is a number of seconds (`0` means don't wait) or `"done"` (wait until the turn ends, up to 4 hours). Defaults: 600 seconds for `SendConsultantMessage`, 0 for `GetConsultantReply`. The old arguments are refused with an error that names the new form, before anything is sent. The old `wait: true/false` is refused too.
+- `SendConsultantMessage` refuses a Codex session the user opened unless `allow_user_session: true`. Such a session keeps the user's permissions and may be able to edit files; until now only the instructions kept Claude from messaging it. Nothing is sent when it refuses.
+
+### Added
+- Progress notifications. When a `tools/call` carries a progress token, a waiting `SendConsultantMessage` or `GetConsultantReply` sends `notifications/progress` at most every 10 seconds, with the turn id, the time so far and the latest line of output. None are sent after a cancellation.
+
+### Fixed
+- `wait` with a number too large for a float (such as `1e400` written out as an integer) gave "Unexpected error"; it now gets the usual `wait` error.
+- Deadlines and waited times use a monotonic clock, so a system clock change can't cut a wait short or stretch it.
+
 ## [0.3.2] - 2026-10-09
 
 Fixes from a Codex review of 0.3.1 and of the architecture document.
@@ -93,7 +108,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jibarix/nouez/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/jibarix/nouez/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/jibarix/nouez/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jibarix/nouez/compare/v0.2.0...v0.3.0

@@ -23,7 +23,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.3.2 |
+| nouez | 0.4.0 |
 | Claude Code | 2.1.295 |
 | Codex CLI | 0.160.1 |
 | Codex app-server daemon | 0.162.0 |
@@ -102,7 +102,7 @@ With more than one consultant running, name the one you mean. Once stopped, a co
 
 ### Using a Codex session you opened yourself
 
-If you'd rather see Codex work in its own window, open it yourself (`cd my-project && codex`) and ask Claude to *"list the consultants and send it …"*. Claude finds the session with `ListConsultants` and talks to it the same way. `StartConsultant` never chooses your session on its own, so Claude only messages it when you ask. The message appears in that terminal as a new prompt. Sessions you open yourself use their own permission settings and approval prompts, and `StopConsultant` won't close them.
+If you'd rather see Codex work in its own window, open it yourself (`cd my-project && codex`) and ask Claude to *"list the consultants and send it …"*. Claude finds the session with `ListConsultants` and talks to it the same way. `StartConsultant` never chooses your session on its own, and `SendConsultantMessage` refuses it unless Claude passes `allow_user_session: true`, which it is told to do only when you ask. The message appears in that terminal as a new prompt. Sessions you open yourself use their own permission settings and approval prompts, and `StopConsultant` won't close them.
 
 ### Tips
 
@@ -110,7 +110,7 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 - **Give Claude standing instructions.** A line in your project's `CLAUDE.md` makes the workflow automatic, for example: *"Before committing non-trivial changes, ask the Codex consultant to review the diff and address its findings. Reuse the existing consultant for this repo if there is one; otherwise start one."*
 - **Give the consultant a role.** `StartConsultant` takes `instructions`, for example *"You are a skeptical senior reviewer. Look for bugs and missing tests; don't rewrite code."*
 - **Run several consultants.** Start several, for example in different repos or with different models. `ListConsultants` shows each one's name and working directory so Claude can pick the right one.
-- **Long tasks.** By default Claude waits up to 10 minutes for a reply. For long jobs, ask Claude to send with `wait: false` and keep working. It can read the answer later with `GetConsultantReply`.
+- **Long tasks.** By default Claude waits up to 10 minutes for a reply. For long jobs, ask Claude to send with `wait: 0` and keep working. It can read the answer later with `GetConsultantReply`.
 - **Idle consultants.** After about a minute without activity, the Codex daemon unloads a consultant. It still appears in `ListConsultants`, and the next message reloads it with the same sandbox and history.
 - **Clean up.** Ask Claude to stop consultants when you're done, so they don't pile up in your Codex session list. Stopping archives a session rather than deleting it, and closes its watch window. On Windows, only windows the bridge opened are closed. On macOS and Linux, any `codex resume <id>` process for that session is ended, and a macOS Terminal window stays open at a shell prompt.
 
@@ -120,8 +120,8 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 |---|---|
 | `StartConsultant` | Starts a background Codex session in a project directory (always read-only; never asks for approvals). If a consultant it started already works in that project, returns it and starts nothing unless `new: true`. Never reuses a session you opened yourself. |
 | `ListConsultants` | Lists Codex sessions loaded on the local daemon, plus recent `StartConsultant` sessions it has unloaded, with each one's name, working directory, model, status and who started it. With `cwd`, only the sessions in that repo. |
-| `SendConsultantMessage` | Sends a message into a session and, by default, waits for and returns the reply. If the session is idle the message starts a new turn; if it's busy it steers the running turn. Unloaded sessions are reloaded first. |
-| `GetConsultantReply` | Reads a reply without sending anything: the latest turn, or a specific turn id. Use it after sending with `wait: false` or after a timeout. While the turn runs, it shows the output so far. |
+| `SendConsultantMessage` | Sends a message into a session and, by default, waits for and returns the reply. If the session is idle the message starts a new turn; if it's busy it steers the running turn. Unloaded sessions are reloaded first. Refuses a session you opened yourself unless `allow_user_session: true`. |
+| `GetConsultantReply` | Reads a reply without sending anything: the latest turn, or a specific turn id. Use it after sending with `wait: 0` or after a timeout. While the turn runs, it shows the output so far. |
 | `WatchConsultant` | Opens a session in a split pane beside Claude Code, or a new terminal window, so you can watch it or type into it. Does nothing if a terminal already shows it. |
 | `StopConsultant` | Archives a session that `StartConsultant` started and closes any terminal window watching it. Needs the exact name or full thread id. Refuses sessions you opened yourself. |
 
@@ -143,19 +143,22 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 | `to` | yes | | Session name from `ListConsultants` (e.g. `codex-myproject-a1b2c3`), full thread id, or unique id prefix/suffix. `name` is accepted as an alias. |
 | `message` | yes | | The text to send |
 | `from` | no | `Claude Code` | Sender label shown to Codex |
-| `wait` | no | `true` | Wait for the reply. With `false`, return once the message is delivered |
-| `timeout_seconds` | no | `600` | Maximum time to wait for the reply, 0 or more (capped at 4 hours) |
-| `until_done` | no | `false` | Wait until the turn ends, up to 4 hours (overrides `timeout_seconds`) |
+| `wait` | no | `600` | How long to wait for the reply: seconds (`0` returns once the message is delivered), or `"done"` to wait until the turn ends. Capped at 4 hours |
+| `allow_user_session` | no | `false` | Allow sending to a session you opened yourself. Claude sets it only when you ask |
 
-`GetConsultantReply` takes `to`, an optional `turn_id` (default: the latest turn; looked up among the 100 most recent turns), an optional `timeout_seconds` (default `0`, which returns at once if the turn is still running), and an optional `until_done` (default `false`; when `true` it waits until the turn ends, up to 4 hours).
+`GetConsultantReply` takes `to`, an optional `turn_id` (default: the latest turn; looked up among the 100 most recent turns), and an optional `wait` like `SendConsultantMessage`'s, but defaulting to `0`, which returns at once if the turn is still running.
 
-For a long review, send with `wait: false`, then call `GetConsultantReply` with the returned `turn_id` and `until_done: true`. Claude Code runs a long call in the background and notifies Claude when it returns: when the turn ends (checked every 1.5 seconds), on an error, or after 4 hours. A "still working" result is never a reply. It shows the turn's output so far (the latest 4,000 characters written since the last message reached it), labelled as a snapshot that may change.
+For a long review, send with `wait: 0`, then call `GetConsultantReply` with the returned `turn_id` and `wait: "done"`. Claude Code runs a long call in the background and notifies Claude when it returns: when the turn ends (checked every 1.5 seconds), on an error, or after 4 hours. A "still working" result is never a reply. It shows the turn's output so far (the latest 4,000 characters written since the last message reached it), labelled as a snapshot that may change.
+
+While a call waits, nouez sends MCP progress notifications (`notifications/progress`, at most one every 10 seconds) naming the turn, the time so far and the latest line of output, when the client asked for them with a progress token. Claude Code 2.1.295 asks but doesn't display them.
 
 If waiting fails after a message was delivered, the error starts with `Delivered to`, so Claude knows not to send it again.
 
 Replies longer than 60,000 characters are cut there. The full text is saved to `nouez/<turn id>.md` in the system temp folder, and the cut reply ends with that path.
 
 `WatchConsultant` and `StopConsultant` take only `to`. `StopConsultant` doesn't accept an id prefix or suffix, so a typo can't stop the wrong session. `ListConsultants` takes an optional `cwd` to list only the sessions whose working directory is in that path's git repo (outside a repo: under the Claude Code workspace folder that contains the path, or under the path itself), and an optional `include_all` (default `false`, ignored with `cwd`) to also show Codex-internal threads such as subagents.
+
+`wait` replaced `until_done`, `timeout_seconds` and the boolean `wait` in 0.4.0; the old arguments get an error that names the new form, and nothing is sent.
 
 Boolean arguments take `true`/`false` (or the strings `"true"`/`"false"`); any other value is an error rather than a guess.
 
@@ -170,7 +173,10 @@ Boolean arguments take `true`/`false` (or the strings `"true"`/`"false"`); any o
 | `'x' names more than one session` | Two sessions share a name (names keep only the last six characters of the id). Use the full thread id. |
 | `No Codex session named 'x'. Use its exact name or full thread id.` | `StopConsultant` matches exactly. Pass the name or full id from `ListConsultants`. |
 | `` `x` must be true or false `` | A boolean argument got some other value. Pass `true` or `false`. |
-| `no reply within 600s` | Codex is still working; any output shown is not the reply. Ask Claude to wait with `GetConsultantReply` and `until_done: true`; it returns when the turn ends. |
+| `` `wait` must be a number of seconds `` | Pass seconds (`0` or more) or `"done"`. |
+| `no reply within 600s` | Codex is still working; any output shown is not the reply. Ask Claude to wait with `GetConsultantReply` and `wait: "done"`; it returns when the turn ends. |
+| `is a Codex session the user opened` | `SendConsultantMessage` refuses your own sessions by default. Ask Claude to message it if you mean to; it then passes `allow_user_session: true`. |
+| `` `until_done` was replaced by `wait` `` | The caller used a pre-0.4 argument. Reconnect the server (`/mcp`) so Claude sees the new tool definitions. |
 | `Delivered to ..., but waiting for the reply failed` | The message reached Codex; only the wait failed. Don't resend it. Read the reply with `GetConsultantReply`. |
 | `was not started by StartConsultant` | That's a session you opened yourself. Close it from its own terminal. |
 | The terminal window opens but shows an error | Make sure `codex` is on the `PATH` of new terminals, and that the session has had its first message. |

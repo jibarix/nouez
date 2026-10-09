@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -108,11 +109,18 @@ class ProtocolTest(unittest.TestCase):
     def test_unknown_method(self):
         self.assertEqual(self.server.request(5, "nope/nope")["error"]["code"], -32601)
 
-    def test_negative_timeout_is_a_tool_error(self):
+    def test_negative_wait_is_a_tool_error(self):
         reply = self.server.request(6, "tools/call", {"name": "SendConsultantMessage", "arguments": {
-            "to": "x", "message": "hi", "timeout_seconds": -5}})
+            "to": "x", "message": "hi", "wait": -5}})
         self.assertTrue(reply["result"]["isError"])
         self.assertIn("0 or more", reply["result"]["content"][0]["text"])
+
+    def test_wait_schema_takes_seconds_or_done(self):
+        tools = {t["name"]: t for t in self.server.request(11, "tools/list")["result"]["tools"]}
+        for name in ("SendConsultantMessage", "GetConsultantReply"):
+            props = tools[name]["inputSchema"]["properties"]
+            self.assertEqual([s["type"] for s in props["wait"]["anyOf"]], ["number", "string"])
+            self.assertFalse({"until_done", "timeout_seconds"} & set(props))
 
     def test_tools_list_schemas_are_objects(self):
         tools = self.server.request(7, "tools/list")["result"]["tools"]
@@ -141,16 +149,61 @@ class ProtocolTest(unittest.TestCase):
 
 
 class ArgumentTest(unittest.TestCase):
-    def test_number_rejects_negative_and_non_finite(self):
-        for value in (-1, "-5", float("nan"), float("inf"), "x", True):
+    def test_wait_rejects_bad_values(self):
+        for value in (-1, "-5", float("nan"), float("inf"), 10 ** 400, "x", True, False, None):
             with self.assertRaises(server.BridgeError):
-                server.number({"t": value}, "t", 0)
+                server.wait_seconds({"wait": value}, 0)
 
-    def test_number_is_capped(self):
-        self.assertEqual(server.number({"t": 10 ** 9}, "t", 0), server.MAX_WAIT_SECONDS)
+    def test_wait_values(self):
+        self.assertEqual(server.wait_seconds({}, 600), 600)
+        self.assertEqual(server.wait_seconds({"wait": 0}, 600), 0)
+        self.assertEqual(server.wait_seconds({"wait": "30"}, 600), 30)
+        self.assertEqual(server.wait_seconds({"wait": 10 ** 9}, 0), server.MAX_WAIT_SECONDS)
+        self.assertEqual(server.wait_seconds({"wait": "done"}, 0), server.MAX_WAIT_SECONDS)
 
-    def test_until_done_is_capped(self):
-        self.assertEqual(server.wait_seconds({"until_done": True}, 0), server.MAX_WAIT_SECONDS)
+    def test_replaced_options_are_refused(self):
+        for old in ({"until_done": True}, {"timeout_seconds": 5}):
+            with self.assertRaises(server.BridgeError) as caught:
+                server.wait_seconds(old, 0)
+            self.assertIn("replaced by `wait`", str(caught.exception))
+
+
+class ProgressTest(unittest.TestCase):
+    def setUp(self):
+        self.sent = []
+        original = server.write_message
+        server.write_message = self.sent.append
+        self.addCleanup(setattr, server, "write_message", original)
+
+    def test_token_from_meta(self):
+        cancel = threading.Event()
+        self.assertIsNone(server.progress_for({}, cancel))
+        self.assertIsNone(server.progress_for({"_meta": {"progressToken": True}}, cancel))
+        self.assertEqual(server.progress_for({"_meta": {"progressToken": 7}}, cancel).token, 7)
+
+    def test_throttled_increasing_and_silent_after_cancel(self):
+        cancel = threading.Event()
+        progress = server.Progress("tok", cancel)
+        progress("a")
+        progress("b")  # within PROGRESS_SECONDS: dropped
+        progress.last -= server.PROGRESS_SECONDS
+        progress("c")
+        self.assertEqual([m["params"]["message"] for m in self.sent], ["a", "c"])
+        self.assertEqual([m["params"]["progress"] for m in self.sent], [1, 2])
+        self.assertEqual(self.sent[0]["method"], "notifications/progress")
+        self.assertEqual(self.sent[0]["params"]["progressToken"], "tok")
+        progress.last -= server.PROGRESS_SECONDS
+        cancel.set()
+        progress("d")
+        self.assertEqual(len(self.sent), 2)
+
+    def test_failed_write_stops_progress_not_the_wait(self):
+        progress = server.Progress("tok", threading.Event())
+        with mock.patch.object(server, "write_message", side_effect=OSError("closed")) as write:
+            progress("a")  # must not raise
+            progress.last -= server.PROGRESS_SECONDS
+            progress("b")
+        self.assertEqual(write.call_count, 1)
 
 
 class ReplyTest(unittest.TestCase):
@@ -288,10 +341,16 @@ class FakeDaemon:
 
 class HandlerTest(unittest.TestCase):
     def use(self, daemon):
-        original = server.CodexClient
-        server.CodexClient = daemon
-        self.addCleanup(setattr, server, "CodexClient", original)
+        self.panes = []
+        # Never open a real terminal from a test.
+        fake_viewer = lambda thread, info, quiet=False: self.panes.append(thread["id"]) or "Opened (test)."
+        for attr, value in (("CodexClient", daemon), ("POLL_SECONDS", 0.01), ("show_viewer", fake_viewer)):
+            self.addCleanup(setattr, server, attr, getattr(server, attr))
+            setattr(server, attr, value)
         return daemon
+
+    def consultant(self, tag, **extra):
+        return {"id": f"0199aaaa-0000-0000-0000-000000{tag}", "cwd": ROOT, "threadSource": "nouez", **extra}
 
     def test_start_never_reuses_a_user_session(self):
         mine = {"id": "0199aaaa-0000-0000-0000-000000user01", "cwd": ROOT}
@@ -311,28 +370,60 @@ class HandlerTest(unittest.TestCase):
         self.assertIn("Ignored model", out)
 
     def test_send_timeout_shows_output_so_far(self):
-        tid = "0199aaaa-0000-0000-0000-000000idle01"
-        self.use(FakeDaemon([{"id": tid, "cwd": ROOT}]))
-        out = server.send_consultant_message({"to": tid, "message": "hi", "timeout_seconds": 0})
+        thread = self.consultant("idle01")
+        self.use(FakeDaemon([thread]))
+        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0.01})
         self.assertIn("still working on turn turn-new; this is not a reply", out)
         self.assertIn("Don't send the message again", out)
+        self.assertIn('wait="done"', out)
         self.assertTrue(out.endswith("working on it"))
 
+    def test_wait_zero_returns_after_delivery(self):
+        thread = self.consultant("idle02")
+        daemon = self.use(FakeDaemon([thread]))
+        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0})
+        self.assertTrue(out.startswith("Delivered to "))
+        self.assertIn('turn_id turn-new, wait="done"', out)
+        self.assertIn("turn/start", daemon.calls)
+
     def test_steered_timeout_hides_output_from_before_the_message(self):
-        tid = "0199aaaa-0000-0000-0000-000000busy01"
+        thread = self.consultant("busy01")
         running = {"id": "turn-1", "status": "inProgress", "items": [user("q"), agent("answer to q")]}
-        self.use(FakeDaemon([{"id": tid, "cwd": ROOT}], {tid: [running]}))
-        out = server.send_consultant_message({"to": tid, "message": "more", "timeout_seconds": 0})
+        self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        out = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0.01})
         self.assertIn("steered into the running turn", out)
         self.assertNotIn("answer to q", out)
 
     def test_failure_after_delivery_says_delivered(self):
-        tid = "0199aaaa-0000-0000-0000-000000fail01"
-        self.use(FakeDaemon([{"id": tid, "cwd": ROOT}], fail_after_start=True))
+        thread = self.consultant("fail01")
+        self.use(FakeDaemon([thread], fail_after_start=True))
         with self.assertRaises(server.BridgeError) as caught:
-            server.send_consultant_message({"to": tid, "message": "hi"})
+            server.send_consultant_message({"to": thread["id"], "message": "hi"})
         self.assertTrue(str(caught.exception).startswith("Delivered to "))
         self.assertIn("Don't send the message again", str(caught.exception))
+
+    def test_user_session_needs_allow_user_session(self):
+        mine = {"id": "0199aaaa-0000-0000-0000-000000user02", "cwd": ROOT}
+        daemon = self.use(FakeDaemon([mine]))
+        with self.assertRaises(server.BridgeError) as caught:
+            server.send_consultant_message({"to": mine["id"], "message": "hi", "wait": 0})
+        self.assertIn("allow_user_session=true", str(caught.exception))
+        self.assertNotIn("turn/start", daemon.calls)
+        out = server.send_consultant_message({"to": mine["id"], "message": "hi", "wait": 0,
+                                              "allow_user_session": True})
+        self.assertTrue(out.startswith("Delivered to "))
+
+    def test_waits_report_progress(self):
+        thread = self.consultant("prog01")
+        self.use(FakeDaemon([thread]))
+        notes = []
+        server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0.01}, None, notes.append)
+        self.assertTrue(notes)
+        self.assertIn("is working on turn turn-new", notes[0])
+        self.assertTrue(notes[0].endswith(": working on it"))
+        notes.clear()
+        server.get_consultant_reply({"to": thread["id"], "wait": 0.01}, None, notes.append)
+        self.assertIn("is working on turn turn-new", notes[0])
 
 
 if __name__ == "__main__":
