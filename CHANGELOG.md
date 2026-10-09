@@ -6,6 +6,26 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-09
+
+Hardening from an MCP best-practices review. Tested with Claude Code 2.1.295, Codex CLI 0.160.1 with app-server daemon 0.162.0, Python 3.13.5 on Windows 11.
+
+### Fixed
+- One malformed line could stop the server. A JSON value that isn't an object (such as `[]`), an id that isn't a string or number, or a `notifications/cancelled` with non-object params raised in the read loop, and every later request went unanswered. These now get `-32600 Invalid Request` (or are ignored, for notifications), and no single message can end the loop.
+- `initialize` echoed whatever protocol version the client asked for, even ones the server doesn't know. It now answers with the requested version if it is one of 2025-11-25, 2025-06-18 or 2025-03-26, and with 2025-11-25 otherwise.
+- `tools/call` with params or `arguments` that aren't objects never got a response, or got an "Unexpected error" result. Both now get `-32602 Invalid params`, and any request with an id gets a response even if handling it fails (`-32603`).
+- `timeout_seconds` accepted negative and non-finite numbers ("no reply within -5s"). It must now be 0 or more.
+- `StopConsultant` could report "Unexpected error" for a stop that had succeeded, if PowerShell printed something unexpected while closing the watch window.
+
+### Changed
+- Waits are capped at 4 hours, `until_done` included, so a hung Codex turn can't hold a call and its Codex connection forever. When the cap is reached the result says the turn is still running, as for any timeout.
+- Replies longer than 60,000 characters are cut, and the full text is saved to `nouez/<turn id>.md` in the system temp folder.
+- `StopConsultant` only accepts the exact name or full thread id, not a unique prefix or suffix.
+- A send that times out now says not to send the message again.
+
+### Added
+- Protocol tests in `tests/` (standard library only, no Codex needed): `python -m unittest discover tests`.
+
 ## [0.3.0] - 2026-10-08
 
 Tested with Claude Code 2.1.295, Codex CLI 0.160.1 with app-server daemon 0.162.0, Python 3.13.5 on Windows 11.
@@ -51,7 +71,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/jibarix/nouez/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jibarix/nouez/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jibarix/nouez/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jibarix/nouez/releases/tag/v0.1.0

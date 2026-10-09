@@ -15,6 +15,7 @@ socket, which speaks JSON-RPC over WebSocket. Standard library only.
 import base64
 import glob
 import json
+import math
 import os
 import queue
 import re
@@ -23,17 +24,23 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.3.1"
+# MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
+# between them; a client asking for any other version is offered the newest.
+PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
 POLL_SECONDS = 1.5
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 RECENT_SAVED_THREADS = 50  # how far back to look for unloaded bridge consultants
 REPLY_LOOKBACK = 100  # how many recent turns GetConsultantReply searches for a turn id
+MAX_WAIT_SECONDS = 4 * 60 * 60  # ceiling on any wait, until_done included, so a hung turn can't pin a call
+MAX_REPLY_CHARS = 60_000  # longer replies are cut here; the full text is saved to a file
 BRIDGE_SOURCE = "nouez"  # threadSource tag on sessions started by StartConsultant
 SANDBOX = "read-only"
 # How Codex 0.160.1 reports a session whose history isn't written yet: before the first
@@ -83,13 +90,22 @@ def flag(args, key, default=False):
 
 
 def number(args, key, default):
+    """A non-negative number of seconds, capped at MAX_WAIT_SECONDS."""
     value = args.get(key, default)
     try:
         if isinstance(value, bool):
             raise ValueError
-        return float(value)
+        seconds = float(value)
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError
     except (TypeError, ValueError):
-        raise BridgeError(f"`{key}` must be a number of seconds, not {value!r}.") from None
+        raise BridgeError(f"`{key}` must be a number of seconds, 0 or more, not {value!r}.") from None
+    return min(seconds, MAX_WAIT_SECONDS)
+
+
+def wait_seconds(args, default):
+    """How long to wait for a turn: until_done means up to MAX_WAIT_SECONDS."""
+    return MAX_WAIT_SECONDS if flag(args, "until_done") else number(args, "timeout_seconds", default)
 
 
 def target(args):
@@ -353,13 +369,15 @@ def load_consultants(client, include_all=False):
     return consultants
 
 
-def resolve(client, target):
+def resolve(client, target, exact_only=False):
+    """The session `target` names. exact_only (for destructive tools) skips id prefix/suffix matches."""
     target = target.strip().lower()
     threads = load_consultants(client, include_all=True)
     exact = [t for t in threads if target in (t["id"].lower(), short_name(t))]
     if exact:
         return exact[0]
-    partial = [t for t in threads if t["id"].lower().startswith(target) or t["id"].lower().endswith(target)]
+    partial = [] if exact_only else [
+        t for t in threads if t["id"].lower().startswith(target) or t["id"].lower().endswith(target)]
     if len(partial) == 1:
         return partial[0]
     if partial:
@@ -370,7 +388,8 @@ def resolve(client, target):
         thread["_loaded"] = False
         return thread
     names = ", ".join(short_name(t) for t in threads) or "none"
-    raise BridgeError(f"No Codex session named '{target}'. Sessions: {names}")
+    exact_note = " Use its exact name or full thread id." if exact_only else ""
+    raise BridgeError(f"No Codex session named '{target}'.{exact_note} Sessions: {names}")
 
 
 def ensure_loaded(client, thread):
@@ -431,9 +450,8 @@ def turn_reply(turn):
 
 def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None):
     """Poll until the turn finishes. Returns the finished turn, or None on timeout.
-    timeout=None waits until the turn ends (still cancellable).
     With `text` (the message we sent), follow an interrupted turn into its continuation."""
-    deadline = None if timeout is None else time.time() + timeout
+    deadline = time.time() + timeout
     grace = None  # an interrupted turn's continuation may take a moment to be listed
     while True:
         turn = find_turn(client, tid, turn_id)
@@ -449,14 +467,31 @@ def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None):
                 continue
         if turn and turn.get("status") != "inProgress":
             return turn
-        if deadline is not None and time.time() >= deadline:
+        if time.time() >= deadline:
             return None
         check_cancel(cancel)
         time.sleep(POLL_SECONDS)
 
 
+def cap_reply(turn_id, reply):
+    """The reply, or its first MAX_REPLY_CHARS with the rest saved to a file the caller can read."""
+    if len(reply) <= MAX_REPLY_CHARS:
+        return reply
+    folder = os.path.join(tempfile.gettempdir(), "nouez")
+    path = os.path.join(folder, re.sub(r"[^0-9A-Za-z-]", "_", turn_id) + ".md")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(reply)
+        where = f"The full reply is saved in {path}."
+    except OSError as e:
+        where = f"The full reply could not be saved ({e}); read it in the consultant's pane."
+    omitted = len(reply) - MAX_REPLY_CHARS
+    return f"{reply[:MAX_REPLY_CHARS]}\n\n[Truncated: {omitted} more characters. {where}]"
+
+
 def format_turn(name, turn):
-    reply = turn_reply(turn)
+    reply = cap_reply(turn["id"], turn_reply(turn))
     if turn["status"] != "completed":
         err = (turn.get("error") or {}).get("message", "")
         hint = ("\nIf the message was folded into a later turn, read it with GetConsultantReply."
@@ -610,7 +645,8 @@ def close_terminals(thread_id):
             for child in pids[1:]:
                 run_text(["taskkill", "/PID", child, "/T", "/F"])
             # Windows Terminal closes a pane by itself only on a clean exit, so end cmd with code 0.
-            end_process(int(pids[0]), 0)
+            if pids[0].isdigit():
+                end_process(int(pids[0]), 0)
         return len(shells)
     pattern = f"codex[^ ]* resume {thread_id}"
     pids = run_text(["pgrep", "-f", pattern]).split()
@@ -775,7 +811,7 @@ def send_consultant_message(args, cancel=None):
     if not message:
         raise BridgeError("`message` is required.")
     wait = flag(args, "wait", True)
-    timeout = None if flag(args, "until_done") else number(args, "timeout_seconds", 600)
+    timeout = wait_seconds(args, 600)
     sender = args.get("from") or "Claude Code"
     text = f"[Message from {sender} via the consultants bridge]\n\n{message}"
 
@@ -817,15 +853,15 @@ def send_consultant_message(args, cancel=None):
         if turn:
             return format_turn(name, turn) + (f"\n\n({watching.strip()})" if watching else "")
         return (f"Delivered to {name} ({mode}), but no reply within {timeout:.0f}s. Turn {turn_id} is "
-                "still running; this is not a reply. Call GetConsultantReply with until_done=true to "
-                "be told when it finishes.")
+                "still running; this is not a reply. Don't send the message again. Call "
+                "GetConsultantReply with until_done=true to be told when it finishes.")
     finally:
         client.close()
 
 
 def get_consultant_reply(args, cancel=None):
     to = target(args)
-    timeout = None if flag(args, "until_done") else number(args, "timeout_seconds", 0)
+    timeout = wait_seconds(args, 0)
     client = CodexClient()
     try:
         thread = resolve(client, to)
@@ -837,7 +873,7 @@ def get_consultant_reply(args, cancel=None):
                 return f"{name} has no turn {turn_id} among its {REPLY_LOOKBACK} most recent turns."
             return f"{name} has no messages yet."
         if turn.get("status") == "inProgress":
-            done = wait_for_turn(client, tid, turn["id"], timeout, cancel) if timeout is None or timeout > 0 else None
+            done = wait_for_turn(client, tid, turn["id"], timeout, cancel) if timeout > 0 else None
             if not done:
                 return (f"{name} is still working on turn {turn['id']}; this is not a reply. "
                         "Call again with until_done=true to be told when it finishes.")
@@ -879,7 +915,7 @@ def stop_consultant(args, cancel=None):
     to = target(args)
     client = CodexClient()
     try:
-        thread = resolve(client, to)
+        thread = resolve(client, to, exact_only=True)
         name = short_name(thread)
         if not is_bridge(thread):
             raise BridgeError(f"{name} was not started by StartConsultant. Close it from its own terminal.")
@@ -911,6 +947,7 @@ INSTRUCTIONS = (
 )
 
 TO_SCHEMA = {"type": "string", "description": "Consultant name, thread id, or unique id prefix/suffix."}
+EXACT_TO_SCHEMA = {"type": "string", "description": "Consultant name or full thread id (exact match only)."}
 
 TOOLS = [
     {
@@ -973,8 +1010,8 @@ TOOLS = [
                 "message": {"type": "string", "description": "The message to send."},
                 "from": {"type": "string", "description": "Sender label shown to Codex, e.g. your session name. Default 'Claude Code'."},
                 "wait": {"type": "boolean", "description": "Wait for the reply. Default true. With false, read it later with GetConsultantReply."},
-                "timeout_seconds": {"type": "number", "description": "Max seconds to wait for the reply. Default 600."},
-                "until_done": {"type": "boolean", "description": "Wait until the turn ends, with no time limit (overrides timeout_seconds). Default false."},
+                "timeout_seconds": {"type": "number", "minimum": 0, "description": "Max seconds to wait for the reply. Default 600, at most 14400."},
+                "until_done": {"type": "boolean", "description": "Wait until the turn ends, up to 4 hours (overrides timeout_seconds). Default false."},
             },
             "required": ["to", "message"],
         },
@@ -993,8 +1030,8 @@ TOOLS = [
             "properties": {
                 "to": TO_SCHEMA,
                 "turn_id": {"type": "string", "description": "Turn id to read. Default: the latest turn."},
-                "timeout_seconds": {"type": "number", "description": "If the turn is still running, wait up to this long. Default 0 (don't wait)."},
-                "until_done": {"type": "boolean", "description": "If the turn is still running, wait until it ends, with no time limit (overrides timeout_seconds). Default false."},
+                "timeout_seconds": {"type": "number", "minimum": 0, "description": "If the turn is still running, wait up to this long. Default 0 (don't wait), at most 14400."},
+                "until_done": {"type": "boolean", "description": "If the turn is still running, wait until it ends, up to 4 hours (overrides timeout_seconds). Default false."},
             },
             "required": ["to"],
         },
@@ -1012,11 +1049,11 @@ TOOLS = [
         "name": "StopConsultant",
         "description": (
             "Stop a Codex session that StartConsultant started, by archiving it and closing any "
-            "terminal window watching it. Refuses sessions "
+            "terminal window watching it. Needs the exact name or full thread id. Refuses sessions "
             "without the StartConsultant tag, such as ones the user opened (a guard against "
             "mistakes, not a security boundary)."
         ),
-        "inputSchema": {"type": "object", "properties": {"to": TO_SCHEMA}, "required": ["to"]},
+        "inputSchema": {"type": "object", "properties": {"to": EXACT_TO_SCHEMA}, "required": ["to"]},
     },
 ]
 
@@ -1081,16 +1118,36 @@ def client_roots():
     return _client_roots or []
 
 
+def invalid_params(msg_id, message):
+    respond(msg_id, error={"code": -32602, "message": message})
+
+
 def handle(msg, cancel):
+    """Answer one request. Any request with an id gets a response, even if handling it fails."""
+    try:
+        dispatch(msg, cancel)
+    except Exception as e:
+        log("request error:", repr(e))
+        if msg.get("id") is not None and not cancel.is_set():
+            respond(msg["id"], error={"code": -32603, "message": f"Internal error: {e!r}"})
+
+
+def dispatch(msg, cancel):
     method, msg_id, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+    if not isinstance(params, dict):
+        if msg_id is not None:
+            invalid_params(msg_id, "params must be an object.")
+        return
     if msg_id is None:
         if method in ("notifications/initialized", "notifications/roots/list_changed") and "roots" in _client_caps:
             refresh_roots()
         return
     if method == "initialize":
-        _client_caps.update(params.get("capabilities") or {})
+        caps = params.get("capabilities")
+        _client_caps.update(caps if isinstance(caps, dict) else {})
+        requested = params.get("protocolVersion")
         respond(msg_id, {
-            "protocolVersion": params.get("protocolVersion", "2025-06-18"),
+            "protocolVersion": requested if requested in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             "instructions": INSTRUCTIONS,
@@ -1102,10 +1159,14 @@ def handle(msg, cancel):
     elif method == "tools/call":
         handler = HANDLERS.get(params.get("name"))
         if not handler:
-            respond(msg_id, error={"code": -32602, "message": f"Unknown tool: {params.get('name')}"})
+            invalid_params(msg_id, f"Unknown tool: {params.get('name')}")
+            return
+        arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            invalid_params(msg_id, "arguments must be an object.")
             return
         try:
-            text, is_error = handler(params.get("arguments") or {}, cancel), False
+            text, is_error = handler(arguments, cancel), False
         except Cancelled:
             return  # the client cancelled the request and expects no response
         except BridgeError as e:
@@ -1134,26 +1195,44 @@ def main():
         except ValueError:
             respond(None, error={"code": -32700, "message": "Parse error"})
             continue
-        if "method" not in msg:  # a response to a request we sent (roots/list)
-            with _client_guard:
-                waiter = _client_requests.get(msg.get("id"))
-            if waiter:
-                waiter[1] = msg
-                waiter[0].set()
-            continue
-        if msg.get("method") == "notifications/cancelled":
+        try:
+            route(msg)
+        except Exception as e:  # one bad line must never end the loop
+            log("bad message:", repr(e))
+
+
+def valid_id(value):
+    return value is None or (isinstance(value, (str, int, float)) and not isinstance(value, bool))
+
+
+def route(msg):
+    """Hand one incoming message to the right place, without blocking the read loop."""
+    if not isinstance(msg, dict) or not valid_id(msg.get("id")):
+        respond(None, error={"code": -32600, "message": "Invalid Request"})
+        return
+    if "method" not in msg:  # a response to a request we sent (roots/list)
+        with _client_guard:
+            waiter = _client_requests.get(msg.get("id"))
+        if waiter:
+            waiter[1] = msg
+            waiter[0].set()
+        return
+    if msg["method"] == "notifications/cancelled":
+        params = msg.get("params")
+        request_id = params.get("requestId") if isinstance(params, dict) else None
+        if valid_id(request_id):
             with _cancel_guard:
-                event = _cancel_events.get((msg.get("params") or {}).get("requestId"))
+                event = _cancel_events.get(request_id)
             if event:
                 event.set()
-            continue
-        # Register before starting the worker, so a cancellation that arrives first isn't lost.
-        cancel = threading.Event()
-        if msg.get("method") == "tools/call" and msg.get("id") is not None:
-            with _cancel_guard:
-                _cancel_events[msg["id"]] = cancel
-        # Tool calls can block for minutes; run each request on its own thread.
-        threading.Thread(target=handle, args=(msg, cancel), daemon=True).start()
+        return
+    # Register before starting the worker, so a cancellation that arrives first isn't lost.
+    cancel = threading.Event()
+    if msg["method"] == "tools/call" and msg.get("id") is not None:
+        with _cancel_guard:
+            _cancel_events[msg["id"]] = cancel
+    # Tool calls can block for minutes; run each request on its own thread.
+    threading.Thread(target=handle, args=(msg, cancel), daemon=True).start()
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.3.0 |
+| nouez | 0.3.1 |
 | Claude Code | 2.1.295 |
 | Codex CLI | 0.160.1 |
 | Codex app-server daemon | 0.162.0 |
@@ -123,7 +123,7 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 | `SendConsultantMessage` | Sends a message into a session and, by default, waits for and returns the reply. If the session is idle the message starts a new turn; if it's busy it steers the running turn. Unloaded sessions are reloaded first. |
 | `GetConsultantReply` | Reads a reply without sending anything: the latest turn, or a specific turn id. Use it after sending with `wait: false` or after a timeout. |
 | `WatchConsultant` | Opens a session in a split pane beside Claude Code, or a new terminal window, so you can watch it or type into it. Does nothing if a terminal already shows it. |
-| `StopConsultant` | Archives a session that `StartConsultant` started and closes any terminal window watching it. Refuses sessions you opened yourself. |
+| `StopConsultant` | Archives a session that `StartConsultant` started and closes any terminal window watching it. Needs the exact name or full thread id. Refuses sessions you opened yourself. |
 
 `StartConsultant` arguments (all optional):
 
@@ -144,14 +144,16 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 | `message` | yes | | The text to send |
 | `from` | no | `Claude Code` | Sender label shown to Codex |
 | `wait` | no | `true` | Wait for the reply |
-| `timeout_seconds` | no | `600` | Maximum time to wait for the reply |
-| `until_done` | no | `false` | Wait until the turn ends, with no time limit (overrides `timeout_seconds`) |
+| `timeout_seconds` | no | `600` | Maximum time to wait for the reply, 0 or more (capped at 4 hours) |
+| `until_done` | no | `false` | Wait until the turn ends, up to 4 hours (overrides `timeout_seconds`) |
 
-`GetConsultantReply` takes `to`, an optional `turn_id` (default: the latest turn; looked up among the 100 most recent turns), an optional `timeout_seconds` (default `0`, which returns at once if the turn is still running), and an optional `until_done` (default `false`; when `true` it waits until the turn ends, with no time limit).
+`GetConsultantReply` takes `to`, an optional `turn_id` (default: the latest turn; looked up among the 100 most recent turns), an optional `timeout_seconds` (default `0`, which returns at once if the turn is still running), and an optional `until_done` (default `false`; when `true` it waits until the turn ends, up to 4 hours).
 
 For a long review, send with `wait: false`, then call `GetConsultantReply` with `until_done: true`. Claude Code runs a long call in the background and notifies Claude when it returns, which now happens only when Codex finishes. A "still working" result is never a reply.
 
-`WatchConsultant` and `StopConsultant` take only `to`. `ListConsultants` takes an optional `cwd` to list only the sessions whose working directory is in that path's git repo (outside a repo: under the Claude Code workspace folder that contains the path, or under the path itself), and an optional `include_all` (default `false`, ignored with `cwd`) to also show Codex-internal threads such as subagents.
+Replies longer than 60,000 characters are cut there. The full text is saved to `nouez/<turn id>.md` in the system temp folder, and the cut reply ends with that path.
+
+`WatchConsultant` and `StopConsultant` take only `to`. `StopConsultant` doesn't accept an id prefix or suffix, so a typo can't stop the wrong session. `ListConsultants` takes an optional `cwd` to list only the sessions whose working directory is in that path's git repo (outside a repo: under the Claude Code workspace folder that contains the path, or under the path itself), and an optional `include_all` (default `false`, ignored with `cwd`) to also show Codex-internal threads such as subagents.
 
 Boolean arguments take `true`/`false` (or the strings `"true"`/`"false"`); any other value is an error rather than a guess.
 
@@ -163,6 +165,7 @@ Boolean arguments take `true`/`false` (or the strings `"true"`/`"false"`); any o
 | `Codex app-server daemon is not reachable` | Open a Codex session, or run `codex app-server daemon start`. |
 | `No Codex sessions` | Ask Claude to start a consultant, or open Codex in a terminal. |
 | `'x' is ambiguous` | Use the full name or thread id from `ListConsultants`. |
+| `No Codex session named 'x'. Use its exact name or full thread id.` | `StopConsultant` matches exactly. Pass the name or full id from `ListConsultants`. |
 | `` `x` must be true or false `` | A boolean argument got some other value. Pass `true` or `false`. |
 | `no reply within 600s` | Codex is still working. Ask Claude to wait with `GetConsultantReply` and `until_done: true`; it returns when the reply is ready. |
 | `was not started by StartConsultant` | That's a session you opened yourself. Close it from its own terminal. |
@@ -173,6 +176,14 @@ Boolean arguments take `true`/`false` (or the strings `"true"`/`"false"`); any o
 ## How it works
 
 `codex app-server proxy` relays stdio to the daemon's control socket, which speaks JSON-RPC over WebSocket. The server does the WebSocket handshake and framing itself, opens one short-lived connection per tool call, and polls the turn until it finishes. Sessions the bridge starts are tagged with `threadSource: "nouez"`, so it can find them again after the daemon unloads them and so `StopConsultant` knows which ones it may archive.
+
+## Tests
+
+The protocol tests use only the standard library and don't need Codex. From the repo root:
+
+```sh
+python -m unittest discover tests
+```
 
 ## Security note
 
