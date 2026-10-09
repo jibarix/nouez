@@ -8,6 +8,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [0.3.0] - 2026-10-08
 
+Tested with Claude Code 2.1.295, Codex CLI 0.160.1 with app-server daemon 0.162.0, Python 3.13.5 on Windows 11.
+
 ### Fixed
 - `ListConsultants` with `cwd` and `StartConsultant` could hang indefinitely on Windows. Finding the repo ran `git rev-parse`; when git stalled, Python's `subprocess.run` killed only the `Git\cmd\git.exe` wrapper at the timeout and then waited, with no limit, for pipes still held by the real `git.exe`. The repo root is now found by looking for `.git`, with no subprocess.
 - All helper commands (`codex --version`, PowerShell process checks, `taskkill`, `pgrep`) kill the whole process tree on timeout and never wait on pipes afterwards.
