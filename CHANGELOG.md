@@ -6,6 +6,28 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-09
+
+Fixes from a Codex review of 0.3.1 and of the architecture document.
+
+### Fixed
+- `StartConsultant` could reuse a Codex session the user opened. That session keeps the user's permissions, so a "read-only consultant" could edit files. It now reuses only sessions it started, which are always read-only, and lists the user's sessions in its result without using them.
+- Two sessions can share a name (names keep only the last six characters of the id), and the first one silently won, including for `StopConsultant`. A shared name is now refused with both full ids.
+- If waiting for a reply failed after the message was delivered, the result was a plain error that invited a resend. It now starts with `Delivered to`, gives the turn id, and says not to send the message again.
+- A timeout after an interrupted turn moved on to its continuation reported the original turn id. It now reports the turn the message continued in.
+- A request with `"id": null` was treated as a notification and got no response; it now gets `-32600 Invalid Request`. `params: []` and `arguments: []` were read as `{}`; they now get `-32602 Invalid params`.
+- Opening a pane now checks the thread id like closing one does, so a malformed id never reaches a command line.
+
+### Changed
+- A timeout shows the turn's output so far: the latest 4,000 characters written since the last message reached the turn, labelled as a snapshot that is not the reply. This applies to `SendConsultantMessage` and `GetConsultantReply`, and to `GetConsultantReply` while it waits.
+- Timeout and "still working" results name the turn id to pass to `GetConsultantReply`.
+- `StartConsultant` says when `model`, `title` or `instructions` were ignored because a consultant was reused, and `watch` now also applies when reusing one.
+- Tool descriptions and the server instructions match the code: reuse is limited to nouez's own sessions, until_done returns when the turn ends, on an error or after 4 hours, and closing windows is best effort.
+
+### Added
+- Tool annotations: `ListConsultants` and `GetConsultantReply` are read-only, `StopConsultant` is destructive, and `WatchConsultant` is idempotent.
+- Tests for the handlers against a fake daemon (reuse, partial output, failure after delivery), shared names, and the new protocol cases.
+
 ## [0.3.1] - 2026-10-09
 
 Hardening from an MCP best-practices review. Tested with Claude Code 2.1.295, Codex CLI 0.160.1 with app-server daemon 0.162.0, Python 3.13.5 on Windows 11.
@@ -71,7 +93,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/jibarix/nouez/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/jibarix/nouez/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jibarix/nouez/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jibarix/nouez/compare/v0.1.0...v0.2.0

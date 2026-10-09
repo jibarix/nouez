@@ -1,7 +1,7 @@
 """nouez: MCP server that lets Claude Code talk to Codex sessions.
 
 Tools
-  StartConsultant        reuse the repo's Codex session, or start one, shown in a pane
+  StartConsultant        reuse the repo's consultant, or start a read-only one, shown in a pane
   ListConsultants        Codex sessions on the local app-server daemon
   SendConsultantMessage  send a message into one of them and return its reply
   GetConsultantReply     read (or wait for) a reply sent with wait=false
@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.3.1"
+SERVER_VERSION = "0.3.2"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -41,6 +41,7 @@ RECENT_SAVED_THREADS = 50  # how far back to look for unloaded bridge consultant
 REPLY_LOOKBACK = 100  # how many recent turns GetConsultantReply searches for a turn id
 MAX_WAIT_SECONDS = 4 * 60 * 60  # ceiling on any wait, until_done included, so a hung turn can't pin a call
 MAX_REPLY_CHARS = 60_000  # longer replies are cut here; the full text is saved to a file
+PARTIAL_CHARS = 4_000  # how much of a still-running turn's output a timeout shows (the most recent part)
 BRIDGE_SOURCE = "nouez"  # threadSource tag on sessions started by StartConsultant
 SANDBOX = "read-only"
 # How Codex 0.160.1 reports a session whose history isn't written yet: before the first
@@ -374,8 +375,12 @@ def resolve(client, target, exact_only=False):
     target = target.strip().lower()
     threads = load_consultants(client, include_all=True)
     exact = [t for t in threads if target in (t["id"].lower(), short_name(t))]
-    if exact:
+    if len(exact) == 1:
         return exact[0]
+    if exact:
+        # Names keep only the id's last six characters, so two sessions can share one.
+        ids = ", ".join(t["id"] for t in exact)
+        raise BridgeError(f"'{target}' names more than one session. Use the full thread id: {ids}")
     partial = [] if exact_only else [
         t for t in threads if t["id"].lower().startswith(target) or t["id"].lower().endswith(target)]
     if len(partial) == 1:
@@ -449,8 +454,9 @@ def turn_reply(turn):
 
 
 def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None):
-    """Poll until the turn finishes. Returns the finished turn, or None on timeout.
-    With `text` (the message we sent), follow an interrupted turn into its continuation."""
+    """Poll until the turn finishes. Returns (done, turn_id, turn): on timeout, done is False and
+    turn is the last snapshot seen (or None). With `text` (the message we sent), follow an
+    interrupted turn into its continuation; turn_id is then the continuation's id."""
     deadline = time.time() + timeout
     grace = None  # an interrupted turn's continuation may take a moment to be listed
     while True:
@@ -466,9 +472,9 @@ def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None):
                 time.sleep(0.5)
                 continue
         if turn and turn.get("status") != "inProgress":
-            return turn
+            return True, turn_id, turn
         if time.time() >= deadline:
-            return None
+            return False, turn_id, turn
         check_cancel(cancel)
         time.sleep(POLL_SECONDS)
 
@@ -488,6 +494,28 @@ def cap_reply(turn_id, reply):
         where = f"The full reply could not be saved ({e}); read it in the consultant's pane."
     omitted = len(reply) - MAX_REPLY_CHARS
     return f"{reply[:MAX_REPLY_CHARS]}\n\n[Truncated: {omitted} more characters. {where}]"
+
+
+def partial_output(turn):
+    """What a running turn has written since its latest user message, newest part kept.
+    Every agent message counts, whatever its phase: a final_answer isn't final until the turn ends."""
+    items = (turn or {}).get("items") or []
+    last_user = max((i for i, item in enumerate(items) if item.get("type") == "userMessage"), default=-1)
+    text = "\n\n".join(item.get("text", "") for item in items[last_user + 1:]
+                       if item.get("type") == "agentMessage" and item.get("text"))
+    if len(text) > PARTIAL_CHARS:
+        text = f"[... {len(text) - PARTIAL_CHARS} earlier characters omitted]\n{text[-PARTIAL_CHARS:]}"
+    return text
+
+
+def still_working(name, turn_id, turn, advice):
+    """The answer for a turn that hasn't ended: clearly not a reply, with its output so far."""
+    out = f"{name} is still working on turn {turn_id}; this is not a reply. {advice}"
+    partial = partial_output(turn)
+    if partial:
+        out += ("\n\nOutput so far (a snapshot of the running turn; it may change and is not "
+                f"the final answer):\n{partial}")
+    return out
 
 
 def format_turn(name, turn):
@@ -574,6 +602,8 @@ def viewer_running(thread_id):
 def open_terminal(cwd, thread_id, codex="codex"):
     """Open `codex resume <id>` beside Claude Code: a split pane when Claude Code runs in
     Windows Terminal or tmux, otherwise a new terminal window. Returns a description of what opened."""
+    if not re.fullmatch(r"[0-9A-Za-z-]+", thread_id):
+        raise BridgeError(f"Refusing to open a terminal for an unexpected thread id: {thread_id!r}")
     cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
     resume = [codex, "resume", thread_id]
     kwargs = {"cwd": cwd, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
@@ -749,14 +779,17 @@ def start_consultant(args, cancel=None):
         params["developerInstructions"] = args["instructions"]
 
     watch, new = flag(args, "watch", True), flag(args, "new")
-    existing, has_turns = [], False
+    existing, users, has_turns = [], [], False
     client = CodexClient()
     try:
         if not new:
             # Reuse before starting: a consultant already in this repo keeps its context, and a
-            # duplicate splits the conversation across sessions. Prefer our own, most recent first.
-            root, existing = repo_consultants(client, cwd)
-            existing.sort(key=lambda t: (is_bridge(t), t.get("updatedAt") or 0), reverse=True)
+            # duplicate splits the conversation across sessions. Only our own sessions are reused:
+            # they were created read-only, while a user's session keeps the user's permissions.
+            root, found = repo_consultants(client, cwd)
+            existing = sorted((t for t in found if is_bridge(t)),
+                              key=lambda t: t.get("updatedAt") or 0, reverse=True)
+            users = [t for t in found if not is_bridge(t)]
         if existing:
             thread = existing[0]
             has_turns = bool(latest_turn(client, thread["id"]))
@@ -769,10 +802,13 @@ def start_consultant(args, cancel=None):
         client.close()
 
     name = short_name(thread)
+    # The latest StartConsultant call decides whether the session gets an automatic pane.
+    with _send_locks_guard:
+        (_unwatched.discard if watch else _unwatched.add)(thread["id"])
+    user_note = (f"\nThe user's own Codex sessions in this repo were not used (they keep the user's "
+                 f"permissions); message one only if the user asks you to:\n{format_threads(users)}"
+                 if users else "")
     if not existing:
-        if not watch:
-            with _send_locks_guard:
-                _unwatched.add(thread["id"])
         return (
             f"Started {name}\n"
             f"    id: {thread['id']}\n"
@@ -781,11 +817,10 @@ def start_consultant(args, cancel=None):
             f"    sandbox: {SANDBOX}\n"
             + ("A pane showing it opens beside Claude Code when you send its first message.\n" if watch else "")
             + "Send it work with SendConsultantMessage."
+            + user_note
         )
 
-    if not is_bridge(thread):
-        pane = "It runs in the user's own Codex terminal."
-    elif not watch:
+    if not watch:
         pane = ""
     elif not has_turns:
         pane = "A pane showing it opens beside Claude Code when you send its first message."
@@ -795,12 +830,15 @@ def start_consultant(args, cancel=None):
         except (BridgeError, OSError) as e:
             pane = f"Could not open a terminal: {e}"
     others = existing[1:]
+    ignored = [k for k in ("model", "title", "instructions") if args.get(k)]
     return (
         f"Using {name}, which already works in {root}; nothing new was started.\n"
         + format_threads([thread]) + "\n"
         + (pane + "\n" if pane else "")
+        + (f"Ignored {', '.join(ignored)}: they apply only to a new session (new=true).\n" if ignored else "")
         + "Send it work with SendConsultantMessage."
-        + (f"\nOther sessions in this repo:\n{format_threads(others)}" if others else "")
+        + (f"\nOther consultants in this repo:\n{format_threads(others)}" if others else "")
+        + user_note
         + "\nOnly if the user asks for a separate consultant, call StartConsultant with new=true."
     )
 
@@ -835,8 +873,11 @@ def send_consultant_message(args, cancel=None):
                 # concurrent send would see the session idle and its turn/start would
                 # interrupt this one.
                 deadline = time.time() + 10
-                while not find_turn(client, tid, turn_id) and time.time() < deadline:
-                    time.sleep(0.2)
+                try:
+                    while not find_turn(client, tid, turn_id) and time.time() < deadline:
+                        time.sleep(0.2)
+                except (BridgeError, OSError):
+                    pass  # delivered already; the wait below reports a lasting failure as such
             # Codex can only show a session once it has a turn, so the pane opens here. Inside
             # the lock, so concurrent sends can't open two.
             watching = ""
@@ -849,12 +890,19 @@ def send_consultant_message(args, cancel=None):
         if not wait:
             return (f"Delivered to {name} ({mode}, turn {turn_id}).{watching} Not waiting; "
                     "read the reply later with GetConsultantReply.")
-        turn = wait_for_turn(client, tid, turn_id, timeout, cancel, text)
-        if turn:
+        try:
+            done, turn_id, turn = wait_for_turn(client, tid, turn_id, timeout, cancel, text)
+        except (BridgeError, OSError) as e:
+            # The message is already in the session; a plain error would invite a resend.
+            raise BridgeError(f"Delivered to {name} ({mode}, turn {turn_id}), but waiting for the reply "
+                              f"failed: {e} Don't send the message again; read the reply with "
+                              f"GetConsultantReply (turn_id {turn_id}).") from None
+        if done:
             return format_turn(name, turn) + (f"\n\n({watching.strip()})" if watching else "")
-        return (f"Delivered to {name} ({mode}), but no reply within {timeout:.0f}s. Turn {turn_id} is "
-                "still running; this is not a reply. Don't send the message again. Call "
-                "GetConsultantReply with until_done=true to be told when it finishes.")
+        return still_working(
+            name, turn_id, turn,
+            f"Delivered ({mode}), but no reply within {timeout:.0f}s. Don't send the message again. "
+            f"Call GetConsultantReply with turn_id {turn_id} and until_done=true to be told when it finishes.")
     finally:
         client.close()
 
@@ -873,15 +921,19 @@ def get_consultant_reply(args, cancel=None):
                 return f"{name} has no turn {turn_id} among its {REPLY_LOOKBACK} most recent turns."
             return f"{name} has no messages yet."
         if turn.get("status") == "inProgress":
-            done = wait_for_turn(client, tid, turn["id"], timeout, cancel) if timeout > 0 else None
+            done = False
+            if timeout > 0:
+                done, _, last = wait_for_turn(client, tid, turn["id"], timeout, cancel)
+                turn = last or turn  # the newest snapshot, for the partial output
             if not done:
-                return (f"{name} is still working on turn {turn['id']}; this is not a reply. "
-                        "Call again with until_done=true to be told when it finishes.")
-            turn = done
+                return still_working(name, turn["id"], turn,
+                                     f"Call again with turn_id {turn['id']} and until_done=true to be "
+                                     "told when it finishes.")
         out = format_turn(name, turn)
         latest = latest_turn(client, tid)
         if turn["status"] == "interrupted" and latest and latest["id"] != turn["id"]:
-            out += f"\nA later turn exists ({latest['id']}, {latest['status']}); read it by omitting turn_id."
+            out += (f"\nA later turn exists ({latest['id']}, {latest['status']}). If your message "
+                    "continued there, read it by omitting turn_id.")
         return out
     finally:
         client.close()
@@ -937,12 +989,13 @@ def stop_consultant(args, cancel=None):
 INSTRUCTIONS = (
     "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your "
     "working directory, even if you don't remember one being open (earlier context may have been "
-    "compacted). It searches first: if a session already works in this repo it returns that one, "
-    "keeping its earlier context, and starts nothing; otherwise it starts one. Either way the "
-    "session is shown in a pane beside Claude Code, and you talk to it with SendConsultantMessage, "
-    "passing the name it returns as `to`. Pass new=true only when the user asks for a separate consultant. "
-    "For a long task, send with wait=false, then call GetConsultantReply with until_done=true; it "
-    "returns only when Codex finishes. A reply that says 'still working' is not a reply: call "
+    "compacted). It reuses a consultant it started earlier in this repo, keeping its context, or "
+    "starts a new read-only one; it never picks a Codex session the user opened. Talk to it with "
+    "SendConsultantMessage, passing the name it returns as `to`. Pass new=true only when the user "
+    "asks for a separate consultant. Message a session the user opened only when the user asks you to. "
+    "For a long task, send with wait=false, then call GetConsultantReply with the returned turn_id "
+    "and until_done=true; it returns when the turn ends, or with an error or after 4 hours. A "
+    "result that says 'still working' is not a reply, even if it shows output so far: call "
     "GetConsultantReply with until_done=true again rather than treating it as done."
 )
 
@@ -953,26 +1006,27 @@ TOOLS = [
     {
         "name": "StartConsultant",
         "description": (
-            "Start a new Codex session (consultant) in the background, with no terminal needed. "
-            "It runs on the local Codex app-server daemon in a read-only sandbox and never asks for "
-            "approvals: it can read files and run read-only commands for auditing, validation and "
-            "research, but cannot edit anything. Returns the consultant's name: pass it as `to` to the other tools. "
-            "Searches first, so call it whenever you need a consultant: if a session already works "
-            "in this repo it returns that one and starts nothing (unless new=true); if none is "
-            "found, it starts one. The session is shown in a pane beside Claude Code (Windows "
-            "Terminal or tmux split, otherwise a new window) once it has its first message."
+            "Get a Codex consultant for a repo: reuse one that StartConsultant started there earlier "
+            "(keeping its context), or start a new one. Call it whenever you need a consultant. "
+            "Consultants run on the local Codex app-server daemon in a read-only sandbox and never ask "
+            "for approvals: they can read files and run read-only commands for auditing, validation "
+            "and research, but cannot edit anything. Codex sessions the user opened are never reused; "
+            "they are listed in the result. Returns the consultant's name: pass it as `to` to the "
+            "other tools. Unless watch=false, the session is shown beside Claude Code (Windows "
+            "Terminal or tmux split pane, otherwise a new window) once it has its first message."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "cwd": {"type": "string", "description": "Absolute path of the project Codex should work in. Pass your working directory. Default: Claude Code's workspace folder."},
-                "model": {"type": "string", "description": "Codex model. Default: the user's Codex config."},
-                "title": {"type": "string", "description": "Optional session title shown in Codex."},
-                "instructions": {"type": "string", "description": "Optional standing instructions for the consultant's role."},
-                "watch": {"type": "boolean", "description": "Show the session in a pane beside Claude Code so the user can watch it work. Default true; pass false only if the user doesn't want a pane."},
-                "new": {"type": "boolean", "description": "Start a new session even though one already works in this repo. Default false. Use only when the user asked for a separate consultant."},
+                "cwd": {"type": "string", "description": "Absolute path of the project Codex should work in. Pass your working directory. Default: Claude Code's first workspace folder."},
+                "model": {"type": "string", "description": "Codex model for a new session. Default: the user's Codex config. Ignored when an existing consultant is reused."},
+                "title": {"type": "string", "description": "Session title for a new session, shown in Codex. Ignored when an existing consultant is reused."},
+                "instructions": {"type": "string", "description": "Standing instructions for a new consultant's role. Ignored when an existing consultant is reused."},
+                "watch": {"type": "boolean", "description": "Show the session in a pane beside Claude Code so the user can watch it work. Default true; pass false only if the user doesn't want a pane. Applies to later sends too."},
+                "new": {"type": "boolean", "description": "Start a new session even though a consultant already works in this repo. Default false. Use only when the user asked for a separate consultant."},
             },
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
     },
     {
         "name": "ListConsultants",
@@ -980,28 +1034,31 @@ TOOLS = [
             "List Codex sessions (consultants) on this machine: sessions loaded on the local Codex "
             "app-server daemon plus recent StartConsultant sessions it has unloaded. Each row gives "
             "the name to pass to the other tools, the working directory, model, status, and who started it. "
-            "Pass cwd to see only the sessions working in that repo; do this before StartConsultant."
+            "Pass cwd to see only the sessions working in that repo."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "cwd": {
                     "type": "string",
-                    "description": "Only list sessions whose working directory is in the same git repo as this path. Outside git: under the Claude Code workspace folder that contains it, or under the path itself.",
+                    "description": "Only list sessions whose working directory is inside the git work tree containing this path (nested repos included). Outside git: inside the Claude Code workspace folder that contains it, or inside the path itself.",
                 },
                 "include_all": {
                     "type": "boolean",
-                    "description": "Also show Codex-internal threads (subagents, guardian reviews). Default false. Ignored with cwd.",
+                    "description": "Also show Codex-internal threads (subagents, guardian reviews). Default false. Ignored with cwd, which always hides them.",
                 },
             },
         },
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     {
         "name": "SendConsultantMessage",
         "description": (
             "Send a message into a Codex session and, by default, wait for and return its reply. "
             "The message appears in that session as a new user turn (or steers the running turn if busy). "
-            "Address it by the name from ListConsultants, the thread id, or a unique id prefix/suffix."
+            "Address it by the name from ListConsultants, the thread id, or a unique id prefix/suffix. "
+            "A session the user opened keeps the user's own permissions and may be able to edit files: "
+            "message one only when the user asks you to. May open the session's pane beside Claude Code."
         ),
         "inputSchema": {
             "type": "object",
@@ -1009,12 +1066,13 @@ TOOLS = [
                 "to": TO_SCHEMA,
                 "message": {"type": "string", "description": "The message to send."},
                 "from": {"type": "string", "description": "Sender label shown to Codex, e.g. your session name. Default 'Claude Code'."},
-                "wait": {"type": "boolean", "description": "Wait for the reply. Default true. With false, read it later with GetConsultantReply."},
-                "timeout_seconds": {"type": "number", "minimum": 0, "description": "Max seconds to wait for the reply. Default 600, at most 14400."},
+                "wait": {"type": "boolean", "description": "Wait for the reply. Default true. With false, return once the message is delivered (timeout_seconds and until_done are then ignored) and read the reply later with GetConsultantReply."},
+                "timeout_seconds": {"type": "number", "minimum": 0, "description": "Max seconds to wait for the reply after delivery. Default 600, at most 14400. On timeout the result shows the output so far, which is not the reply."},
                 "until_done": {"type": "boolean", "description": "Wait until the turn ends, up to 4 hours (overrides timeout_seconds). Default false."},
             },
             "required": ["to", "message"],
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
     },
     {
         "name": "GetConsultantReply",
@@ -1022,8 +1080,9 @@ TOOLS = [
             "Read a consultant's reply without sending anything: the latest turn, or a specific turn id "
             "returned by SendConsultantMessage (searched among the 100 most recent turns). Use after "
             "sending with wait=false or after a timeout. For long turns pass until_done=true: the call "
-            "returns only when the turn ends, so a client that runs long calls in the background is "
-            "notified exactly when the reply is ready."
+            "returns when the turn ends (polled every 1.5 s), or with an error or after 4 hours, so a "
+            "client that runs long calls in the background is notified soon after the reply is ready. "
+            "While the turn runs, the result shows its output so far, which is not the reply."
         ),
         "inputSchema": {
             "type": "object",
@@ -1035,25 +1094,30 @@ TOOLS = [
             },
             "required": ["to"],
         },
+        # Its one write is nouez's own copy of an over-long reply in the temp folder.
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     {
         "name": "WatchConsultant",
         "description": (
             "Open a Codex session beside Claude Code (a split pane in Windows Terminal or tmux, otherwise a new terminal window) on the user's machine (`codex resume <id>`), "
-            "so the user can watch it work or type into it. If the session has no messages yet, the "
-            "window opens when the first one is sent."
+            "so the user can watch it work or type into it. Does nothing if a terminal already shows it. "
+            "If the session has no messages yet, the window opens when the next SendConsultantMessage "
+            "delivers one."
         ),
         "inputSchema": {"type": "object", "properties": {"to": TO_SCHEMA}, "required": ["to"]},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     {
         "name": "StopConsultant",
         "description": (
-            "Stop a Codex session that StartConsultant started, by archiving it and closing any "
-            "terminal window watching it. Needs the exact name or full thread id. Refuses sessions "
-            "without the StartConsultant tag, such as ones the user opened (a guard against "
-            "mistakes, not a security boundary)."
+            "Stop a Codex session that StartConsultant started: archive it, and end the `codex resume` "
+            "processes showing it so their terminal windows close (best effort). Needs the exact name "
+            "or full thread id. Refuses sessions without the StartConsultant tag, such as ones the "
+            "user opened (a guard against mistakes, not a security boundary)."
         ),
         "inputSchema": {"type": "object", "properties": {"to": EXACT_TO_SCHEMA}, "required": ["to"]},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     },
 ]
 
@@ -1133,7 +1197,8 @@ def handle(msg, cancel):
 
 
 def dispatch(msg, cancel):
-    method, msg_id, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+    method, msg_id, params = msg.get("method"), msg.get("id"), msg.get("params")
+    params = {} if params is None else params
     if not isinstance(params, dict):
         if msg_id is not None:
             invalid_params(msg_id, "params must be an object.")
@@ -1161,7 +1226,8 @@ def dispatch(msg, cancel):
         if not handler:
             invalid_params(msg_id, f"Unknown tool: {params.get('name')}")
             return
-        arguments = params.get("arguments") or {}
+        arguments = params.get("arguments")
+        arguments = {} if arguments is None else arguments
         if not isinstance(arguments, dict):
             invalid_params(msg_id, "arguments must be an object.")
             return
@@ -1207,7 +1273,9 @@ def valid_id(value):
 
 def route(msg):
     """Hand one incoming message to the right place, without blocking the read loop."""
-    if not isinstance(msg, dict) or not valid_id(msg.get("id")):
+    # MCP request ids are never null; a request with "id": null would otherwise pass as a notification.
+    null_id = isinstance(msg, dict) and "method" in msg and "id" in msg and msg["id"] is None
+    if not isinstance(msg, dict) or not valid_id(msg.get("id")) or null_id:
         respond(None, error={"code": -32600, "message": "Invalid Request"})
         return
     if "method" not in msg:  # a response to a request we sent (roots/list)

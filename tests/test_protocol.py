@@ -120,6 +120,25 @@ class ProtocolTest(unittest.TestCase):
         for tool in tools:
             self.assertEqual(tool["inputSchema"]["type"], "object")
 
+    def test_annotations(self):
+        tools = {t["name"]: t["annotations"] for t in self.server.request(8, "tools/list")["result"]["tools"]}
+        read_only = {name for name, a in tools.items() if a.get("readOnlyHint")}
+        self.assertEqual(read_only, {"ListConsultants", "GetConsultantReply"})
+        destructive = {name for name, a in tools.items() if a.get("destructiveHint")}
+        self.assertEqual(destructive, {"StopConsultant"})
+
+    def test_null_id_is_invalid_request(self):
+        self.server.send({"jsonrpc": "2.0", "id": None, "method": "ping"})
+        reply = self.server.recv()
+        self.assertEqual(reply["error"]["code"], -32600)
+        self.assertIsNone(reply["id"])
+        self.assert_alive()
+
+    def test_empty_array_params_are_invalid(self):
+        self.assertEqual(self.server.request(9, "ping", [])["error"]["code"], -32602)
+        reply = self.server.request(10, "tools/call", {"name": "ListConsultants", "arguments": []})
+        self.assertEqual(reply["error"]["code"], -32602)
+
 
 class ArgumentTest(unittest.TestCase):
     def test_number_rejects_negative_and_non_finite(self):
@@ -182,6 +201,138 @@ class ResolveTest(unittest.TestCase):
     def test_exact_only_accepts_name_and_full_id(self):
         self.assertTrue(server.resolve(self.client, "codex-repo-123456", exact_only=True))
         self.assertTrue(server.resolve(self.client, "0199aaaa-bbbb-cccc-dddd-eeeeee123456", exact_only=True))
+
+    def test_shared_name_is_refused(self):
+        client = FakeClient([{"id": "0199aaaa-0000-0000-0000-000000123456", "cwd": "/repo"},
+                             {"id": "0199bbbb-0000-0000-0000-000000123456", "cwd": "/repo"}])
+        for exact_only in (False, True):
+            with self.assertRaises(server.BridgeError) as caught:
+                server.resolve(client, "codex-repo-123456", exact_only=exact_only)
+            self.assertIn("more than one session", str(caught.exception))
+        self.assertEqual(server.resolve(client, "0199bbbb-0000-0000-0000-000000123456")["id"][:8], "0199bbbb")
+
+
+def agent(text, phase=None):
+    return {"type": "agentMessage", "phase": phase, "text": text}
+
+
+def user(text):
+    return {"type": "userMessage", "content": [{"type": "text", "text": text}]}
+
+
+class PartialTest(unittest.TestCase):
+    def test_only_output_since_the_latest_user_message(self):
+        turn = {"items": [user("first"), agent("old answer", "final_answer"),
+                          user("steered"), agent("looking", "commentary"), agent("draft", "final_answer")]}
+        self.assertEqual(server.partial_output(turn), "looking\n\ndraft")
+
+    def test_newest_part_is_kept(self):
+        text = "x" * 10 + "y" * server.PARTIAL_CHARS
+        out = server.partial_output({"items": [user("q"), agent(text)]})
+        self.assertTrue(out.startswith("[... 10 earlier characters omitted]"))
+        self.assertTrue(out.endswith("y" * server.PARTIAL_CHARS))
+
+    def test_still_working_is_marked_not_a_reply(self):
+        self.assertNotIn("Output so far", server.still_working("c", "t1", None, "Wait."))
+        out = server.still_working("c", "t1", {"items": [user("q"), agent("half")]}, "Wait.")
+        self.assertIn("this is not a reply", out)
+        self.assertIn("Output so far", out)
+        self.assertTrue(out.endswith("half"))
+
+
+class FakeDaemon:
+    """A daemon with threads and turns, for the tool handlers. Pass it as CodexClient."""
+
+    def __init__(self, threads, turns=None, fail_after_start=False):
+        self.threads = {t["id"]: t for t in threads}
+        self.turns = turns or {}  # thread id -> turns, newest first
+        self.fail_after_start = fail_after_start
+        self.calls = []
+        self.info = {}
+
+    def __call__(self):
+        return self
+
+    def close(self):
+        pass
+
+    def request(self, method, params):
+        self.calls.append(method)
+        if method == "thread/loaded/list":
+            return {"data": list(self.threads)}
+        if method == "thread/read":
+            return {"thread": dict(self.threads[params["threadId"]])}
+        if method == "thread/list":
+            return {"data": []}
+        if method == "thread/start":
+            thread = {"id": "0199ffff-0000-0000-0000-000000new001", "threadSource": "nouez", **params}
+            self.threads[thread["id"]] = thread
+            return {"thread": thread}
+        if method == "thread/resume":
+            return {}
+        if method == "thread/turns/list":
+            if self.fail_after_start and "turn/start" in self.calls:
+                raise server.BridgeError("thread/turns/list timed out after 15s.")
+            return {"data": self.turns.get(params["threadId"], [])[:params["limit"]]}
+        if method == "turn/start":
+            turn = {"id": "turn-new", "status": "inProgress",
+                    "items": [user(params["input"][0]["text"]), agent("working on it", "commentary")]}
+            self.turns.setdefault(params["threadId"], []).insert(0, turn)
+            return {"turn": turn}
+        if method == "turn/steer":
+            running = self.turns[params["threadId"]][0]
+            running["items"].append(user(params["input"][0]["text"]))
+            return {"turnId": running["id"]}
+        raise AssertionError(method)
+
+
+class HandlerTest(unittest.TestCase):
+    def use(self, daemon):
+        original = server.CodexClient
+        server.CodexClient = daemon
+        self.addCleanup(setattr, server, "CodexClient", original)
+        return daemon
+
+    def test_start_never_reuses_a_user_session(self):
+        mine = {"id": "0199aaaa-0000-0000-0000-000000user01", "cwd": ROOT}
+        daemon = self.use(FakeDaemon([mine]))
+        out = server.start_consultant({"cwd": ROOT, "watch": False})
+        self.assertIn("thread/start", daemon.calls)
+        self.assertTrue(out.startswith("Started "))
+        self.assertIn("were not used", out)
+        self.assertIn(server.short_name(mine), out)
+
+    def test_start_reuses_its_own_consultant(self):
+        ours = {"id": "0199aaaa-0000-0000-0000-000000ours01", "cwd": ROOT, "threadSource": "nouez"}
+        daemon = self.use(FakeDaemon([ours]))
+        out = server.start_consultant({"cwd": ROOT, "watch": False, "model": "m"})
+        self.assertNotIn("thread/start", daemon.calls)
+        self.assertTrue(out.startswith(f"Using {server.short_name(ours)}"))
+        self.assertIn("Ignored model", out)
+
+    def test_send_timeout_shows_output_so_far(self):
+        tid = "0199aaaa-0000-0000-0000-000000idle01"
+        self.use(FakeDaemon([{"id": tid, "cwd": ROOT}]))
+        out = server.send_consultant_message({"to": tid, "message": "hi", "timeout_seconds": 0})
+        self.assertIn("still working on turn turn-new; this is not a reply", out)
+        self.assertIn("Don't send the message again", out)
+        self.assertTrue(out.endswith("working on it"))
+
+    def test_steered_timeout_hides_output_from_before_the_message(self):
+        tid = "0199aaaa-0000-0000-0000-000000busy01"
+        running = {"id": "turn-1", "status": "inProgress", "items": [user("q"), agent("answer to q")]}
+        self.use(FakeDaemon([{"id": tid, "cwd": ROOT}], {tid: [running]}))
+        out = server.send_consultant_message({"to": tid, "message": "more", "timeout_seconds": 0})
+        self.assertIn("steered into the running turn", out)
+        self.assertNotIn("answer to q", out)
+
+    def test_failure_after_delivery_says_delivered(self):
+        tid = "0199aaaa-0000-0000-0000-000000fail01"
+        self.use(FakeDaemon([{"id": tid, "cwd": ROOT}], fail_after_start=True))
+        with self.assertRaises(server.BridgeError) as caught:
+            server.send_consultant_message({"to": tid, "message": "hi"})
+        self.assertTrue(str(caught.exception).startswith("Delivered to "))
+        self.assertIn("Don't send the message again", str(caught.exception))
 
 
 if __name__ == "__main__":
