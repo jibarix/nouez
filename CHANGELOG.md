@@ -7,6 +7,8 @@ All notable changes to this project are recorded here. The format follows
 ## [Unreleased]
 
 ### Changed
+- `SendConsultantMessage` waits 5 seconds by default instead of 600: long enough to confirm delivery and return a quick reply, short enough that Claude is free again right away. Read a longer reply with `GetConsultantReply`, or pass a larger `wait` when sending.
+- The server instructions and the results of a send no longer tell Claude to wait for the reply with `wait: "done"`. Claude now says the consultation is under way and carries on or ends its turn, and reads the reply when asked or when it next needs it. `wait: "done"` remains for when the user wants Claude to wait.
 - When the Codex daemon is not running (for example after a reboot), the first tool call starts it with `codex app-server daemon start` and retries, instead of failing with `Codex app-server daemon is not reachable`. The error now appears only if the daemon still can't be reached about 20 seconds later.
 
 ## [0.4.0] - 2026-10-09

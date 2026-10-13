@@ -42,6 +42,7 @@ RECENT_SAVED_THREADS = 50  # how far back to look for unloaded bridge consultant
 REPLY_LOOKBACK = 100  # how many recent turns GetConsultantReply searches for a turn id
 MAX_WAIT_SECONDS = 4 * 60 * 60  # ceiling on any wait, wait="done" included, so a hung turn can't pin a call
 MAX_REPLY_CHARS = 60_000  # longer replies are cut here; the full text is saved to a file
+SEND_WAIT_SECONDS = 5  # SendConsultantMessage's default wait: a quick answer fits, a long one doesn't hold the caller
 PARTIAL_CHARS = 4_000  # how much of a still-running turn's output a timeout shows (the most recent part)
 PROGRESS_SECONDS = 10  # least time between two progress notifications for one call
 BRIDGE_SOURCE = "nouez"  # threadSource tag on sessions started by StartConsultant
@@ -563,6 +564,13 @@ def still_working(name, turn_id, turn, advice):
     return out
 
 
+def read_later(turn_id):
+    """What to do about a reply that isn't ready: leave the caller free rather than have it wait."""
+    return ("Don't wait for the reply: tell the user the consultation is under way, then carry on "
+            "with other work or end your turn. Read it with GetConsultantReply (turn_id "
+            f"{turn_id}) when the user asks or when you next need it.")
+
+
 def progress_reporter(progress, name):
     """An on_poll for wait_for_turn that reports the wait as MCP progress, or None without a token."""
     if not progress:
@@ -907,7 +915,7 @@ def send_consultant_message(args, cancel=None, progress=None):
     message = args.get("message") or ""
     if not message:
         raise BridgeError("`message` is required.")
-    timeout = wait_seconds(args, 600)
+    timeout = wait_seconds(args, SEND_WAIT_SECONDS)
     allow_user = flag(args, "allow_user_session")
     sender = args.get("from") or "Claude Code"
     text = f"[Message from {sender} via the consultants bridge]\n\n{message}"
@@ -954,8 +962,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                 except (BridgeError, OSError) as e:
                     watching = f" Could not open a terminal: {e}"
         if not timeout:
-            return (f"Delivered to {name} ({mode}, turn {turn_id}).{watching} Not waiting; read the "
-                    f"reply with GetConsultantReply (turn_id {turn_id}, wait=\"done\").")
+            return f"Delivered to {name} ({mode}, turn {turn_id}).{watching} {read_later(turn_id)}"
         try:
             done, turn_id, turn = wait_for_turn(client, tid, turn_id, timeout, cancel, text,
                                                 progress_reporter(progress, name))
@@ -969,7 +976,7 @@ def send_consultant_message(args, cancel=None, progress=None):
         return still_working(
             name, turn_id, turn,
             f"Delivered ({mode}), but no reply within {timeout:.0f}s. Don't send the message again. "
-            f"Call GetConsultantReply with turn_id {turn_id} and wait=\"done\" to be told when it finishes.")
+            f"{read_later(turn_id)}")
     finally:
         client.close()
 
@@ -995,8 +1002,8 @@ def get_consultant_reply(args, cancel=None, progress=None):
                 turn = last or turn  # the newest snapshot, for the partial output
             if not done:
                 return still_working(name, turn["id"], turn,
-                                     f"Call again with turn_id {turn['id']} and wait=\"done\" to be "
-                                     "told when it finishes.")
+                                     f"Check again later with turn_id {turn['id']}; pass wait=\"done\" "
+                                     "only if the user wants you to wait for it.")
         out = format_turn(name, turn)
         latest = latest_turn(client, tid)
         if turn["status"] == "interrupted" and latest and latest["id"] != turn["id"]:
@@ -1061,11 +1068,13 @@ INSTRUCTIONS = (
     "starts a new read-only one; it never picks a Codex session the user opened. Talk to it with "
     "SendConsultantMessage, passing the name it returns as `to`. Pass new=true only when the user "
     "asks for a separate consultant. Message a session the user opened only when the user asks you "
-    "to, with allow_user_session=true. For a long task, send with wait=0, then call "
-    "GetConsultantReply with the returned turn_id and wait=\"done\"; it returns when the turn ends, "
-    "or with an error or after 4 hours. A result that says 'still working' is not a reply, even if "
-    "it shows output so far: call GetConsultantReply with wait=\"done\" again rather than treating "
-    "it as done."
+    "to, with allow_user_session=true. SendConsultantMessage returns about 5 seconds after delivery, "
+    "usually before the reply is ready; replies often take minutes. Do not wait for one: tell the "
+    "user the consultation is under way, then carry on with other work or end your turn so the "
+    "user can keep working. Read the reply with GetConsultantReply and the returned turn_id when "
+    "the user asks or when you next need it. Pass wait=\"done\" only if the user asks you to wait "
+    "for the reply. A result that says 'still working' is not a reply, even if it shows output so "
+    "far: never treat it as done."
 )
 
 TO_SCHEMA = {"type": "string", "description": "Consultant name, thread id, or unique id prefix/suffix."}
@@ -1132,7 +1141,8 @@ TOOLS = [
     {
         "name": "SendConsultantMessage",
         "description": (
-            "Send a message into a Codex session and, by default, wait for and return its reply. "
+            "Send a message into a Codex session. By default it waits 5 seconds, enough to confirm delivery "
+            "and return a quick reply; a longer answer is read later with GetConsultantReply, without waiting for it. "
             "The message appears in that session as a new user turn (or steers the running turn if busy). "
             "Address it by the name from ListConsultants, the thread id, or a unique id prefix/suffix. "
             "Sessions the user opened are refused unless allow_user_session=true: they keep the user's "
@@ -1144,7 +1154,7 @@ TOOLS = [
                 "to": TO_SCHEMA,
                 "message": {"type": "string", "description": "The message to send."},
                 "from": {"type": "string", "description": "Sender label shown to Codex, e.g. your session name. Default 'Claude Code'."},
-                "wait": wait_schema(600),
+                "wait": wait_schema(SEND_WAIT_SECONDS),
                 "allow_user_session": {"type": "boolean", "description": "Allow sending to a Codex session the user opened (not started by StartConsultant). Default false. Set it only when the user asked you to message that session."},
             },
             "required": ["to", "message"],
@@ -1156,7 +1166,8 @@ TOOLS = [
         "description": (
             "Read a consultant's reply without sending anything: the latest turn, or a specific turn id "
             "returned by SendConsultantMessage (searched among the 100 most recent turns). Use after "
-            "sending with wait=0 or after a timeout. For long turns pass wait=\"done\": the call "
+            "a send that came back before the reply. By default it returns at once, with the reply or a "
+            "'still working' note. Only when the user wants you to wait, pass wait=\"done\": the call "
             "returns when the turn ends (polled every 1.5 s), or with an error or after 4 hours, so a "
             "client that runs long calls in the background is notified soon after the reply is ready. "
             "While the turn runs, the result shows its output so far, which is not the reply."

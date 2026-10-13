@@ -416,7 +416,8 @@ class HandlerTest(unittest.TestCase):
         out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0.01})
         self.assertIn("still working on turn turn-new; this is not a reply", out)
         self.assertIn("Don't send the message again", out)
-        self.assertIn('wait="done"', out)
+        self.assertIn("Don't wait for the reply", out)
+        self.assertIn("GetConsultantReply (turn_id turn-new)", out)
         self.assertTrue(out.endswith("working on it"))
 
     def test_wait_zero_returns_after_delivery(self):
@@ -424,7 +425,8 @@ class HandlerTest(unittest.TestCase):
         daemon = self.use(FakeDaemon([thread]))
         out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0})
         self.assertTrue(out.startswith("Delivered to "))
-        self.assertIn('turn_id turn-new, wait="done"', out)
+        self.assertIn("Don't wait for the reply", out)
+        self.assertIn("GetConsultantReply (turn_id turn-new)", out)
         self.assertIn("turn/start", daemon.calls)
 
     def test_steered_timeout_hides_output_from_before_the_message(self):
