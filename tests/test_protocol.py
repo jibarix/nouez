@@ -6,6 +6,7 @@ Run from the repo root: python -m unittest discover tests
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -467,6 +468,42 @@ class HandlerTest(unittest.TestCase):
         notes.clear()
         server.get_consultant_reply({"to": thread["id"], "wait": 0.01}, None, notes.append)
         self.assertIn("is working on turn turn-new", notes[0])
+
+
+class ReleaseTest(unittest.TestCase):
+    """A change to server.py ships as a version: these fail until the version step is done."""
+
+    def read(self, *parts):
+        with open(os.path.join(ROOT, *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def git(self, *args):
+        try:
+            return subprocess.run(["git", "-C", ROOT, *args], stdin=subprocess.DEVNULL, capture_output=True,
+                                  text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("git is not available")
+
+    def test_version_is_recorded_everywhere(self):
+        version = server.SERVER_VERSION
+        changelog = self.read("CHANGELOG.md")
+        self.assertRegex(changelog, rf"(?m)^## \[{re.escape(version)}\] - \d{{4}}-\d\d-\d\d$")
+        self.assertIn(f"\n[{version}]: ", changelog)
+        self.assertIn(f"compare/v{version}...HEAD", changelog)
+        self.assertIn(f"| nouez | {version} |", self.read("README.md"))
+        self.assertIn(f"\\title{{\\textbf{{nouez}} {version}", self.read("docs", "architecture.tex"))
+
+    def test_changed_server_has_a_new_version(self):
+        tag = self.git("describe", "--tags", "--abbrev=0", "--match", "v*")
+        if tag.returncode:
+            self.skipTest("no version tag to compare with")
+        tag = tag.stdout.strip()
+        if self.git("diff", "--quiet", tag, "--", "server.py").returncode == 0:
+            return
+        self.assertNotEqual(
+            f"v{server.SERVER_VERSION}", tag,
+            f"server.py differs from {tag} but SERVER_VERSION is unchanged. Bump it and do the version "
+            "step: CHANGELOG section, README table, docs/architecture.tex and PDF, tag, release.")
 
 
 if __name__ == "__main__":

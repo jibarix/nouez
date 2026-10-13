@@ -86,8 +86,8 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.4.0\\[0.3em]\large Architecture and message reference}
-\date{October 9, 2026}
+\title{\textbf{nouez} 0.5.0\\[0.3em]\large Architecture and message reference}
+\date{October 13, 2026}
 \author{}
 
 \begin{document}
@@ -96,7 +96,7 @@
 
 \begin{abstract}
 \noindent nouez is an MCP server that lets Claude Code consult live Codex sessions. This document
-describes nouez 0.4.0: how the pieces fit together, and an example of every message nouez sends
+describes nouez 0.5.0: how the pieces fit together, and an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, and the commands nouez runs on
 the operating system. The daemon also sends notifications and its own requests, which nouez
@@ -285,8 +285,8 @@ nouez answers with the requested version if it supports it (2025-11-25, 2025-06-
 {"jsonrpc": "2.0", "id": 1, "result": {
   "protocolVersion": "2025-11-25",
   "capabilities": {"tools": {}},
-  "serverInfo": {"name": "nouez", "version": "0.4.0"},
-  "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: call GetConsultantReply with wait=\"done\" again rather than treating it as done."}}
+  "serverInfo": {"name": "nouez", "version": "0.5.0"},
+  "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: never treat it as done."}}
 \end{wire}
 
 \begin{wire}[Claude Code $\rightarrow$ nouez]
@@ -311,7 +311,7 @@ roots. The same request is sent again on \code{notifications/roots/list\_changed
 \begin{wire}[nouez $\rightarrow$ Claude Code (one of six tools shown)]
 {"jsonrpc": "2.0", "id": 2, "result": {"tools": [
   {"name": "SendConsultantMessage",
-   "description": "Send a message into a Codex session and, by default, wait for and return its reply. ...",
+   "description": "Send a message into a Codex session. By default it waits 5 seconds, enough to confirm delivery and return a quick reply; ...",
    "inputSchema": {"type": "object",
      "properties": {
        "to": {"type": "string", "description": "Consultant name, thread id, or unique id prefix/suffix."},
@@ -319,7 +319,7 @@ roots. The same request is sent again on \code{notifications/roots/list\_changed
        "from": {"type": "string", "description": "Sender label shown to Codex, ..."},
        "wait": {"anyOf": [{"type": "number", "minimum": 0, "maximum": 14400},
                           {"type": "string", "enum": ["done"]}],
-                "description": "How long to wait for the reply: a number of seconds (0 = don't wait), or \"done\" ... Default 600. ..."},
+                "description": "How long to wait for the reply: a number of seconds (0 = don't wait), or \"done\" ... Default 5. ..."},
        "allow_user_session": {"type": "boolean", "description": "Allow sending to a Codex session the user opened ... Default false. ..."}},
      "required": ["to", "message"]},
    "annotations": {"readOnlyHint": false, "destructiveHint": false}},
@@ -384,7 +384,7 @@ get a JSON-RPC error instead.
 \end{wire}
 \begin{wire}[nouez $\rightarrow$ Claude Code: tool error]
 {"jsonrpc": "2.0", "id": 15, "result": {"content": [{"type": "text",
-  "text": "Codex app-server daemon is not reachable. Start it with `codex app-server daemon start`, or open a Codex session."}],
+  "text": "Codex app-server daemon is not reachable, and starting it did not help. Run `codex app-server daemon start` in a terminal to see why, or open a Codex session."}],
   "isError": true}}
 \end{wire}
 
@@ -474,7 +474,7 @@ connection has four steps:
   \msg{3.0}{0}{6}{HTTP GET / Upgrade: websocket}
   \ret{3.8}{6}{0}{HTTP/1.1 101 Switching Protocols}
   \side{3.8}{6}{15 s deadline, read on a side thread}
-  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.4.0)}
+  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.5.0)}
   \ret{5.6}{12}{0}{userAgent, codexHome}
   \msg{6.4}{0}{12}{initialized (notification)}
   \msg{7.4}{0}{12}{requests for this tool call ...}
@@ -497,8 +497,12 @@ Connection: Upgrade
 Sec-WebSocket-Accept: ...
 \end{plain}
 
-If the proxy closes its output before answering, nouez reports \emph{``Codex app-server daemon is
-not reachable. Start it with `codex app-server daemon start`, or open a Codex session.''}; if it
+If the proxy closes its output before answering, no daemon is listening (it does not survive a
+restart of the computer). nouez then runs \code{codex app-server daemon start} once, without
+pipes and waiting at most 30 seconds for the command, and retries the connection every half
+second for up to 20 seconds. Only if that fails does it report \emph{``Codex app-server daemon is
+not reachable, and starting it did not help. Run `codex app-server daemon start` in a terminal to
+see why, or open a Codex session.''} If the proxy
 says nothing within 15 seconds, \emph{``Codex app-server proxy did not respond within 15s.''}; for
 any status other than 101, \emph{``WebSocket upgrade refused: <first 200 bytes of the header>''}.
 
@@ -529,11 +533,11 @@ The daemon speaks JSON-RPC without the \code{"jsonrpc"} member. Ids are integers
 on each connection.
 
 \begin{wire}[nouez $\rightarrow$ daemon]
-{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.4.0"}}}
+{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.5.0"}}}
 \end{wire}
 \begin{wire}[daemon $\rightarrow$ nouez]
 {"id": 1, "result": {
-  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.4.0)",
+  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.5.0)",
   "codexHome": "C:\\Users\\you\\.codex",
   "platformFamily": "windows", "platformOs": "windows"}}
 \end{wire}
@@ -807,7 +811,7 @@ doesn't block other senders.
   \side{16.1}{5}{interrupted: follow the turn that carries our text}
   \ret{17.9}{5}{0}{reply / partial / "not a reply"}
 \end{tikzpicture}
-\caption{SendConsultantMessage with the default \code{wait} of 600 seconds. Before the lock, a
+\caption{SendConsultantMessage with a \code{wait} above zero (the default is 5 seconds). Before the lock, a
 session the user opened is refused unless \code{allow\_user\_session: true}, and nothing is sent.
 Progress notifications go out only if the request carried a progress token. With
 \code{wait: 0} it returns after the steps inside the lock (delivery, the listing check and the pane), skipping
@@ -852,10 +856,10 @@ Two issues. 1) route() accepts float ids but ...
 (Opened codex-nouez-4d9f17 in a Windows Terminal split pane.)
 \end{plain}
 \begin{plain}[Result text: wait=0]
-Delivered to codex-nouez-4d9f17 (started a new turn, turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31). Not waiting; read the reply with GetConsultantReply (turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31, wait="done").
+Delivered to codex-nouez-4d9f17 (started a new turn, turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31). Don't wait for the reply: tell the user the consultation is under way, then carry on with other work or end your turn. Read it with GetConsultantReply (turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31) when the user asks or when you next need it.
 \end{plain}
 \begin{plain}[Result text: timeout (isError false; the message was delivered)]
-codex-nouez-4d9f17 is still working on turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31; this is not a reply. Delivered (started a new turn), but no reply within 600s. Don't send the message again. Call GetConsultantReply with turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31 and wait="done" to be told when it finishes.
+codex-nouez-4d9f17 is still working on turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31; this is not a reply. Delivered (started a new turn), but no reply within 600s. Don't send the message again. Don't wait for the reply: tell the user the consultation is under way, then carry on with other work or end your turn. Read it with GetConsultantReply (turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31) when the user asks or when you next need it.
 
 Output so far (a snapshot of the running turn; it may change and is not the final answer):
 Reading server.py ... route() looks fine; checking dispatch next.
@@ -882,9 +886,10 @@ Reply from codex-nouez-4d9f17:
 % -----------------------------------------------------------------------------
 \subsection{GetConsultantReply}
 
-Reads a reply without sending anything. The recommended pattern for long work is to send with
-\code{wait: 0} and then call this tool with the returned \code{turn\_id} and
-\code{wait: "done"}. The call returns when the turn ends, when an error occurs (such as a
+Reads a reply without sending anything. A send returns after 5 seconds by default, usually before
+the reply is ready, and Claude is told not to wait for it: it calls this tool with the returned
+\code{turn\_id} when the user asks or when it next needs the reply, and the call returns at once.
+When the user does want Claude to wait, it passes \code{wait: "done"}. That call returns when the turn ends, when an error occurs (such as a
 lost daemon connection), or after the 4-hour cap, so a client that moved it to the background is
 notified when the reply is ready, up to one 1.5-second poll late. An error or the cap is not a
 reply; call again.
@@ -915,7 +920,7 @@ Reply from codex-nouez-4d9f17:
 
 Two issues. 1) ...
 
-codex-nouez-4d9f17 is still working on turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31; this is not a reply. Call again with turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31 and wait="done" to be told when it finishes.
+codex-nouez-4d9f17 is still working on turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31; this is not a reply. Check again later with turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31; pass wait="done" only if the user wants you to wait for it.
 
 Output so far (a snapshot of the running turn; it may change and is not the final answer):
 Reading server.py ...
@@ -1073,7 +1078,8 @@ the direct process elsewhere. The pane itself is started without waiting, so it 
 \code{MAX\_FRAME\_BYTES} & 64 MiB & largest WebSocket message accepted \\
 Daemon request timeout & 15 s & per Codex request and for the handshake \\
 \code{roots/list} timeout & 5 s & then nouez assumes no roots \\
-Default \code{wait} & 600 s / 0 s & SendConsultantMessage / GetConsultantReply \\
+Default \code{wait} & 5 s / 0 s & SendConsultantMessage / GetConsultantReply \\
+\code{DAEMON\_START\_SECONDS} & 20 s & wait for a daemon nouez started to accept connections \\
 \bottomrule
 \end{tabular}
 \end{center}

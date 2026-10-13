@@ -32,7 +32,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")

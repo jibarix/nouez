@@ -6,6 +6,10 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-13
+
+Claude no longer waits for a consultant's reply by default, and the Codex daemon is started when it isn't running. Tested with Claude Code 2.1.296, Codex CLI 0.160.1 with app-server daemon 0.162.1, Python 3.13.5 on Windows 11.
+
 ### Changed
 - `SendConsultantMessage` waits 5 seconds by default instead of 600: long enough to confirm delivery and return a quick reply, short enough that Claude is free again right away. Read a longer reply with `GetConsultantReply`, or pass a larger `wait` when sending.
 - The server instructions and the results of a send no longer tell Claude to wait for the reply with `wait: "done"`. Claude now says the consultation is under way and carries on or ends its turn, and reads the reply when asked or when it next needs it. `wait: "done"` remains for when the user wants Claude to wait.
@@ -113,7 +117,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jibarix/nouez/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jibarix/nouez/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/jibarix/nouez/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/jibarix/nouez/compare/v0.3.0...v0.3.1

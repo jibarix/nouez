@@ -23,10 +23,10 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.4.0 |
-| Claude Code | 2.1.295 |
+| nouez | 0.5.0 |
+| Claude Code | 2.1.296 |
 | Codex CLI | 0.160.1 |
-| Codex app-server daemon | 0.162.0 |
+| Codex app-server daemon | 0.162.1 |
 | Python | 3.13.5 |
 | OS | Windows 11 |
 
