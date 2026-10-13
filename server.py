@@ -72,6 +72,10 @@ class BridgeError(Exception):
     pass
 
 
+class DaemonDown(BridgeError):
+    pass
+
+
 class Cancelled(Exception):
     pass
 
@@ -153,6 +157,20 @@ def run_text(argv, timeout=20):
 
 # --- Codex app-server client -------------------------------------------------
 
+DAEMON_START_SECONDS = 20  # how long to wait for a daemon we started to accept connections
+
+
+def start_daemon(exe):
+    """Run `codex app-server daemon start`, which does nothing if the daemon is already up.
+    No pipes and no kill on timeout: the daemon outlives this command, and would hold a pipe
+    open or die with the tree."""
+    log("Codex daemon not reachable; starting it")
+    try:
+        subprocess.Popen([exe, "app-server", "daemon", "start"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait(timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
 
 class CodexClient:
     """One short-lived connection to the Codex app-server daemon."""
@@ -165,6 +183,30 @@ class CodexClient:
         self.next_id = 1
         self.q = queue.Queue()
         self._write_lock = threading.Lock()
+        try:
+            self._connect(exe)
+        except DaemonDown:
+            # Nothing is listening: start the daemon ourselves and wait for its socket.
+            start_daemon(exe)
+            deadline = time.monotonic() + DAEMON_START_SECONDS
+            while True:
+                try:
+                    self._connect(exe)
+                    break
+                except DaemonDown:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.5)
+        try:
+            threading.Thread(target=self._reader, daemon=True).start()
+            # userAgent carries the daemon's version and codexHome its install root.
+            self.info = self.request("initialize", {"clientInfo": {"name": "nouez", "version": SERVER_VERSION}})
+            self.notify("initialized")
+        except Exception:
+            self.close()
+            raise
+
+    def _connect(self, exe):
         self.proc = subprocess.Popen(
             [exe, "app-server", "proxy"],
             stdin=subprocess.PIPE,
@@ -173,10 +215,6 @@ class CodexClient:
         )
         try:
             self._handshake()
-            threading.Thread(target=self._reader, daemon=True).start()
-            # userAgent carries the daemon's version and codexHome its install root.
-            self.info = self.request("initialize", {"clientInfo": {"name": "nouez", "version": SERVER_VERSION}})
-            self.notify("initialized")
         except Exception:
             self.close()
             raise
@@ -216,9 +254,9 @@ class CodexClient:
             reader.start()
             reader.join(self.timeout)
         if result.get("eof"):
-            raise BridgeError(
-                "Codex app-server daemon is not reachable. Start it with "
-                "`codex app-server daemon start`, or open a Codex session."
+            raise DaemonDown(
+                "Codex app-server daemon is not reachable, and starting it did not help. Run "
+                "`codex app-server daemon start` in a terminal to see why, or open a Codex session."
             )
         if "header" not in result:
             raise BridgeError(f"Codex app-server proxy did not respond within {self.timeout}s.")

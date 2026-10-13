@@ -56,7 +56,7 @@ On macOS/Linux, use `python3` if `python` isn't on your `PATH`. On Windows, use 
 
 ## Usage
 
-**1. Make sure the Codex daemon is running.** It starts automatically whenever you open Codex. To start it on its own, run:
+**1. Nothing to start.** If the Codex daemon isn't running (it stops when the computer restarts), the first tool call starts it, which adds a few seconds. To start it yourself, run:
 
 ```sh
 codex app-server daemon start
@@ -167,7 +167,7 @@ Boolean arguments take `true`/`false` (or the strings `"true"`/`"false"`); any o
 | Message | Fix |
 |---|---|
 | `` `codex` CLI not found on PATH `` | Install the Codex CLI, or make sure the shell that launches Claude Code can find it. |
-| `Codex app-server daemon is not reachable` | Open a Codex session, or run `codex app-server daemon start`. |
+| `Codex app-server daemon is not reachable, and starting it did not help` | Run `codex app-server daemon start` in a terminal to see why it fails, or open a Codex session. |
 | `No Codex sessions` | Ask Claude to start a consultant, or open Codex in a terminal. |
 | `'x' is ambiguous` | Use the full name or thread id from `ListConsultants`. |
 | `'x' names more than one session` | Two sessions share a name (names keep only the last six characters of the id). Use the full thread id. |

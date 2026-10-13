@@ -6,6 +6,9 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- When the Codex daemon is not running (for example after a reboot), the first tool call starts it with `codex app-server daemon start` and retries, instead of failing with `Codex app-server daemon is not reachable`. The error now appears only if the daemon still can't be reached about 20 seconds later.
+
 ## [0.4.0] - 2026-10-09
 
 Breaking: `SendConsultantMessage` and `GetConsultantReply` take a single `wait` argument instead of `wait`, `timeout_seconds` and `until_done`.

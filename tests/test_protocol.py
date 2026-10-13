@@ -222,6 +222,47 @@ class ReplyTest(unittest.TestCase):
         self.assertEqual(server.cap_reply("t", "short"), "short")
 
 
+class DaemonStartTest(unittest.TestCase):
+    def connect(self, failures):
+        """A CodexClient whose first `failures` connections find no daemon; returns start_daemon's mock."""
+        attempts = iter([server.DaemonDown("down")] * failures)
+
+        def fake_connect(client, exe):
+            client.proc = mock.Mock()
+            for error in attempts:
+                raise error
+
+        patches = (mock.patch.object(server.shutil, "which", return_value="codex"),
+                   mock.patch.object(server.CodexClient, "_connect", fake_connect),
+                   mock.patch.object(server.CodexClient, "_reader"),
+                   mock.patch.object(server.CodexClient, "request", return_value={}),
+                   mock.patch.object(server.CodexClient, "notify"),
+                   mock.patch.object(server, "DAEMON_START_SECONDS", 0.01),
+                   mock.patch.object(server.time, "sleep"))
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        start = mock.patch.object(server, "start_daemon").start()
+        self.addCleanup(mock.patch.stopall)
+        return start
+
+    def test_running_daemon_is_not_started(self):
+        start = self.connect(0)
+        server.CodexClient()
+        start.assert_not_called()
+
+    def test_missing_daemon_is_started_once_then_retried(self):
+        start = self.connect(2)
+        server.CodexClient()
+        start.assert_called_once_with("codex")
+
+    def test_gives_up_when_the_daemon_never_comes_up(self):
+        start = self.connect(1000)
+        with self.assertRaises(server.DaemonDown):
+            server.CodexClient()
+        start.assert_called_once_with("codex")
+
+
 class FakeClient:
     """Just enough of CodexClient for resolve()."""
 
