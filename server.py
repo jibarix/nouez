@@ -11,6 +11,8 @@ Tools
 Command line
   server.py wait <thread_id> <turn_id>   wait for a turn to end and print its reply, for a client
                                          to run in the background so the reply wakes it
+  server.py allow-rule                   print the Claude Code permission rules that let the
+                                         waiter run without asking
 
 Transport to Codex: `codex app-server proxy` relays stdio to the daemon's control
 socket, which speaks JSON-RPC over WebSocket. Standard library only.
@@ -36,7 +38,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.6.1"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -48,6 +50,7 @@ MAX_WAIT_SECONDS = 4 * 60 * 60  # ceiling on any wait, wait="done" included, so 
 MAX_REPLY_CHARS = 60_000  # longer replies are cut here; the full text is saved to a file
 WAITER_REPLY_CHARS = 20_000  # the same for the waiter, whose output reaches Claude through a shell tool
 WAITER_RETRIES = 3  # connection failures in a row the waiter rides out (a daemon restart, say)
+WAITER_SECONDS = 25 * 60  # one waiter run; under Claude Code's 30-minute default for background commands
 SEND_WAIT_SECONDS = 5  # SendConsultantMessage's default wait: a quick answer fits, a long one doesn't hold the caller
 PARTIAL_CHARS = 4_000  # how much of a still-running turn's output a timeout shows (the most recent part)
 PROGRESS_SECONDS = 10  # least time between two progress notifications for one call
@@ -570,17 +573,31 @@ def still_working(name, turn_id, turn, advice):
     return out
 
 
-def waiter_command(thread_id, turn_id):
-    """The shell command that waits for a turn and prints its reply, with absolute paths."""
+def waiter_prefix():
+    """The start of every waiter command: this interpreter and this file, with absolute paths.
+    A path is quoted only if it has a space, so the command runs as is in bash and PowerShell
+    alike and a permission rule can match it by prefix."""
     def q(path):
-        return '"' + path.replace("\\", "/") + '"'
-    return f"{q(sys.executable)} -I {q(os.path.abspath(__file__))} wait {thread_id} {turn_id}"
+        path = path.replace("\\", "/")
+        return f'"{path}"' if " " in path else path
+    return f"{q(sys.executable)} -I {q(os.path.abspath(__file__))} wait"
+
+
+def waiter_command(thread_id, turn_id):
+    """The shell command that waits for a turn and prints its reply."""
+    cmd = f"{waiter_prefix()} {thread_id} {turn_id}"
+    return cmd + ("\n(In PowerShell, put & and a space before it.)" if cmd.startswith('"') else "")
+
+
+def allow_rules():
+    """Claude Code permission rules matching every waiter command of this install, one per shell tool."""
+    return [f"{tool}({waiter_prefix()} *)" for tool in ("Bash", "PowerShell")]
 
 
 def read_later(thread_id, turn_id):
     """What to do about a reply that isn't ready: leave the caller free, and have the reply wake it."""
     return ("Don't wait for the reply. To be woken when it is ready, run this as a background command "
-            "(in Claude Code: the Bash tool with run_in_background); it exits with the reply when the "
+            "(in Claude Code: the Bash or PowerShell tool with run_in_background); it exits with the reply when the "
             f"turn ends:\n{waiter_command(thread_id, turn_id)}\nThen tell the user the consultation is "
             "under way and carry on with other work or end your turn. If you can't run background "
             f"commands, read the reply later with GetConsultantReply (turn_id {turn_id}).")
@@ -1087,8 +1104,8 @@ INSTRUCTIONS = (
     "asks for a separate consultant. Message a session the user opened only when the user asks you "
     "to, with allow_user_session=true. SendConsultantMessage returns about 5 seconds after delivery, "
     "usually before the reply is ready; replies often take minutes. Do not wait for one. Instead run "
-    "the waiter command the result gives as a background command (in Claude Code: the Bash tool "
-    "with run_in_background), tell the user the consultation is under way, and carry on with other "
+    "the waiter command the result gives as a background command (in Claude Code: the Bash or "
+    "PowerShell tool with run_in_background), tell the user the consultation is under way, and carry on with other "
     "work or end your turn so the user can keep working. The waiter exits with the reply when the "
     "turn ends, which wakes you; then act on the reply or report it. Without background commands, "
     "read the reply with GetConsultantReply and the returned turn_id when the user asks or when you "
@@ -1390,7 +1407,7 @@ def run_waiter(thread_id, turn_id):
     """`server.py wait <thread_id> <turn_id>`: wait until the turn ends, print its reply, return the
     exit code. Run as a background command, its exit wakes the client with the reply. Rides out a
     few failed connections, such as a daemon restart, rather than give up on a long turn."""
-    deadline = time.monotonic() + MAX_WAIT_SECONDS
+    deadline = time.monotonic() + WAITER_SECONDS
     failures = 0  # in a row: reset by each connection that works
     while True:
         try:
@@ -1420,9 +1437,10 @@ def run_waiter(thread_id, turn_id):
             time.sleep(min(10, left))
             continue
         if not done:
-            print(still_working(name, turn_id, turn, "Waited 4 hours. Read the reply later with "
-                                f"GetConsultantReply (turn_id {turn_id})."))
-            return 1
+            print(still_working(name, turn_id, turn, f"Waited {WAITER_SECONDS // 60} minutes. To keep "
+                                "waiting, run the same command again in the background:\n"
+                                f"{waiter_command(tid, turn_id)}"))
+            return 0
         print(f"The consultant's turn has ended (thread {tid}, turn {turn_id}).\n")
         print(format_turn(name, turn, WAITER_REPLY_CHARS))
         return 0
@@ -1488,4 +1506,8 @@ if __name__ == "__main__":
             sys.exit("usage: server.py wait <thread_id> <turn_id>")
         sys.stdout.reconfigure(encoding="utf-8")
         sys.exit(run_waiter(sys.argv[2], sys.argv[3]))
+    if sys.argv[1:] == ["allow-rule"]:
+        print("Add these to permissions.allow in ~/.claude/settings.json:")
+        print(",\n".join(json.dumps(rule) for rule in allow_rules()))
+        sys.exit(0)
     main()

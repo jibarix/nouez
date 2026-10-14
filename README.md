@@ -23,7 +23,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.6.0 |
+| nouez | 0.6.1 |
 | Claude Code | 2.1.296 |
 | Codex CLI | 0.160.1 |
 | Codex app-server daemon | 0.162.1 |
@@ -52,7 +52,22 @@ claude mcp add consultants -- python /absolute/path/to/nouez/server.py
 
 On macOS/Linux, use `python3` if `python` isn't on your `PATH`. On Windows, use a path like `C:/Users/you/nouez/server.py`.
 
-**3. Check it.** Run `claude mcp list`, or `/mcp` inside Claude Code. You should see `consultants` connected.
+**3. Let Claude run the waiter.** Codex replies often take minutes, so Claude doesn't wait for them: it starts a small waiter command in the background, and the waiter wakes Claude with the reply when Codex finishes (see [Long tasks](#tips)). Claude Code asks before running a command it has no rule for, and in auto mode it may block one. To allow the waiter in every project, print its permission rules with the same `python` and path you registered:
+
+```sh
+python /absolute/path/to/nouez/server.py allow-rule
+```
+
+It prints two rules, one for the Bash tool and one for the PowerShell tool, for example:
+
+```json
+"Bash(C:/Python313/python.exe -I C:/Users/you/nouez/server.py wait *)",
+"PowerShell(C:/Python313/python.exe -I C:/Users/you/nouez/server.py wait *)"
+```
+
+Add them to `permissions.allow` in `~/.claude/settings.json` (create the `permissions` and `allow` keys if they're missing), or approve the waiter the first time Claude Code asks and choose not to be asked again. The rules allow only this script's `wait` command with this interpreter, so auto mode keeps them. If you move nouez or change Python, run `allow-rule` again and replace them. Without them everything still works, but Claude Code asks each time, and if the waiter can't run Claude reads the reply only when you ask for it.
+
+**4. Check it.** Run `claude mcp list`, or `/mcp` inside Claude Code. You should see `consultants` connected. Sessions that were already open keep the old server until you reconnect it there: `/mcp`, then reconnect `consultants`. Do the same after updating nouez. A change to `settings.json` applies to sessions started after it.
 
 ## Usage
 
@@ -110,7 +125,7 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 - **Give Claude standing instructions.** A line in your project's `CLAUDE.md` makes the workflow automatic, for example: *"Before committing non-trivial changes, ask the Codex consultant to review the diff and address its findings. Reuse the existing consultant for this repo if there is one; otherwise start one."*
 - **Give the consultant a role.** `StartConsultant` takes `instructions`, for example *"You are a skeptical senior reviewer. Look for bugs and missing tests; don't rewrite code."*
 - **Run several consultants.** Start several, for example in different repos or with different models. `ListConsultants` shows each one's name and working directory so Claude can pick the right one.
-- **Long tasks.** By default Claude waits 5 seconds after sending, enough to confirm delivery and catch a quick answer, then starts a small waiter in the background, tells you the consultation is under way, and is free again, and so are you. When Codex finishes, the waiter exits with the reply and Claude Code wakes Claude with it, so Claude acts on the answer or reports it without you asking. Claude needs permission to run the waiter: approve it, or allow it in your settings.
+- **Long tasks.** By default Claude waits 5 seconds after sending, enough to confirm delivery and catch a quick answer, then starts a small waiter in the background, tells you the consultation is under way, and is free again, and so are you. When Codex finishes, the waiter exits with the reply and Claude Code wakes Claude with it, so Claude acts on the answer or reports it without you asking. Claude needs permission to run the waiter; see [Setup](#setup), step 3.
 - **Idle consultants.** After about a minute without activity, the Codex daemon unloads a consultant. It still appears in `ListConsultants`, and the next message reloads it with the same sandbox and history.
 - **Clean up.** Ask Claude to stop consultants when you're done, so they don't pile up in your Codex session list. Stopping archives a session rather than deleting it, and closes its watch window. On Windows, only windows the bridge opened are closed. On macOS and Linux, any `codex resume <id>` process for that session is ended, and a macOS Terminal window stays open at a shell prompt.
 
@@ -120,7 +135,7 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 |---|---|
 | `StartConsultant` | Starts a background Codex session in a project directory (always read-only; never asks for approvals). If a consultant it started already works in that project, returns it and starts nothing unless `new: true`. Never reuses a session you opened yourself. |
 | `ListConsultants` | Lists Codex sessions loaded on the local daemon, plus recent `StartConsultant` sessions it has unloaded, with each one's name, working directory, model, status and who started it. With `cwd`, only the sessions in that repo. |
-| `SendConsultantMessage` | Sends a message into a session and, by default, waits for and returns the reply. If the session is idle the message starts a new turn; if it's busy it steers the running turn. Unloaded sessions are reloaded first. Refuses a session you opened yourself unless `allow_user_session: true`. |
+| `SendConsultantMessage` | Sends a message into a session, waits 5 seconds by default, and returns the reply if it is ready by then, or the turn id and a waiter command if not. If the session is idle the message starts a new turn; if it's busy it steers the running turn. Unloaded sessions are reloaded first. Refuses a session you opened yourself unless `allow_user_session: true`. |
 | `GetConsultantReply` | Reads a reply without sending anything: the latest turn, or a specific turn id. Use it after sending with `wait: 0` or after a timeout. While the turn runs, it shows the output so far. |
 | `WatchConsultant` | Opens a session in a split pane beside Claude Code, or a new terminal window, so you can watch it or type into it. Does nothing if a terminal already shows it. |
 | `StopConsultant` | Archives a session that `StartConsultant` started and closes any terminal window watching it. Needs the exact name or full thread id. Refuses sessions you opened yourself. |
@@ -148,7 +163,7 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 
 `GetConsultantReply` takes `to`, an optional `turn_id` (default: the latest turn; looked up among the 100 most recent turns), and an optional `wait` like `SendConsultantMessage`'s, but defaulting to `0`, which returns at once if the turn is still running.
 
-Most replies take longer than the default 5 seconds. Claude is told not to wait for them. Instead the result gives a waiter command, `python server.py wait <thread_id> <turn_id>` with full paths, which Claude runs as a background command (the Bash tool with `run_in_background`). The waiter checks the turn every 1.5 seconds; when the turn ends it prints the reply (cut at 20,000 characters, with the rest saved to a file) and exits, and Claude Code wakes Claude with that output. It rides out up to three failed connections in a row, such as a daemon restart, and gives up after 4 hours. In a client that can't run background commands, Claude reads the reply later by calling `GetConsultantReply` with the returned `turn_id`, which returns at once. If you would rather have Claude wait, ask it to; it then passes `wait: "done"`, and the call returns when the turn ends (checked every 1.5 seconds), on an error, or after 4 hours. Claude Code keeps such a call in the foreground for about two minutes before moving it to the background. A "still working" result is never a reply. It shows the turn's output so far (the latest 4,000 characters written since the last message reached it), labelled as a snapshot that may change.
+Most replies take longer than the default 5 seconds. Claude is told not to wait for them. Instead the result gives a waiter command, `python server.py wait <thread_id> <turn_id>` with full paths, which Claude runs as a background command (the Bash or PowerShell tool with `run_in_background`). A path is quoted only if it contains a space, so the command runs as is in either shell and the permission rules from `allow-rule` match it. The waiter checks the turn every 1.5 seconds; when the turn ends it prints the reply (cut at 20,000 characters, with the rest saved to a file) and exits, and Claude Code wakes Claude with that output. Claude Code stops a background command after 30 minutes by default, so after 25 minutes the waiter exits on its own with the output so far and the same command to run again, and Claude starts a new one. It rides out up to three failed connections in a row, such as a daemon restart. In a client that can't run background commands, Claude reads the reply later by calling `GetConsultantReply` with the returned `turn_id`, which returns at once. If you would rather have Claude wait, ask it to; it then passes `wait: "done"`, and the call returns when the turn ends (checked every 1.5 seconds), on an error, or after 4 hours. Claude Code keeps such a call in the foreground for about two minutes before moving it to the background. A "still working" result is never a reply. It shows the turn's output so far (the latest 4,000 characters written since the last message reached it), labelled as a snapshot that may change.
 
 While a call waits, nouez sends MCP progress notifications (`notifications/progress`, at most one every 10 seconds) naming the turn, the time so far and the latest line of output, when the client asked for them with a progress token. Claude Code 2.1.295 asks but doesn't display them.
 
@@ -175,6 +190,7 @@ Boolean arguments take `true`/`false` (or the strings `"true"`/`"false"`); any o
 | `` `x` must be true or false `` | A boolean argument got some other value. Pass `true` or `false`. |
 | `` `wait` must be a number of seconds `` | Pass seconds (`0` or more) or `"done"`. |
 | `no reply within 5s` | Codex is still working; any output shown is not the reply. This is normal for the default 5-second wait. Claude starts a waiter that brings the reply back when it is ready. |
+| Claude Code asks before running `server.py wait`, or auto mode blocks it | The waiter has no permission rule. Add the rules that `python server.py allow-rule` prints (see [Setup](#setup), step 3), then start a new session. Meanwhile, ask Claude for the reply with `GetConsultantReply`. |
 | `is a Codex session the user opened` | `SendConsultantMessage` refuses your own sessions by default. Ask Claude to message it if you mean to; it then passes `allow_user_session: true`. |
 | `` `until_done` was replaced by `wait` `` | The caller used a pre-0.4 argument. Reconnect the server (`/mcp`) so Claude sees the new tool definitions. |
 | `Delivered to ..., but waiting for the reply failed` | The message reached Codex; only the wait failed. Don't resend it. Read the reply with `GetConsultantReply`. |

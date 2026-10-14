@@ -464,13 +464,37 @@ class HandlerTest(unittest.TestCase):
         self.use(FakeDaemon([thread]))
         out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0})
         self.assertIn("run_in_background", out)
-        self.assertIn(f'server.py" wait {thread["id"]} turn-new\n', out)
+        self.assertIn(f'server.py wait {thread["id"]} turn-new\n', out)
+
+    def test_waiter_command_quotes_only_paths_with_spaces(self):
+        with mock.patch.object(server.sys, "executable", r"C:\Py\python.exe"), \
+             mock.patch.object(server.os.path, "abspath", return_value=r"C:\My Tools\server.py"):
+            self.assertEqual(server.waiter_command("t1", "u1"),
+                             'C:/Py/python.exe -I "C:/My Tools/server.py" wait t1 u1')
 
     def run_waiter(self, *args):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = server.run_waiter(*args)
         return code, buf.getvalue()
+
+    def test_allow_rules_match_the_waiter_command(self):
+        cmd = server.waiter_command("t1", "u1")
+        for rule in server.allow_rules():
+            prefix = rule[rule.index("(") + 1:-len(" *)")]
+            self.assertTrue(cmd.startswith(prefix + " "), (rule, cmd))
+        self.assertEqual([r.split("(")[0] for r in server.allow_rules()], ["Bash", "PowerShell"])
+
+    def test_waiter_hands_over_before_the_background_timeout(self):
+        thread = self.consultant("wait07")
+        running = {"id": "turn-1", "status": "inProgress", "items": [user("q")]}
+        self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        with mock.patch.object(server, "WAITER_SECONDS", 0.05):
+            code, out = self.run_waiter(thread["id"], "turn-1")
+        self.assertEqual(code, 0)
+        self.assertIn("still working", out)
+        self.assertIn(f"run the same command again in the background:\n", out)
+        self.assertIn(f"wait {thread['id']} turn-1", out)
 
     def test_waiter_prints_the_reply(self):
         thread = self.consultant("wait02")
