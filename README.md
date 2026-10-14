@@ -58,14 +58,20 @@ On macOS/Linux, use `python3` if `python` isn't on your `PATH`. On Windows, use 
 python /absolute/path/to/nouez/server.py allow-rule
 ```
 
-It prints two rules, one for the Bash tool and one for the PowerShell tool, for example:
+On Windows, quote a path that contains spaces: `python "C:/Users/you/My Projects/nouez/server.py" allow-rule`. It prints two rules, one for the Bash tool and one for the PowerShell tool. Add them to `permissions.allow` in `~/.claude/settings.json` (on Windows, `C:\Users\<you>\.claude\settings.json`), keeping anything already in the file. With no other permissions, the file looks like this:
 
 ```json
-"Bash(C:/Python313/python.exe -I C:/Users/you/nouez/server.py wait *)",
-"PowerShell(C:/Python313/python.exe -I C:/Users/you/nouez/server.py wait *)"
+{
+  "permissions": {
+    "allow": [
+      "Bash(C:/Python313/python.exe -I C:/Users/you/nouez/server.py wait *)",
+      "PowerShell(C:/Python313/python.exe -I C:/Users/you/nouez/server.py wait *)"
+    ]
+  }
+}
 ```
 
-Add them to `permissions.allow` in `~/.claude/settings.json` (create the `permissions` and `allow` keys if they're missing), or approve the waiter the first time Claude Code asks and choose not to be asked again. The rules allow only this script's `wait` command with this interpreter, so auto mode keeps them. If you move nouez or change Python, run `allow-rule` again and replace them. Without them everything still works, but Claude Code asks each time, and if the waiter can't run Claude reads the reply only when you ask for it.
+Instead of editing the file, you can approve the waiter the first time Claude Code asks and choose not to be asked again. The rules allow only this script's `wait` command with this interpreter, so auto mode keeps them. If you move nouez or change Python, run `allow-rule` again and replace them. Without them everything still works, but Claude Code asks each time, and if the waiter can't run Claude reads the reply only when you ask for it.
 
 **4. Check it.** Run `claude mcp list`, or `/mcp` inside Claude Code. You should see `consultants` connected. Sessions that were already open keep the old server until you reconnect it there: `/mcp`, then reconnect `consultants`. Do the same after updating nouez. A change to `settings.json` applies to sessions started after it.
 
