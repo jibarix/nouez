@@ -6,6 +6,16 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-14
+
+A finished consultation now wakes Claude with the reply. Tested with Claude Code 2.1.296, Codex CLI 0.160.1 with app-server daemon 0.162.1, Python 3.13.5 on Windows 11.
+
+### Added
+- `server.py wait <thread_id> <turn_id>`: waits until a turn ends, prints its reply (up to 20,000 characters; the rest is saved to a file) and exits. Run as a background command, its exit wakes Claude with the reply. It rides out up to three failed connections in a row and gives up after 4 hours.
+
+### Changed
+- When a send returns before the reply, its result gives the waiter command with full paths and tells Claude to run it in the background, then carry on or end its turn. The server instructions say the same. `GetConsultantReply`'s 'still working' result offers the waiter too.
+
 ## [0.5.0] - 2026-10-13
 
 Claude no longer waits for a consultant's reply by default, and the Codex daemon is started when it isn't running. Tested with Claude Code 2.1.296, Codex CLI 0.160.1 with app-server daemon 0.162.1, Python 3.13.5 on Windows 11.
@@ -117,7 +127,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jibarix/nouez/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jibarix/nouez/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jibarix/nouez/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/jibarix/nouez/compare/v0.3.1...v0.3.2

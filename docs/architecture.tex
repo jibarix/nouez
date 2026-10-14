@@ -86,8 +86,8 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.5.0\\[0.3em]\large Architecture and message reference}
-\date{October 13, 2026}
+\title{\textbf{nouez} 0.6.0\\[0.3em]\large Architecture and message reference}
+\date{October 14, 2026}
 \author{}
 
 \begin{document}
@@ -96,7 +96,7 @@
 
 \begin{abstract}
 \noindent nouez is an MCP server that lets Claude Code consult live Codex sessions. This document
-describes nouez 0.5.0: how the pieces fit together, and an example of every message nouez sends
+describes nouez 0.6.0: how the pieces fit together, and an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, and the commands nouez runs on
 the operating system. The daemon also sends notifications and its own requests, which nouez
@@ -285,7 +285,7 @@ nouez answers with the requested version if it supports it (2025-11-25, 2025-06-
 {"jsonrpc": "2.0", "id": 1, "result": {
   "protocolVersion": "2025-11-25",
   "capabilities": {"tools": {}},
-  "serverInfo": {"name": "nouez", "version": "0.5.0"},
+  "serverInfo": {"name": "nouez", "version": "0.6.0"},
   "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: never treat it as done."}}
 \end{wire}
 
@@ -474,7 +474,7 @@ connection has four steps:
   \msg{3.0}{0}{6}{HTTP GET / Upgrade: websocket}
   \ret{3.8}{6}{0}{HTTP/1.1 101 Switching Protocols}
   \side{3.8}{6}{15 s deadline, read on a side thread}
-  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.5.0)}
+  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.6.0)}
   \ret{5.6}{12}{0}{userAgent, codexHome}
   \msg{6.4}{0}{12}{initialized (notification)}
   \msg{7.4}{0}{12}{requests for this tool call ...}
@@ -533,11 +533,11 @@ The daemon speaks JSON-RPC without the \code{"jsonrpc"} member. Ids are integers
 on each connection.
 
 \begin{wire}[nouez $\rightarrow$ daemon]
-{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.5.0"}}}
+{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.6.0"}}}
 \end{wire}
 \begin{wire}[daemon $\rightarrow$ nouez]
 {"id": 1, "result": {
-  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.5.0)",
+  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.6.0)",
   "codexHome": "C:\\Users\\you\\.codex",
   "platformFamily": "windows", "platformOs": "windows"}}
 \end{wire}
@@ -856,10 +856,14 @@ Two issues. 1) route() accepts float ids but ...
 (Opened codex-nouez-4d9f17 in a Windows Terminal split pane.)
 \end{plain}
 \begin{plain}[Result text: wait=0]
-Delivered to codex-nouez-4d9f17 (started a new turn, turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31). Don't wait for the reply: tell the user the consultation is under way, then carry on with other work or end your turn. Read it with GetConsultantReply (turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31) when the user asks or when you next need it.
+Delivered to codex-nouez-4d9f17 (started a new turn, turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31). Don't wait for the reply. To be woken when it is ready, run this as a background command (in Claude Code: the Bash tool with run_in_background); it exits with the reply when the turn ends:
+"C:/Python313/python.exe" -I "C:/Users/you/nouez/server.py" wait 01a1f3c2-5e10-7c3a-9f44-2b8d1e4d9f17 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31
+Then tell the user the consultation is under way and carry on with other work or end your turn. If you can't run background commands, read the reply later with GetConsultantReply (turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31).
 \end{plain}
 \begin{plain}[Result text: timeout (isError false; the message was delivered)]
-codex-nouez-4d9f17 is still working on turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31; this is not a reply. Delivered (started a new turn), but no reply within 600s. Don't send the message again. Don't wait for the reply: tell the user the consultation is under way, then carry on with other work or end your turn. Read it with GetConsultantReply (turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31) when the user asks or when you next need it.
+codex-nouez-4d9f17 is still working on turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31; this is not a reply. Delivered (started a new turn), but no reply within 600s. Don't send the message again. Don't wait for the reply. To be woken when it is ready, run this as a background command (in Claude Code: the Bash tool with run_in_background); it exits with the reply when the turn ends:
+"C:/Python313/python.exe" -I "C:/Users/you/nouez/server.py" wait 01a1f3c2-5e10-7c3a-9f44-2b8d1e4d9f17 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31
+Then tell the user the consultation is under way and carry on with other work or end your turn. If you can't run background commands, read the reply later with GetConsultantReply (turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31).
 
 Output so far (a snapshot of the running turn; it may change and is not the final answer):
 Reading server.py ... route() looks fine; checking dispatch next.
@@ -887,7 +891,8 @@ Reply from codex-nouez-4d9f17:
 \subsection{GetConsultantReply}
 
 Reads a reply without sending anything. A send returns after 5 seconds by default, usually before
-the reply is ready, and Claude is told not to wait for it: it calls this tool with the returned
+the reply is ready, and Claude is told not to wait for it but to run the waiter (next section) in
+the background. Without background commands, it calls this tool with the returned
 \code{turn\_id} when the user asks or when it next needs the reply, and the call returns at once.
 When the user does want Claude to wait, it passes \code{wait: "done"}. That call returns when the turn ends, when an error occurs (such as a
 lost daemon connection), or after the 4-hour cap, so a client that moved it to the background is
@@ -920,7 +925,9 @@ Reply from codex-nouez-4d9f17:
 
 Two issues. 1) ...
 
-codex-nouez-4d9f17 is still working on turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31; this is not a reply. Check again later with turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31; pass wait="done" only if the user wants you to wait for it.
+codex-nouez-4d9f17 is still working on turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31; this is not a reply. To be woken when it is ready, run in the background:
+"C:/Python313/python.exe" -I "C:/Users/you/nouez/server.py" wait 01a1f3c2-5e10-7c3a-9f44-2b8d1e4d9f17 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31
+Or check again later with turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31; pass wait="done" only if the user wants you to wait for it.
 
 Output so far (a snapshot of the running turn; it may change and is not the final answer):
 Reading server.py ...
@@ -934,6 +941,30 @@ An interrupted turn followed by a newer turn adds:
 \emph{``A later turn exists (01a1f3c6-..., completed). If your message continued there, read it
 by omitting turn\_id.''} nouez does not check that the later turn holds the message here; the
 newer turn may be someone else's.
+
+% -----------------------------------------------------------------------------
+\subsection{The waiter command}
+
+\code{server.py wait <thread\_id> <turn\_id>} is not a tool but a command line. A send that
+returns before the reply, and a \code{GetConsultantReply} that finds the turn still working, give
+it with full paths (\code{sys.executable -I} and the absolute path of \code{server.py}) and tell
+Claude to run it as a background command. In Claude Code that is the Bash tool with
+\code{run\_in\_background}: Claude is free at once, and when the command exits Claude Code wakes it
+with the command's output, so the reply arrives without the user asking for it.
+
+The waiter opens its own connection, resolves the thread by exact id, and looks for the turn among
+its \code{REPLY\_LOOKBACK} (100) most recent turns. A turn that is missing ends it with exit
+code~1. A turn that has already ended is printed at once; a running one, which is always among the
+newest, is polled with \code{wait\_for\_turn} for up to 4 hours. When it ends, the waiter prints
+\emph{``The consultant's turn has ended (thread \ldots, turn \ldots).''} and the turn formatted as
+\code{GetConsultantReply} would, with the reply cut at \code{WAITER\_REPLY\_CHARS} (20,000)
+characters and the rest saved to a file, and exits with code~0. Its standard output is UTF-8.
+
+A failed connection (\code{BridgeError}, or an \code{OSError} such as a broken pipe) is retried
+10 seconds later, never past the 4-hour deadline. After \code{WAITER\_RETRIES} (3) failures in a
+row, a count that each working connection resets, it prints \emph{``Stopped waiting for turn
+\ldots''} with a pointer to \code{GetConsultantReply} and exits with code~1. The waiter dies with
+the Claude Code session that started it; the reply stays readable with \code{GetConsultantReply}.
 
 % -----------------------------------------------------------------------------
 \subsection{WatchConsultant}
@@ -1080,6 +1111,8 @@ Daemon request timeout & 15 s & per Codex request and for the handshake \\
 \code{roots/list} timeout & 5 s & then nouez assumes no roots \\
 Default \code{wait} & 5 s / 0 s & SendConsultantMessage / GetConsultantReply \\
 \code{DAEMON\_START\_SECONDS} & 20 s & wait for a daemon nouez started to accept connections \\
+\code{WAITER\_REPLY\_CHARS} & 20,000 & longest reply the waiter prints \\
+\code{WAITER\_RETRIES} & 3 & failed connections the waiter rides out \\
 \bottomrule
 \end{tabular}
 \end{center}

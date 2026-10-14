@@ -8,6 +8,10 @@ Tools
   WatchConsultant        open a session in a terminal window
   StopConsultant         archive a session that StartConsultant started
 
+Command line
+  server.py wait <thread_id> <turn_id>   wait for a turn to end and print its reply, for a client
+                                         to run in the background so the reply wakes it
+
 Transport to Codex: `codex app-server proxy` relays stdio to the daemon's control
 socket, which speaks JSON-RPC over WebSocket. Standard library only.
 """
@@ -32,7 +36,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -42,6 +46,8 @@ RECENT_SAVED_THREADS = 50  # how far back to look for unloaded bridge consultant
 REPLY_LOOKBACK = 100  # how many recent turns GetConsultantReply searches for a turn id
 MAX_WAIT_SECONDS = 4 * 60 * 60  # ceiling on any wait, wait="done" included, so a hung turn can't pin a call
 MAX_REPLY_CHARS = 60_000  # longer replies are cut here; the full text is saved to a file
+WAITER_REPLY_CHARS = 20_000  # the same for the waiter, whose output reaches Claude through a shell tool
+WAITER_RETRIES = 3  # connection failures in a row the waiter rides out (a daemon restart, say)
 SEND_WAIT_SECONDS = 5  # SendConsultantMessage's default wait: a quick answer fits, a long one doesn't hold the caller
 PARTIAL_CHARS = 4_000  # how much of a still-running turn's output a timeout shows (the most recent part)
 PROGRESS_SECONDS = 10  # least time between two progress notifications for one call
@@ -525,9 +531,9 @@ def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None, on_poll=None
         time.sleep(POLL_SECONDS)
 
 
-def cap_reply(turn_id, reply):
-    """The reply, or its first MAX_REPLY_CHARS with the rest saved to a file the caller can read."""
-    if len(reply) <= MAX_REPLY_CHARS:
+def cap_reply(turn_id, reply, limit=MAX_REPLY_CHARS):
+    """The reply, or its first `limit` characters with the rest saved to a file the caller can read."""
+    if len(reply) <= limit:
         return reply
     folder = os.path.join(tempfile.gettempdir(), "nouez")
     path = os.path.join(folder, re.sub(r"[^0-9A-Za-z-]", "_", turn_id) + ".md")
@@ -538,8 +544,8 @@ def cap_reply(turn_id, reply):
         where = f"The full reply is saved in {path}."
     except OSError as e:
         where = f"The full reply could not be saved ({e}); read it in the consultant's pane."
-    omitted = len(reply) - MAX_REPLY_CHARS
-    return f"{reply[:MAX_REPLY_CHARS]}\n\n[Truncated: {omitted} more characters. {where}]"
+    omitted = len(reply) - limit
+    return f"{reply[:limit]}\n\n[Truncated: {omitted} more characters. {where}]"
 
 
 def partial_output(turn):
@@ -564,11 +570,20 @@ def still_working(name, turn_id, turn, advice):
     return out
 
 
-def read_later(turn_id):
-    """What to do about a reply that isn't ready: leave the caller free rather than have it wait."""
-    return ("Don't wait for the reply: tell the user the consultation is under way, then carry on "
-            "with other work or end your turn. Read it with GetConsultantReply (turn_id "
-            f"{turn_id}) when the user asks or when you next need it.")
+def waiter_command(thread_id, turn_id):
+    """The shell command that waits for a turn and prints its reply, with absolute paths."""
+    def q(path):
+        return '"' + path.replace("\\", "/") + '"'
+    return f"{q(sys.executable)} -I {q(os.path.abspath(__file__))} wait {thread_id} {turn_id}"
+
+
+def read_later(thread_id, turn_id):
+    """What to do about a reply that isn't ready: leave the caller free, and have the reply wake it."""
+    return ("Don't wait for the reply. To be woken when it is ready, run this as a background command "
+            "(in Claude Code: the Bash tool with run_in_background); it exits with the reply when the "
+            f"turn ends:\n{waiter_command(thread_id, turn_id)}\nThen tell the user the consultation is "
+            "under way and carry on with other work or end your turn. If you can't run background "
+            f"commands, read the reply later with GetConsultantReply (turn_id {turn_id}).")
 
 
 def progress_reporter(progress, name):
@@ -584,8 +599,8 @@ def progress_reporter(progress, name):
     return report
 
 
-def format_turn(name, turn):
-    reply = cap_reply(turn["id"], turn_reply(turn))
+def format_turn(name, turn, limit=MAX_REPLY_CHARS):
+    reply = cap_reply(turn["id"], turn_reply(turn), limit)
     if turn["status"] != "completed":
         err = (turn.get("error") or {}).get("message", "")
         hint = ("\nIf the message was folded into a later turn, read it with GetConsultantReply."
@@ -962,7 +977,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                 except (BridgeError, OSError) as e:
                     watching = f" Could not open a terminal: {e}"
         if not timeout:
-            return f"Delivered to {name} ({mode}, turn {turn_id}).{watching} {read_later(turn_id)}"
+            return f"Delivered to {name} ({mode}, turn {turn_id}).{watching} {read_later(tid, turn_id)}"
         try:
             done, turn_id, turn = wait_for_turn(client, tid, turn_id, timeout, cancel, text,
                                                 progress_reporter(progress, name))
@@ -976,7 +991,7 @@ def send_consultant_message(args, cancel=None, progress=None):
         return still_working(
             name, turn_id, turn,
             f"Delivered ({mode}), but no reply within {timeout:.0f}s. Don't send the message again. "
-            f"{read_later(turn_id)}")
+            f"{read_later(tid, turn_id)}")
     finally:
         client.close()
 
@@ -1002,8 +1017,10 @@ def get_consultant_reply(args, cancel=None, progress=None):
                 turn = last or turn  # the newest snapshot, for the partial output
             if not done:
                 return still_working(name, turn["id"], turn,
-                                     f"Check again later with turn_id {turn['id']}; pass wait=\"done\" "
-                                     "only if the user wants you to wait for it.")
+                                     f"To be woken when it is ready, run in the background:\n"
+                                     f"{waiter_command(tid, turn['id'])}\nOr check again later with "
+                                     f"turn_id {turn['id']}; pass wait=\"done\" only if the user wants "
+                                     "you to wait for it.")
         out = format_turn(name, turn)
         latest = latest_turn(client, tid)
         if turn["status"] == "interrupted" and latest and latest["id"] != turn["id"]:
@@ -1069,10 +1086,13 @@ INSTRUCTIONS = (
     "SendConsultantMessage, passing the name it returns as `to`. Pass new=true only when the user "
     "asks for a separate consultant. Message a session the user opened only when the user asks you "
     "to, with allow_user_session=true. SendConsultantMessage returns about 5 seconds after delivery, "
-    "usually before the reply is ready; replies often take minutes. Do not wait for one: tell the "
-    "user the consultation is under way, then carry on with other work or end your turn so the "
-    "user can keep working. Read the reply with GetConsultantReply and the returned turn_id when "
-    "the user asks or when you next need it. Pass wait=\"done\" only if the user asks you to wait "
+    "usually before the reply is ready; replies often take minutes. Do not wait for one. Instead run "
+    "the waiter command the result gives as a background command (in Claude Code: the Bash tool "
+    "with run_in_background), tell the user the consultation is under way, and carry on with other "
+    "work or end your turn so the user can keep working. The waiter exits with the reply when the "
+    "turn ends, which wakes you; then act on the reply or report it. Without background commands, "
+    "read the reply with GetConsultantReply and the returned turn_id when the user asks or when you "
+    "next need it. Pass wait=\"done\" only if the user asks you to wait "
     "for the reply. A result that says 'still working' is not a reply, even if it shows output so "
     "far: never treat it as done."
 )
@@ -1366,6 +1386,48 @@ def dispatch(msg, cancel):
         respond(msg_id, error={"code": -32601, "message": f"Method not found: {method}"})
 
 
+def run_waiter(thread_id, turn_id):
+    """`server.py wait <thread_id> <turn_id>`: wait until the turn ends, print its reply, return the
+    exit code. Run as a background command, its exit wakes the client with the reply. Rides out a
+    few failed connections, such as a daemon restart, rather than give up on a long turn."""
+    deadline = time.monotonic() + MAX_WAIT_SECONDS
+    failures = 0  # in a row: reset by each connection that works
+    while True:
+        try:
+            client = CodexClient()
+            try:
+                thread = resolve(client, thread_id, exact_only=True)
+                tid, name = thread["id"], short_name(thread)
+                failures = 0
+                turn = find_turn(client, tid, turn_id, REPLY_LOOKBACK)
+                if not turn:
+                    print(f"{name} has no turn {turn_id} among its {REPLY_LOOKBACK} most recent turns.")
+                    return 1
+                if turn.get("status") == "inProgress":  # a running turn is among the newest few
+                    done, turn_id, turn = wait_for_turn(client, tid, turn_id,
+                                                        max(0, deadline - time.monotonic()), None)
+                else:
+                    done = True
+            finally:
+                client.close()
+        except (BridgeError, OSError) as e:
+            failures += 1
+            left = deadline - time.monotonic()
+            if failures > WAITER_RETRIES or left <= 0:
+                print(f"Stopped waiting for turn {turn_id}: {e} Read the reply with GetConsultantReply "
+                      f"(to {thread_id}, turn_id {turn_id}).")
+                return 1
+            time.sleep(min(10, left))
+            continue
+        if not done:
+            print(still_working(name, turn_id, turn, "Waited 4 hours. Read the reply later with "
+                                f"GetConsultantReply (turn_id {turn_id})."))
+            return 1
+        print(f"The consultant's turn has ended (thread {tid}, turn {turn_id}).\n")
+        print(format_turn(name, turn, WAITER_REPLY_CHARS))
+        return 0
+
+
 def main():
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
@@ -1421,4 +1483,9 @@ def route(msg):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["wait"]:
+        if len(sys.argv) != 4:
+            sys.exit("usage: server.py wait <thread_id> <turn_id>")
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.exit(run_waiter(sys.argv[2], sys.argv[3]))
     main()

@@ -3,6 +3,8 @@
 Run from the repo root: python -m unittest discover tests
 """
 
+import contextlib
+import io
 import json
 import os
 import queue
@@ -456,6 +458,63 @@ class HandlerTest(unittest.TestCase):
         out = server.send_consultant_message({"to": mine["id"], "message": "hi", "wait": 0,
                                               "allow_user_session": True})
         self.assertTrue(out.startswith("Delivered to "))
+
+    def test_send_offers_the_waiter(self):
+        thread = self.consultant("wait01")
+        self.use(FakeDaemon([thread]))
+        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0})
+        self.assertIn("run_in_background", out)
+        self.assertIn(f'server.py" wait {thread["id"]} turn-new\n', out)
+
+    def run_waiter(self, *args):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = server.run_waiter(*args)
+        return code, buf.getvalue()
+
+    def test_waiter_prints_the_reply(self):
+        thread = self.consultant("wait02")
+        done = {"id": "turn-1", "status": "completed", "items": [user("q"), agent("the answer", "final_answer")]}
+        self.use(FakeDaemon([thread], {thread["id"]: [done]}))
+        code, out = self.run_waiter(thread["id"], "turn-1")
+        self.assertEqual(code, 0)
+        self.assertIn("turn has ended", out)
+        self.assertIn("the answer", out)
+
+    def test_waiter_returns_an_old_finished_turn_at_once(self):
+        thread = self.consultant("wait05")
+        newer = [{"id": f"turn-{n}", "status": "completed", "items": []} for n in range(20)]
+        old = {"id": "turn-old", "status": "completed", "items": [user("q"), agent("old answer", "final_answer")]}
+        self.use(FakeDaemon([thread], {thread["id"]: newer + [old]}))
+        code, out = self.run_waiter(thread["id"], "turn-old")
+        self.assertEqual(code, 0)
+        self.assertIn("old answer", out)
+
+    def test_waiter_refuses_an_unknown_turn(self):
+        thread = self.consultant("wait03")
+        self.use(FakeDaemon([thread]))
+        code, out = self.run_waiter(thread["id"], "turn-nope")
+        self.assertEqual(code, 1)
+        self.assertIn("has no turn turn-nope", out)
+
+    def test_waiter_gives_up_after_repeated_connection_failures(self):
+        def down():
+            raise server.DaemonDown("down")
+        self.use(down)
+        with mock.patch.object(server.time, "sleep") as sleep:
+            code, out = self.run_waiter("0199aaaa-0000-0000-0000-000000wait04", "turn-1")
+        self.assertEqual(code, 1)
+        self.assertEqual(sleep.call_count, server.WAITER_RETRIES)
+        self.assertIn("Stopped waiting for turn turn-1", out)
+
+    def test_waiter_rides_out_os_errors(self):
+        def broken():
+            raise BrokenPipeError("pipe closed")
+        self.use(broken)
+        with mock.patch.object(server.time, "sleep"):
+            code, out = self.run_waiter("0199aaaa-0000-0000-0000-000000wait06", "turn-1")
+        self.assertEqual(code, 1)
+        self.assertIn("pipe closed", out)
 
     def test_waits_report_progress(self):
         thread = self.consultant("prog01")
