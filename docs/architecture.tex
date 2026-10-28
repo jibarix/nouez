@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.6.1\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.7.0\\[0.3em]\large Architecture and message reference}
 \date{October 14, 2026}
 \author{}
 
@@ -96,7 +96,7 @@
 
 \begin{abstract}
 \noindent nouez is an MCP server that lets Claude Code consult live Codex sessions. This document
-describes nouez 0.6.1: how the pieces fit together, and an example of every message nouez sends
+describes nouez 0.7.0: how the pieces fit together, and an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, and the commands nouez runs on
 the operating system. The daemon also sends notifications and its own requests, which nouez
@@ -285,7 +285,7 @@ nouez answers with the requested version if it supports it (2025-11-25, 2025-06-
 {"jsonrpc": "2.0", "id": 1, "result": {
   "protocolVersion": "2025-11-25",
   "capabilities": {"tools": {}},
-  "serverInfo": {"name": "nouez", "version": "0.6.1"},
+  "serverInfo": {"name": "nouez", "version": "0.7.0"},
   "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: never treat it as done."}}
 \end{wire}
 
@@ -474,7 +474,7 @@ connection has four steps:
   \msg{3.0}{0}{6}{HTTP GET / Upgrade: websocket}
   \ret{3.8}{6}{0}{HTTP/1.1 101 Switching Protocols}
   \side{3.8}{6}{15 s deadline, read on a side thread}
-  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.6.1)}
+  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.7.0)}
   \ret{5.6}{12}{0}{userAgent, codexHome}
   \msg{6.4}{0}{12}{initialized (notification)}
   \msg{7.4}{0}{12}{requests for this tool call ...}
@@ -533,11 +533,11 @@ The daemon speaks JSON-RPC without the \code{"jsonrpc"} member. Ids are integers
 on each connection.
 
 \begin{wire}[nouez $\rightarrow$ daemon]
-{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.6.1"}}}
+{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.7.0"}}}
 \end{wire}
 \begin{wire}[daemon $\rightarrow$ nouez]
 {"id": 1, "result": {
-  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.6.1)",
+  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.7.0)",
   "codexHome": "C:\\Users\\you\\.codex",
   "platformFamily": "windows", "platformOs": "windows"}}
 \end{wire}
@@ -736,6 +736,17 @@ also decides whether later sends open a pane. The ``Ignored'' line appears only 
 \code{model}, \code{title} or \code{instructions} were passed. Other nouez sessions in the same
 repository follow \emph{``Other consultants in this repo:''}, and the user-session note appears
 only when there are user sessions; it is added to the ``Started'' result too.
+
+Both results end with an update notice when the \code{codex} CLI on the PATH or the daemon is
+older than the latest Codex release. nouez takes the latest version from
+\code{<codexHome>/version.json}, the cache Codex keeps for its own update check, so it makes no
+network request. The CLI version comes from \code{codex --version} and the daemon's from
+\code{userAgent}. The notice names only the part that is behind and appears once per server
+process. It doesn't appear when the cache is missing or the user dismissed that version in
+Codex. nouez updates nothing itself; Claude runs the commands if the user asks:
+\begin{plain}[Result text: update notice]
+Codex 0.165.0 is out; the codex CLI on PATH is 0.163.0 and the app-server daemon is 0.162.1. Tell the user and go ahead with the consultation. Only if the user asks you to update, run these in a shell: `codex update` updates the CLI; `codex app-server daemon update` updates the daemon, which may interrupt running Codex work, consultants and the user's own sessions included.
+\end{plain}
 
 % -----------------------------------------------------------------------------
 \subsection{ListConsultants}

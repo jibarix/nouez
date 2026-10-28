@@ -23,9 +23,9 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.6.1 |
-| Claude Code | 2.1.296 |
-| Codex CLI | 0.160.1 |
+| nouez | 0.7.0 |
+| Claude Code | 2.1.312 |
+| Codex CLI | 0.163.0 |
 | Codex app-server daemon | 0.162.1 |
 | Python | 3.13.5 |
 | OS | Windows 11 |
@@ -139,7 +139,7 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 
 | Tool | What it does |
 |---|---|
-| `StartConsultant` | Starts a background Codex session in a project directory (always read-only; never asks for approvals). If a consultant it started already works in that project, returns it and starts nothing unless `new: true`. Never reuses a session you opened yourself. |
+| `StartConsultant` | Starts a background Codex session in a project directory (always read-only; never asks for approvals). If a consultant it started already works in that project, returns it and starts nothing unless `new: true`. Never reuses a session you opened yourself. Says so if the Codex CLI or daemon is out of date (see [Codex updates](#codex-updates)). |
 | `ListConsultants` | Lists Codex sessions loaded on the local daemon, plus recent `StartConsultant` sessions it has unloaded, with each one's name, working directory, model, status and who started it. With `cwd`, only the sessions in that repo. |
 | `SendConsultantMessage` | Sends a message into a session, waits 5 seconds by default, and returns the reply if it is ready by then, or the turn id and a waiter command if not. If the session is idle the message starts a new turn; if it's busy it steers the running turn. Unloaded sessions are reloaded first. Refuses a session you opened yourself unless `allow_user_session: true`. |
 | `GetConsultantReply` | Reads a reply without sending anything: the latest turn, or a specific turn id. Use it after sending with `wait: 0` or after a timeout. While the turn runs, it shows the output so far. |
@@ -182,6 +182,10 @@ Replies longer than 60,000 characters are cut there. The full text is saved to `
 `wait` replaced `until_done`, `timeout_seconds` and the boolean `wait` in 0.4.0; the old arguments get an error that names the new form, and nothing is sent.
 
 Boolean arguments take `true`/`false` (or the strings `"true"`/`"false"`); any other value is an error rather than a guess.
+
+### Codex updates
+
+When the `codex` CLI on your `PATH` or the app-server daemon is older than the latest Codex release, `StartConsultant` adds a notice to its result. Claude tells you about it and goes on with the consultation. The latest version comes from `version.json` in your Codex home, the cache Codex keeps for its own update check, so nouez makes no network request. If that file is missing, or you dismissed that version in Codex, there is no notice. The notice is given once per server process (normally once per Claude Code session). nouez doesn't update anything itself. Ask Claude to update and it runs `codex update` for the CLI and `codex app-server daemon update` for the daemon. Updating the daemon may interrupt running Codex work, including consultants and your own sessions.
 
 ## Troubleshooting
 

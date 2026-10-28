@@ -6,6 +6,13 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-28
+
+`StartConsultant` says when Codex is out of date. Tested with Claude Code 2.1.312, Codex CLI 0.163.0 with app-server daemon 0.162.1, Python 3.13.5 on Windows 11.
+
+### Added
+- When the `codex` CLI on the PATH or the app-server daemon is older than the latest Codex release, `StartConsultant`'s result ends with a notice. It names the versions and tells Claude to let the user know and go on with the consultation. Only if the user asks does Claude update, with `codex update` for the CLI and `codex app-server daemon update` for the daemon (which may interrupt running Codex work). The latest version comes from the cache Codex keeps for its own update check (`version.json` in the Codex home), so there is no network request. The notice appears once per server process, and not for a version the user dismissed in Codex.
+
 ## [0.6.1] - 2026-10-14
 
 The waiter works in new conversations, under either shell and without a permission prompt. Tested with Claude Code 2.1.296, Codex CLI 0.160.1 with app-server daemon 0.162.1, Python 3.13.5 on Windows 11.
@@ -138,7 +145,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jibarix/nouez/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/jibarix/nouez/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/jibarix/nouez/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jibarix/nouez/compare/v0.4.0...v0.5.0

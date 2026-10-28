@@ -9,8 +9,10 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -266,6 +268,47 @@ class DaemonStartTest(unittest.TestCase):
         start.assert_called_once_with("codex")
 
 
+class UpdateNoticeTest(unittest.TestCase):
+    def notice(self, cache, cli="0.163.0", daemon="0.162.1", home=True):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        if cache is not None:
+            with open(os.path.join(folder, "version.json"), "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+        info = {"userAgent": f"codex_app_server/{daemon} (Windows 11)", **({"codexHome": folder} if home else {})}
+        with mock.patch.object(server, "codex_version", return_value=cli), \
+             mock.patch.object(server, "_update_noted", set()):
+            return server.update_notice(info), server.update_notice(info)
+
+    def test_behind_cli_and_daemon(self):
+        first, second = self.notice({"latest_version": "0.165.0"})
+        self.assertIn("Codex 0.165.0 is out", first)
+        self.assertIn("CLI on PATH is 0.163.0", first)
+        self.assertIn("daemon is 0.162.1", first)
+        self.assertIn("`codex update`", first)
+        self.assertIn("`codex app-server daemon update`", first)
+        self.assertIn("go ahead with the consultation", first)
+        self.assertEqual(second, "")  # told once per server process
+
+    def test_only_the_part_that_is_behind(self):
+        out = self.notice({"latest_version": "0.165.0"}, cli="0.165.0")[0]
+        self.assertNotIn("`codex update`", out)
+        self.assertIn("daemon update", out)
+
+    def test_nothing_when_current_dismissed_or_unknown(self):
+        self.assertEqual(self.notice({"latest_version": "0.165.0"}, cli="0.165.0", daemon="0.165.0")[0], "")
+        self.assertEqual(self.notice({"latest_version": "0.165.0"}, cli="0.170.0", daemon="0.166.0")[0], "")
+        self.assertEqual(self.notice({"latest_version": "0.165.0", "dismissed_version": "0.165.0"})[0], "")
+        self.assertEqual(self.notice(None)[0], "")
+        self.assertEqual(self.notice({"latest_version": "0.165.0"}, home=False)[0], "")
+        self.assertEqual(self.notice({"latest_version": None})[0], "")
+        self.assertEqual(self.notice(["not", "an", "object"])[0], "")
+
+    def test_versions_compare_as_numbers(self):
+        self.assertLess(server.version_key("0.99.0"), server.version_key("0.165.0"))
+        self.assertEqual(server.version_key("0.165.0-alpha.1"), (0, 165, 0))
+
+
 class FakeClient:
     """Just enough of CodexClient for resolve()."""
 
@@ -412,6 +455,15 @@ class HandlerTest(unittest.TestCase):
         self.assertNotIn("thread/start", daemon.calls)
         self.assertTrue(out.startswith(f"Using {server.short_name(ours)}"))
         self.assertIn("Ignored model", out)
+
+    def test_start_tells_about_a_codex_update_and_goes_on(self):
+        for existing in ([], [self.consultant("ours02")]):
+            self.use(FakeDaemon(existing))
+            with mock.patch.object(server, "update_notice", return_value="Codex 9.9.9 is out.") as notice:
+                out = server.start_consultant({"cwd": ROOT, "watch": False})
+            notice.assert_called_once()
+            self.assertTrue(out.endswith("\nCodex 9.9.9 is out."))
+            self.assertIn("Send it work with SendConsultantMessage.", out)
 
     def test_send_timeout_shows_output_so_far(self):
         thread = self.consultant("idle01")

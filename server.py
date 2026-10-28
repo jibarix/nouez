@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.6.1"
+SERVER_VERSION = "0.7.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -65,6 +65,7 @@ _send_locks = {}  # thread id -> lock, so concurrent sends can't both start a tu
 _send_locks_guard = threading.Lock()
 _watch_pending = set()  # consultants to open in a terminal once their first turn starts
 _unwatched = set()  # StartConsultant sessions started with watch=false: no automatic pane
+_update_noted = set()  # latest Codex versions StartConsultant has already told about
 _cancel_events = {}  # MCP request id -> Event set by notifications/cancelled
 _cancel_guard = threading.Lock()
 _client_caps = {}  # capabilities Claude Code advertised in initialize
@@ -684,6 +685,49 @@ def viewer_codex(info):
     return "codex", ""
 
 
+def version_key(version):
+    return tuple(int(n) for n in re.findall(r"\d+", version.split("-", 1)[0])[:3])
+
+
+def update_notice(info):
+    """A note for the result when the codex CLI or the daemon is behind the latest Codex release,
+    or "" (also once it has been given in this server process). The latest version comes from
+    the cache Codex keeps for its own update check, so nothing goes over the network; a version
+    the user dismissed in Codex isn't raised again."""
+    info = info or {}
+    home = info.get("codexHome")
+    if not home:
+        return ""
+    try:
+        with open(os.path.join(home, "version.json"), encoding="utf-8") as f:
+            cache = json.load(f)
+        latest = version_of(cache.get("latest_version"))
+    except (OSError, ValueError, AttributeError):
+        return ""
+    if not latest or cache.get("dismissed_version") == latest:
+        return ""
+    with _send_locks_guard:
+        if latest in _update_noted:
+            return ""
+    daemon = version_of((info.get("userAgent") or "").split("/", 1)[-1])
+    cli = codex_version("codex")
+    behind = [(what, v) for what, v in (("the codex CLI on PATH", cli), ("the app-server daemon", daemon))
+              if v and version_key(v) < version_key(latest)]
+    if not behind:
+        return ""
+    with _send_locks_guard:
+        _update_noted.add(latest)
+    steps = []
+    if any(what.startswith("the codex CLI") for what, _ in behind):
+        steps.append("`codex update` updates the CLI")
+    if any(what.startswith("the app-server daemon") for what, _ in behind):
+        steps.append("`codex app-server daemon update` updates the daemon, which may interrupt running "
+                     "Codex work, consultants and the user's own sessions included")
+    return (f"Codex {latest} is out; " + " and ".join(f"{what} is {v}" for what, v in behind) + ". "
+            "Tell the user and go ahead with the consultation. Only if the user asks you to update, "
+            "run these in a shell: " + "; ".join(steps) + ".")
+
+
 def viewer_running(thread_id):
     """Whether some `codex resume <id>` is already showing the session, whether open_terminal
     started it or the user did. Errs toward False, so a failed check still opens a window."""
@@ -896,6 +940,7 @@ def start_consultant(args, cancel=None, progress=None):
             thread = client.request("thread/start", params)["thread"]
             if args.get("title"):
                 client.request("thread/name/set", {"threadId": thread["id"], "name": args["title"]})
+        notice = update_notice(client.info)
     finally:
         client.close()
 
@@ -917,6 +962,7 @@ def start_consultant(args, cancel=None, progress=None):
             + ("A pane showing it opens beside Claude Code when you send its first message.\n" if watch else "")
             + "Send it work with SendConsultantMessage."
             + user_note
+            + (f"\n{notice}" if notice else "")
         )
 
     if not watch:
@@ -939,6 +985,7 @@ def start_consultant(args, cancel=None, progress=None):
         + (f"\nOther consultants in this repo:\n{format_threads(others)}" if others else "")
         + user_note
         + "\nOnly if the user asks for a separate consultant, call StartConsultant with new=true."
+        + (f"\n{notice}" if notice else "")
     )
 
 
@@ -1137,7 +1184,8 @@ TOOLS = [
             "and research, but cannot edit anything. Codex sessions the user opened are never reused; "
             "they are listed in the result. Returns the consultant's name: pass it as `to` to the "
             "other tools. Unless watch=false, the session is shown beside Claude Code (Windows "
-            "Terminal or tmux split pane, otherwise a new window) once it has its first message."
+            "Terminal or tmux split pane, otherwise a new window) once it has its first message. "
+            "The result says so if the codex CLI or the daemon is behind the latest Codex release."
         ),
         "inputSchema": {
             "type": "object",
