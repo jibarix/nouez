@@ -268,6 +268,38 @@ class DaemonStartTest(unittest.TestCase):
         start.assert_called_once_with("codex")
 
 
+class DaemonEnvTest(unittest.TestCase):
+    def folders(self):
+        """An MSYS folder (holds msys-2.0.dll, like Git\\usr\\bin) and a plain one."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        msys, plain = os.path.join(root, "usr-bin"), os.path.join(root, "system32")
+        for folder in (msys, plain):
+            os.mkdir(folder)
+        open(os.path.join(msys, "msys-2.0.dll"), "w").close()
+        return msys, plain
+
+    def test_git_bash_environment_is_cleaned(self):
+        msys, plain = self.folders()
+        env = server.daemon_env({"MSYSTEM": "MINGW64", "SHELL": r"C:\Program Files\Git\bin\bash.exe",
+                                 "EXEPATH": r"C:\Program Files\Git\bin", "CODEX_HOME": r"C:\codex",
+                                 "PATH": f"{msys};{plain};;{msys}"})
+        self.assertEqual(env, {"CODEX_HOME": r"C:\codex", "PATH": plain})
+
+    def test_outside_git_bash_the_environment_is_inherited(self):
+        msys, plain = self.folders()
+        self.assertIsNone(server.daemon_env({"PATH": f"{msys};{plain}"}))
+        self.assertIsNone(server.daemon_env({"MSYSTEM": "", "PATH": plain}))
+
+    def test_daemon_is_started_with_the_cleaned_environment(self):
+        with mock.patch.object(server.os, "name", "nt"), \
+             mock.patch.dict(server.os.environ, {"MSYSTEM": "MINGW64"}), \
+             mock.patch.object(server.subprocess, "Popen") as popen:
+            server.start_daemon("codex")
+        env = popen.call_args.kwargs["env"]
+        self.assertNotIn("MSYSTEM", {k.upper() for k in env})
+
+
 class UpdateNoticeTest(unittest.TestCase):
     def notice(self, cache, cli="0.163.0", daemon="0.162.1", home=True):
         folder = tempfile.mkdtemp()

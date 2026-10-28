@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.7.1"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -176,11 +176,30 @@ def start_daemon(exe):
     No pipes and no kill on timeout: the daemon outlives this command, and would hold a pipe
     open or die with the tree."""
     log("Codex daemon not reachable; starting it")
+    env = daemon_env(os.environ) if os.name == "nt" else None
     try:
         subprocess.Popen([exe, "app-server", "daemon", "start"], stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait(timeout=30)
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env).wait(timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         pass
+
+
+GIT_BASH_VARIABLES = ("MSYSTEM", "SHELL", "EXEPATH")  # set by Git Bash for its own shell
+
+
+def daemon_env(environ):
+    """The Windows environment to start the daemon with, or None to inherit `environ`. Under Git
+    Bash (MSYSTEM is set; Claude Code's Bash tool runs the waiter there) the daemon, and with it
+    `codex app-server daemon update`, would inherit MSYS's PATH: the updater's bare `tar` then finds
+    GNU tar, which reads `C:` as a remote host, and the update fails. So drop Git Bash's variables
+    and the PATH folders holding msys-2.0.dll; a PATH the user set up without MSYSTEM is left alone."""
+    if not environ.get("MSYSTEM"):
+        return None
+    env = {k: v for k, v in environ.items() if k.upper() not in GIT_BASH_VARIABLES}
+    for key in [k for k in env if k.upper() == "PATH"]:
+        env[key] = ";".join(p for p in env[key].split(";")
+                            if p and not os.path.isfile(os.path.join(p, "msys-2.0.dll")))
+    return env
 
 
 class CodexClient:

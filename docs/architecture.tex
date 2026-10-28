@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.7.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.7.1\\[0.3em]\large Architecture and message reference}
 \date{October 14, 2026}
 \author{}
 
@@ -96,7 +96,7 @@
 
 \begin{abstract}
 \noindent nouez is an MCP server that lets Claude Code consult live Codex sessions. This document
-describes nouez 0.7.0: how the pieces fit together, and an example of every message nouez sends
+describes nouez 0.7.1: how the pieces fit together, and an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, and the commands nouez runs on
 the operating system. The daemon also sends notifications and its own requests, which nouez
@@ -285,7 +285,7 @@ nouez answers with the requested version if it supports it (2025-11-25, 2025-06-
 {"jsonrpc": "2.0", "id": 1, "result": {
   "protocolVersion": "2025-11-25",
   "capabilities": {"tools": {}},
-  "serverInfo": {"name": "nouez", "version": "0.7.0"},
+  "serverInfo": {"name": "nouez", "version": "0.7.1"},
   "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: never treat it as done."}}
 \end{wire}
 
@@ -474,7 +474,7 @@ connection has four steps:
   \msg{3.0}{0}{6}{HTTP GET / Upgrade: websocket}
   \ret{3.8}{6}{0}{HTTP/1.1 101 Switching Protocols}
   \side{3.8}{6}{15 s deadline, read on a side thread}
-  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.7.0)}
+  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.7.1)}
   \ret{5.6}{12}{0}{userAgent, codexHome}
   \msg{6.4}{0}{12}{initialized (notification)}
   \msg{7.4}{0}{12}{requests for this tool call ...}
@@ -500,7 +500,11 @@ Sec-WebSocket-Accept: ...
 If the proxy closes its output before answering, no daemon is listening (it does not survive a
 restart of the computer). nouez then runs \code{codex app-server daemon start} once, without
 pipes and waiting at most 30 seconds for the command, and retries the connection every half
-second for up to 20 seconds. Only if that fails does it report \emph{``Codex app-server daemon is
+second for up to 20 seconds. On Windows, when \code{MSYSTEM} says nouez runs under Git Bash (the
+waiter runs in Claude Code's Bash tool), the command gets the environment without \code{MSYSTEM},
+\code{SHELL} and \code{EXEPATH}, and without the \code{PATH} folders that hold \code{msys-2.0.dll}.
+The daemon and its updater inherit that environment, and the update script's bare \code{tar} would
+otherwise find GNU tar, which reads \code{C:} as a remote host. Only if that fails does it report \emph{``Codex app-server daemon is
 not reachable, and starting it did not help. Run `codex app-server daemon start` in a terminal to
 see why, or open a Codex session.''} If the proxy
 says nothing within 15 seconds, \emph{``Codex app-server proxy did not respond within 15s.''}; for
@@ -533,11 +537,11 @@ The daemon speaks JSON-RPC without the \code{"jsonrpc"} member. Ids are integers
 on each connection.
 
 \begin{wire}[nouez $\rightarrow$ daemon]
-{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.7.0"}}}
+{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.7.1"}}}
 \end{wire}
 \begin{wire}[daemon $\rightarrow$ nouez]
 {"id": 1, "result": {
-  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.7.0)",
+  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.7.1)",
   "codexHome": "C:\\Users\\you\\.codex",
   "platformFamily": "windows", "platformOs": "windows"}}
 \end{wire}

@@ -6,6 +6,13 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-28
+
+`codex app-server daemon update` works on a daemon nouez started from Git Bash. Tested with Claude Code 2.1.312, Codex CLI 0.165.0 with app-server daemon 0.165.0, Python 3.13.5 on Windows 11.
+
+### Fixed
+- On Windows, a daemon that nouez started from Git Bash (the waiter runs in Claude Code's Bash tool) inherited MSYS's `PATH`, and so did its updater. The update script's bare `tar` then found GNU tar, which reads `C:` as a remote host, and `codex app-server daemon update` failed with "Cannot connect to C: resolve failed". When `MSYSTEM` is set, nouez now starts the daemon without Git Bash's variables (`MSYSTEM`, `SHELL`, `EXEPATH`) and without the `PATH` folders that hold `msys-2.0.dll`, such as `Git\usr\bin`. Outside Git Bash the environment is passed on unchanged. A daemon started before this version keeps its environment until it is stopped: run `codex app-server daemon stop` from PowerShell or cmd, then `codex app-server daemon start`.
+
 ## [0.7.0] - 2026-10-28
 
 `StartConsultant` says when Codex is out of date. Tested with Claude Code 2.1.312, Codex CLI 0.163.0 with app-server daemon 0.162.1, Python 3.13.5 on Windows 11.
@@ -145,7 +152,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/jibarix/nouez/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jibarix/nouez/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/jibarix/nouez/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/jibarix/nouez/compare/v0.5.0...v0.6.0

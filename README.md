@@ -23,10 +23,10 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.7.0 |
+| nouez | 0.7.1 |
 | Claude Code | 2.1.312 |
-| Codex CLI | 0.163.0 |
-| Codex app-server daemon | 0.162.1 |
+| Codex CLI | 0.165.0 |
+| Codex app-server daemon | 0.165.0 |
 | Python | 3.13.5 |
 | OS | Windows 11 |
 
@@ -186,6 +186,8 @@ Boolean arguments take `true`/`false` (or the strings `"true"`/`"false"`); any o
 ### Codex updates
 
 When the `codex` CLI on your `PATH` or the app-server daemon is older than the latest Codex release, `StartConsultant` adds a notice to its result. Claude tells you about it and goes on with the consultation. The latest version comes from `version.json` in your Codex home, the cache Codex keeps for its own update check, so nouez makes no network request. If that file is missing, or you dismissed that version in Codex, there is no notice. The notice is given once per server process (normally once per Claude Code session). nouez doesn't update anything itself. Ask Claude to update and it runs `codex update` for the CLI and `codex app-server daemon update` for the daemon. Updating the daemon may interrupt running Codex work, including consultants and your own sessions.
+
+On Windows, if `codex app-server daemon update` fails with `Cannot connect to C: resolve failed`, the daemon was started from Git Bash and its updater found GNU tar instead of Windows' tar. nouez 0.7.1 and later start the daemon without Git Bash's environment. For a daemon started some other way, run `codex app-server daemon stop` and then `codex app-server daemon start` from PowerShell or cmd, then update again.
 
 ## Troubleshooting
 
