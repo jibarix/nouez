@@ -6,6 +6,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-07
+
+`OpenClaudeSession` can record that the user trusts a folder, so a session in a new project can be opened from the phone. Tested with Claude Code 2.1.319 and Python 3.11.9 on Windows 11; the Codex side was last tested with Codex CLI 0.165.0 and app-server daemon 0.165.0, with nouez 0.7.1.
+
+### Added
+- `OpenClaudeSession` takes `trust: true`, for when the user has said they trust the folder. nouez records that in Claude Code's state file (`~/.claude.json`, under `CLAUDE_CONFIG_DIR` if set) as `hasTrustDialogAccepted` for the folder Claude Code keeps it on (in git, the repository's root; for a worktree, its main checkout), the way the trust dialog does, and then opens the window. Before each change it saves a dated copy of the file to its own folder (`%LOCALAPPDATA%\nouez\claude-json-backups`, or `$XDG_STATE_HOME`/`~/.local/state/nouez/claude-json-backups`), keeps the newest 20, and names the copy in the result. Only that one value changes; the file is checked unchanged just before it's replaced and read back after. It refuses the home folder, a drive's root, Claude Code's own folder and git layouts it can't place, and changes nothing when the file can't be read or isn't laid out as expected.
+
+### Changed
+- Sessions `OpenClaudeSession` opens start on Opus at medium effort (`--model opus --effort medium`) instead of the user's Claude Code defaults. `model` and `effort` arguments choose others, when the user asks; a model must be an alias or a model's full name, never something that reads as an option.
+- When a folder isn't trusted, the result tells Claude to ask the user whether they trust it, and to pass `trust: true` only if they say yes, instead of sending them to the computer. `open_untrusted: true` still opens a window that waits at the trust question.
+
 ## [0.9.0] - 2026-11-07
 
 `StartConsultant` says when a newer nouez is out, and `OpenClaudeSession` can create the folder and won't open a window that would sit at the trust question. Tested with Claude Code 2.1.319 and Python 3.11.9 on Windows 11; the Codex side was last tested with Codex CLI 0.165.0 and app-server daemon 0.165.0, with nouez 0.7.1.
@@ -176,7 +187,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/jibarix/nouez/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/jibarix/nouez/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jibarix/nouez/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/jibarix/nouez/compare/v0.7.0...v0.7.1

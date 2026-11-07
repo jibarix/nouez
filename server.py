@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.9.0"
+SERVER_VERSION = "0.10.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -1334,6 +1334,11 @@ def run_claude(spec_path):
         return 1
     name = spec["name"]
     argv = [exe, "--remote-control", name, "--name", name]
+    if spec.get("model"):
+        argv += ["--model", spec["model"]]
+    if spec.get("effort"):
+        argv += ["--effort", spec["effort"]]
+        env["CLAUDE_CODE_EFFORT_LEVEL"] = spec["effort"]  # it outranks --effort, so one inherited can't win
     if spec.get("prompt"):
         argv += ["--", spec["prompt"]]  # so a prompt starting with "-" can't pass for an option
     child = subprocess.Popen(argv, cwd=spec["cwd"], env=env)
@@ -1438,6 +1443,148 @@ def folder_trusted(path):
     return any(key == p or key.startswith(p + os.sep) for p in trusted)
 
 
+CLAUDE_MODEL = "opus"     # the model sessions OpenClaudeSession opens start with: the latest Opus
+CLAUDE_EFFORT = "medium"  # and their effort level
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+CLAUDE_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,99}")  # an alias or full name, never an option
+TRUST_BACKUPS_KEPT = 20  # dated copies of Claude Code's state file kept before nouez's changes
+
+
+def trust_backup_dir():
+    """Where nouez keeps its copies of Claude Code's state file: the user's own, private data folder."""
+    if os.name == "nt":
+        base, fallback = os.environ.get("LOCALAPPDATA"), os.path.join("~", "AppData", "Local")
+    else:
+        base, fallback = os.environ.get("XDG_STATE_HOME"), os.path.join("~", ".local", "state")
+    if not base or not os.path.isabs(base):  # a relative one would put the copies in the project
+        base = os.path.expanduser(fallback)
+    return os.path.join(base, "nouez", "claude-json-backups")
+
+
+def backup_claude_state(text):
+    """Save `text` (the state file as read) to a new dated backup, check it, and keep only the newest
+    TRUST_BACKUPS_KEPT. Returns the backup's path."""
+    folder = trust_backup_dir()
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    fd, path = tempfile.mkstemp(prefix=f".claude.json.{stamp}.", suffix=".bak", dir=folder)  # private (0600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        with open(path, encoding="utf-8", newline="") as f:
+            if f.read() != text:
+                raise OSError("the copy doesn't match")
+    except OSError as e:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise BridgeError(f"Couldn't back up Claude Code's settings to {folder}: {e}. Nothing was changed.")
+    dated = []
+    for other in glob.glob(os.path.join(glob.escape(folder), ".claude.json.*.bak")):
+        try:
+            dated.append((os.path.getmtime(other), other))
+        except OSError:
+            pass  # another nouez server removed it meanwhile
+    for _, extra in sorted(dated)[:-TRUST_BACKUPS_KEPT]:
+        if extra != path:
+            try:
+                os.remove(extra)
+            except OSError:
+                pass
+    return path
+
+
+def exactly_trusted(key):
+    """Whether Claude Code's state file records trust for `key` itself (not just a folder above it)."""
+    exact = _trust_norm(key)
+    try:
+        with open(claude_state_file(), encoding="utf-8") as f:
+            projects = json.load(f).get("projects") or {}
+        return any(_trust_norm(p) == exact and isinstance(v, dict) and v.get("hasTrustDialogAccepted") is True
+                   for p, v in projects.items())
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+
+
+def trust_folder(path):
+    """Record the user's trust in `path` as Claude Code's trust dialog does:
+    projects["<folder>"].hasTrustDialogAccepted = true in its state file, where the folder is the
+    repository root in git (a linked worktree's main checkout). Before each change the file is copied
+    to a new dated backup; only that one value changes; the file is checked again just before it is
+    replaced, and read back after. Returns (folder, backup or None); None if it was already trusted."""
+    key, _ = trust_key(path)
+    if key is None:
+        raise BridgeError("Not recording trust: nouez can't tell which folder Claude Code keeps the trust "
+                          "for here (the git layout is unusual). Nothing was changed; the user can answer "
+                          "the trust question on the computer.")
+    norm_key = _trust_norm(key)
+    home = _trust_norm(os.path.expanduser("~"))
+    if norm_key == home or os.path.dirname(norm_key) == norm_key or norm_key == _trust_norm(claude_config_dir()):
+        raise BridgeError(f"Not trusting {key}: Claude Code doesn't record trust for the home folder, a "
+                          "drive's root or its own folder, so choose a project folder.")
+    state = claude_state_file()
+    backup = None
+    for attempt in range(3):
+        try:
+            with open(state, encoding="utf-8", newline="") as f:
+                text = f.read()
+            data = json.loads(text)
+        except (OSError, ValueError) as e:
+            raise BridgeError(f"Couldn't read {state}: {e}. Nothing was changed.")
+        projects = data.get("projects") if isinstance(data, dict) else None
+        if projects is None and isinstance(data, dict):
+            projects = data["projects"] = {}
+        if not isinstance(projects, dict):
+            raise BridgeError(f"{state} isn't laid out as expected (no projects table). Nothing was changed.")
+        name = next((p for p in projects if _trust_norm(p) == norm_key), None)
+        if name is not None and isinstance(projects[name], dict) and projects[name].get("hasTrustDialogAccepted") is True:
+            return name, backup
+        if name is not None and not isinstance(projects[name], dict):
+            raise BridgeError(f"{state} has an unexpected entry for {name}. Nothing was changed.")
+        name = name or (key.replace("\\", "/") if os.name == "nt" else key)
+        projects.setdefault(name, {})["hasTrustDialogAccepted"] = True
+        try:
+            # allow_nan=False: a number too big for a float (1e400) must not come back as Infinity,
+            # which isn't JSON; encode(): a lone surrogate escape can't be written as UTF-8.
+            new = json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False)
+            new.encode("utf-8")
+            same = json.loads(new) == data
+        except (ValueError, UnicodeError):
+            same = False
+        if not same:
+            raise BridgeError(f"{state} has values nouez can't write back unchanged. Nothing was changed.")
+        backup = backup_claude_state(text)
+        with open(state, encoding="utf-8", newline="") as f:
+            if f.read() != text:
+                continue  # a Claude Code session wrote it meanwhile: start over from its version
+        # A temporary file of its own beside the state file, so two servers can't write into one.
+        fd, tmp = tempfile.mkstemp(prefix=".claude.json.", suffix=".nouez-tmp", dir=os.path.dirname(state))
+        replaced = False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                f.write(new)
+            os.replace(tmp, state)
+            replaced = True
+        except OSError:
+            pass
+        finally:
+            if not replaced:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        if not replaced:
+            time.sleep(0.2)
+            continue
+        time.sleep(0.5)  # then make sure no session wrote over it
+        if exactly_trusted(key):
+            return name, backup
+    raise BridgeError(f"Couldn't record the trust for {key}: {state} kept changing (other Claude Code "
+                      f"sessions write it). Its last version before nouez's change is backed up in "
+                      f"{backup or trust_backup_dir()}. Try again, or answer the trust question on the computer.")
+
+
 def open_claude_session(args, cancel=None, progress=None):
     cwd = args.get("cwd")
     if not isinstance(cwd, str) or not os.path.isabs(cwd):
@@ -1457,45 +1604,53 @@ def open_claude_session(args, cancel=None, progress=None):
     prompt = args.get("prompt") or ""
     if not isinstance(name, str) or not isinstance(prompt, str):
         raise BridgeError("name and prompt must be strings.")
+    model = args.get("model") or CLAUDE_MODEL
+    effort = args.get("effort") or CLAUDE_EFFORT
+    if not isinstance(model, str) or not CLAUDE_MODEL_NAME.fullmatch(model):
+        raise BridgeError("model must be a Claude Code model alias (such as opus or sonnet) or a model's full name.")
+    if effort not in CLAUDE_EFFORTS:
+        raise BridgeError("effort must be one of " + ", ".join(CLAUDE_EFFORTS) + ".")
     notes = [f"Created the folder {cwd}."] if created else []
     trusted = folder_trusted(cwd)
     key, in_git = trust_key(cwd)
+    if flag(args, "trust") and not (key and exactly_trusted(key)):
+        recorded, backup = trust_folder(cwd)
+        if backup:
+            notes.append(f"Recorded the user's trust in {recorded} in Claude Code's settings "
+                         f"({claude_state_file()}), as its trust dialog would. The file as it was is "
+                         f"backed up in {backup}.")
+        trusted = folder_trusted(cwd)
     if trusted is False and not flag(args, "open_untrusted"):
         return " ".join(notes + [
             f"Not opened: Claude Code hasn't been trusted in {key}"
             + (" (a git repository is trusted on its own, not through a folder above it)" if in_git else "")
             + ", so a session there would wait at the trust question on the computer and couldn't "
-            "connect to the Claude app until someone answers it. nouez doesn't answer it for the user. "
-            "Tell the user: they can answer it on the computer, once, and then ask again; if they're at "
-            "the computer, or want the window opened anyway to answer it there, call OpenClaudeSession "
-            "again with open_untrusted=true."])
+            "connect to the Claude app until someone answers it. Ask the user whether they trust this "
+            "folder: trusting it lets its Claude Code settings, hooks and MCP servers run. Only if they "
+            "say yes, call OpenClaudeSession again with trust=true, which records their answer in Claude "
+            "Code's settings as the trust dialog would (backing the file up first). If they're at the "
+            "computer and would rather answer Claude Code's own question there, use open_untrusted=true."])
     asks = []
     if trusted and key:
-        exact = _trust_norm(key)
-        try:
-            with open(claude_state_file(), encoding="utf-8") as f:
-                projects = json.load(f).get("projects") or {}
-            exact_trusted = any(_trust_norm(p) == exact and isinstance(v, dict) and v.get("hasTrustDialogAccepted")
-                                for p, v in projects.items())
-        except (OSError, ValueError, AttributeError, TypeError):
-            exact_trusted = False
+        exact_trusted = exactly_trusted(key)
         project = git_root(cwd) or cwd  # the launched checkout: a worktree has its own files
         if not exact_trusted and os.path.isfile(os.path.join(project, ".claude", "settings.json")):
             asks.append("its .claude/settings.json may bring the trust question back (allow rules and "
-                        "additional directories need the folder itself trusted, not just a folder above it)")
+                        "additional directories need the folder itself trusted, not just a folder above it; "
+                        "trust=true, if the user says they trust it, records that)")
         if os.path.isfile(os.path.join(project, ".mcp.json")):
             asks.append("its .mcp.json servers are approved separately, so Claude Code may ask before "
                         "connecting them")
     fd, spec = tempfile.mkstemp(prefix="nouez-claude-", suffix=".json")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump({"cwd": cwd, "name": name, "prompt": prompt}, f)
+        json.dump({"cwd": cwd, "name": name, "prompt": prompt, "model": model, "effort": effort}, f)
     try:
         how = open_window(cwd, [sys.executable, "-I", os.path.abspath(__file__), "claude", spec], f"Claude: {name}")
     except Exception:
         os.remove(spec)
         raise
     out = " ".join(notes + [
-        f"Opened {how} in {cwd} running Claude Code with Remote Control, named \"{name}\". It is a "
+        f"Opened {how} in {cwd} running Claude Code ({model}, {effort} effort) with Remote Control, named \"{name}\". It is a "
         "normal session: its transcript is saved and it can be resumed later. It appears in the "
         "Claude app's session list under that name once it connects, in a few seconds."])
     if trusted is False:
@@ -2139,15 +2294,19 @@ TOOLS = [
             "example for another project. The session starts as if the user had typed `claude` in a "
             "fresh terminal: its transcript is saved, unlike a `claude` started from your own shell, "
             "which inherits this session's environment. If Claude Code hasn't been trusted in the "
-            "folder, nothing is opened and the result says what to tell the user: trusting a folder is "
-            "the user's answer to Claude Code's own question on the computer, which nouez never gives."
+            "folder, nothing is opened and the result says what to ask the user. Only when the user says "
+            "they trust the folder, pass trust=true: nouez records that in Claude Code's settings as its "
+            "trust dialog would, after backing the file up."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "cwd": {"type": "string", "description": "Absolute path of the project folder the session works in."},
                 "create": {"type": "boolean", "description": "Create the folder if it doesn't exist (its parent must exist). Use when the user asks for a session in a new folder."},
+                "trust": {"type": "boolean", "description": "true: the user has said, in this conversation, that they trust this folder; record that in Claude Code's settings before opening, as its trust dialog would. Never set it on your own judgment. Default false."},
                 "open_untrusted": {"type": "boolean", "description": "Open the window even though Claude Code hasn't been trusted in the folder, so the user can answer the trust question on the computer. Default false. Set it only when the user asks for that."},
+                "model": {"type": "string", "description": "Claude Code model alias or full name. Default: opus (the latest Opus). Set it only when the user asks for another model."},
+                "effort": {"type": "string", "enum": list(CLAUDE_EFFORTS), "description": "Effort level. Default: medium. Set it only when the user asks for another."},
                 "name": {"type": "string", "description": "Session name, shown in the Claude app's session list. Default: the folder's name."},
                 "prompt": {"type": "string", "description": "Optional first message for the new session. Leave it out unless the user gave one."},
             },

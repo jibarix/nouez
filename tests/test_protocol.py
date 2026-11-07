@@ -529,7 +529,9 @@ class TrustTest(unittest.TestCase):
         self.config = os.path.join(self.tmp, "config")
         os.mkdir(self.config)
         self.state = os.path.join(self.config, ".claude.json")
-        patch = mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": self.config})
+        self.data_home = os.path.join(self.tmp, "data")
+        patch = mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": self.config, "LOCALAPPDATA": self.data_home,
+                                                    "XDG_STATE_HOME": self.data_home})
         patch.start()
         self.addCleanup(patch.stop)
         self.projects = os.path.join(self.tmp, "Projects")
@@ -608,19 +610,119 @@ class TrustTest(unittest.TestCase):
         os.remove(self.state)
         self.assertIsNone(server.folder_trusted(self.plain))
 
-    def test_nouez_never_writes_claude_state(self):
-        self.assertFalse(hasattr(server, "trust_folder"))
-        with open(self.state, encoding="utf-8") as f:
-            before = f.read()
+    def open(self, args):
         with mock.patch.object(server, "open_window", return_value="a window") as open_window:
-            server.open_claude_session({"cwd": self.repo})
-            server.open_claude_session({"cwd": self.repo, "open_untrusted": True})
-            server.open_claude_session({"cwd": self.plain})
+            out = server.open_claude_session(args)
         for call in open_window.call_args_list:
             os.remove(call[0][1][-1])
+        return out, open_window.called
+
+    def backups(self):
+        folder = server.trust_backup_dir()
+        return sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+
+    def test_claude_state_is_written_only_when_the_user_trusts(self):
+        with open(self.state, encoding="utf-8") as f:
+            before = f.read()
+        out, opened = self.open({"cwd": self.repo})
+        self.assertFalse(opened)
+        self.assertIn("trust=true", out)
+        self.open({"cwd": self.repo, "open_untrusted": True})
+        self.open({"cwd": self.plain})
         with open(self.state, encoding="utf-8") as f:
             self.assertEqual(f.read(), before)
         self.assertEqual(os.listdir(self.config), [".claude.json"])
+        self.assertEqual(self.backups(), [])
+
+    def test_trust_records_the_repository_and_backs_up_first(self):
+        with open(self.state, encoding="utf-8") as f:
+            before = f.read()
+        out, opened = self.open({"cwd": os.path.join(self.repo, "src"), "trust": True})
+        self.assertTrue(opened)
+        self.assertIn("Recorded the user's trust in " + self.slash(self.repo), out)
+        self.assertNotIn("Warning", out)
+        data = self.read()
+        self.assertIs(data["projects"][self.slash(self.repo)]["hasTrustDialogAccepted"], True)
+        self.assertEqual(data["numStartups"], 3)  # everything else is kept
+        self.assertEqual(data["projects"]["other"], {"allowedTools": ["x"]})
+        self.assertEqual(data["é"], "ü")
+        [backup] = self.backups()
+        self.assertIn(backup, out)
+        with open(os.path.join(server.trust_backup_dir(), backup), encoding="utf-8") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(os.listdir(self.config), [".claude.json"])  # no temporary file left behind
+        # Already trusted: nothing more is written or backed up.
+        out, _ = self.open({"cwd": self.repo, "trust": True})
+        self.assertNotIn("Recorded", out)
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_only_the_newest_backups_are_kept(self):
+        for i in range(server.TRUST_BACKUPS_KEPT + 3):
+            folder = os.path.join(self.projects, f"p{i}")
+            os.mkdir(folder)
+            server.trust_folder(folder)
+        self.assertEqual(len(self.backups()), server.TRUST_BACKUPS_KEPT)
+        self.assertTrue(all(server.folder_trusted(os.path.join(self.projects, f"p{i}"))
+                            for i in range(server.TRUST_BACKUPS_KEPT + 3)))
+
+    def test_trust_is_refused_where_claude_code_doesnt_keep_it(self):
+        with open(self.state, encoding="utf-8") as f:
+            before = f.read()
+        with mock.patch.object(server.os.path, "expanduser", side_effect=lambda p: p.replace("~", self.plain)):
+            with self.assertRaisesRegex(server.BridgeError, "home folder"):
+                server.trust_folder(self.plain)
+        meta = os.path.join(self.tmp, "metadata", ".git")
+        wt = self.worktree(os.path.join(meta, "worktrees", "wt"), "../..")
+        with self.assertRaisesRegex(server.BridgeError, "git layout is unusual"):
+            server.trust_folder(wt)
+        self.write([1, 2])
+        with self.assertRaisesRegex(server.BridgeError, "Nothing was changed"):
+            server.trust_folder(self.repo)
+        self.write({"projects": {}})
+        with open(self.state, "a", encoding="utf-8") as f:
+            f.write("garbage")
+        with self.assertRaisesRegex(server.BridgeError, "Nothing was changed"):
+            server.trust_folder(self.repo)
+        self.assertEqual(self.backups(), [])
+        self.write(json.loads(before))
+
+    def test_values_that_cant_be_written_back_leave_the_file_alone(self):
+        for text in ('{"big": 1e400, "projects": {}}', '{"odd": "\\ud800", "projects": {}}',
+                     '{"nan": NaN, "projects": {}}'):
+            with open(self.state, "w", encoding="utf-8") as f:
+                f.write(text)
+            with self.assertRaisesRegex(server.BridgeError, "Nothing was changed"):
+                server.trust_folder(self.repo)
+            with open(self.state, encoding="utf-8") as f:
+                self.assertEqual(f.read(), text)
+            self.assertEqual(os.listdir(self.config), [".claude.json"])
+        self.assertEqual(self.backups(), [])
+
+    def test_a_failed_write_leaves_no_temporary_file(self):
+        with mock.patch.object(server.os, "replace", side_effect=OSError("busy")), \
+                mock.patch.object(server.time, "sleep"):
+            with self.assertRaisesRegex(server.BridgeError, "kept changing"):
+                server.trust_folder(self.repo)
+        self.assertEqual(os.listdir(self.config), [".claude.json"])
+
+    def test_relative_backup_folders_are_ignored(self):
+        with mock.patch.dict(server.os.environ, {"LOCALAPPDATA": "rel", "XDG_STATE_HOME": "rel"}):
+            folder = server.trust_backup_dir()
+        self.assertTrue(os.path.isabs(folder))
+        self.assertNotIn(os.path.join("rel", "nouez"), folder)
+
+    def test_backups_another_server_removed_are_skipped(self):
+        real = os.path.getmtime
+        def gone(path):
+            if path.endswith(".bak") and os.path.basename(path).startswith(".claude.json.0"):
+                raise FileNotFoundError(path)
+            return real(path)
+        os.makedirs(server.trust_backup_dir())
+        open(os.path.join(server.trust_backup_dir(), ".claude.json.0-vanished.bak"), "w").close()
+        with mock.patch.object(server.os.path, "getmtime", side_effect=gone):
+            name, backup = server.trust_folder(self.repo)
+        self.assertTrue(os.path.exists(backup))
+        self.assertTrue(server.folder_trusted(self.repo))
 
     def test_inherited_trust_notes_what_may_still_ask(self):
         os.makedirs(os.path.join(self.plain, ".claude"))
@@ -1021,10 +1123,10 @@ class OpenClaudeSessionTests(unittest.TestCase):
                 os.chdir(cwd)
         self.assertEqual(os.path.dirname(found), bin_dir)
 
-    def run_helper(self, prompt, returncode=0, closed=False):
+    def run_helper(self, prompt, returncode=0, closed=False, extra=None):
         fd, spec = tempfile.mkstemp(prefix="nouez-claude-", suffix=".json")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"cwd": ROOT, "name": "n", "prompt": prompt}, f)
+            json.dump(dict({"cwd": ROOT, "name": "n", "prompt": prompt}, **(extra or {})), f)
         child = mock.Mock(pid=999999)
         child.wait.return_value = returncode
         marker = server.close_marker(999999)
@@ -1035,6 +1137,7 @@ class OpenClaudeSessionTests(unittest.TestCase):
             code = server.run_claude(spec)
         self.assertFalse(os.path.exists(spec))
         self.assertFalse(os.path.exists(marker))
+        self.child_env = popen.call_args[1]["env"]
         return popen.call_args[0][0], code
 
     def test_prompt_cannot_become_an_option(self):
@@ -1042,6 +1145,33 @@ class OpenClaudeSessionTests(unittest.TestCase):
         self.assertEqual(argv, ["claude", "--remote-control", "n", "--name", "n", "--", "--dangerously-skip-permissions"])
         argv, _ = self.run_helper("")
         self.assertEqual(argv, ["claude", "--remote-control", "n", "--name", "n"])
+
+    def test_model_and_effort_are_passed_on(self):
+        with mock.patch.dict(server.os.environ, {"CLAUDE_CODE_EFFORT_LEVEL": "high"}):
+            argv, _ = self.run_helper("hi", extra={"model": "opus", "effort": "medium"})
+        self.assertEqual(argv, ["claude", "--remote-control", "n", "--name", "n", "--model", "opus",
+                                "--effort", "medium", "--", "hi"])
+        self.assertEqual(self.child_env["CLAUDE_CODE_EFFORT_LEVEL"], "medium")  # it outranks --effort
+
+    def test_sessions_start_on_opus_at_medium_effort(self):
+        def spec_of(args):
+            with mock.patch.object(server, "open_window", return_value="a window") as open_window, \
+                    mock.patch.object(server, "folder_trusted", return_value=True):
+                out = server.open_claude_session(dict({"cwd": ROOT}, **args))
+            path = open_window.call_args[0][1][-1]
+            with open(path, encoding="utf-8") as f:
+                spec = json.load(f)
+            os.remove(path)
+            return spec, out
+        spec, out = spec_of({})
+        self.assertEqual((spec["model"], spec["effort"]), ("opus", "medium"))
+        self.assertIn("(opus, medium effort)", out)
+        spec, _ = spec_of({"model": "claude-sonnet-5-5", "effort": "high"})
+        self.assertEqual((spec["model"], spec["effort"]), ("claude-sonnet-5-5", "high"))
+        for bad in ({"model": "--dangerously-skip-permissions"}, {"model": "opus sonnet"}, {"model": 5},
+                    {"effort": "huge"}, {"effort": True}):
+            with self.assertRaises(server.BridgeError):
+                spec_of(bad)
 
     def test_helper_exits_cleanly_when_closed_on_purpose(self):
         self.assertEqual(self.run_helper("", returncode=1, closed=True)[1], 0)
@@ -1060,7 +1190,7 @@ class OpenClaudeSessionTests(unittest.TestCase):
         self.assertEqual(argv[-2], "claude")
         with open(argv[-1], encoding="utf-8") as f:
             self.assertEqual(json.load(f), {"cwd": os.path.abspath(ROOT), "name": os.path.basename(ROOT),
-                                            "prompt": "a; b \"c\""})
+                                            "prompt": "a; b \"c\"", "model": "opus", "effort": "medium"})
         os.remove(argv[-1])
         self.assertIn("Remote Control", out)
 

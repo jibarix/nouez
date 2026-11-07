@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.9.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.10.0\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -97,7 +97,7 @@
 \begin{abstract}
 \noindent nouez is an MCP server that lets Claude Code consult live Codex sessions, and open, list and
 close Claude Code sessions on the same computer. This document
-describes nouez 0.9.0: how the pieces fit together, and an example of every message nouez sends
+describes nouez 0.10.0: how the pieces fit together, and an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, the commands nouez runs on
 the operating system, and its one request to GitHub, which looks for a newer nouez release. The daemon also sends notifications and its own requests, which nouez
@@ -296,7 +296,7 @@ nouez answers with the requested version if it supports it (2025-11-25, 2025-06-
 {"jsonrpc": "2.0", "id": 1, "result": {
   "protocolVersion": "2025-11-25",
   "capabilities": {"tools": {}},
-  "serverInfo": {"name": "nouez", "version": "0.9.0"},
+  "serverInfo": {"name": "nouez", "version": "0.10.0"},
   "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: never treat it as done."}}
 \end{wire}
 
@@ -488,7 +488,7 @@ connection has four steps:
   \msg{3.0}{0}{6}{HTTP GET / Upgrade: websocket}
   \ret{3.8}{6}{0}{HTTP/1.1 101 Switching Protocols}
   \side{3.8}{6}{15 s deadline, read on a side thread}
-  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.9.0)}
+  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.10.0)}
   \ret{5.6}{12}{0}{userAgent, codexHome}
   \msg{6.4}{0}{12}{initialized (notification)}
   \msg{7.4}{0}{12}{requests for this tool call ...}
@@ -551,11 +551,11 @@ The daemon speaks JSON-RPC without the \code{"jsonrpc"} member. Ids are integers
 on each connection.
 
 \begin{wire}[nouez $\rightarrow$ daemon]
-{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.9.0"}}}
+{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.10.0"}}}
 \end{wire}
 \begin{wire}[daemon $\rightarrow$ nouez]
 {"id": 1, "result": {
-  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.9.0)",
+  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.10.0)",
   "codexHome": "C:\\Users\\you\\.codex",
   "platformFamily": "windows", "platformOs": "windows"}}
 \end{wire}
@@ -784,9 +784,9 @@ they are. Setting \code{NOUEZ\_NO\_UPDATE\_CHECK=1} turns the lookup off.
 \begin{plain}[nouez to GitHub (HTTPS)]
 GET https://api.github.com/repos/jibarix/nouez/releases/latest
 Accept: application/vnd.github+json
-User-Agent: nouez/0.9.0
+User-Agent: nouez/0.10.0
 
-200 {"tag_name": "v0.10.0", ...}             (drafts and pre-releases are never "latest")
+200 {"tag_name": "v0.11.0", ...}             (drafts and pre-releases are never "latest")
 \end{plain}
 nouez keeps the version only if the tag reads \code{v}$n.n.n$; anything else, and any failure
 (offline, a proxy, a rate limit), means no notice. The notice appears once per server process,
@@ -797,7 +797,7 @@ control character gets no command: Claude is told to ask the user to run the pul
 isn't a git checkout, the notice points to the release page instead. Either way, Claude asks the
 user to reconnect only after the update worked:
 \begin{plain}[Result text: nouez update notice]
-nouez 0.10.0 is out; this server is 0.9.0. What changed: https://github.com/jibarix/nouez/releases/tag/v0.10.0. Tell the user and go ahead with the consultation. Only if the user asks you to update, run `git -C 'C:/Users/you/nouez' pull` in a shell. If git fails (local changes, a conflict, no branch checked out), stop there: tell the user what git said, don't ask them to reconnect, and don't discard, stash or switch anything without the user's say. Only after the pull succeeds, ask the user to run /mcp and reconnect consultants, which loads the new version; the Codex consultants keep their sessions.
+nouez 0.11.0 is out; this server is 0.10.0. What changed: https://github.com/jibarix/nouez/releases/tag/v0.11.0. Tell the user and go ahead with the consultation. Only if the user asks you to update, run `git -C 'C:/Users/you/nouez' pull` in a shell. If git fails (local changes, a conflict, no branch checked out), stop there: tell the user what git said, don't ask them to reconnect, and don't discard, stash or switch anything without the user's say. Only after the pull succeeds, ask the user to run /mcp and reconnect consultants, which loads the new version; the Codex consultants keep their sessions.
 \end{plain}
 
 % -----------------------------------------------------------------------------
@@ -1109,28 +1109,42 @@ codex-nouez-77c2e0 was not started by StartConsultant. Close it from its own ter
 \label{sec:claude-tools}
 
 \code{OpenClaudeSession} takes \code{cwd} (required, an absolute path), \code{name} (default: the
-folder's name), an optional first \code{prompt}, \code{create} and \code{open\_untrusted}. With
-\code{create: true} a missing folder is made (its parent must exist). It writes \code{cwd}, name and
-prompt to a temporary file and opens a new terminal window running \code{server.py claude <file>}
+folder's name), an optional first \code{prompt}, \code{model} (default \code{opus}, the latest
+Opus), \code{effort} (default \code{medium}), \code{create}, \code{trust} and
+\code{open\_untrusted}. The session starts with \code{--model} and \code{--effort} from those, not
+the user's own Claude Code defaults, and with \code{CLAUDE\_CODE\_EFFORT\_LEVEL} set to the same
+effort, since that variable outranks the flag; a model must be an alias or a full model name, so it can't read
+as another option. With
+\code{create: true} a missing folder is made (its parent must exist). It writes \code{cwd}, name, prompt,
+model and effort to a temporary file and opens a new terminal window running \code{server.py claude <file>}
 (Section~\ref{sec:claude-os}); the window reads the file, deletes it, and starts Claude Code.
 
 First it checks whether Claude Code has been trusted in the folder (Section~\ref{sec:trust}),
 since a session waiting at the trust question can't connect. If not, nothing opens and the result
-tells Claude to let the user answer the question on the computer; \code{open\_untrusted: true} opens
-the window anyway, with a warning, for a user at the computer. nouez never answers the question.
-If it can't tell, the window opens and the result says the session may be waiting at the question.
+tells Claude to ask the user whether they trust the folder. Only if they say yes does Claude call
+again with \code{trust: true}: nouez records the answer as the trust dialog would, after backing up
+Claude Code's state file (Section~\ref{sec:trust}), and opens the window, so it works from the
+phone. \code{open\_untrusted: true} opens the window untrusted instead, with a warning, for a user
+at the computer who would rather answer Claude Code's own question. If nouez can't tell, the window
+opens and the result says the session may be waiting at the question.
 
 \begin{wire}[Claude Code $\rightarrow$ nouez]
 {"jsonrpc": "2.0", "id": 19, "method": "tools/call", "params": {"name": "OpenClaudeSession", "arguments": {"cwd": "C:\\Users\\me\\Projects\\other"}}}
 \end{wire}
 \begin{plain}[Result text]
-Opened a new Windows Terminal window in C:\Users\me\Projects\other running Claude Code with Remote Control, named "other". It is a normal session: its transcript is saved and it can be resumed later. It appears in the Claude app's session list under that name once it connects, in a few seconds.
+Opened a new Windows Terminal window in C:\Users\me\Projects\other running Claude Code (opus, medium effort) with Remote Control, named "other". It is a normal session: its transcript is saved and it can be resumed later. It appears in the Claude app's session list under that name once it connects, in a few seconds.
 \end{plain}
 \begin{wire}[Claude Code $\rightarrow$ nouez: a new folder]
 {"jsonrpc": "2.0", "id": 20, "method": "tools/call", "params": {"name": "OpenClaudeSession", "arguments": {"cwd": "C:\\Users\\me\\Projects\\economic-recession", "create": true}}}
 \end{wire}
 \begin{plain}[Result text: folder not trusted]
-Created the folder C:\Users\me\Projects\economic-recession. Not opened: Claude Code hasn't been trusted in C:\Users\me\Projects\economic-recession, so a session there would wait at the trust question on the computer and couldn't connect to the Claude app until someone answers it. nouez doesn't answer it for the user. Tell the user: they can answer it on the computer, once, and then ask again; if they're at the computer, or want the window opened anyway to answer it there, call OpenClaudeSession again with open_untrusted=true.
+Created the folder C:\Users\me\Projects\economic-recession. Not opened: Claude Code hasn't been trusted in C:\Users\me\Projects\economic-recession, so a session there would wait at the trust question on the computer and couldn't connect to the Claude app until someone answers it. Ask the user whether they trust this folder: trusting it lets its Claude Code settings, hooks and MCP servers run. Only if they say yes, call OpenClaudeSession again with trust=true, which records their answer in Claude Code's settings as the trust dialog would (backing the file up first). If they're at the computer and would rather answer Claude Code's own question there, use open_untrusted=true.
+\end{plain}
+\begin{wire}[Claude Code $\rightarrow$ nouez: the user said they trust it]
+{"jsonrpc": "2.0", "id": 21, "method": "tools/call", "params": {"name": "OpenClaudeSession", "arguments": {"cwd": "C:\\Users\\me\\Projects\\economic-recession", "trust": true}}}
+\end{wire}
+\begin{plain}[Result text: trust recorded]
+Recorded the user's trust in C:/Users/me/Projects/economic-recession in Claude Code's settings (C:\Users\me\.claude.json), as its trust dialog would. The file as it was is backed up in C:\Users\me\AppData\Local\nouez\claude-json-backups\.claude.json.20261107-190412.k3j2x9.bak. Opened a new Windows Terminal window in ...
 \end{plain}
 A folder inside a trusted folder (outside git) counts as trusted, but Claude Code can still ask
 there: allow rules and additional directories in the project's \code{.claude/settings.json} need
@@ -1267,7 +1281,7 @@ wt -w new -d <cwd> --title "Claude: <name>"
 That helper reads and deletes the file, then starts Claude Code in \code{cwd}:
 
 \begin{plain}[What the helper runs]
-claude --remote-control <name> --name <name> [-- <prompt>]
+claude --remote-control <name> --name <name> --model <model> --effort <effort> [-- <prompt>]
 \end{plain}
 
 Claude Code sets \code{CLAUDECODE}, \code{CLAUDE\_CODE\_CHILD\_SESSION},
@@ -1316,7 +1330,7 @@ wrapper between Claude Code and nouez would hide the caller from that check.
 Claude Code asks whether the user trusts a folder the first time it runs there, and records the
 answer in its state file, \code{\textasciitilde/.claude.json} (in \code{\$CLAUDE\_CONFIG\_DIR} when
 that is set), as \code{hasTrustDialogAccepted = true} in the folder's entry under \code{projects},
-with forward slashes in the folder's name on Windows. nouez only reads it. Claude Code's
+with forward slashes in the folder's name on Windows. Claude Code's
 documentation gives the rule nouez follows: outside a git repository, trust on a folder covers the
 folders inside it, except git repositories; in a repository, trust is recorded for the
 repository's root, and for a linked worktree, its main checkout's root. nouez finds that from the
@@ -1329,9 +1343,25 @@ other files would still be taken for a checkout, as \code{git worktree list} tak
 submodule is its own repository. So a trusted \code{C:/Users/me/Projects} covers \code{Projects/notes} but not the repository \code{Projects/nouez}. A state file that is
 missing or can't be parsed also means nouez doesn't know.
 
-nouez doesn't write the state file. Every running Claude Code session rewrites it, with the user's
-MCP servers and project settings in it, and nothing outside Claude Code can update it without the
-risk of undoing a change a session saves at the same moment.
+With \code{trust: true} nouez sets that one value, for the folder above, and nothing else. It
+refuses the home folder, a drive's root and Claude Code's own folder (where Claude Code doesn't keep
+trust), and a key it can't place. It reads the file and parses it, adding a \code{projects} table if there is none; a file it
+can't read or parse, whose \code{projects} isn't a table, or whose entry for the folder isn't one, is
+left alone. It checks that the changed JSON reads back equal to what it means to write (a number
+too big for a float, or text that can't be written as UTF-8, means it leaves the file alone), then copies the file as
+read to a new dated backup in its own folder (\code{\%LOCALAPPDATA\%\textbackslash
+nouez\textbackslash claude-json-backups} on Windows, \code{\$XDG\_STATE\_HOME} or
+\code{\textasciitilde/.local/state} elsewhere; a relative one is ignored; created private), reads the copy back, and keeps
+the newest 20. Just before replacing the file it reads it again: if a session has written it in
+the meantime, it starts over from that version (three tries). The new text goes to a temporary
+file of its own beside the state file and is moved into place in one step; half a second later
+nouez reads the trust back.
+
+That narrows the risk but can't remove it. Every running Claude Code session rewrites the state
+file, with the user's MCP servers and project settings in it, and nothing outside Claude Code can
+lock it, so a session saving in the instant between nouez's last check and its replace could lose
+that change, and a session that rewrites the file from what it read earlier could drop nouez's.
+The read-back catches the second; the backups are there for the first.
 
 % =============================================================================
 \section{Limits and constants}
