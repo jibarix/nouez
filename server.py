@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.8.0"
+SERVER_VERSION = "0.9.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -61,6 +61,11 @@ PARTIAL_CHARS = 4_000  # how much of a still-running turn's output a timeout sho
 PROGRESS_SECONDS = 10  # least time between two progress notifications for one call
 BRIDGE_SOURCE = "nouez"  # threadSource tag on sessions started by StartConsultant
 SANDBOX = "read-only"
+RELEASES_URL = "https://api.github.com/repos/jibarix/nouez/releases/latest"
+RELEASE_PAGE = "https://github.com/jibarix/nouez/releases/tag/v{}"
+RELEASE_CHECK_SECONDS = 24 * 60 * 60  # how long a looked-up latest release is trusted
+RELEASE_RETRY_SECONDS = 60 * 60  # how long after a failed lookup the next one waits
+RELEASE_TIMEOUT = 3  # seconds each network step of the lookup may block; it runs in the background
 # How Codex 0.160.1 reports a session whose history isn't written yet: before the first
 # message (titled or not), and in the moment the first turn's rollout file is created.
 NO_HISTORY_ERRORS = ("not materialized", "missing source rollout", "no rollout found", "is empty",
@@ -71,6 +76,8 @@ _send_locks_guard = threading.Lock()
 _watch_pending = set()  # consultants to open in a terminal once their first turn starts
 _unwatched = set()  # StartConsultant sessions started with watch=false: no automatic pane
 _update_noted = set()  # latest Codex versions StartConsultant has already told about
+_nouez_latest = None  # the latest nouez release found this process, e.g. "0.9.0"
+_nouez_noted = False  # whether StartConsultant has told about it
 _cancel_events = {}  # MCP request id -> Event set by notifications/cancelled
 _cancel_guard = threading.Lock()
 _client_caps = {}  # capabilities Claude Code advertised in initialize
@@ -752,6 +759,169 @@ def update_notice(info):
             "run these in a shell: " + "; ".join(steps) + ".")
 
 
+RELEASE_VERSION = re.compile(r"\d{1,6}\.\d{1,6}\.\d{1,6}")
+RELEASE_CACHE_BYTES = 4096  # a cache file bigger than this isn't nouez's
+
+
+def update_check_off(env=None):
+    """Whether the user turned off the nouez release check with NOUEZ_NO_UPDATE_CHECK."""
+    value = (os.environ if env is None else env).get("NOUEZ_NO_UPDATE_CHECK", "").strip().lower()
+    return value not in ("", "0", "false", "no")
+
+
+def release_cache_file():
+    """Where the latest release looked up is kept, in the user's own cache folder."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(os.path.join("~", "AppData", "Local"))
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser(os.path.join("~", ".cache"))
+    return os.path.join(base, "nouez", "latest-release.json")
+
+
+def fetch_latest_release():
+    """The version of the latest nouez release on GitHub, e.g. "0.9.0" for the tag "v0.9.0",
+    or None. GitHub's latest-release answer leaves out drafts and pre-releases."""
+    req = urllib.request.Request(RELEASES_URL, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": f"nouez/{SERVER_VERSION}"})
+    with urllib.request.urlopen(req, timeout=RELEASE_TIMEOUT) as r:
+        data = json.loads(r.read(1_000_000).decode("utf-8"))
+    tag = data.get("tag_name") if isinstance(data, dict) else None
+    if isinstance(tag, str) and tag.startswith("v") and RELEASE_VERSION.fullmatch(tag[1:]):
+        return tag[1:]
+    return None
+
+
+def read_release_cache(path, now):
+    """(fresh, latest) from the cache file. A successful lookup stays fresh for a day, a
+    failed one (latest None) for an hour; anything unreadable or odd is not fresh."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read(RELEASE_CACHE_BYTES + 1)
+        if len(text) > RELEASE_CACHE_BYTES:
+            return False, None
+        cache = json.loads(text)
+        checked, latest = cache["checked"], cache["latest"]
+        if isinstance(checked, bool) or not isinstance(checked, (int, float)) or not math.isfinite(checked):
+            return False, None
+        if latest is not None and not (isinstance(latest, str) and RELEASE_VERSION.fullmatch(latest)):
+            return False, None
+        keep = RELEASE_CHECK_SECONDS if latest else RELEASE_RETRY_SECONDS
+        return 0 <= now - checked < keep, latest
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return False, None
+
+
+def save_release_cache(path, now, latest):
+    """Write the cache through a temporary file of its own, so servers starting together
+    don't write into the same file; a failure leaves no temporary file behind."""
+    tmp = None
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="latest-release.", suffix=".tmp", dir=os.path.dirname(path))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"checked": now, "latest": latest}, f)
+        os.replace(tmp, path)
+        tmp = None
+    except OSError:
+        pass
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def latest_release(now=None):
+    """The latest nouez release: from the cache file if it's fresh, otherwise from GitHub.
+    The answer is saved for next time, and so is a failure, so an offline computer or a rate
+    limit means one attempt an hour rather than one per server. None if there's no answer."""
+    now = time.time() if now is None else now
+    path = release_cache_file()
+    fresh, latest = read_release_cache(path, now)
+    if fresh:
+        return latest
+    try:
+        latest = fetch_latest_release()
+    except Exception:  # offline, a proxy, a rate limit, a bad answer: say nothing
+        latest = None
+    save_release_cache(path, now, latest)
+    return latest
+
+
+def check_for_release():
+    global _nouez_latest
+    if update_check_off():
+        return
+    try:
+        latest = latest_release()
+    except Exception:  # an optional check: never let it surface anywhere
+        return
+    if latest:
+        with _send_locks_guard:
+            _nouez_latest = latest
+
+
+def start_release_check():
+    """Look up the latest nouez release in the background, so no tool call waits for it. A
+    thread that can't start just means no check: the initialize answer is already sent."""
+    if update_check_off():
+        return
+    try:
+        threading.Thread(target=check_for_release, daemon=True).start()
+    except Exception as e:
+        log(f"release check not started: {e}")
+
+
+def shell_literal(path):
+    """The path in single quotes, which PowerShell, Bash and zsh all read literally, or None if
+    it holds a single quote or a control character (those would need shell-specific quoting).
+    PowerShell also ends a single-quoted string at the typographic quotes ‘ ’ ‚ ‛."""
+    if any(c in "'‘’‚‛" or ord(c) < 32 or ord(c) == 127 for c in path):
+        return None
+    return f"'{path}'"
+
+
+def nouez_update_notice():
+    """A note for StartConsultant's result when a newer nouez is released, or "" (also once it
+    has been given in this server process)."""
+    global _nouez_noted
+    with _send_locks_guard:
+        latest = _nouez_latest
+        if (not latest or _nouez_noted or not RELEASE_VERSION.fullmatch(latest)
+                or version_key(latest) <= version_key(SERVER_VERSION)):
+            return ""
+        _nouez_noted = True
+    folder = os.path.dirname(os.path.abspath(__file__))
+    page = RELEASE_PAGE.format(latest)
+    shown = folder.replace("\\", "/") if os.name == "nt" else folder
+    quoted = shell_literal(shown)
+    reconnect = ("ask the user to run /mcp and reconnect consultants, which loads the new "
+                 "version; the Codex consultants keep their sessions.")
+    if os.path.exists(os.path.join(folder, ".git")) and quoted:
+        how = (f"run `git -C {quoted} pull` in a shell. If git fails (local changes, a conflict, "
+               "no branch checked out), stop there: tell the user what git said, don't ask them "
+               "to reconnect, and don't discard, stash or switch anything without the user's say. "
+               "Only after the pull succeeds, " + reconnect)
+    elif os.path.exists(os.path.join(folder, ".git")):
+        how = (f"tell the user to run git pull themselves in the nouez folder {json.dumps(shown)}, "
+               "whose name needs quoting this notice doesn't attempt; once it succeeds, " + reconnect)
+    else:
+        how = f"tell the user to download it from {page} into {json.dumps(shown)}; then " + reconnect
+    return (f"nouez {latest} is out; this server is {SERVER_VERSION}. What changed: {page}. "
+            "Tell the user and go ahead with the consultation. Only if the user asks you to update, "
+            + how)
+
+
+def safe_nouez_update_notice():
+    """nouez_update_notice, but an optional note can never fail a consultation."""
+    try:
+        return nouez_update_notice()
+    except Exception as e:
+        log(f"nouez update notice skipped: {e}")
+        return ""
+
+
 def viewer_running(thread_id):
     """Whether some `codex resume <id>` is already showing the session, whether open_terminal
     started it or the user did. Errs toward False, so a failed check still opens a window."""
@@ -1201,28 +1371,121 @@ def open_window(cwd, argv, title):
     return os.path.basename(term)
 
 
+def trust_key(path):
+    """The folder Claude Code keys its trust for `path` on, and whether it is in git. In git it is
+    the repository's root (for a linked worktree, the main checkout's root), and the trust covers
+    the whole repository; outside git it is the folder, and the trust covers the folders inside it
+    except git repositories. The key is None for a worktree whose main checkout can't be told."""
+    root = git_root(path)
+    if not root:
+        return os.path.abspath(path), False
+    dotgit = os.path.join(root, ".git")
+    if os.path.isfile(dotgit):  # a linked worktree or a submodule: `gitdir: <path>`
+        try:
+            with open(dotgit, encoding="utf-8") as f:
+                m = re.match(r"gitdir:\s*(.+)", f.read().strip())
+            if not m:
+                return None, True
+            gitdir = os.path.normpath(os.path.join(root, m.group(1).strip()))
+            commondir = os.path.join(gitdir, "commondir")
+            if not os.path.isfile(commondir):
+                return root, True  # a submodule (its own repository) or a separate git dir
+            with open(commondir, encoding="utf-8") as f:
+                common = os.path.normpath(os.path.join(gitdir, f.read().strip()))
+        except (OSError, UnicodeError):
+            return None, True
+        return _main_checkout(common), True
+    return root, True
+
+
+def _main_checkout(common):
+    """The main checkout whose .git is the common git dir `common`, or None if that can't be told.
+    A separate git dir (`git init --separate-git-dir`) can itself be named .git, in a folder that
+    is no checkout, and git records no link back to the checkout; so the folder counts only when
+    its .git is that directory and it holds something besides it."""
+    if os.path.basename(common) != ".git" or not os.path.isdir(common):
+        return None
+    candidate = os.path.dirname(common)
+    try:
+        if not os.path.samefile(os.path.join(candidate, ".git"), common):
+            return None
+        if not any(name != ".git" for name in os.listdir(candidate)):
+            return None  # only the git data: a separate git dir's holder, not a checkout
+    except OSError:
+        return None
+    return candidate
+
+
+def _trust_norm(p):
+    return os.path.normcase(os.path.abspath(p)).rstrip("\\/")
+
+
 def folder_trusted(path):
-    """Whether Claude Code has recorded the user's trust in a folder or one above it (None if unknown)."""
+    """Whether Claude Code would start in `path` without asking whether to trust it (None if unknown):
+    the user accepted the trust dialog for its repository, or, outside git, for it or a folder above it."""
     try:
         with open(claude_state_file(), encoding="utf-8") as f:
             projects = json.load(f).get("projects") or {}
-    except (OSError, ValueError, AttributeError):
+        trusted = {_trust_norm(p) for p, v in projects.items() if isinstance(v, dict) and v.get("hasTrustDialogAccepted")}
+    except (OSError, ValueError, AttributeError, TypeError):
         return None
-    norm = lambda p: os.path.normcase(os.path.abspath(p))
-    trusted = [norm(p) for p, v in projects.items() if isinstance(v, dict) and v.get("hasTrustDialogAccepted")]
-    target = norm(path)
-    return any(target == p or target.startswith(p.rstrip("\\/") + os.sep) for p in trusted)
+    key, in_git = trust_key(path)
+    if key is None:
+        return None
+    key = _trust_norm(key)
+    if in_git:
+        return key in trusted  # a folder above a repository doesn't cover it
+    return any(key == p or key.startswith(p + os.sep) for p in trusted)
 
 
 def open_claude_session(args, cancel=None, progress=None):
     cwd = args.get("cwd")
-    if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
-        raise BridgeError("cwd must be the absolute path of an existing folder.")
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        raise BridgeError("cwd must be an absolute path.")
     cwd = os.path.abspath(cwd)
+    created = False
+    if flag(args, "create") and not os.path.exists(cwd):
+        parent = os.path.dirname(cwd)
+        if not os.path.isdir(parent):
+            raise BridgeError(f"Can't create {cwd}: its parent folder {parent} doesn't exist.")
+        os.mkdir(cwd)
+        created = True
+    if not os.path.isdir(cwd):
+        raise BridgeError("cwd must be the absolute path of an existing folder "
+                          "(or pass create=true to make a new one).")
     name = args.get("name") or os.path.basename(cwd.rstrip("\\/")) or "claude"
     prompt = args.get("prompt") or ""
     if not isinstance(name, str) or not isinstance(prompt, str):
         raise BridgeError("name and prompt must be strings.")
+    notes = [f"Created the folder {cwd}."] if created else []
+    trusted = folder_trusted(cwd)
+    key, in_git = trust_key(cwd)
+    if trusted is False and not flag(args, "open_untrusted"):
+        return " ".join(notes + [
+            f"Not opened: Claude Code hasn't been trusted in {key}"
+            + (" (a git repository is trusted on its own, not through a folder above it)" if in_git else "")
+            + ", so a session there would wait at the trust question on the computer and couldn't "
+            "connect to the Claude app until someone answers it. nouez doesn't answer it for the user. "
+            "Tell the user: they can answer it on the computer, once, and then ask again; if they're at "
+            "the computer, or want the window opened anyway to answer it there, call OpenClaudeSession "
+            "again with open_untrusted=true."])
+    asks = []
+    if trusted and key:
+        exact = _trust_norm(key)
+        try:
+            with open(claude_state_file(), encoding="utf-8") as f:
+                projects = json.load(f).get("projects") or {}
+            exact_trusted = any(_trust_norm(p) == exact and isinstance(v, dict) and v.get("hasTrustDialogAccepted")
+                                for p, v in projects.items())
+        except (OSError, ValueError, AttributeError, TypeError):
+            exact_trusted = False
+        project = git_root(cwd) or cwd  # the launched checkout: a worktree has its own files
+        if not exact_trusted and os.path.isfile(os.path.join(project, ".claude", "settings.json")):
+            asks.append("its .claude/settings.json may bring the trust question back (allow rules and "
+                        "additional directories need the folder itself trusted, not just a folder above it)")
+        if os.path.isfile(os.path.join(project, ".mcp.json")):
+            asks.append("its .mcp.json servers are approved separately, so Claude Code may ask before "
+                        "connecting them")
     fd, spec = tempfile.mkstemp(prefix="nouez-claude-", suffix=".json")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump({"cwd": cwd, "name": name, "prompt": prompt}, f)
@@ -1231,12 +1494,19 @@ def open_claude_session(args, cancel=None, progress=None):
     except Exception:
         os.remove(spec)
         raise
-    out = (f"Opened {how} in {cwd} running Claude Code with Remote Control, named \"{name}\". It is a "
-           "normal session: its transcript is saved and it can be resumed later. It appears in the "
-           "Claude app's session list under that name once it connects, in a few seconds.")
-    if folder_trusted(cwd) is False:
+    out = " ".join(notes + [
+        f"Opened {how} in {cwd} running Claude Code with Remote Control, named \"{name}\". It is a "
+        "normal session: its transcript is saved and it can be resumed later. It appears in the "
+        "Claude app's session list under that name once it connects, in a few seconds."])
+    if trusted is False:
         out += (" Warning: Claude Code hasn't been trusted in this folder yet, so the new session is "
-                "waiting at the trust prompt on the computer and won't connect until someone answers it there.")
+                "waiting at the trust question on the computer and won't connect until someone answers it there.")
+    elif trusted is None:
+        out += (" Note: nouez can't tell whether Claude Code has been trusted in this folder (its settings "
+                "couldn't be read, or the git layout is unusual). If it hasn't, the session is waiting at "
+                "the trust question on the computer.")
+    elif asks:
+        out += " Note: the session may wait for an answer on the computer: " + "; ".join(asks) + "."
     return out
 
 
@@ -1509,7 +1779,7 @@ def start_consultant(args, cancel=None, progress=None):
             thread = client.request("thread/start", params)["thread"]
             if args.get("title"):
                 client.request("thread/name/set", {"threadId": thread["id"], "name": args["title"]})
-        notice = update_notice(client.info)
+        notice = "\n".join(n for n in (safe_nouez_update_notice(), update_notice(client.info)) if n)
     finally:
         client.close()
 
@@ -1868,12 +2138,16 @@ TOOLS = [
             "their phone or the web. Use when the user asks for a new Claude Code session, for "
             "example for another project. The session starts as if the user had typed `claude` in a "
             "fresh terminal: its transcript is saved, unlike a `claude` started from your own shell, "
-            "which inherits this session's environment."
+            "which inherits this session's environment. If Claude Code hasn't been trusted in the "
+            "folder, nothing is opened and the result says what to tell the user: trusting a folder is "
+            "the user's answer to Claude Code's own question on the computer, which nouez never gives."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "cwd": {"type": "string", "description": "Absolute path of the project folder the session works in."},
+                "create": {"type": "boolean", "description": "Create the folder if it doesn't exist (its parent must exist). Use when the user asks for a session in a new folder."},
+                "open_untrusted": {"type": "boolean", "description": "Open the window even though Claude Code hasn't been trusted in the folder, so the user can answer the trust question on the computer. Default false. Set it only when the user asks for that."},
                 "name": {"type": "string", "description": "Session name, shown in the Claude app's session list. Default: the folder's name."},
                 "prompt": {"type": "string", "description": "Optional first message for the new session. Leave it out unless the user gave one."},
             },
@@ -2041,6 +2315,7 @@ def dispatch(msg, cancel):
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             "instructions": INSTRUCTIONS,
         })
+        start_release_check()
     elif method == "ping":
         respond(msg_id, {})
     elif method == "tools/list":

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -25,11 +26,11 @@ import server  # noqa: E402
 class Server:
     """server.py in a subprocess, spoken to one JSON-RPC line at a time."""
 
-    def __init__(self):
+    def __init__(self, env=None):
         self.proc = subprocess.Popen(
             [sys.executable, "-I", "-B", os.path.join(ROOT, "server.py")],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            encoding="utf-8", cwd=ROOT,
+            encoding="utf-8", cwd=ROOT, env=env or {**os.environ, "NOUEZ_NO_UPDATE_CHECK": "1"},
         )
         self.lines = queue.Queue()
         threading.Thread(target=self._read, daemon=True).start()
@@ -70,6 +71,23 @@ class ProtocolTest(unittest.TestCase):
         for requested in server.PROTOCOL_VERSIONS:
             reply = self.server.request(1, "initialize", {"protocolVersion": requested, "capabilities": {}})
             self.assertEqual(reply["result"]["protocolVersion"], requested)
+
+    def test_initialize_with_the_release_check_on(self):
+        # The check runs, but a cached failed lookup from just now keeps it off the network.
+        cache = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cache)
+        os.mkdir(os.path.join(cache, "nouez"))
+        with open(os.path.join(cache, "nouez", "latest-release.json"), "w", encoding="utf-8") as f:
+            json.dump({"checked": time.time(), "latest": None}, f)
+        env = {**os.environ, "LOCALAPPDATA": cache, "XDG_CACHE_HOME": cache}
+        env.pop("NOUEZ_NO_UPDATE_CHECK", None)
+        live = Server(env)
+        self.addCleanup(live.close)
+        reply = live.request(1, "initialize", {"protocolVersion": server.PROTOCOL_VERSIONS[0], "capabilities": {}})
+        self.assertIn("result", reply)
+        self.assertEqual(live.request(2, "ping"), {"jsonrpc": "2.0", "id": 2, "result": {}})
+        with self.assertRaises(queue.Empty):
+            live.recv(timeout=0.5)  # one answer to initialize, nothing more
 
     def test_unknown_version_gets_latest_supported(self):
         reply = self.server.request(1, "initialize", {"protocolVersion": "1900-01-01", "capabilities": {}})
@@ -339,6 +357,288 @@ class UpdateNoticeTest(unittest.TestCase):
     def test_versions_compare_as_numbers(self):
         self.assertLess(server.version_key("0.99.0"), server.version_key("0.165.0"))
         self.assertEqual(server.version_key("0.165.0-alpha.1"), (0, 165, 0))
+
+
+class NouezUpdateTest(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        self.cache = os.path.join(folder, "nouez", "latest-release.json")
+        patch = mock.patch.object(server, "release_cache_file", return_value=self.cache)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def notice(self, latest, current="0.9.0"):
+        with mock.patch.object(server, "_nouez_latest", latest), \
+             mock.patch.object(server, "_nouez_noted", False), \
+             mock.patch.object(server, "SERVER_VERSION", current):
+            return server.nouez_update_notice(), server.nouez_update_notice()
+
+    def test_newer_release_told_once(self):
+        first, second = self.notice("0.10.0")
+        self.assertIn("nouez 0.10.0 is out; this server is 0.9.0", first)
+        self.assertIn("releases/tag/v0.10.0", first)
+        self.assertIn("go ahead with the consultation", first)
+        self.assertIn("/mcp", first)
+        if os.path.exists(os.path.join(ROOT, ".git")):
+            self.assertIn("pull`", first)
+            self.assertIn("don't discard", first)
+        self.assertEqual(second, "")
+
+    def test_nothing_when_current_newer_or_unknown(self):
+        self.assertEqual(self.notice("0.9.0")[0], "")
+        self.assertEqual(self.notice("0.8.0")[0], "")
+        self.assertEqual(self.notice(None)[0], "")
+
+    def test_fresh_cache_skips_github(self):
+        os.makedirs(os.path.dirname(self.cache))
+        with open(self.cache, "w", encoding="utf-8") as f:
+            json.dump({"checked": 1000, "latest": "0.9.1"}, f)
+        with mock.patch.object(server, "fetch_latest_release") as fetch:
+            self.assertEqual(server.latest_release(now=1000 + 3600), "0.9.1")
+        fetch.assert_not_called()
+
+    def test_stale_or_bad_cache_looks_up_and_saves(self):
+        os.makedirs(os.path.dirname(self.cache))
+        for cache in ({"checked": 1000, "latest": "0.9.1"}, {"checked": 1000, "latest": "; rm -rf"}, ["x"]):
+            with open(self.cache, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            with mock.patch.object(server, "fetch_latest_release", return_value="0.9.2") as fetch:
+                self.assertEqual(server.latest_release(now=1000 + 2 * 86400), "0.9.2")
+            fetch.assert_called_once()
+            with open(self.cache, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"checked": 1000 + 2 * 86400, "latest": "0.9.2"})
+
+    def test_lookup_failure_is_silent_and_waits_an_hour(self):
+        with mock.patch.object(server, "fetch_latest_release", side_effect=OSError("offline")) as fetch:
+            self.assertIsNone(server.latest_release(now=5))
+            self.assertIsNone(server.latest_release(now=5 + 1800))  # another server, half an hour on
+            self.assertEqual(fetch.call_count, 1)
+            self.assertIsNone(server.latest_release(now=5 + 3600))
+            self.assertEqual(fetch.call_count, 2)
+        with open(self.cache, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"checked": 5 + 3600, "latest": None})
+        self.assertEqual(os.listdir(os.path.dirname(self.cache)), ["latest-release.json"])
+
+    def test_odd_cache_is_not_trusted(self):
+        os.makedirs(os.path.dirname(self.cache))
+        for text in ('{"checked": 1000, "latest": "0.%s.0"}' % ("9" * 5000),
+                     '{"checked": 1e400, "latest": "0.9.1"}', '{"checked": NaN, "latest": "0.9.1"}',
+                     '{"checked": true, "latest": "0.9.1"}', '{"checked": 1000, "latest": "0.9.1", "x": "%s"}' % ("y" * 5000)):
+            with open(self.cache, "w", encoding="utf-8") as f:
+                f.write(text)
+            self.assertEqual(server.read_release_cache(self.cache, 1000), (False, None), text[:60])
+            with mock.patch.object(server, "fetch_latest_release", return_value=None):
+                self.assertIsNone(server.latest_release(now=1000))
+
+    def test_save_failure_leaves_nothing_behind(self):
+        os.makedirs(os.path.dirname(self.cache))
+        with mock.patch.object(server.os, "replace", side_effect=OSError("locked")):
+            server.save_release_cache(self.cache, 1, "0.9.1")
+        self.assertEqual(os.listdir(os.path.dirname(self.cache)), [])
+
+    def test_concurrent_writers_each_use_their_own_temporary_file(self):
+        def save(n):
+            for i in range(20):
+                server.save_release_cache(self.cache, n * 100 + i, "0.9.%d" % n)
+        threads = [threading.Thread(target=save, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        fresh, latest = server.read_release_cache(self.cache, 400)
+        self.assertIn(latest, {"0.9.0", "0.9.1", "0.9.2", "0.9.3"})
+        self.assertEqual([n for n in os.listdir(os.path.dirname(self.cache)) if n.endswith(".tmp")], [])
+
+    def test_thread_start_failure_is_contained(self):
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_UPDATE_CHECK": ""}), \
+             mock.patch.object(server.threading, "Thread") as thread:
+            thread.return_value.start.side_effect = RuntimeError("can't start new thread")
+            server.start_release_check()  # doesn't raise
+
+    def test_notice_failure_cannot_fail_the_consultation(self):
+        with mock.patch.object(server, "nouez_update_notice", side_effect=ValueError("odd")):
+            self.assertEqual(server.safe_nouez_update_notice(), "")
+        self.assertEqual(self.notice("0.%s.0" % ("9" * 5000))[0], "")
+
+    def notice_in(self, folder, git, latest="0.10.0"):
+        real_exists = os.path.exists
+        with mock.patch.object(server.os.path, "abspath", return_value=os.path.join(folder, "server.py")), \
+             mock.patch.object(server.os.path, "exists",
+                               side_effect=lambda p: git if p == os.path.join(folder, ".git") else real_exists(p)):
+            return self.notice(latest)[0]
+
+    def test_hostile_folder_names_are_not_put_in_a_command(self):
+        base = "C:\\Users\\you" if os.name == "nt" else "/home/you"
+        for name in ("$(Write-Output injected)", "`calc`", '"quoted"', "a;b"):
+            text = self.notice_in(os.path.join(base, name, "nouez"), True)
+            self.assertIn("git -C '", text)
+            command = text.split("`git -C ")[1].split("` in a shell")[0]
+            self.assertTrue(command.startswith("'") and command.endswith("' pull"), command)
+            self.assertEqual(command.count("'"), 2)
+        for name in ("it's", "it’s; Write-Output INJECTED; #", "‘a", "‚b", "‛c", "a\nb"):
+            text = self.notice_in(os.path.join(base, name, "nouez"), True)
+            self.assertNotIn("git -C", text)
+            self.assertIn("git pull themselves", text)
+
+    def test_git_failure_stops_before_reconnect(self):
+        text = self.notice_in(os.path.join(os.path.abspath(os.sep), "x", "nouez"), True)
+        self.assertLess(text.index("If git fails"), text.index("Only after the pull succeeds"))
+        self.assertLess(text.index("Only after the pull succeeds"), text.index("/mcp"))
+        self.assertIn("don't ask them to reconnect", text)
+
+    def test_download_notice_without_git(self):
+        text = self.notice_in(os.path.join(os.path.abspath(os.sep), "x", "nouez"), False)
+        self.assertNotIn("git -C", text)
+        self.assertNotIn("pull", text)
+        self.assertIn("download it from https://github.com/jibarix/nouez/releases/tag/v0.10.0", text)
+        self.assertIn("/mcp", text)
+
+    def test_github_answer_parsed(self):
+        def answer(body):
+            resp = mock.MagicMock()
+            resp.__enter__.return_value.read.return_value = json.dumps(body).encode()
+            return resp
+        with mock.patch.object(server.urllib.request, "urlopen", return_value=answer({"tag_name": "v1.2.3"})) as op:
+            self.assertEqual(server.fetch_latest_release(), "1.2.3")
+        req = op.call_args[0][0]
+        self.assertEqual(req.full_url, server.RELEASES_URL)
+        self.assertTrue(req.get_header("User-agent").startswith("nouez/"))
+        for body in ({"tag_name": "v1.2.3`; echo"}, {"tag_name": None}, ["v1.2.3"], {"tag_name": "1.2.3"},
+                     {"tag_name": "v1.2.%s" % ("3" * 50)}):
+            with mock.patch.object(server.urllib.request, "urlopen", return_value=answer(body)):
+                self.assertIsNone(server.fetch_latest_release())
+
+    def test_opt_out(self):
+        for value, off in (("", False), ("0", False), ("false", False), ("1", True), ("yes", True)):
+            self.assertEqual(server.update_check_off({"NOUEZ_NO_UPDATE_CHECK": value}), off)
+        self.assertFalse(server.update_check_off({}))
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_UPDATE_CHECK": "1"}), \
+             mock.patch.object(server, "latest_release") as latest, \
+             mock.patch.object(server.threading, "Thread") as thread:
+            server.check_for_release()
+            server.start_release_check()
+        latest.assert_not_called()
+        thread.assert_not_called()
+
+
+class TrustTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.config = os.path.join(self.tmp, "config")
+        os.mkdir(self.config)
+        self.state = os.path.join(self.config, ".claude.json")
+        patch = mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": self.config})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.projects = os.path.join(self.tmp, "Projects")
+        self.plain = os.path.join(self.projects, "plain", "sub")
+        self.repo = os.path.join(self.projects, "repo")
+        os.makedirs(self.plain)
+        os.makedirs(os.path.join(self.repo, ".git"))
+        os.makedirs(os.path.join(self.repo, "src"))
+        self.write({"numStartups": 3, "projects": {self.slash(self.projects): {"hasTrustDialogAccepted": True},
+                                                   "other": {"allowedTools": ["x"]}}, "é": "ü"})
+
+    def slash(self, p):
+        return p.replace("\\", "/") if os.name == "nt" else p
+
+    def write(self, data):
+        with open(self.state, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2, ensure_ascii=False))
+
+    def read(self):
+        with open(self.state, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_trust_reaches_plain_folders_but_not_repositories(self):
+        self.assertTrue(server.folder_trusted(self.plain))
+        self.assertFalse(server.folder_trusted(self.repo))
+        self.assertFalse(server.folder_trusted(os.path.join(self.repo, "src")))
+        self.assertFalse(server.folder_trusted(self.tmp))
+
+    def worktree(self, gitdir, commondir):
+        wt = os.path.join(self.tmp, "wt")
+        os.makedirs(gitdir)
+        os.mkdir(wt)
+        with open(os.path.join(wt, ".git"), "w") as f:
+            f.write(f"gitdir: {gitdir}\n")
+        if commondir is not None:
+            with open(os.path.join(gitdir, "commondir"), "w") as f:
+                f.write(commondir + "\n")
+        return wt
+
+    def test_worktree_is_keyed_on_the_main_checkout(self):
+        wt = self.worktree(os.path.join(self.repo, ".git", "worktrees", "wt"), "../..")
+        self.assertEqual(server.trust_key(wt), (self.repo, True))
+
+    def test_worktree_with_a_separate_git_dir_is_unknown(self):
+        meta = os.path.join(self.tmp, "metadata")
+        wt = self.worktree(os.path.join(meta, "worktrees", "wt"), "../..")
+        self.assertEqual(server.trust_key(wt), (None, True))
+        self.assertIsNone(server.folder_trusted(wt))
+
+    def test_separate_git_dir_named_dot_git_is_unknown(self):
+        # git init --separate-git-dir=<metadata>/.git: the folder holding it is no checkout.
+        common = os.path.join(self.tmp, "metadata", ".git")
+        wt = self.worktree(os.path.join(common, "worktrees", "wt"), "../..")
+        self.assertEqual(server.trust_key(wt), (None, True))
+        self.assertIsNone(server.folder_trusted(wt))
+
+    def test_worktree_files_are_checked_in_the_worktree(self):
+        wt = self.worktree(os.path.join(self.repo, ".git", "worktrees", "wt"), "../..")
+        with open(os.path.join(wt, ".mcp.json"), "w") as f:
+            f.write("{}")
+        os.makedirs(os.path.join(wt, ".claude"))
+        with open(os.path.join(wt, ".claude", "settings.json"), "w") as f:
+            f.write("{}")
+        self.write({"projects": {self.slash(self.repo): {"hasTrustDialogAccepted": True}}})
+        with mock.patch.object(server, "open_window", return_value="a window") as open_window:
+            out = server.open_claude_session({"cwd": wt})
+        os.remove(open_window.call_args[0][1][-1])
+        self.assertIn(".mcp.json servers are approved separately", out)
+        self.assertNotIn("settings.json", out)  # the repository itself is trusted exactly
+
+    def test_submodule_is_its_own_repository(self):
+        wt = self.worktree(os.path.join(self.repo, ".git", "modules", "sub"), None)
+        self.assertEqual(server.trust_key(wt), (wt, True))
+
+    def test_unreadable_state_is_unknown(self):
+        os.remove(self.state)
+        self.assertIsNone(server.folder_trusted(self.plain))
+
+    def test_nouez_never_writes_claude_state(self):
+        self.assertFalse(hasattr(server, "trust_folder"))
+        with open(self.state, encoding="utf-8") as f:
+            before = f.read()
+        with mock.patch.object(server, "open_window", return_value="a window") as open_window:
+            server.open_claude_session({"cwd": self.repo})
+            server.open_claude_session({"cwd": self.repo, "open_untrusted": True})
+            server.open_claude_session({"cwd": self.plain})
+        for call in open_window.call_args_list:
+            os.remove(call[0][1][-1])
+        with open(self.state, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(os.listdir(self.config), [".claude.json"])
+
+    def test_inherited_trust_notes_what_may_still_ask(self):
+        os.makedirs(os.path.join(self.plain, ".claude"))
+        for name in (os.path.join(".claude", "settings.json"), ".mcp.json"):
+            with open(os.path.join(self.plain, name), "w") as f:
+                f.write("{}")
+        with mock.patch.object(server, "open_window", return_value="a window") as open_window:
+            out = server.open_claude_session({"cwd": self.plain})
+        os.remove(open_window.call_args[0][1][-1])
+        self.assertIn(".claude/settings.json may bring the trust question back", out)
+        self.assertIn(".mcp.json servers are approved separately", out)
+        # Trusted exactly: only the MCP servers may still ask.
+        self.write({"projects": {self.slash(self.plain): {"hasTrustDialogAccepted": True}}})
+        with mock.patch.object(server, "open_window", return_value="a window") as open_window:
+            out = server.open_claude_session({"cwd": self.plain})
+        os.remove(open_window.call_args[0][1][-1])
+        self.assertNotIn("settings.json", out)
+        self.assertIn(".mcp.json", out)
 
 
 class FakeClient:
@@ -763,6 +1063,48 @@ class OpenClaudeSessionTests(unittest.TestCase):
                                             "prompt": "a; b \"c\""})
         os.remove(argv[-1])
         self.assertIn("Remote Control", out)
+
+    def test_untrusted_folder_isnt_opened_without_an_answer(self):
+        with mock.patch.object(server, "open_window") as open_window, \
+                mock.patch.object(server, "folder_trusted", return_value=False):
+            out = server.open_claude_session({"cwd": ROOT})
+        open_window.assert_not_called()
+        self.assertIn("Not opened", out)
+        self.assertIn("open_untrusted=true", out)
+        self.assertIn("a git repository is trusted on its own", out)  # ROOT is a checkout
+
+    def test_open_untrusted_opens_with_a_warning(self):
+        with mock.patch.object(server, "open_window", return_value="a window") as open_window, \
+                mock.patch.object(server, "folder_trusted", return_value=False):
+            out = server.open_claude_session({"cwd": ROOT, "open_untrusted": True})
+        os.remove(open_window.call_args[0][1][-1])
+        self.assertIn("waiting at the trust question", out)
+
+    def test_unknown_trust_opens_with_a_note(self):
+        with mock.patch.object(server, "open_window", return_value="a window") as open_window, \
+                mock.patch.object(server, "folder_trusted", return_value=None):
+            out = server.open_claude_session({"cwd": ROOT})
+        os.remove(open_window.call_args[0][1][-1])
+        self.assertIn("can't tell whether Claude Code has been trusted", out)
+
+    def test_create_a_new_folder(self):
+        with tempfile.TemporaryDirectory() as parent:
+            cwd = os.path.join(parent, "economic recession")
+            with mock.patch.object(server, "open_window") as open_window, \
+                    mock.patch.object(server, "folder_trusted", return_value=False):
+                out = server.open_claude_session({"cwd": cwd, "create": True})
+            self.assertTrue(os.path.isdir(cwd))
+            open_window.assert_not_called()
+            self.assertIn("Created the folder", out)
+            self.assertIn("Not opened", out)
+            with mock.patch.object(server, "open_window", return_value="a window") as open_window, \
+                    mock.patch.object(server, "folder_trusted", return_value=True):
+                out = server.open_claude_session({"cwd": cwd, "create": True})
+            os.remove(open_window.call_args[0][1][-1])
+            self.assertNotIn("Created", out)  # already there
+            self.assertNotIn("Note", out)
+            with self.assertRaises(server.BridgeError):  # parent must exist
+                server.open_claude_session({"cwd": os.path.join(parent, "a", "b"), "create": True})
 
     @unittest.skipUnless(os.name == "nt", "Windows checks the process creation time")
     def test_registry_entries_need_a_matching_start_time(self):
