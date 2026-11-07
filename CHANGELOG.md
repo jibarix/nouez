@@ -6,6 +6,18 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-07
+
+Consultant panes open beside the Claude Code session that asked for them, and a session can open, list and close other Claude Code sessions on the computer. Tested with Claude Code 2.1.319 and Python 3.11.9 on Windows 11; the Codex side was last tested with Codex CLI 0.165.0 and app-server daemon 0.165.0, with nouez 0.7.1.
+
+### Added
+- `OpenClaudeSession` opens a new terminal window and starts an interactive Claude Code session there with Remote Control, so you can ask a session you're driving from your phone for another one, in another project. The session saves its transcript like one you started yourself. A `claude` started from Claude Code's own shell inherits `CLAUDE_CODE_CHILD_SESSION` and the other variables that tie it to its parent, and doesn't save its transcript; the new session starts without them. Only those go: your own settings, such as `CLAUDE_CODE_OAUTH_TOKEN` or a provider choice, stay. It runs the `claude` on your `PATH`, never one in the project folder, and passes the first prompt after `--`, so a prompt can't turn into an option. The name and first prompt reach it through a temporary file, not a command line. The result warns when the folder hasn't been trusted yet, since the new session would wait at the trust prompt on the computer.
+- `ListClaudeSessions` lists the Claude Code sessions running on the computer, whoever started them: name, process id, folder, status, whether Remote Control is on, and which one is the caller. It reads the registry Claude Code keeps in `~/.claude/sessions` (under `CLAUDE_CONFIG_DIR` if set) and, on Windows, lists an entry only while a process created at the time it records is running.
+- `CloseClaudeSession` closes one of them, such as a stuck one, by name (or process id when names repeat): it ends its `claude` process and keeps the transcript, so it can be resumed. A session `OpenClaudeSession` opened also gets its window closed; for others the terminal stays open at the shell prompt. On Windows it holds the process open from the identity check to the end, so the pid can't pass to another process in between, and it reports an error if the process is still running. It never closes the caller, and Claude is told to show you the list and close only the ones you pick.
+
+### Fixed
+- With two or more Windows Terminal windows open, a consultant's pane opened in whichever window was used last, often another Claude Code session's. It now opens in the window running the Claude Code session that asked for it. The server finds that window through Claude Code's console and brings it to the front just while `wt` runs, then gives the focus back. If Claude Code's tab isn't the selected one in its window, the consultant gets a new tab there. If the window can't be found or brought to the front, the consultant gets a new window rather than a pane in another session's window. Names and folders with a `;` no longer break `wt`, which reads it as the start of another command.
+
 ## [0.7.1] - 2026-10-28
 
 `codex app-server daemon update` works on a daemon nouez started from Git Bash. Tested with Claude Code 2.1.312, Codex CLI 0.165.0 with app-server daemon 0.165.0, Python 3.13.5 on Windows 11.
@@ -152,7 +164,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jibarix/nouez/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/jibarix/nouez/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jibarix/nouez/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/jibarix/nouez/compare/v0.6.0...v0.6.1

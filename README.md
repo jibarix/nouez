@@ -1,6 +1,6 @@
 # nouez
 
-An MCP server that lets Claude Code consult live Codex sessions.
+An MCP server that lets Claude Code consult live Codex sessions, and open, list and close Claude Code sessions on your computer, so you can start a new one from your phone.
 
 ## Why
 
@@ -10,6 +10,8 @@ Two coding agents look at a problem differently. This bridge gives each one a fi
 - **Codex is the consultant.** Claude asks it for second opinions: reviewing a plan, checking a diff, finding a bug, validating a claim, or gathering context for research. The consultant only reads; it never edits your files.
 
 Without the bridge, you run two terminals and copy text between them. With it, Claude starts a Codex consultant in the background, sends it questions, reads the answers and keeps working, all from your single Claude Code terminal. If you prefer to watch Codex work, you can still open it yourself and Claude will talk to that session instead.
+
+The same server also helps when you drive Claude Code from your phone with Remote Control: a session can open a new Claude Code session in another project on the computer, list the ones running, and close a stuck one (see [A new Claude Code session from your phone](#a-new-claude-code-session-from-your-phone)).
 
 ## Requirements
 
@@ -23,11 +25,11 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.7.1 |
-| Claude Code | 2.1.312 |
+| nouez | 0.8.0 |
+| Claude Code | 2.1.319 |
 | Codex CLI | 0.165.0 |
 | Codex app-server daemon | 0.165.0 |
-| Python | 3.13.5 |
+| Python | 3.11.9 |
 | OS | Windows 11 |
 
 Run `claude --version` and `codex --version` to see your versions. Codex updates its daemon by itself, so the daemon can be newer than the CLI; the folder under `~/.codex/packages/app-server-daemon/releases/` shows its version.
@@ -101,7 +103,7 @@ Claude calls `StartConsultant` to create a background Codex session in your proj
 
 **The consultant is always read-only.** It can read your files and run read-only commands for auditing, validation and research, but it can't change anything. It never stops to ask for approvals, because no terminal is attached to answer them. Claude does all the writing. There is no option to give a consultant write access.
 
-**3. Watch or join in (optional).** A background consultant is an ordinary Codex session. A consultant started by `StartConsultant` is shown automatically (pass `watch: false` to skip that); for a session you opened yourself, ask Claude to *"open the consultant in a terminal"* (`WatchConsultant`). Either way, `codex resume <id>` opens next to Claude Code: as a split pane in the same tab when Claude Code runs in Windows Terminal or tmux, otherwise in a new terminal window. You can read along there or type into the session yourself. Codex can't open a session before its first message, so the pane appears when Claude sends that message, and reappears on the next message if you close it. Without a split, Windows uses a new Windows Terminal window (falling back to a console window), macOS uses Terminal, and Linux uses `x-terminal-emulator`, `gnome-terminal` or `xterm`. Windows Terminal splits the active tab of the window you used most recently, and its command line can't target a particular tab, so stay on Claude Code's tab until the pane opens. If a terminal already shows the session, no second one opens. The window runs the Codex daemon's own `codex` binary, so it always matches the daemon's version.
+**3. Watch or join in (optional).** A background consultant is an ordinary Codex session. A consultant started by `StartConsultant` is shown automatically (pass `watch: false` to skip that); for a session you opened yourself, ask Claude to *"open the consultant in a terminal"* (`WatchConsultant`). Either way, `codex resume <id>` opens next to Claude Code: as a split pane in the same tab when Claude Code runs in Windows Terminal or tmux, otherwise in a new terminal window. You can read along there or type into the session yourself. Codex can't open a session before its first message, so the pane appears when Claude sends that message, and reappears on the next message if you close it. Without a split, Windows uses a new Windows Terminal window (falling back to a console window), macOS uses Terminal, and Linux uses `x-terminal-emulator`, `gnome-terminal` or `xterm`. In Windows Terminal the pane opens in the window running the Claude Code session that asked for it, even if you last used another window: nouez brings that window to the front while `wt` runs, then gives the focus back. If Claude Code's tab isn't the selected tab in its window, the consultant opens in a new tab there instead, and if the window can't be found or brought to the front (a locked screen, say), it opens in a new window of its own rather than in another session's. If a terminal already shows the session, no second one opens. The window runs the Codex daemon's own `codex` binary, so it always matches the daemon's version.
 
 ### Reusing a consultant
 
@@ -125,6 +127,12 @@ With more than one consultant running, name the one you mean. Once stopped, a co
 
 If you'd rather see Codex work in its own window, open it yourself (`cd my-project && codex`) and ask Claude to *"list the consultants and send it …"*. Claude finds the session with `ListConsultants` and talks to it the same way. `StartConsultant` never chooses your session on its own, and `SendConsultantMessage` refuses it unless Claude passes `allow_user_session: true`, which it is told to do only when you ask. The message appears in that terminal as a new prompt. Sessions you open yourself use their own permission settings and approval prompts, and `StopConsultant` won't close them.
 
+### A new Claude Code session from your phone
+
+Driving Claude Code from the Claude app with Remote Control, you can ask the session for another one: *"open a new Claude session for C:/Users/me/Projects/other"*. Claude calls `OpenClaudeSession`, which opens a new terminal window on the computer and starts `claude --remote-control <name>` in that folder. The new session shows up in the app's session list a few seconds later. It is an ordinary session that saves its transcript and can be resumed. A `claude` you start from Claude Code's own shell doesn't save its transcript, because it inherits `CLAUDE_CODE_CHILD_SESSION` and the other variables that mark it as a child session. `OpenClaudeSession` starts it without them, keeping any variable you set yourself in your Windows environment. If Claude Code hasn't been trusted in the folder yet, the new session waits at the trust prompt on the computer, and the result says so.
+
+To see what's running, ask any session *"which Claude sessions are open?"*. `ListClaudeSessions` lists every Claude Code session on the computer, whoever started it, with its name, folder, status and whether Remote Control is on. To close one, such as a stuck one, say which: *"close hours-tracker"*. `CloseClaudeSession` ends its `claude` process. A session `OpenClaudeSession` opened also gets its window closed; one you started yourself leaves its terminal at the shell prompt. The transcript stays, so `claude --resume` in that folder picks it up again. Claude shows you the list and closes only the sessions you pick, one call each, and never the one you're talking to. The list comes from `~/.claude/sessions`, which Claude Code keeps but doesn't document, so a future Claude Code version could change it.
+
 ### Tips
 
 - **Give Codex context.** Codex can read the files in its own working directory, so start it in the same repo. Tell Claude to include the specific file, diff or question in the message.
@@ -144,6 +152,9 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 | `SendConsultantMessage` | Sends a message into a session, waits 5 seconds by default, and returns the reply if it is ready by then, or the turn id and a waiter command if not. If the session is idle the message starts a new turn; if it's busy it steers the running turn. Unloaded sessions are reloaded first. Refuses a session you opened yourself unless `allow_user_session: true`. |
 | `GetConsultantReply` | Reads a reply without sending anything: the latest turn, or a specific turn id. Use it after sending with `wait: 0` or after a timeout. While the turn runs, it shows the output so far. |
 | `WatchConsultant` | Opens a session in a split pane beside Claude Code, or a new terminal window, so you can watch it or type into it. Does nothing if a terminal already shows it. |
+| `OpenClaudeSession` | Opens a new terminal window running an interactive Claude Code session with Remote Control in `cwd` (required), named `name` (default: the folder's name), optionally with a first `prompt`. The session saves its transcript like one you started yourself. |
+| `ListClaudeSessions` | Lists the Claude Code sessions running on the computer: name, process id, folder, status, Remote Control, and which one is the caller. |
+| `CloseClaudeSession` | Closes one of them by `name` (or `pid` when names repeat), keeping its transcript. Never the caller. |
 | `StopConsultant` | Archives a session that `StartConsultant` started and closes any terminal window watching it. Needs the exact name or full thread id. Refuses sessions you opened yourself. |
 
 `StartConsultant` arguments (all optional):
@@ -209,11 +220,18 @@ On Windows, if `codex app-server daemon update` fails with `Cannot connect to C:
 | `was not started by StartConsultant` | That's a session you opened yourself. Close it from its own terminal. |
 | The terminal window opens but shows an error | Make sure `codex` is on the `PATH` of new terminals, and that the session has had its first message. |
 | The terminal window asks to restart the daemon ("incompatible feature set") | The window's `codex` is a different version from the daemon. Choose **Cancel**: restarting interrupts running consultants, and running without the daemon shows a separate copy of the session. The bridge normally avoids this by using the daemon's own binary; if it warned that it couldn't find it, update the Codex CLI to the daemon's version. |
+| The consultant's pane opened in a new window instead of beside Claude Code | nouez couldn't find Claude Code's Windows Terminal window, or couldn't bring it to the front (a locked screen, or a program that isn't responding has the focus), so it used a new window rather than another session's. |
+| `cwd must be the absolute path of an existing folder` | `OpenClaudeSession` needs a full path to a folder that exists. |
+| A new session doesn't appear in the Claude app | It may be waiting at Claude Code's trust prompt on the computer: the result warns when the folder isn't trusted. Run `claude` in that folder once and answer it. Also check that `claude` is on the `PATH` of new terminals; if not, the new window says so. |
+| `No running Claude Code session matches` | The name must match exactly. The error lists the sessions that are running. |
+| `That is the session you are running in` | `CloseClaudeSession` never closes its caller. Ask another session to close it, or quit it with `/exit`. |
 | Anything else after updating Codex | Compare your versions with the [Tested with](#tested-with) table. The Codex app-server protocol may have changed. |
 
 ## How it works
 
 `codex app-server proxy` relays stdio to the daemon's control socket, which speaks JSON-RPC over WebSocket. The server does the WebSocket handshake and framing itself, opens one short-lived connection per tool call, and polls the turn until it finishes. Sessions the bridge starts are tagged with `threadSource: "nouez"`, so it can find them again after the daemon unloads them and so `StopConsultant` knows which ones it may archive.
+
+For the Claude Code session tools, nouez doesn't talk to Claude Code at all. `OpenClaudeSession` opens a terminal window that runs `server.py claude`, which clears the variables Claude Code sets to tie its commands to its session and starts `claude --remote-control`. It runs the `claude` on your `PATH`, never one in the project folder. `ListClaudeSessions` reads the registry Claude Code keeps in `~/.claude/sessions` and checks that each process is still the one that wrote its entry. `CloseClaudeSession` ends the chosen process. [docs/architecture.pdf](docs/architecture.pdf) has the details.
 
 ## Tests
 
@@ -227,11 +245,17 @@ python -m unittest discover tests
 
 - Every Claude Code session with this server enabled can send messages into **any** Codex session on the machine, and those messages run with that session's permissions and sandbox settings. Enabling the server gives Claude the ability to drive your Codex sessions. If you register the server with `--scope user`, this applies to every project you open in Claude Code.
 - Consultants started by the bridge never ask for approvals, so their read-only sandbox is the only limit. They can't edit files, but they can read anything the sandbox allows, which typically includes files outside `cwd`. Write access can't be requested through the bridge. A session you open yourself keeps its own permissions, and messages sent to it run with them.
+- `CloseClaudeSession` can end **any** Claude Code session running under your account on the computer, including ones you started yourself; only its caller is refused. Claude is told to close only sessions you pick from the list. The transcript is kept, but work in progress in that session (a running command, an unsent message) is lost.
+- `OpenClaudeSession` starts Claude Code with your normal settings and permissions in the folder you name. Its first prompt, if any, is passed through a temporary file that the new window deletes once it has read it.
 - The `nouez` tag is a guard against mistakes, not a security boundary. Any local program that can reach the Codex daemon can set the same tag, and can archive sessions directly anyway.
 
 ## Limitations
 
-- Local only: it talks to the Codex daemon on the same machine.
+- Local only: it talks to the Codex daemon on the same machine, and opens and closes Claude Code sessions on the same machine.
+- `ListClaudeSessions` reads `~/.claude/sessions` (under `CLAUDE_CONFIG_DIR` if you set it), which Claude Code keeps but doesn't document. A Claude Code update could change it. On Windows a session is listed only if its entry records when its process started, so an entry can't point at an unrelated process that reused the pid.
+- In Windows Terminal, the moment between bringing Claude Code's window to the front and `wt` opening the pane is short but not locked: if you click another window in that instant, the pane can land there. Two tabs with the same title in one window can't be told apart, so the pane may split the other one.
+- Finding Claude Code's own Windows Terminal window, and closing a session's window, are Windows-only. Elsewhere the pane opens as before, and a closed session's terminal stays open.
+- Nothing can start a session on the computer from your phone unless something there is already running and connected: an open Claude Code session with Remote Control, for instance.
 - Only the 50 most recent saved sessions are checked for unloaded consultants. Older ones can still be reached by their full thread id.
 - Uses the experimental Codex app-server protocol (`thread/start`, `thread/resume`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/name/set`, `thread/turns/list`, `thread/archive`, `turn/start`, `turn/steer`), which may change between Codex releases. See [Tested with](#tested-with).
 

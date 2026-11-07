@@ -136,9 +136,9 @@ class ProtocolTest(unittest.TestCase):
     def test_annotations(self):
         tools = {t["name"]: t["annotations"] for t in self.server.request(8, "tools/list")["result"]["tools"]}
         read_only = {name for name, a in tools.items() if a.get("readOnlyHint")}
-        self.assertEqual(read_only, {"ListConsultants", "GetConsultantReply"})
+        self.assertEqual(read_only, {"ListConsultants", "GetConsultantReply", "ListClaudeSessions"})
         destructive = {name for name, a in tools.items() if a.get("destructiveHint")}
-        self.assertEqual(destructive, {"StopConsultant"})
+        self.assertEqual(destructive, {"StopConsultant", "CloseClaudeSession"})
 
     def test_null_id_is_invalid_request(self):
         self.server.send({"jsonrpc": "2.0", "id": None, "method": "ping"})
@@ -671,6 +671,162 @@ class ReleaseTest(unittest.TestCase):
             f"v{server.SERVER_VERSION}", tag,
             f"server.py differs from {tag} but SERVER_VERSION is unchanged. Bump it and do the version "
             "step: CHANGELOG section, README table, docs/architecture.tex and PDF, tag, release.")
+
+
+class HostWindowTests(unittest.TestCase):
+    def test_title_ignores_the_spinner(self):
+        self.assertTrue(server._same_title("◐ Fix the build", "✳ Fix the build"))
+        self.assertTrue(server._same_title("Fix the build", "Fix the build"))
+        self.assertFalse(server._same_title("◐ Fix the build", "◐ Other session"))
+
+    def test_unknown_window_gets_a_window_of_its_own(self):
+        with mock.patch.object(server, "wt_host_window", return_value=None), \
+                mock.patch.object(server.subprocess, "Popen") as popen:
+            how = server.run_in_host_window("wt", ".", ["cmd", "a;b"])
+        self.assertEqual(popen.call_args[0][0], ["wt", "-w", "new", "cmd", "a\\;b"])
+        self.assertIn("new Windows Terminal window", how)
+
+    def test_semicolons_are_escaped_for_wt(self):
+        self.assertEqual(server.wt_escape("demo;calc.exe;"), "demo\\;calc.exe\\;")
+        with mock.patch.object(server.shutil, "which", return_value="wt"), \
+                mock.patch.object(server.os, "name", "nt"), \
+                mock.patch.object(server.subprocess, "Popen") as popen:
+            server.open_window("C:/a;b", ["claude"], "Claude: x;calc")
+        self.assertEqual(popen.call_args[0][0],
+                         ["wt", "-w", "new", "-d", "C:/a\\;b", "--title", "Claude: x\\;calc", "claude"])
+
+
+class OpenClaudeSessionTests(unittest.TestCase):
+    def test_only_session_variables_are_dropped(self):
+        env = {"PATH": "p", "CLAUDECODE": "1", "CLAUDE_CODE_CHILD_SESSION": "1", "CLAUDE_CODE_SESSION_ID": "x",
+               "CLAUDE_PID": "1", "AI_AGENT": "a", "CLAUDE_CODE_MESSAGING_TOKEN": "t",
+               "ANTHROPIC_MODEL": "m", "CLAUDE_CODE_OAUTH_TOKEN": "o", "CLAUDE_CODE_USE_BEDROCK": "1"}
+        self.assertEqual(server.fresh_claude_env(env),
+                         {"PATH": "p", "ANTHROPIC_MODEL": "m", "CLAUDE_CODE_OAUTH_TOKEN": "o",
+                          "CLAUDE_CODE_USE_BEDROCK": "1"})
+
+    def test_claude_is_not_taken_from_the_project(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            name = "claude.exe" if os.name == "nt" else "claude"
+            for folder in (project, bin_dir):
+                path = os.path.join(folder, name)
+                with open(path, "w") as f:
+                    f.write("")
+                os.chmod(path, 0o755)
+            cwd = os.getcwd()
+            os.chdir(project)
+            try:
+                found = server.find_program("claude", os.pathsep.join([".", "", "relative", bin_dir]))
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(os.path.dirname(found), bin_dir)
+
+    def run_helper(self, prompt, returncode=0, closed=False):
+        fd, spec = tempfile.mkstemp(prefix="nouez-claude-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"cwd": ROOT, "name": "n", "prompt": prompt}, f)
+        child = mock.Mock(pid=999999)
+        child.wait.return_value = returncode
+        marker = server.close_marker(999999)
+        if closed:
+            open(marker, "w").close()
+        with mock.patch.object(server, "find_program", return_value="claude"), \
+                mock.patch.object(server.subprocess, "Popen", return_value=child) as popen:
+            code = server.run_claude(spec)
+        self.assertFalse(os.path.exists(spec))
+        self.assertFalse(os.path.exists(marker))
+        return popen.call_args[0][0], code
+
+    def test_prompt_cannot_become_an_option(self):
+        argv, _ = self.run_helper("--dangerously-skip-permissions")
+        self.assertEqual(argv, ["claude", "--remote-control", "n", "--name", "n", "--", "--dangerously-skip-permissions"])
+        argv, _ = self.run_helper("")
+        self.assertEqual(argv, ["claude", "--remote-control", "n", "--name", "n"])
+
+    def test_helper_exits_cleanly_when_closed_on_purpose(self):
+        self.assertEqual(self.run_helper("", returncode=1, closed=True)[1], 0)
+        self.assertEqual(self.run_helper("", returncode=1)[1], 1)
+
+    def test_cwd_must_be_an_existing_absolute_folder(self):
+        for cwd in (None, "relative", os.path.join(ROOT, "no-such-folder")):
+            with self.assertRaises(server.BridgeError):
+                server.open_claude_session({"cwd": cwd})
+
+    def test_spec_is_passed_by_file(self):
+        with mock.patch.object(server, "open_window", return_value="a window") as open_window, \
+                mock.patch.object(server, "folder_trusted", return_value=True):
+            out = server.open_claude_session({"cwd": ROOT, "prompt": "a; b \"c\""})
+        argv = open_window.call_args[0][1]
+        self.assertEqual(argv[-2], "claude")
+        with open(argv[-1], encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"cwd": os.path.abspath(ROOT), "name": os.path.basename(ROOT),
+                                            "prompt": "a; b \"c\""})
+        os.remove(argv[-1])
+        self.assertIn("Remote Control", out)
+
+    @unittest.skipUnless(os.name == "nt", "Windows checks the process creation time")
+    def test_registry_entries_need_a_matching_start_time(self):
+        with tempfile.TemporaryDirectory() as config:
+            os.mkdir(os.path.join(config, "sessions"))
+            for pid, start in ((11, 123), (12, None), (13, "unknown"), (14, 999)):
+                entry = {"pid": pid, "name": f"s{pid}", "kind": "interactive"}
+                if start is not None:
+                    entry["procStart"] = str(start)
+                with open(os.path.join(config, "sessions", f"{pid}.json"), "w") as f:
+                    json.dump(entry, f)
+            with mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": config}), \
+                    mock.patch.object(server, "process_table", return_value={}), \
+                    mock.patch.object(server, "process_start", return_value=123):
+                names = [s["name"] for s in server.claude_sessions()]
+        self.assertEqual(names, ["s11"])
+
+    def session(self, name, pid, helper=None):
+        return {"name": name, "pid": pid, "cwd": "C:/p", "status": "idle", "session_id": f"s{pid}",
+                "remote": True, "helper": helper, "start": 1, "helper_start": 0 if helper else None}
+
+    def test_list_marks_this_session(self):
+        out = server.describe_sessions([self.session("other", 41, helper=40), self.session("me", 51)], {51})
+        self.assertIn("other (pid 41): C:/p [idle, Remote Control, opened by OpenClaudeSession]", out)
+        self.assertIn("me (pid 51): C:/p [idle, Remote Control, this session]", out)
+
+    def test_close_refuses_unknown_and_own_sessions(self):
+        running = [self.session("other", 41), self.session("me", 51)]
+        with mock.patch.object(server, "claude_sessions", return_value=running), \
+                mock.patch.object(server, "own_claude_pids", return_value={51}), \
+                mock.patch.object(server, "end_session") as end:
+            for args in ({}, {"name": "typed-by-hand"}, {"name": "me"}, {"pid": 51}, {"pid": True}):
+                with self.assertRaises(server.BridgeError):
+                    server.close_claude_session(args)
+            end.assert_not_called()
+
+    def test_close_needs_pid_when_names_repeat(self):
+        running = [self.session("x", 41), self.session("x", 61, helper=60)]
+        with mock.patch.object(server, "claude_sessions", return_value=running), \
+                mock.patch.object(server, "own_claude_pids", return_value=set()), \
+                mock.patch.object(server, "end_session") as end:
+            with self.assertRaises(server.BridgeError):
+                server.close_claude_session({"name": "x"})
+            out = server.close_claude_session({"name": "x", "pid": 61})
+        self.assertIn("pid 61) and its window", out)
+        self.assertIn("claude --resume s61", out)
+        end.assert_called_once_with(running[1])
+
+    @unittest.skipUnless(os.name == "nt", "Windows process handles")
+    def test_end_session_checks_identity_and_result(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            start = server.process_start(proc.pid)
+            target = {"name": "t", "pid": proc.pid, "start": start + 1, "helper": None}
+            with self.assertRaises(server.BridgeError):
+                server.end_session(target)  # another process now holds that pid
+            self.assertIsNone(proc.poll())
+            server.end_session(dict(target, start=start))
+            self.assertIsNotNone(proc.wait(timeout=5))
+            with self.assertRaises(server.BridgeError):
+                server.end_session(dict(target, start=start))  # already gone
+        finally:
+            proc.kill()
+            proc.wait()
 
 
 if __name__ == "__main__":

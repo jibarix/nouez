@@ -7,10 +7,14 @@ Tools
   GetConsultantReply     read (or wait for) a reply sent with wait=0
   WatchConsultant        open a session in a terminal window
   StopConsultant         archive a session that StartConsultant started
+  OpenClaudeSession      open a new terminal running a fresh Claude Code session with Remote Control
+  ListClaudeSessions     the Claude Code sessions running on this computer
+  CloseClaudeSession     close one of them (never the caller)
 
 Command line
   server.py wait <thread_id> <turn_id>   wait for a turn to end and print its reply, for a client
                                          to run in the background so the reply wakes it
+  server.py claude <spec.json>           start that Claude Code session (run by OpenClaudeSession)
   server.py allow-rule                   print the Claude Code permission rules that let the
                                          waiter run without asking
 
@@ -28,6 +32,7 @@ import reprlib
 import re
 import shlex
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -38,7 +43,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.7.1"
+SERVER_VERSION = "0.8.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -760,6 +765,247 @@ def viewer_running(thread_id):
     return bool(run_text(["pgrep", "-f", f"codex[^ ]* resume {thread_id}"]).split())
 
 
+_console_lock = threading.Lock()  # AttachConsole is per process, so one lookup at a time
+
+
+def _wt_user32():
+    import ctypes
+    from ctypes import wintypes
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    kernel32.GetConsoleWindow.restype = wintypes.HWND
+    user32.GetWindow.restype = wintypes.HWND
+    user32.GetWindow.argtypes = [wintypes.HWND, ctypes.c_uint]
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    for name in ("GetClassNameW", "GetWindowTextW"):
+        getattr(user32, name).argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    for name in ("SetForegroundWindow", "BringWindowToTop", "IsIconic", "IsWindow", "IsHungAppWindow"):
+        getattr(user32, name).argtypes = [wintypes.HWND]
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    return ctypes, user32, kernel32
+
+
+def _window_text(ctypes, user32, hwnd, getter="GetWindowTextW"):
+    buf = ctypes.create_unicode_buffer(512)
+    getattr(user32, getter)(hwnd, buf, 512)
+    return buf.value
+
+
+def process_table():
+    """Windows: {pid: (parent pid, exe name)} for every running process, or {} if it can't be read."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    snap = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return {}
+    table = {}
+    try:
+        entry = Entry()
+        entry.dwSize = ctypes.sizeof(Entry)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            table[entry.th32ProcessID] = (entry.th32ParentProcessID, entry.szExeFile)
+            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    return table
+
+
+def _ancestor_pids(table=None):
+    """Windows: this process's parent, grandparent and so on, nearest first."""
+    table = table if table is not None else process_table()
+    chain, pid = [], table.get(os.getpid(), (None,))[0]
+    while pid and pid in table and pid not in chain and len(chain) < 16:
+        chain.append(pid)
+        pid = table[pid][0]
+    return chain
+
+
+def _kernel32():
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, ctypes.c_uint]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return ctypes, wintypes, kernel32
+
+
+QUERY, SYNCHRONIZE, TERMINATE = 0x1000, 0x100000, 0x0001
+
+
+def open_process(pid, access=QUERY):
+    """Windows: a handle to a process, or None. While it is open, the pid can't go to another process."""
+    _, _, kernel32 = _kernel32()
+    return kernel32.OpenProcess(access, False, pid) or None
+
+
+def handle_start(handle):
+    """Windows: the creation time (100 ns units since 1601) of a process that is still running, or None."""
+    ctypes, wintypes, kernel32 = _kernel32()
+    times = [wintypes.FILETIME() for _ in range(4)]
+    code = wintypes.DWORD()
+    if not kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+        return None
+    if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != 259:  # STILL_ACTIVE
+        return None
+    return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+
+
+def close_handle(handle):
+    if handle:
+        _kernel32()[2].CloseHandle(handle)
+
+
+def process_start(pid):
+    """Windows: a running process's creation time in 100 ns units since 1601, or None if it isn't running."""
+    handle = open_process(pid)
+    if not handle:
+        return None
+    try:
+        return handle_start(handle)
+    finally:
+        close_handle(handle)
+
+
+def wait_handle(handle, seconds):
+    """Windows: whether the process ended within `seconds`."""
+    return _kernel32()[2].WaitForSingleObject(handle, int(seconds * 1000)) == 0  # WAIT_OBJECT_0
+
+
+def wt_host_window():
+    """Windows: the Windows Terminal window showing Claude Code, as (hwnd, console title), or None.
+    Claude Code starts this server without a console, so borrow the console of the nearest
+    ancestor that has one (Claude Code's). In Windows Terminal that console's window is a hidden
+    pseudo-console window owned by the terminal window it is shown in, even after the tab is
+    dragged to another window."""
+    try:
+        ctypes, user32, kernel32 = _wt_user32()
+        from ctypes import wintypes
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        kernel32.SetStdHandle.argtypes = [wintypes.DWORD, wintypes.HANDLE]
+        with _console_lock:
+            own = kernel32.GetConsoleWindow()
+            candidates = [None] if own else _ancestor_pids()
+            # AttachConsole and FreeConsole replace the standard handles, which carry the MCP pipes
+            # and are what subprocess hands to children, so put them back after every attempt.
+            std = [(n, kernel32.GetStdHandle(n)) for n in (-10 & 0xFFFFFFFF, -11 & 0xFFFFFFFF, -12 & 0xFFFFFFFF)]
+            for pid in candidates:
+                if pid is not None:
+                    kernel32.FreeConsole()
+                    attached = kernel32.AttachConsole(pid)
+                    for n, h in std:
+                        kernel32.SetStdHandle(n, h)
+                    if not attached:
+                        continue
+                try:
+                    console = kernel32.GetConsoleWindow()
+                    if not console:
+                        continue
+                    owner = user32.GetWindow(console, 4)  # GW_OWNER
+                    if not owner or _window_text(ctypes, user32, owner, "GetClassNameW") != "CASCADIA_HOSTING_WINDOW_CLASS":
+                        return None
+                    title = ctypes.create_unicode_buffer(512)
+                    kernel32.GetConsoleTitleW(title, 512)
+                    return owner, title.value
+                finally:
+                    if pid is not None:
+                        kernel32.FreeConsole()
+                        for n, h in std:
+                            kernel32.SetStdHandle(n, h)
+    except (OSError, AttributeError, ValueError):
+        pass
+    return None
+
+
+def _same_title(a, b):
+    # Claude Code animates a spinner at the start of its title, so compare what follows it.
+    strip = lambda s: re.sub(r"^\W+", "", s or "").strip()
+    return strip(a) == strip(b)
+
+
+def _activate_window(ctypes, user32, kernel32, hwnd):
+    """Bring a window to the foreground, even from this background process. Returns whether it is."""
+    foreground = user32.GetForegroundWindow()
+    if foreground == hwnd:
+        return True
+    me = kernel32.GetCurrentThreadId()
+    other = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+    # Sharing the foreground thread's input state lifts the rule that only it may change focus. It
+    # also makes this thread wait on that one, so skip it when the foreground window isn't responding
+    # (activation then usually fails, and the caller falls back to a new window).
+    hung = bool(foreground and user32.IsHungAppWindow(foreground))
+    attached = bool(other and other != me and not hung and user32.AttachThreadInput(me, other, True))
+    try:
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(me, other, False)
+    for _ in range(10):
+        if user32.GetForegroundWindow() == hwnd:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def wt_escape(arg):
+    """wt.exe splits its command line into several commands at every `;`, even inside a quoted
+    argument, unless it is escaped as `\\;`."""
+    return arg.replace(";", "\\;")
+
+
+def run_in_host_window(wt, cwd, command):
+    """Windows Terminal: open `command` in a pane of Claude Code's own window, not whichever
+    window was used last. wt.exe can't name a window by its handle, only by "-w 0", the most
+    recently used one, so bring Claude Code's window to the front for the moment wt.exe runs,
+    then give the focus back. Returns a description of where it opened."""
+    command = [wt_escape(a) for a in command]
+    host = wt_host_window()
+    ctypes, user32, kernel32 = _wt_user32()
+    previous = user32.GetForegroundWindow()
+    if not host or not _activate_window(ctypes, user32, kernel32, host[0]):
+        # Opening it in another session's window is worse than a window of its own.
+        subprocess.Popen([wt, "-w", "new", *command], cwd=cwd, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        why = "couldn't be brought to the front" if host else "couldn't be found"
+        return f"a new Windows Terminal window (Claude Code's window {why})"
+    hwnd, console_title = host
+    # split-pane splits the window's selected tab; if that isn't Claude Code's, open a tab instead.
+    in_view = _same_title(_window_text(ctypes, user32, hwnd), console_title)
+    action, how = (["split-pane", "-V"], "a Windows Terminal split pane") if in_view else \
+                  (["new-tab"], "a new tab in Claude Code's Windows Terminal window")
+    try:
+        subprocess.Popen([wt, "-w", "0", *action, *command], cwd=cwd, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait(timeout=10)
+        time.sleep(0.5)  # wt.exe hands the request to the running terminal; let it land first
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        if previous and previous != hwnd and user32.IsWindow(previous):
+            _activate_window(ctypes, user32, kernel32, previous)
+    return how
+
+
 def open_terminal(cwd, thread_id, codex="codex"):
     """Open `codex resume <id>` beside Claude Code: a split pane when Claude Code runs in
     Windows Terminal or tmux, otherwise a new terminal window. Returns a description of what opened."""
@@ -775,11 +1021,10 @@ def open_terminal(cwd, thread_id, codex="codex"):
         # codex on PATH is usually an npm .cmd shim, so run it through cmd; /k keeps errors on screen.
         wt = shutil.which("wt")
         if wt and os.environ.get("WT_SESSION"):
-            # -w 0 is the most recently used Windows Terminal window, normally Claude Code's own.
-            argv, how = [wt, "-w", "0", "split-pane", "-V", "-d", cwd, "--title", "Codex consultant",
-                         "cmd", "/k", *resume], "a Windows Terminal split pane"
+            return run_in_host_window(wt, cwd, ["-d", cwd, "--title", "Codex consultant", "cmd", "/k", *resume])
         elif wt:
-            argv, how = [wt, "-w", "new", "-d", cwd, "--title", "Codex consultant", "cmd", "/k", *resume], "Windows Terminal"
+            argv = [wt, "-w", "new", *map(wt_escape, ["-d", cwd, "--title", "Codex consultant", "cmd", "/k", *resume])]
+            how = "Windows Terminal"
         else:
             argv, how = ["cmd", "/c", "start", "Codex consultant", "cmd", "/k", *resume], "a console window"
     elif sys.platform == "darwin":
@@ -844,6 +1089,311 @@ def close_terminals(thread_id):
     if pids:
         run_text(["pkill", "-f", pattern])
     return len(pids)
+
+
+# Variables Claude Code sets for the commands it runs, tying them to its session. A `claude` that
+# inherits them takes itself for a child session and, among other things, doesn't save its
+# transcript. Only these go: other CLAUDE_CODE_* variables are the user's settings (a token, a
+# provider) and stay.
+CLAUDE_SESSION_VARS = frozenset((
+    "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "AI_AGENT", "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_SSE_PORT",
+))
+
+
+def fresh_claude_env(env):
+    """`env` without the variables that tie a process to the Claude Code session that started it."""
+    return {k: v for k, v in env.items() if k.upper() not in CLAUDE_SESSION_VARS}
+
+
+def claude_config_dir(env=None):
+    """Where Claude Code keeps its settings and session registry."""
+    env = os.environ if env is None else env
+    return env.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def claude_state_file(env=None):
+    """Claude Code's state file, with the folders the user has trusted."""
+    env = os.environ if env is None else env
+    if env.get("CLAUDE_CONFIG_DIR"):
+        return os.path.join(env["CLAUDE_CONFIG_DIR"], ".claude.json")
+    return os.path.join(os.path.expanduser("~"), ".claude.json")
+
+
+def find_program(name, path):
+    """An executable on `path`, ignoring the current folder and relative entries. Windows looks in
+    the current folder first, and here that is the project, which could ship its own `claude`."""
+    exts = [""]
+    if os.name == "nt":
+        exts = [e for e in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(";") if e]
+    for folder in (path or "").split(os.pathsep):
+        folder = folder.strip().strip('"')
+        if not folder or not os.path.isabs(folder):
+            continue
+        for ext in exts:
+            candidate = os.path.join(folder, name + ext)
+            if os.path.isfile(candidate) and (os.name == "nt" or os.access(candidate, os.X_OK)):
+                return candidate
+    return None
+
+
+def close_marker(pid):
+    """A file CloseClaudeSession leaves to tell the helper that it ended this claude on purpose."""
+    return os.path.join(tempfile.gettempdir(), f"nouez-closed-{pid}")
+
+
+def run_claude(spec_path):
+    """The `claude` subcommand: start an interactive Claude Code session with Remote Control, as if
+    the user had opened a terminal and typed it. Reads its settings from a file OpenClaudeSession
+    wrote, so no prompt text passes through a command line."""
+    try:
+        with open(spec_path, encoding="utf-8") as f:
+            spec = json.load(f)
+    finally:
+        try:
+            os.remove(spec_path)
+        except OSError:
+            pass
+    env = fresh_claude_env(os.environ)
+    exe = find_program("claude", env.get("PATH"))
+    if not exe:
+        print("claude isn't on PATH. Open a terminal and run claude yourself.")
+        input("Press Enter to close.")
+        return 1
+    name = spec["name"]
+    argv = [exe, "--remote-control", name, "--name", name]
+    if spec.get("prompt"):
+        argv += ["--", spec["prompt"]]  # so a prompt starting with "-" can't pass for an option
+    child = subprocess.Popen(argv, cwd=spec["cwd"], env=env)
+    code = child.wait()
+    marker = close_marker(child.pid)
+    if os.path.exists(marker):
+        # CloseClaudeSession ended it. Exit cleanly so the terminal closes this window.
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+        return 0
+    return code
+
+
+def open_window(cwd, argv, title):
+    """Run `argv` in a new terminal window. Returns a description of what opened."""
+    kwargs = {"cwd": cwd, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if os.name == "nt":
+        wt = shutil.which("wt")
+        if wt:
+            subprocess.Popen([wt, "-w", "new", *map(wt_escape, ["-d", cwd, "--title", title, *argv])], **kwargs)
+            return "a new Windows Terminal window"
+        subprocess.Popen(argv, cwd=cwd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        return "a new console window"
+    if sys.platform == "darwin":
+        script = f"cd {shlex.quote(cwd)} && {shlex.join(argv)}"
+        subprocess.Popen(["osascript", "-e", f"tell application \"Terminal\" to do script {json.dumps(script)}"],
+                         start_new_session=True, **kwargs)
+        return "a new Terminal window"
+    term = shutil.which("x-terminal-emulator") or shutil.which("gnome-terminal") or shutil.which("xterm")
+    if not term:
+        raise BridgeError("No terminal emulator found.")
+    subprocess.Popen([term, "--" if term.endswith("gnome-terminal") else "-e", *argv], start_new_session=True, **kwargs)
+    return os.path.basename(term)
+
+
+def folder_trusted(path):
+    """Whether Claude Code has recorded the user's trust in a folder or one above it (None if unknown)."""
+    try:
+        with open(claude_state_file(), encoding="utf-8") as f:
+            projects = json.load(f).get("projects") or {}
+    except (OSError, ValueError, AttributeError):
+        return None
+    norm = lambda p: os.path.normcase(os.path.abspath(p))
+    trusted = [norm(p) for p, v in projects.items() if isinstance(v, dict) and v.get("hasTrustDialogAccepted")]
+    target = norm(path)
+    return any(target == p or target.startswith(p.rstrip("\\/") + os.sep) for p in trusted)
+
+
+def open_claude_session(args, cancel=None, progress=None):
+    cwd = args.get("cwd")
+    if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+        raise BridgeError("cwd must be the absolute path of an existing folder.")
+    cwd = os.path.abspath(cwd)
+    name = args.get("name") or os.path.basename(cwd.rstrip("\\/")) or "claude"
+    prompt = args.get("prompt") or ""
+    if not isinstance(name, str) or not isinstance(prompt, str):
+        raise BridgeError("name and prompt must be strings.")
+    fd, spec = tempfile.mkstemp(prefix="nouez-claude-", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"cwd": cwd, "name": name, "prompt": prompt}, f)
+    try:
+        how = open_window(cwd, [sys.executable, "-I", os.path.abspath(__file__), "claude", spec], f"Claude: {name}")
+    except Exception:
+        os.remove(spec)
+        raise
+    out = (f"Opened {how} in {cwd} running Claude Code with Remote Control, named \"{name}\". It is a "
+           "normal session: its transcript is saved and it can be resumed later. It appears in the "
+           "Claude app's session list under that name once it connects, in a few seconds.")
+    if folder_trusted(cwd) is False:
+        out += (" Warning: Claude Code hasn't been trusted in this folder yet, so the new session is "
+                "waiting at the trust prompt on the computer and won't connect until someone answers it there.")
+    return out
+
+
+def claude_sessions():
+    """The Claude Code sessions running on this computer, from the registry Claude Code keeps in
+    ~/.claude/sessions (one <pid>.json per process; not a documented format, so read defensively).
+    A file can outlive its process, so only those whose process is still the one that wrote it count."""
+    folder = os.path.join(claude_config_dir(), "sessions")
+    table = process_table() if os.name == "nt" else {}
+    sessions = []
+    for path in glob.glob(os.path.join(glob.escape(folder), "*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                info = json.load(f)
+            pid = int(info["pid"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if not isinstance(info, dict) or info.get("kind", "interactive") != "interactive":
+            continue
+        started = helper = helper_start = None
+        if os.name == "nt":
+            # The entry counts only if its process was created when the entry says: a pid can be reused.
+            recorded = str(info.get("procStart") or "")
+            started = process_start(pid)
+            if not recorded.isdigit() or started is None or int(recorded) != started:
+                continue
+            parent = table.get(pid, (None, ""))[0]
+            parent_exe = table.get(parent, (None, ""))[1].lower() if parent else ""
+            if parent_exe.startswith("python") and _is_nouez_helper(parent):
+                helper_start = process_start(parent)
+                # A parent is older than its child; a younger one took over a dead parent's pid.
+                if helper_start is not None and helper_start <= started:
+                    helper = parent
+        else:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                pass
+        sessions.append({"pid": pid, "name": str(info.get("name") or "?"), "cwd": info.get("cwd") or "?",
+                         "status": info.get("status") or "?", "session_id": info.get("sessionId"),
+                         "remote": bool(info.get("bridgeSessionId")), "helper": helper,
+                         "start": started, "helper_start": helper_start})
+    return sorted(sessions, key=lambda s: s["name"].lower())
+
+
+def end_session(target):
+    """End a session's claude process and its children, and the helper window around it if
+    OpenClaudeSession opened it. Raises BridgeError if the process is still running afterwards."""
+    pid = target["pid"]
+    if os.name != "nt":
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except PermissionError as e:
+            raise BridgeError(f"Couldn't close {target['name']} (pid {pid}): {e}")
+        for _ in range(50):
+            time.sleep(0.1)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+        raise BridgeError(f"{target['name']} (pid {pid}) is still running after being asked to quit.")
+    # Hold handles from the identity check to the end, so neither pid can pass to another process.
+    handle = open_process(pid, QUERY | SYNCHRONIZE | TERMINATE)
+    helper = open_process(target["helper"], QUERY | SYNCHRONIZE | TERMINATE) if target.get("helper") else None
+    marker, closed = close_marker(pid), False
+    try:
+        if not handle or handle_start(handle) != target["start"]:
+            raise BridgeError(f"{target['name']} (pid {pid}) has already ended.")
+        if helper and handle_start(helper) != target["helper_start"]:
+            close_handle(helper)
+            helper = None
+        if helper:
+            with open(marker, "w"):
+                pass
+        result = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True,
+                                timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if not wait_handle(handle, 5):
+            _kernel32()[2].TerminateProcess(handle, 1)
+            if not wait_handle(handle, 2):
+                detail = (result.stderr or result.stdout).strip()
+                raise BridgeError(f"Couldn't close {target['name']} (pid {pid}). {detail}".strip())
+        # The helper exits by itself, cleanly, once it sees the marker; make sure of it.
+        if helper and not wait_handle(helper, 3):
+            # Windows Terminal closes a window by itself only on a clean exit, so end it with code 0.
+            _kernel32()[2].TerminateProcess(helper, 0)
+        closed = True
+    except subprocess.TimeoutExpired:
+        raise BridgeError(f"taskkill didn't finish closing {target['name']} (pid {pid}).")
+    finally:
+        close_handle(handle)
+        close_handle(helper)
+        if not closed and os.path.exists(marker):
+            try:
+                os.remove(marker)
+            except OSError:
+                pass
+
+
+def _is_nouez_helper(pid):
+    """Whether a process is the `server.py claude` helper OpenClaudeSession runs, which owns the window."""
+    if os.name != "nt" or not isinstance(pid, int):
+        return False
+    ps = f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"
+    line = run_text(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=20)
+    return " claude " in line and "nouez-claude-" in line
+
+
+def own_claude_pids():
+    """Pids of the processes above this server, among them the Claude Code session it serves."""
+    return set(_ancestor_pids()) if os.name == "nt" else {os.getppid()}
+
+
+def describe_sessions(sessions, own):
+    if not sessions:
+        return "No Claude Code sessions are running on this computer."
+    rows = []
+    for s in sessions:
+        notes = [s["status"]]
+        if s["remote"]:
+            notes.append("Remote Control")
+        if s["helper"]:
+            notes.append("opened by OpenClaudeSession")
+        if s["pid"] in own:
+            notes.append("this session")
+        rows.append(f"- {s['name']} (pid {s['pid']}): {s['cwd']} [{', '.join(notes)}]")
+    return "Claude Code sessions running on this computer:\n" + "\n".join(rows)
+
+
+def list_claude_sessions(args, cancel=None, progress=None):
+    return describe_sessions(claude_sessions(), own_claude_pids())
+
+
+def close_claude_session(args, cancel=None, progress=None):
+    name, pid = args.get("name"), args.get("pid")
+    if not name and pid is None:
+        raise BridgeError("Pass the name or pid of the session to close. ListClaudeSessions lists them.")
+    if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int)):
+        raise BridgeError("pid must be an integer.")
+    sessions, own = claude_sessions(), own_claude_pids()
+    matches = [s for s in sessions if (pid is None or s["pid"] == pid) and (not name or s["name"] == name)]
+    if not matches:
+        raise BridgeError("No running Claude Code session matches. " + describe_sessions(sessions, own))
+    if len(matches) > 1:
+        raise BridgeError(f"Several sessions are named {name}: "
+                          + ", ".join(f"pid {s['pid']} in {s['cwd']}" for s in matches) + ". Pass pid to pick one.")
+    target = matches[0]
+    if target["pid"] in own:
+        raise BridgeError("That is the session you are running in; it can't close itself.")
+    end_session(target)
+    where = "and its window" if target["helper"] else "(its terminal stays open at the shell prompt)"
+    resume = f"claude --resume {target['session_id']}" if target["session_id"] else "claude --resume"
+    return (f"Closed {target['name']} (pid {target['pid']}) {where}. Its transcript is kept: "
+            f"`{resume}` in {target['cwd']} picks it up again.")
 
 
 def git_root(path):
@@ -1310,6 +1860,56 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {"to": EXACT_TO_SCHEMA}, "required": ["to"]},
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     },
+    {
+        "name": "OpenClaudeSession",
+        "description": (
+            "Open a new terminal window on the user's computer and start an interactive Claude Code "
+            "session there with Remote Control, so the user can pick it up from the Claude app on "
+            "their phone or the web. Use when the user asks for a new Claude Code session, for "
+            "example for another project. The session starts as if the user had typed `claude` in a "
+            "fresh terminal: its transcript is saved, unlike a `claude` started from your own shell, "
+            "which inherits this session's environment."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cwd": {"type": "string", "description": "Absolute path of the project folder the session works in."},
+                "name": {"type": "string", "description": "Session name, shown in the Claude app's session list. Default: the folder's name."},
+                "prompt": {"type": "string", "description": "Optional first message for the new session. Leave it out unless the user gave one."},
+            },
+            "required": ["cwd"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    },
+    {
+        "name": "ListClaudeSessions",
+        "description": (
+            "List the Claude Code sessions running on the user's computer, whoever started them: each "
+            "one's name, process id, folder and status, whether it has Remote Control, and which one "
+            "is you. Use it when the user asks which sessions are open, or before CloseClaudeSession."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "CloseClaudeSession",
+        "description": (
+            "Close one Claude Code session running on the user's computer, for example a stuck one: "
+            "end its claude process. A session OpenClaudeSession opened also gets its window closed; "
+            "for others, the terminal stays open at the shell prompt. The transcript is kept, so the "
+            "session can be resumed. Close only sessions the user named for closing: list them with "
+            "ListClaudeSessions, show the user the list, and wait for them to choose. To close several, "
+            "call it once per session. It never closes the session you run in."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The session's name, as ListClaudeSessions shows it."},
+                "pid": {"type": "integer", "description": "The session's process id from ListClaudeSessions, to pick one of several with the same name."},
+            },
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+    },
 ]
 
 HANDLERS = {
@@ -1319,6 +1919,9 @@ HANDLERS = {
     "GetConsultantReply": get_consultant_reply,
     "WatchConsultant": watch_consultant,
     "StopConsultant": stop_consultant,
+    "OpenClaudeSession": open_claude_session,
+    "ListClaudeSessions": list_claude_sessions,
+    "CloseClaudeSession": close_claude_session,
 }
 
 
@@ -1573,6 +2176,10 @@ if __name__ == "__main__":
             sys.exit("usage: server.py wait <thread_id> <turn_id>")
         sys.stdout.reconfigure(encoding="utf-8")
         sys.exit(run_waiter(sys.argv[2], sys.argv[3]))
+    if sys.argv[1:2] == ["claude"]:
+        if len(sys.argv) != 3:
+            sys.exit("usage: server.py claude <spec.json>  (written by OpenClaudeSession)")
+        sys.exit(run_claude(sys.argv[2]))
     if sys.argv[1:] == ["allow-rule"]:
         print("Add these to permissions.allow in ~/.claude/settings.json:")
         print(",\n".join(json.dumps(rule) for rule in allow_rules()))

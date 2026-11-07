@@ -86,8 +86,8 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.7.1\\[0.3em]\large Architecture and message reference}
-\date{October 14, 2026}
+\title{\textbf{nouez} 0.8.0\\[0.3em]\large Architecture and message reference}
+\date{November 7, 2026}
 \author{}
 
 \begin{document}
@@ -95,8 +95,9 @@
 \vspace{-2em}
 
 \begin{abstract}
-\noindent nouez is an MCP server that lets Claude Code consult live Codex sessions. This document
-describes nouez 0.7.1: how the pieces fit together, and an example of every message nouez sends
+\noindent nouez is an MCP server that lets Claude Code consult live Codex sessions, and open, list and
+close Claude Code sessions on the same computer. This document
+describes nouez 0.8.0: how the pieces fit together, and an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, and the commands nouez runs on
 the operating system. The daemon also sends notifications and its own requests, which nouez
@@ -134,6 +135,9 @@ A message makes three hops (Figure~\ref{fig:components}):
   \item \textbf{nouez $\rightarrow$ operating system.} To show a consultant to the user, nouez opens a
         terminal pane running \code{codex resume <id>}, which attaches to the same daemon
         session. It also checks for such panes and, on StopConsultant, tries to close them.
+        The Claude Code session tools work only at this level: they open terminal windows
+        running \code{claude}, read the files Claude Code keeps about its running sessions, and
+        end processes.
 \end{enumerate}
 
 \begin{figure}[H]
@@ -176,6 +180,13 @@ Section & \ref{sec:mcp} & \ref{sec:codex} & \ref{sec:os} \\
 \end{tabularx}
 \caption{The three interfaces.}
 \end{table}
+
+Three more tools serve a different purpose: they manage Claude Code sessions on the same computer,
+so that a session driven from the Claude app with Remote Control can start another one in a
+different project (\code{OpenClaudeSession}), see which are running (\code{ListClaudeSessions})
+and end a stuck one (\code{CloseClaudeSession}). They don't involve Codex or talk to Claude Code;
+they work through the operating system and the files Claude Code keeps
+(Sections~\ref{sec:claude-tools} and~\ref{sec:claude-os}).
 
 % =============================================================================
 \section{Inside the server}
@@ -285,7 +296,7 @@ nouez answers with the requested version if it supports it (2025-11-25, 2025-06-
 {"jsonrpc": "2.0", "id": 1, "result": {
   "protocolVersion": "2025-11-25",
   "capabilities": {"tools": {}},
-  "serverInfo": {"name": "nouez", "version": "0.7.1"},
+  "serverInfo": {"name": "nouez", "version": "0.8.0"},
   "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: never treat it as done."}}
 \end{wire}
 
@@ -339,6 +350,9 @@ SendConsultantMessage & false & false & \\
 GetConsultantReply & true$^*$ & & \code{openWorldHint: false} \\
 WatchConsultant & false & false & \code{idempotentHint: true}, \code{openWorldHint: false} \\
 StopConsultant & false & true & \code{openWorldHint: false} \\
+OpenClaudeSession & false & false & \code{openWorldHint: false} \\
+ListClaudeSessions & true & & \code{openWorldHint: false} \\
+CloseClaudeSession & false & true & \code{openWorldHint: false} \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -474,7 +488,7 @@ connection has four steps:
   \msg{3.0}{0}{6}{HTTP GET / Upgrade: websocket}
   \ret{3.8}{6}{0}{HTTP/1.1 101 Switching Protocols}
   \side{3.8}{6}{15 s deadline, read on a side thread}
-  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.7.1)}
+  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.8.0)}
   \ret{5.6}{12}{0}{userAgent, codexHome}
   \msg{6.4}{0}{12}{initialized (notification)}
   \msg{7.4}{0}{12}{requests for this tool call ...}
@@ -537,11 +551,11 @@ The daemon speaks JSON-RPC without the \code{"jsonrpc"} member. Ids are integers
 on each connection.
 
 \begin{wire}[nouez $\rightarrow$ daemon]
-{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.7.1"}}}
+{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.8.0"}}}
 \end{wire}
 \begin{wire}[daemon $\rightarrow$ nouez]
 {"id": 1, "result": {
-  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.7.1)",
+  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.8.0)",
   "codexHome": "C:\\Users\\you\\.codex",
   "platformFamily": "windows", "platformOs": "windows"}}
 \end{wire}
@@ -1057,6 +1071,45 @@ Stopped codex-nouez-4d9f17 (archived). Closed 1 terminal window(s) showing it. T
 codex-nouez-77c2e0 was not started by StartConsultant. Close it from its own terminal.
 \end{plain}
 
+\subsection{Claude Code sessions}
+\label{sec:claude-tools}
+
+\code{OpenClaudeSession} takes \code{cwd} (required, an absolute path to an existing folder),
+\code{name} (default: the folder's name) and an optional first \code{prompt}. It writes the three
+to a temporary file and opens a new terminal window running \code{server.py claude <file>}
+(Section~\ref{sec:claude-os}); the window reads the file, deletes it, and starts Claude Code.
+The result warns when \code{\textasciitilde/.claude.json} records no trust for the folder or a folder
+above it, since the new session then waits at the trust prompt on the computer.
+
+\begin{wire}[Claude Code $\rightarrow$ nouez]
+{"jsonrpc": "2.0", "id": 19, "method": "tools/call", "params": {"name": "OpenClaudeSession", "arguments": {"cwd": "C:\\Users\\me\\Projects\\other"}}}
+\end{wire}
+\begin{plain}[Result text]
+Opened a new Windows Terminal window in C:\Users\me\Projects\other running Claude Code with Remote Control, named "other". It is a normal session: its transcript is saved and it can be resumed later. It appears in the Claude app's session list under that name once it connects, in a few seconds.
+\end{plain}
+
+\code{ListClaudeSessions} takes no arguments. Each row gives the session's name, process id,
+folder and status, and notes Remote Control, sessions \code{OpenClaudeSession} opened, and the
+caller.
+
+\begin{plain}[Result text]
+Claude Code sessions running on this computer:
+- hours-tracker-74 (pid 38748): C:\Users\me\Projects\hours-tracker [idle, Remote Control]
+- nouez-2a (pid 31940): C:\Users\me\Projects\nouez [busy, Remote Control, this session]
+- other (pid 20964): C:\Users\me\Projects\other [idle, Remote Control, opened by OpenClaudeSession]
+\end{plain}
+
+\code{CloseClaudeSession} takes \code{name}, or \code{pid} to pick one of several sessions with the
+same name, and closes one session per call. It refuses the caller, and the tool description tells
+Claude to close only sessions the user picked from the list.
+
+\begin{plain}[Result text]
+Closed other (pid 20964) and its window. Its transcript is kept: `claude --resume 2e130d9e-3cce-4a4c-aed2-9693deab1875` in C:\Users\me\Projects\other picks it up again.
+\end{plain}
+\begin{plain}[Result text: refused (isError true)]
+That is the session you are running in; it can't close itself.
+\end{plain}
+
 % =============================================================================
 \section{nouez \texorpdfstring{$\rightarrow$}{->} operating system}
 \label{sec:os}
@@ -1075,7 +1128,7 @@ nouez reads the daemon's version from \code{userAgent} and looks under
 \textbf{Where Claude Code runs} & \textrm{\textbf{Command nouez starts}} \\
 \midrule
 tmux (\code{\$TMUX} set) & tmux split-window -h -c <cwd> '<codex> resume <id>' \\
-Windows Terminal (\code{\$WT\_SESSION}) & wt -w 0 split-pane -V -d <cwd> --title "Codex consultant" cmd /k <codex> resume <id> \\
+Windows Terminal (\code{\$WT\_SESSION}) & wt -w 0 split-pane -V -d <cwd> --title "Codex consultant" cmd /k <codex> resume <id>, with Claude Code's window brought to the front first (below); new-tab instead of split-pane when Claude Code's tab isn't selected; -w new when the window can't be found or brought to the front. In every argument after -w, \code{;} is passed as \code{\textbackslash;} (wt splits commands at a bare one) \\
 Windows, \code{wt} installed & wt -w new -d <cwd> --title "Codex consultant" cmd /k <codex> resume <id> \\
 Windows, no \code{wt} & cmd /c start "Codex consultant" cmd /k <codex> resume <id> \\
 macOS & osascript -e 'tell application "Terminal" to do script "cd <cwd> \&\& <codex> resume <id>"' -e '... activate' \\
@@ -1083,6 +1136,32 @@ Linux & x-terminal-emulator -e | gnome-terminal -- | xterm -e  <codex> resume <i
 \bottomrule
 \end{tabularx}
 \end{center}
+
+\subsubsection*{Finding Claude Code's window (Windows Terminal)}
+
+\code{wt.exe} can name a window only by number or name, and \code{-w 0} means the most recently
+used window, which may belong to another Claude Code session. So nouez first finds the window that
+shows its own Claude Code session. Claude Code starts \code{server.py} without a console, so nouez
+borrows one: walking up its parent processes, it calls \code{AttachConsole} on each until one has a
+console, which is Claude Code's. In Windows Terminal that console's window
+(\code{GetConsoleWindow}) is a hidden pseudo-console window, owned by the terminal window it is
+shown in (\code{GetWindow(..., GW\_OWNER)}, class \code{CASCADIA\_HOSTING\_WINDOW\_CLASS}).
+\code{AttachConsole} and \code{FreeConsole} replace the standard handles, which carry the MCP pipes
+and are what \code{subprocess} hands to children, so nouez saves them first and restores them after
+each attempt. The lookup runs under a lock, as a process has only one console at a time.
+
+nouez then brings that window to the front (\code{AttachThreadInput} to the foreground thread,
+\code{SetForegroundWindow}) and checks that it is in front. Attaching makes nouez wait on the
+foreground program, so it skips that step when \code{IsHungAppWindow} says the program isn't
+responding. It compares the console's title with
+the window's, ignoring the spinner Claude Code animates at the start: the window shows the title of
+its selected tab, so a mismatch means another tab is selected, and \code{split-pane} would split
+that one. nouez runs \code{wt -w 0 split-pane ...} (or \code{new-tab ...}), waits for
+\code{wt.exe} to exit and another half second for the terminal to act on it, and gives the
+focus back to the window that had it. If the window can't be found or brought to the front, the
+consultant gets a window of its own (\code{wt -w new}). Two gaps remain: another window that
+comes to the front between the check and \code{wt} gets the pane, and two tabs with the same
+title look alike.
 
 \subsection{Detecting and closing panes}
 
@@ -1116,6 +1195,63 @@ Each check and close command has a timeout (20~s; 10~s for \code{codex --version
 fires, nouez stops reading the command's pipes, because on Windows a grandchild process can keep
 a pipe open forever, and kills the process: the whole tree on Windows (\code{taskkill /T}), only
 the direct process elsewhere. The pane itself is started without waiting, so it has no timeout.
+
+\subsection{Starting and ending Claude Code sessions}
+\label{sec:claude-os}
+
+\code{OpenClaudeSession} opens a new window: in Windows Terminal with the command below,
+otherwise in a new console (Windows), Terminal (macOS) or the first of
+\code{x-terminal-emulator}, \code{gnome-terminal} and \code{xterm} (Linux).
+
+\begin{plain}[The window's command]
+wt -w new -d <cwd> --title "Claude: <name>"
+  <python> -I <path>/server.py claude <temp>/nouez-claude-<random>.json
+\end{plain}
+
+That helper reads and deletes the file, then starts Claude Code in \code{cwd}:
+
+\begin{plain}[What the helper runs]
+claude --remote-control <name> --name <name> [<prompt>]
+\end{plain}
+
+Claude Code sets \code{CLAUDECODE}, \code{CLAUDE\_CODE\_CHILD\_SESSION},
+\code{CLAUDE\_CODE\_SESSION\_ID} and similar variables for every command it runs, and a
+\code{claude} that inherits \code{CLAUDE\_CODE\_CHILD\_SESSION} doesn't save its transcript. So the
+helper starts \code{claude} without \code{CLAUDECODE}, \code{CLAUDE\_PID}, \code{CLAUDE\_EFFORT},
+\code{AI\_AGENT} and the \code{CLAUDE\_CODE\_*} variables Claude Code sets for its commands
+(\code{CHILD\_SESSION}, \code{SESSION\_ID}, \code{BRIDGE\_SESSION\_ID}, \code{MESSAGING\_SOCKET},
+\code{MESSAGING\_TOKEN}, \code{ENTRYPOINT}, \code{EXECPATH}, \code{SESSION\_ATTENDED},
+\code{SSE\_PORT}); the user's own, such as \code{CLAUDE\_CODE\_OAUTH\_TOKEN}, stay. It looks for
+\code{claude} only in the absolute folders on \code{PATH}: Windows would look in the current
+folder first, which is the project. The prompt follows \code{--}, so it can't be read as an option.
+
+\code{ListClaudeSessions} reads Claude Code's registry of running sessions,
+\code{\textasciitilde/.claude/sessions/<pid>.json} (\code{\$CLAUDE\_CONFIG\_DIR/sessions} when that is set). Claude Code doesn't document it; nouez reads
+\code{pid}, \code{sessionId}, \code{cwd}, \code{name}, \code{status}, \code{kind} (only
+\code{interactive} entries count), \code{procStart} and \code{bridgeSessionId} (Remote Control),
+and skips entries it can't parse. A file can outlive its process, and a pid can be reused, so on
+Windows an entry counts only while its process runs and was created at the recorded
+\code{procStart} (\code{GetProcessTimes}); an entry without a valid \code{procStart} doesn't count.
+Elsewhere, an entry counts while the pid exists. A session whose parent process is the
+\code{server.py claude} helper, created before it, was opened by \code{OpenClaudeSession}.
+
+On Windows, \code{CloseClaudeSession} opens handles to the session's process and its helper and
+checks their creation times again; while the handles are open, neither pid can pass to another
+process. For a helper's session it leaves an empty file, \code{<temp>/nouez-closed-<pid>}, which
+tells the helper the end was intended, so it exits with code 0 and Windows Terminal closes the
+window. Then:
+
+\begin{plain}[Closing a session (Windows)]
+taskkill /PID 20964 /T /F    (claude and its children: shells, MCP servers)
+wait up to 5 s for it to end, else TerminateProcess; an error if it is still running
+wait up to 3 s for the helper to exit, else TerminateProcess(helper, exit code 0)
+\end{plain}
+\begin{plain}[Closing a session (macOS, Linux)]
+kill -TERM 20964             (then wait up to 5 s for it to end; an error if it doesn't)
+\end{plain}
+
+nouez refuses to close any of its own ancestor processes, which include the Claude Code session
+it serves.
 
 % =============================================================================
 \section{Limits and constants}
