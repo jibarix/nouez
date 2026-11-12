@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.11.0"
+SERVER_VERSION = "0.11.1"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -1447,7 +1447,9 @@ CLAUDE_MODEL = "opus"     # the model sessions OpenClaudeSession opens start wit
 CLAUDE_EFFORT = "medium"  # and their effort level
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,99}")  # an alias or full name, never an option
-CODEX_SETTING = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")  # a Codex model id or effort level, never an option
+# A Codex model id or effort level. Both travel in JSON, so only blanks and control characters are refused:
+# provider ids such as gpt-oss:20b or org/model pass, and Codex rejects what the model doesn't support.
+CODEX_SETTING = re.compile(r"[^\s\x00-\x1f\x7f]{1,200}")
 TRUST_BACKUPS_KEPT = 20  # dated copies of Claude Code's state file kept before nouez's changes
 
 
@@ -2002,6 +2004,7 @@ def send_consultant_message(args, cancel=None, progress=None):
             raise BridgeError(f"`{key}` must be a Codex {'model id' if key == 'model' else 'effort level'}, "
                               f"such as {'gpt-6.1-sol' if key == 'model' else 'high'}, not {value!r}.")
         overrides[key] = value
+    settings = ", ".join(f"{k} {v}" for k, v in overrides.items())
     sender = args.get("from") or "Claude Code"
     text = f"[Message from {sender} via the consultants bridge]\n\n{message}"
 
@@ -2037,7 +2040,6 @@ def send_consultant_message(args, cancel=None, progress=None):
                 started = client.request("turn/start", {"threadId": tid, "input": [{"type": "text", "text": text}], **overrides})
                 turn_id, mode = started["turn"]["id"], "started a new turn"
                 if overrides:
-                    settings = ", ".join(f"{k} {v}" for k, v in overrides.items())
                     mode += f" on {settings}, which the consultant keeps for later messages until changed"
                 # turns/list lags turn/start. Hold the lock until the turn is listed, or a
                 # concurrent send would see the session idle and its turn/start would
@@ -2068,7 +2070,8 @@ def send_consultant_message(args, cancel=None, progress=None):
                               f"failed: {e} Don't send the message again; read the reply with "
                               f"GetConsultantReply (turn_id {turn_id}).") from None
         if done:
-            return format_turn(name, turn) + (f"\n\n({watching.strip()})" if watching else "")
+            changed = f"\n\n({name} now runs on {settings} until changed.)" if overrides else ""
+            return format_turn(name, turn) + changed + (f"\n\n({watching.strip()})" if watching else "")
         return still_working(
             name, turn_id, turn,
             f"Delivered ({mode}), but no reply within {timeout:.0f}s. Don't send the message again. "
@@ -2248,7 +2251,7 @@ TOOLS = [
             "The message appears in that session as a new user turn (or steers the running turn if busy). "
             "model and effort change the consultant's Codex model or reasoning effort from this message "
             "on, keeping its context; they stay until changed, so pass the usual values again to go back. "
-            "They can't change a running turn, so a send with them to a busy consultant is refused. "
+            "They can't change a running turn, so a send with them to a consultant nouez sees busy is refused. "
             "Address it by the name from ListConsultants, the thread id, or a unique id prefix/suffix. "
             "Sessions the user opened are refused unless allow_user_session=true: they keep the user's "
             "own permissions and may be able to edit files. May open the session's pane beside Claude Code."
@@ -2260,7 +2263,7 @@ TOOLS = [
                 "message": {"type": "string", "description": "The message to send."},
                 "from": {"type": "string", "description": "Sender label shown to Codex, e.g. your session name. Default 'Claude Code'."},
                 "model": {"type": "string", "description": "Codex model id for this message and later ones, e.g. gpt-6-astra. Default: unchanged. Set it when the user asks, or when the user's own rules call for another model."},
-                "effort": {"type": "string", "description": "Codex reasoning effort for this message and later ones: low, medium, high, xhigh or max, as the model supports. Default: unchanged. Set it when the user asks, or when the user's own rules call for more or less effort."},
+                "effort": {"type": "string", "description": "Codex reasoning effort for this message and later ones, such as low, medium, high or xhigh; which levels exist depends on the model. Default: unchanged. Set it when the user asks, or when the user's own rules call for more or less effort."},
                 "wait": wait_schema(SEND_WAIT_SECONDS),
                 "allow_user_session": {"type": "boolean", "description": "Allow sending to a Codex session the user opened (not started by StartConsultant). Default false. Set it only when the user asked you to message that session."},
             },

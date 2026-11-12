@@ -817,8 +817,9 @@ class PartialTest(unittest.TestCase):
 class FakeDaemon:
     """A daemon with threads and turns, for the tool handlers. Pass it as CodexClient."""
 
-    def __init__(self, threads, turns=None, fail_after_start=False):
+    def __init__(self, threads, turns=None, fail_after_start=False, answer=None):
         self.threads = {t["id"]: t for t in threads}
+        self.answer = answer  # if set, a started turn completes at once with this reply
         self.turns = turns or {}  # thread id -> turns, newest first
         self.fail_after_start = fail_after_start
         self.calls = []
@@ -852,6 +853,8 @@ class FakeDaemon:
             self.started = params
             turn = {"id": "turn-new", "status": "inProgress",
                     "items": [user(params["input"][0]["text"]), agent("working on it", "commentary")]}
+            if self.answer:
+                turn = {**turn, "status": "completed", "items": [user(params["input"][0]["text"]), agent(self.answer, "final_answer")]}
             self.turns.setdefault(params["threadId"], []).insert(0, turn)
             return {"turn": turn}
         if method == "turn/steer":
@@ -930,6 +933,20 @@ class HandlerTest(unittest.TestCase):
         self.assertIn("on model gpt-6-astra, effort xhigh", out)
         self.assertIn("keeps for later messages until changed", out)
 
+    def test_a_quick_reply_still_says_the_setting_changed(self):
+        thread = self.consultant("tune05")
+        self.use(FakeDaemon([thread], answer="the answer"))
+        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "effort": "xhigh"})
+        self.assertIn("the answer", out)
+        self.assertIn("now runs on effort xhigh until changed", out)
+
+    def test_provider_model_ids_pass(self):
+        thread = self.consultant("tune06")
+        for model in ("gpt-oss:20b", "org/model-1", "gpt-6-astra"):
+            daemon = self.use(FakeDaemon([thread]))
+            server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0, "model": model})
+            self.assertEqual(daemon.started["model"], model)
+
     def test_without_model_or_effort_the_turn_keeps_its_settings(self):
         thread = self.consultant("tune02")
         daemon = self.use(FakeDaemon([thread]))
@@ -940,7 +957,7 @@ class HandlerTest(unittest.TestCase):
 
     def test_bad_model_or_effort_is_refused_before_sending(self):
         thread = self.consultant("tune03")
-        for key, value in (("model", "-c x"), ("effort", "very high"), ("effort", 3)):
+        for key, value in (("model", "-c x"), ("model", "a\tb"), ("effort", "very high"), ("effort", 3)):
             daemon = self.use(FakeDaemon([thread]))
             with self.assertRaises(server.BridgeError) as caught:
                 server.send_consultant_message({"to": thread["id"], "message": "hi", key: value})

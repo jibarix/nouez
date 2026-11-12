@@ -6,6 +6,18 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-12
+
+Fixes from a Codex review of 0.11.0. Tested with Claude Code 2.1.322, Codex CLI 0.165.0 with app-server daemon 0.167.2, Python 3.13.5 on Windows 11.
+
+### Fixed
+- `model` refused ids with `:` or `/`, such as `gpt-oss:20b` from a local provider. nouez now refuses only an empty value, blanks and control characters, and leaves the rest to Codex.
+- A reply that came back within the wait didn't say that `model` or `effort` had changed for later messages. It now ends with a line naming the new setting.
+
+### Changed
+- The `effort` description gives levels as examples and says they depend on the model, instead of a fixed list.
+- The docs say the busy check covers turns nouez can see: a turn another client starts at the same moment isn't caught, as with the choice between starting and steering a turn.
+
 ## [0.11.0] - 2026-11-12
 
 A consultant's Codex model and reasoning effort can be changed while it keeps its context. Tested with Claude Code 2.1.322, Codex CLI 0.165.0 with app-server daemon 0.167.2, Python 3.13.5 on Windows 11.
@@ -195,7 +207,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/jibarix/nouez/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/jibarix/nouez/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/jibarix/nouez/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/jibarix/nouez/compare/v0.8.0...v0.9.0

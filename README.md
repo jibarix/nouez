@@ -25,7 +25,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.11.0 |
+| nouez | 0.11.1 |
 | Claude Code | 2.1.322 |
 | Codex CLI | 0.165.0 |
 | Codex app-server daemon | 0.167.2 |
@@ -177,8 +177,8 @@ To see what's running, ask any session *"which Claude sessions are open?"*. `Lis
 | `to` | yes | | Session name from `ListConsultants` (e.g. `codex-myproject-a1b2c3`), full thread id, or unique id prefix/suffix. `name` is accepted as an alias. |
 | `message` | yes | | The text to send |
 | `from` | no | `Claude Code` | Sender label shown to Codex |
-| `model` | no | unchanged | Codex model id, e.g. `gpt-6-astra`, for this message and later ones. The consultant keeps its context. Refused, with nothing sent, while the consultant is mid-turn |
-| `effort` | no | unchanged | Codex reasoning effort (`low`, `medium`, `high`, `xhigh`, `max`, as the model supports) for this message and later ones; send the usual value again to go back. Refused, with nothing sent, while the consultant is mid-turn |
+| `model` | no | unchanged | Codex model id, e.g. `gpt-6-astra`, for this message and later ones. The consultant keeps its context. Refused, with nothing sent, while nouez sees the consultant mid-turn |
+| `effort` | no | unchanged | Codex reasoning effort (such as `low`, `medium`, `high` or `xhigh`; the levels depend on the model) for this message and later ones; send the usual value again to go back. Refused, with nothing sent, while nouez sees the consultant mid-turn |
 | `wait` | no | `5` | How long to wait for the reply: seconds (`0` returns once the message is delivered), or `"done"` to wait until the turn ends. Capped at 4 hours |
 | `allow_user_session` | no | `false` | Allow sending to a session you opened yourself. Claude sets it only when you ask |
 
