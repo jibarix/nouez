@@ -849,6 +849,7 @@ class FakeDaemon:
                 raise server.BridgeError("thread/turns/list timed out after 15s.")
             return {"data": self.turns.get(params["threadId"], [])[:params["limit"]]}
         if method == "turn/start":
+            self.started = params
             turn = {"id": "turn-new", "status": "inProgress",
                     "items": [user(params["input"][0]["text"]), agent("working on it", "commentary")]}
             self.turns.setdefault(params["threadId"], []).insert(0, turn)
@@ -889,6 +890,7 @@ class HandlerTest(unittest.TestCase):
         self.assertNotIn("thread/start", daemon.calls)
         self.assertTrue(out.startswith(f"Using {server.short_name(ours)}"))
         self.assertIn("Ignored model", out)
+        self.assertIn("pass model to SendConsultantMessage", out)
 
     def test_start_tells_about_a_codex_update_and_goes_on(self):
         for existing in ([], [self.consultant("ours02")]):
@@ -917,6 +919,43 @@ class HandlerTest(unittest.TestCase):
         self.assertIn("Don't wait for the reply", out)
         self.assertIn("GetConsultantReply (turn_id turn-new)", out)
         self.assertIn("turn/start", daemon.calls)
+
+    def test_model_and_effort_go_to_the_new_turn(self):
+        thread = self.consultant("tune01")
+        daemon = self.use(FakeDaemon([thread]))
+        out = server.send_consultant_message(
+            {"to": thread["id"], "message": "hi", "wait": 0, "model": "gpt-6-astra", "effort": "xhigh"})
+        self.assertEqual(daemon.started["model"], "gpt-6-astra")
+        self.assertEqual(daemon.started["effort"], "xhigh")
+        self.assertIn("on model gpt-6-astra, effort xhigh", out)
+        self.assertIn("keeps for later messages until changed", out)
+
+    def test_without_model_or_effort_the_turn_keeps_its_settings(self):
+        thread = self.consultant("tune02")
+        daemon = self.use(FakeDaemon([thread]))
+        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0, "effort": ""})
+        self.assertNotIn("model", daemon.started)
+        self.assertNotIn("effort", daemon.started)
+        self.assertNotIn("until changed", out)
+
+    def test_bad_model_or_effort_is_refused_before_sending(self):
+        thread = self.consultant("tune03")
+        for key, value in (("model", "-c x"), ("effort", "very high"), ("effort", 3)):
+            daemon = self.use(FakeDaemon([thread]))
+            with self.assertRaises(server.BridgeError) as caught:
+                server.send_consultant_message({"to": thread["id"], "message": "hi", key: value})
+            self.assertIn(f"`{key}` must be", str(caught.exception))
+            self.assertNotIn("turn/start", daemon.calls)
+
+    def test_model_or_effort_on_a_busy_consultant_sends_nothing(self):
+        thread = self.consultant("tune04")
+        running = {"id": "turn-1", "status": "inProgress", "items": [user("q")]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        with self.assertRaises(server.BridgeError) as caught:
+            server.send_consultant_message({"to": thread["id"], "message": "more", "effort": "high"})
+        self.assertIn("Nothing was sent", str(caught.exception))
+        self.assertNotIn("turn/steer", daemon.calls)
+        self.assertNotIn("turn/start", daemon.calls)
 
     def test_steered_timeout_hides_output_from_before_the_message(self):
         thread = self.consultant("busy01")

@@ -6,6 +6,14 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-12
+
+A consultant's Codex model and reasoning effort can be changed while it keeps its context. Tested with Claude Code 2.1.322, Codex CLI 0.165.0 with app-server daemon 0.167.2, Python 3.13.5 on Windows 11.
+
+### Added
+- `SendConsultantMessage` takes `model` and `effort`, such as `effort: "xhigh"` for a hard question or `model: "gpt-6-astra"`, so a consultant can be turned up or down without starting a new session. They go into Codex's `turn/start`, and Codex keeps them for the session's later turns too: the result says so, and going back means sending the usual values again. Each must be a plain name (letters, digits, `.`, `_`, `-`); Codex rejects one the model doesn't support. A running turn can't change them, so a send with either to a busy consultant is refused and nothing is sent; send again once the turn ends, or without them to steer the running turn.
+- When `StartConsultant` reuses a consultant and ignores `model`, its result points to `SendConsultantMessage`'s `model`.
+
 ## [0.10.0] - 2026-11-07
 
 `OpenClaudeSession` can record that the user trusts a folder, so a session in a new project can be opened from the phone. Tested with Claude Code 2.1.319 and Python 3.11.9 on Windows 11; the Codex side was last tested with Codex CLI 0.165.0 and app-server daemon 0.165.0, with nouez 0.7.1.
@@ -187,7 +195,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/jibarix/nouez/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/jibarix/nouez/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/jibarix/nouez/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jibarix/nouez/compare/v0.7.1...v0.8.0
