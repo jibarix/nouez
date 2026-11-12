@@ -6,6 +6,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-11-12
+
+Security fixes from a review of 0.11.2. Nothing changes in normal use. Tested with Claude Code 2.1.322, Codex CLI 0.165.0 with app-server daemon 0.167.2, Python 3.13.5 on Windows 11.
+
+### Fixed
+- `OpenClaudeSession` passed its `name` to `claude` unchecked, so a name starting with `-`, such as `--dangerously-skip-permissions`, was read as an option. A name must now start with a letter or digit and hold only letters (any language), digits, spaces, `.`, `_` and `-`, up to 64 characters; anything else is refused before a folder is created or a window opens. A name taken from the folder is cleaned up instead (other characters become `-`, leading ones are dropped). The window checks the name again before starting `claude`.
+- A consultant was set read-only only when it started, so permissions changed later in its watch pane carried over to Claude's messages. Every `turn/start` to a consultant now sends a read-only sandbox and `approvalPolicy: never`, which Codex keeps for later turns too. Sessions the user opened keep their own settings.
+
+### Changed
+- The update notice suggests `git pull --ff-only`, so a copy with its own commits stops with git's message instead of merging.
+
 ## [0.11.2] - 2026-11-12
 
 Anyone who installs nouez can set up their own model and effort routing. Tested with Claude Code 2.1.322, Codex CLI 0.165.0 with app-server daemon 0.167.2, Python 3.13.5 on Windows 11.
@@ -217,7 +228,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.11.2...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.11.3...HEAD
+[0.11.3]: https://github.com/jibarix/nouez/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/jibarix/nouez/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/jibarix/nouez/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/jibarix/nouez/compare/v0.10.0...v0.11.0

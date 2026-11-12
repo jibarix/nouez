@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.11.2"
+SERVER_VERSION = "0.11.3"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -899,7 +899,7 @@ def nouez_update_notice():
     reconnect = ("ask the user to run /mcp and reconnect consultants, which loads the new "
                  "version; the Codex consultants keep their sessions.")
     if os.path.exists(os.path.join(folder, ".git")) and quoted:
-        how = (f"run `git -C {quoted} pull` in a shell. If git fails (local changes, a conflict, "
+        how = (f"run `git -C {quoted} pull --ff-only` in a shell. If git fails (local changes, a conflict, "
                "no branch checked out), stop there: tell the user what git said, don't ask them "
                "to reconnect, and don't discard, stash or switch anything without the user's say. "
                "Only after the pull succeeds, " + reconnect)
@@ -1333,6 +1333,10 @@ def run_claude(spec_path):
         input("Press Enter to close.")
         return 1
     name = spec["name"]
+    if not isinstance(name, str) or not CLAUDE_SESSION_NAME.fullmatch(name):
+        print("This session's name can't be passed to claude safely. Open a terminal and run claude yourself.")
+        input("Press Enter to close.")
+        return 1
     argv = [exe, "--remote-control", name, "--name", name]
     if spec.get("model"):
         argv += ["--model", spec["model"]]
@@ -1446,6 +1450,18 @@ def folder_trusted(path):
 CLAUDE_MODEL = "opus"     # the model sessions OpenClaudeSession opens start with: the latest Opus
 CLAUDE_EFFORT = "medium"  # and their effort level
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# A session name: letters (any language), digits, spaces, . _ -, starting with a letter or digit, so
+# claude can never read it as an option.
+CLAUDE_SESSION_NAME = re.compile(r"[^\W_][\w .-]{0,63}")
+
+
+def session_name_from(folder):
+    """A session name made from a folder's name: other characters become -, leading ones are dropped."""
+    name = re.sub(r"[^\w .-]", "-", folder)
+    name = re.sub(r"^[\W_]+", "", name)[:64].rstrip()
+    return name if CLAUDE_SESSION_NAME.fullmatch(name) else "claude"
+
+
 CLAUDE_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,99}")  # an alias or full name, never an option
 # A Codex model id or effort level. Both travel in JSON, so only blanks and control characters are refused:
 # provider ids such as gpt-oss:20b or org/model pass, and Codex rejects what the model doesn't support.
@@ -1593,6 +1609,13 @@ def open_claude_session(args, cancel=None, progress=None):
     if not isinstance(cwd, str) or not os.path.isabs(cwd):
         raise BridgeError("cwd must be an absolute path.")
     cwd = os.path.abspath(cwd)
+    given = args.get("name")
+    if given and not isinstance(given, str):
+        raise BridgeError("name and prompt must be strings.")
+    if given and not CLAUDE_SESSION_NAME.fullmatch(given):
+        # Checked before anything is created, and so claude can never read the name as an option.
+        raise BridgeError(f"name {given!r} isn't usable: use letters, digits, spaces, '.', '_' and '-', "
+                          "starting with a letter or digit, up to 64 characters. Nothing was opened.")
     created = False
     if flag(args, "create") and not os.path.exists(cwd):
         parent = os.path.dirname(cwd)
@@ -1603,9 +1626,9 @@ def open_claude_session(args, cancel=None, progress=None):
     if not os.path.isdir(cwd):
         raise BridgeError("cwd must be the absolute path of an existing folder "
                           "(or pass create=true to make a new one).")
-    name = args.get("name") or os.path.basename(cwd.rstrip("\\/")) or "claude"
+    name = args.get("name") or session_name_from(os.path.basename(cwd.rstrip("\\/")))
     prompt = args.get("prompt") or ""
-    if not isinstance(name, str) or not isinstance(prompt, str):
+    if not isinstance(prompt, str):
         raise BridgeError("name and prompt must be strings.")
     model = args.get("model") or CLAUDE_MODEL
     effort = args.get("effort") or CLAUDE_EFFORT
@@ -2037,7 +2060,11 @@ def send_consultant_message(args, cancel=None, progress=None):
                 turn_id, mode = current["id"], "steered into the running turn"
             else:
                 # Codex keeps a turn's model and effort for the session's later turns too.
-                started = client.request("turn/start", {"threadId": tid, "input": [{"type": "text", "text": text}], **overrides})
+                # A consultant is read-only on every turn, even if its permissions were changed in the
+                # watch pane; Codex keeps these for later turns. A user's own session keeps its settings.
+                policy = {"sandboxPolicy": {"type": "readOnly"}, "approvalPolicy": "never"} if is_bridge(thread) else {}
+                started = client.request("turn/start", {"threadId": tid, "input": [{"type": "text", "text": text}],
+                                                        **overrides, **policy})
                 turn_id, mode = started["turn"]["id"], "started a new turn"
                 if overrides:
                     mode += f" on {settings}, which the consultant keeps for later messages until changed"
@@ -2341,7 +2368,7 @@ TOOLS = [
                 "open_untrusted": {"type": "boolean", "description": "Open the window even though Claude Code hasn't been trusted in the folder, so the user can answer the trust question on the computer. Default false. Set it only when the user asks for that."},
                 "model": {"type": "string", "description": "Claude Code model alias or full name. Default: opus (the latest Opus). Set it only when the user asks for another model."},
                 "effort": {"type": "string", "enum": list(CLAUDE_EFFORTS), "description": "Effort level. Default: medium. Set it only when the user asks for another."},
-                "name": {"type": "string", "description": "Session name, shown in the Claude app's session list. Default: the folder's name."},
+                "name": {"type": "string", "description": "Session name, shown in the Claude app's session list: letters, digits, spaces, '.', '_' and '-', starting with a letter or digit, up to 64 characters. Default: the folder's name."},
                 "prompt": {"type": "string", "description": "Optional first message for the new session. Leave it out unless the user gave one."},
             },
             "required": ["cwd"],

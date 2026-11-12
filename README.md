@@ -25,7 +25,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.11.2 |
+| nouez | 0.11.3 |
 | Claude Code | 2.1.322 |
 | Codex CLI | 0.165.0 |
 | Codex app-server daemon | 0.167.2 |
@@ -217,7 +217,7 @@ Boolean arguments take `true`/`false` (or the strings `"true"`/`"false"`); any o
 
 ### nouez updates
 
-When a newer nouez is released on GitHub, `StartConsultant` adds a notice to its result with a link to the release notes. Claude tells you about it and goes on with the consultation. Ask Claude to update and it runs `git -C '<your nouez folder>' pull` in that same session. If git fails (local changes, a conflict), Claude stops there, shows you what git said and doesn't discard anything. Only after the pull succeeds does it ask you to run `/mcp` and reconnect `consultants` to load the new version. (If the folder's name has a `'` in it, Claude asks you to run the pull yourself.) Your consultants keep their Codex sessions. Other open Claude Code sessions keep the old version until you reconnect there too.
+When a newer nouez is released on GitHub, `StartConsultant` adds a notice to its result with a link to the release notes. Claude tells you about it and goes on with the consultation. Ask Claude to update and it runs `git -C '<your nouez folder>' pull --ff-only` in that same session. If git fails (local changes, a conflict, or your copy has commits GitHub doesn't), Claude stops there, shows you what git said and doesn't discard anything. Only after the pull succeeds does it ask you to run `/mcp` and reconnect `consultants` to load the new version. (If the folder's name has a `'` in it, Claude asks you to run the pull yourself.) Your consultants keep their Codex sessions. Other open Claude Code sessions keep the old version until you reconnect there too.
 
 To find out, nouez asks GitHub for the latest release (`api.github.com/repos/jibarix/nouez/releases/latest`). It sends no sign-in and nothing from your projects or sessions: GitHub sees an HTTPS request from your IP address with `nouez/<version>` as the client name, at the time the server starts, through your proxy if you have one set. An answer is reused for 24 hours and a failed attempt waits an hour before the next, kept in `nouez/latest-release.json` in your cache folder (`%LOCALAPPDATA%` on Windows, `$XDG_CACHE_HOME` or `~/.cache` elsewhere); servers that start at the same moment may each ask. The request runs in the background when the server starts, and each network step gives up after 3 seconds, so no tool waits for it; if you're offline there is simply no notice. The notice is given once per server process. To turn the check off, set the environment variable `NOUEZ_NO_UPDATE_CHECK=1`.
 

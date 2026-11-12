@@ -387,7 +387,7 @@ class NouezUpdateTest(unittest.TestCase):
         self.assertIn("go ahead with the consultation", first)
         self.assertIn("/mcp", first)
         if os.path.exists(os.path.join(ROOT, ".git")):
-            self.assertIn("pull`", first)
+            self.assertIn("pull --ff-only`", first)
             self.assertIn("don't discard", first)
         self.assertEqual(second, "")
 
@@ -480,7 +480,7 @@ class NouezUpdateTest(unittest.TestCase):
             text = self.notice_in(os.path.join(base, name, "nouez"), True)
             self.assertIn("git -C '", text)
             command = text.split("`git -C ")[1].split("` in a shell")[0]
-            self.assertTrue(command.startswith("'") and command.endswith("' pull"), command)
+            self.assertTrue(command.startswith("'") and command.endswith("' pull --ff-only"), command)
             self.assertEqual(command.count("'"), 2)
         for name in ("it's", "it’s; Write-Output INJECTED; #", "‘a", "‚b", "‛c", "a\nb"):
             text = self.notice_in(os.path.join(base, name, "nouez"), True)
@@ -730,6 +730,23 @@ class TrustTest(unittest.TestCase):
         self.assertTrue(os.path.exists(backup))
         self.assertTrue(server.folder_trusted(self.repo))
 
+    def test_a_name_that_reads_as_an_option_opens_nothing(self):
+        target = os.path.join(self.plain, "new-folder")
+        for name in ("--dangerously-skip-permissions", "-x", "a;b", "a\nb", "x" * 65):
+            with mock.patch.object(server, "open_window") as open_window:
+                with self.assertRaises(server.BridgeError) as caught:
+                    server.open_claude_session({"cwd": target, "name": name, "create": True})
+            self.assertIn("Nothing was opened", str(caught.exception))
+            open_window.assert_not_called()
+            self.assertFalse(os.path.exists(target))
+
+    def test_session_names_from_folders(self):
+        self.assertEqual(server.session_name_from("my project"), "my project")
+        self.assertEqual(server.session_name_from("análisis 2"), "análisis 2")
+        self.assertEqual(server.session_name_from("--x;y"), "x-y")
+        self.assertEqual(server.session_name_from("---"), "claude")
+        self.assertTrue(server.CLAUDE_SESSION_NAME.fullmatch(server.session_name_from("a" * 100)))
+
     def test_inherited_trust_notes_what_may_still_ask(self):
         os.makedirs(os.path.join(self.plain, ".claude"))
         for name in (os.path.join(".claude", "settings.json"), ".mcp.json"):
@@ -937,6 +954,8 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual(daemon.started["model"], "gpt-6-astra")
         self.assertEqual(daemon.started["effort"], "xhigh")
         self.assertIn("on model gpt-6-astra, effort xhigh", out)
+        self.assertEqual(daemon.started["sandboxPolicy"], {"type": "readOnly"})
+        self.assertEqual(daemon.started["approvalPolicy"], "never")
         self.assertIn("keeps for later messages until changed", out)
 
     def test_a_quick_reply_still_says_the_setting_changed(self):
@@ -1006,6 +1025,9 @@ class HandlerTest(unittest.TestCase):
         out = server.send_consultant_message({"to": mine["id"], "message": "hi", "wait": 0,
                                               "allow_user_session": True})
         self.assertTrue(out.startswith("Delivered to "))
+        # The user's own session keeps its own sandbox and approvals.
+        self.assertNotIn("sandboxPolicy", daemon.started)
+        self.assertNotIn("approvalPolicy", daemon.started)
 
     def test_send_offers_the_waiter(self):
         thread = self.consultant("wait01")
