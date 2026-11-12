@@ -72,6 +72,12 @@ class ProtocolTest(unittest.TestCase):
             reply = self.server.request(1, "initialize", {"protocolVersion": requested, "capabilities": {}})
             self.assertEqual(reply["result"]["protocolVersion"], requested)
 
+    def test_instructions_leave_model_choice_to_the_user(self):
+        reply = self.server.request(1, "initialize", {"protocolVersion": server.PROTOCOL_VERSIONS[0], "capabilities": {}})
+        text = reply["result"]["instructions"]
+        self.assertIn("only when the user asks or the user's own instructions", text)
+        self.assertIn("send the usual values again", text)
+
     def test_initialize_with_the_release_check_on(self):
         # The check runs, but a cached failed lookup from just now keeps it off the network.
         cache = tempfile.mkdtemp()

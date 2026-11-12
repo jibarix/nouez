@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.11.1"
+SERVER_VERSION = "0.11.2"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -2178,7 +2178,10 @@ INSTRUCTIONS = (
     "read the reply with GetConsultantReply and the returned turn_id when the user asks or when you "
     "next need it. Pass wait=\"done\" only if the user asks you to wait "
     "for the reply. A result that says 'still working' is not a reply, even if it shows output so "
-    "far: never treat it as done."
+    "far: never treat it as done. Change a consultant's model or reasoning effort (SendConsultantMessage "
+    "model and effort) only when the user asks or the user's own instructions, such as their CLAUDE.md, "
+    "call for it. The change keeps the consultant's context and stays for later messages, so once the "
+    "harder part is done, send the usual values again."
 )
 
 TO_SCHEMA = {"type": "string", "description": "Consultant name, thread id, or unique id prefix/suffix."}

@@ -25,7 +25,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.11.1 |
+| nouez | 0.11.2 |
 | Claude Code | 2.1.322 |
 | Codex CLI | 0.165.0 |
 | Codex app-server daemon | 0.167.2 |
@@ -134,6 +134,23 @@ Driving Claude Code from the Claude app with Remote Control, you can ask the ses
 Claude Code asks whether you trust a folder the first time it runs there, and a session waiting at that question can't connect to the app. So before opening a window, nouez checks Claude Code's settings (`~/.claude.json`). If the folder isn't trusted, nothing opens and Claude asks you whether you trust it. If you say yes, Claude calls it again with `trust: true`, and nouez records your answer in `~/.claude.json` the way Claude Code's trust dialog does, then opens the window, so this works from your phone. Before each change nouez saves a dated copy of the file (the newest 20 are kept, in `%LOCALAPPDATA%\nouez\claude-json-backups`, or `$XDG_STATE_HOME/nouez/claude-json-backups` elsewhere, by default `~/.local/state/nouez/claude-json-backups`) and the result names it. Only that one setting changes. If you're at the computer, Claude can instead open the window untrusted (`open_untrusted: true`) so you answer Claude Code's own question there. Trust works like Claude Code's: outside a git repository, trusting a folder covers the folders inside it, but a git repository is trusted on its own (for a worktree, its main checkout), so trusting `C:/Users/me/Projects` doesn't cover a repository in it. Even in a trusted folder Claude Code can still ask on the computer: a project's own `.claude/settings.json` allow rules need that folder itself trusted, not just a folder above it, and a project's `.mcp.json` servers have their own approval. The result mentions these when the files are there, and says when nouez can't tell whether a folder is trusted (Claude Code's settings can't be read, or the git layout is unusual).
 
 To see what's running, ask any session *"which Claude sessions are open?"*. `ListClaudeSessions` lists the interactive Claude Code sessions registered in your Claude Code config folder, whoever started them, each with its name, folder, status and whether Remote Control is on. To close one, such as a stuck one, say which: *"close hours-tracker"*. `CloseClaudeSession` ends its `claude` process. A session `OpenClaudeSession` opened also gets its window closed; one you started yourself leaves its terminal at the shell prompt. The transcript stays, so `claude --resume` in that folder picks it up again. Claude shows you the list and closes only the sessions you pick, one call each, and never the one you're talking to. The list comes from `~/.claude/sessions`, which Claude Code keeps but doesn't document, so a future Claude Code version could change it.
+
+### Choosing model and effort
+
+A consultant uses the model and reasoning effort from your Codex config (`model` and `model_reasoning_effort` in `~/.codex/config.toml`). Claude can change either one for a hard question without starting over: `SendConsultantMessage` takes `model` and `effort`, the consultant keeps its context, and the setting stays for later messages until Claude sends the usual values again. nouez tells Claude to do this only when you ask, or when your own instructions say when. Which model suits which work is your call, so nouez doesn't decide it for you.
+
+To have Claude route work this way without being asked, write your rules in `~/.claude/CLAUDE.md`. Claude Code reads that file in every project, so the rules apply wherever you use a consultant. A project's own `CLAUDE.md` covers only that project. A starting point to adapt (the model ids are examples; `/model` in Codex lists the ones your account offers):
+
+```markdown
+- **Model and effort routing.** Defaults: Claude Code on <model> at <effort>; Codex consultants on
+  gpt-6.1-sol at high. Send research to a Codex consultant (StartConsultant, then
+  SendConsultantMessage); for hard research across many sources, send that message with
+  model "gpt-6-astra". When a result is poor, find out why before changing anything: missing
+  information → fix the context or the prompt; steps skipped or rushed → raise effort one level;
+  tried properly and still failed → a stronger model. Use the top effort levels only after the
+  level below has failed. A consultant's model and effort stay set for later messages, so send
+  the defaults again once the hard part is done.
+```
 
 ### Tips
 

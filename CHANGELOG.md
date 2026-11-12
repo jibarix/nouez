@@ -6,6 +6,16 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-11-12
+
+Anyone who installs nouez can set up their own model and effort routing. Tested with Claude Code 2.1.322, Codex CLI 0.165.0 with app-server daemon 0.167.2, Python 3.13.5 on Windows 11.
+
+### Added
+- README: "Choosing model and effort" explains where a consultant's model and effort come from, how Claude changes them, and how to write your own routing rules in `~/.claude/CLAUDE.md` so they apply in every project, with a template to adapt.
+
+### Changed
+- The server instructions tell Claude to change a consultant's model or effort only when the user asks or the user's own instructions call for it, and to send the usual values again once the harder part is done, since the setting stays.
+
 ## [0.11.1] - 2026-11-12
 
 Fixes from a Codex review of 0.11.0. Tested with Claude Code 2.1.322, Codex CLI 0.165.0 with app-server daemon 0.167.2, Python 3.13.5 on Windows 11.
@@ -207,7 +217,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.11.2...HEAD
+[0.11.2]: https://github.com/jibarix/nouez/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/jibarix/nouez/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/jibarix/nouez/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/jibarix/nouez/compare/v0.9.0...v0.10.0

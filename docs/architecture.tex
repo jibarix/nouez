@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.11.1\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.11.2\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -97,7 +97,7 @@
 \begin{abstract}
 \noindent nouez is an MCP server that lets Claude Code consult live Codex sessions, and open, list and
 close Claude Code sessions on the same computer. This document
-describes nouez 0.11.1: how the pieces fit together, and an example of every message nouez sends
+describes nouez 0.11.2: how the pieces fit together, and an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, the commands nouez runs on
 the operating system, and its one request to GitHub, which looks for a newer nouez release. The daemon also sends notifications and its own requests, which nouez
@@ -296,8 +296,8 @@ nouez answers with the requested version if it supports it (2025-11-25, 2025-06-
 {"jsonrpc": "2.0", "id": 1, "result": {
   "protocolVersion": "2025-11-25",
   "capabilities": {"tools": {}},
-  "serverInfo": {"name": "nouez", "version": "0.11.1"},
-  "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: never treat it as done."}}
+  "serverInfo": {"name": "nouez", "version": "0.11.2"},
+  "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: never treat it as done. Change a consultant's model or reasoning effort ... only when the user asks or the user's own instructions, such as their CLAUDE.md, call for it. ..."}}
 \end{wire}
 
 \begin{wire}[Claude Code $\rightarrow$ nouez]
@@ -490,7 +490,7 @@ connection has four steps:
   \msg{3.0}{0}{6}{HTTP GET / Upgrade: websocket}
   \ret{3.8}{6}{0}{HTTP/1.1 101 Switching Protocols}
   \side{3.8}{6}{15 s deadline, read on a side thread}
-  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.11.1)}
+  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.11.2)}
   \ret{5.6}{12}{0}{userAgent, codexHome}
   \msg{6.4}{0}{12}{initialized (notification)}
   \msg{7.4}{0}{12}{requests for this tool call ...}
@@ -553,11 +553,11 @@ The daemon speaks JSON-RPC without the \code{"jsonrpc"} member. Ids are integers
 on each connection.
 
 \begin{wire}[nouez $\rightarrow$ daemon]
-{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.11.1"}}}
+{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.11.2"}}}
 \end{wire}
 \begin{wire}[daemon $\rightarrow$ nouez]
 {"id": 1, "result": {
-  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.11.1)",
+  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.11.2)",
   "codexHome": "C:\\Users\\you\\.codex",
   "platformFamily": "windows", "platformOs": "windows"}}
 \end{wire}
@@ -786,7 +786,7 @@ they are. Setting \code{NOUEZ\_NO\_UPDATE\_CHECK=1} turns the lookup off.
 \begin{plain}[nouez to GitHub (HTTPS)]
 GET https://api.github.com/repos/jibarix/nouez/releases/latest
 Accept: application/vnd.github+json
-User-Agent: nouez/0.11.1
+User-Agent: nouez/0.11.2
 
 200 {"tag_name": "v0.12.0", ...}             (drafts and pre-releases are never "latest")
 \end{plain}
@@ -799,7 +799,7 @@ control character gets no command: Claude is told to ask the user to run the pul
 isn't a git checkout, the notice points to the release page instead. Either way, Claude asks the
 user to reconnect only after the update worked:
 \begin{plain}[Result text: nouez update notice]
-nouez 0.12.0 is out; this server is 0.11.1. What changed: https://github.com/jibarix/nouez/releases/tag/v0.12.0. Tell the user and go ahead with the consultation. Only if the user asks you to update, run `git -C 'C:/Users/you/nouez' pull` in a shell. If git fails (local changes, a conflict, no branch checked out), stop there: tell the user what git said, don't ask them to reconnect, and don't discard, stash or switch anything without the user's say. Only after the pull succeeds, ask the user to run /mcp and reconnect consultants, which loads the new version; the Codex consultants keep their sessions.
+nouez 0.12.0 is out; this server is 0.11.2. What changed: https://github.com/jibarix/nouez/releases/tag/v0.12.0. Tell the user and go ahead with the consultation. Only if the user asks you to update, run `git -C 'C:/Users/you/nouez' pull` in a shell. If git fails (local changes, a conflict, no branch checked out), stop there: tell the user what git said, don't ask them to reconnect, and don't discard, stash or switch anything without the user's say. Only after the pull succeeds, ask the user to run /mcp and reconnect consultants, which loads the new version; the Codex consultants keep their sessions.
 \end{plain}
 
 % -----------------------------------------------------------------------------
