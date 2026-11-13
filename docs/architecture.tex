@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.11.3\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.12.0\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -97,7 +97,7 @@
 \begin{abstract}
 \noindent nouez is an MCP server that lets Claude Code consult live Codex sessions, and open, list and
 close Claude Code sessions on the same computer. This document
-describes nouez 0.11.3: how the pieces fit together, and an example of every message nouez sends
+describes nouez 0.12.0: how the pieces fit together, and an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, the commands nouez runs on
 the operating system, and its one request to GitHub, which looks for a newer nouez release. The daemon also sends notifications and its own requests, which nouez
@@ -296,7 +296,7 @@ nouez answers with the requested version if it supports it (2025-11-25, 2025-06-
 {"jsonrpc": "2.0", "id": 1, "result": {
   "protocolVersion": "2025-11-25",
   "capabilities": {"tools": {}},
-  "serverInfo": {"name": "nouez", "version": "0.11.3"},
+  "serverInfo": {"name": "nouez", "version": "0.12.0"},
   "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: never treat it as done. Change a consultant's model or reasoning effort ... only when the user asks or the user's own instructions, such as their CLAUDE.md, call for it. ..."}}
 \end{wire}
 
@@ -350,6 +350,7 @@ StartConsultant & false & false & \\
 ListConsultants & true & & \code{openWorldHint: false} \\
 SendConsultantMessage & false & false & \\
 GetConsultantReply & true$^*$ & & \code{openWorldHint: false} \\
+GetConsultantHistory & true & & \code{openWorldHint: false} \\
 WatchConsultant & false & false & \code{idempotentHint: true}, \code{openWorldHint: false} \\
 StopConsultant & false & true & \code{openWorldHint: false} \\
 OpenClaudeSession & false & false & \code{openWorldHint: false} \\
@@ -490,7 +491,7 @@ connection has four steps:
   \msg{3.0}{0}{6}{HTTP GET / Upgrade: websocket}
   \ret{3.8}{6}{0}{HTTP/1.1 101 Switching Protocols}
   \side{3.8}{6}{15 s deadline, read on a side thread}
-  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.11.3)}
+  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.12.0)}
   \ret{5.6}{12}{0}{userAgent, codexHome}
   \msg{6.4}{0}{12}{initialized (notification)}
   \msg{7.4}{0}{12}{requests for this tool call ...}
@@ -553,11 +554,11 @@ The daemon speaks JSON-RPC without the \code{"jsonrpc"} member. Ids are integers
 on each connection.
 
 \begin{wire}[nouez $\rightarrow$ daemon]
-{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.11.3"}}}
+{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.12.0"}}}
 \end{wire}
 \begin{wire}[daemon $\rightarrow$ nouez]
 {"id": 1, "result": {
-  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.11.3)",
+  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.12.0)",
   "codexHome": "C:\\Users\\you\\.codex",
   "platformFamily": "windows", "platformOs": "windows"}}
 \end{wire}
@@ -639,8 +640,10 @@ permissions changed in a watch pane would otherwise carry over.}
 \subsection{Finding a session}
 \label{sec:resolve}
 
-Every tool that takes \code{to} first lists sessions, then matches. Listing costs one request per
-session, because \code{thread/list} omits \code{threadSource}:
+A \code{to} that is a full thread id is read directly with one \code{thread/read}, plus
+\code{thread/loaded/list} to know whether it is loaded. Every other \code{to} first lists
+sessions, then matches. Listing costs one request per session, because \code{thread/list} omits
+\code{threadSource}:
 
 \begin{wire}[1. Sessions loaded in the daemon (paged)]
 -> {"id": 2, "method": "thread/loaded/list", "params": {}}
@@ -719,7 +722,7 @@ approval policy; those are only listed in the result.
 {"id": 8, "method": "thread/start", "params": {
   "cwd": "C:\\Users\\you\\Projects\\nouez", "sandbox": "read-only", "approvalPolicy": "never",
   "threadSource": "nouez",
-  "developerInstructions": "You are a skeptical senior reviewer. Look for bugs; don't rewrite code."}}
+  "developerInstructions": "Answer with a verdict line first, then findings, then what you didn't check."}}
 {"id": 9, "method": "thread/name/set", "params": {"threadId": "01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17", "name": "Diff review"}}
 \end{wire}
 \begin{plain}[Result text: started]
@@ -736,12 +739,16 @@ Using codex-nouez-4d9f17, which already works in C:\Users\you\Projects\nouez; no
 - codex-nouez-4d9f17
     id: 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17
     cwd: C:\Users\you\Projects\nouez
-    model: gpt-5.6-sol (openai)
+    model: gpt-5.6-sol (openai), effort high
     status: idle (unloaded; reloads on the next message)
     started by: StartConsultant
     title: Diff review
+    started: 2026-11-10 09:14 (2 days ago); 14 turn(s)
+    last turn: 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31 [completed, 2026-11-12 16:40 (35 min ago), took 212s] from Claude Code: "Review this diff for bugs:" -> "Two issues. 1) route() accepts float ids but ..."
+    GetConsultantHistory lists its earlier turns.
 Opened codex-nouez-4d9f17 in a Windows Terminal split pane.
 Ignored title, instructions: they apply only to a new session (new=true).
+To give this consultant new standing instructions and keep its context, send them as a message with SendConsultantMessage.
 Send it work with SendConsultantMessage.
 The user's own Codex sessions in this repo were not used (they keep the user's permissions). Message one only if the user asks you to, with allow_user_session=true:
 - codex-nouez-77c2e0
@@ -751,12 +758,17 @@ The user's own Codex sessions in this repo were not used (they keep the user's p
 Only if the user asks for a separate consultant, call StartConsultant with new=true.
 \end{plain}
 
-The pane line is omitted with \code{watch: false}. If the session has no turns yet it reads
+The \code{started} and \code{last turn} lines come from \code{thread/turns/list} (up to 100
+turns, newest first; ``100+'' when there may be more), and show when the session was created, how
+many turns it has had, and its last turn the way \code{GetConsultantHistory} does
+(Section~\ref{sec:history}), so Claude can tell whether it is still the right consultant. The
+effort is the one \code{thread/resume} reports. The pane line is omitted with \code{watch: false}. If the session has no turns yet it reads
 \emph{``A pane showing it opens beside Claude Code when you send its first message.''}, and if a
 terminal already shows it, nothing is opened and the line is \emph{``... is already open in a
 terminal; no new one was opened.''} The \code{watch} value of the latest StartConsultant call
 also decides whether later sends open a pane. The ``Ignored'' line appears only when
-\code{model}, \code{title} or \code{instructions} were passed. Other nouez sessions in the same
+\code{model}, \code{title} or \code{instructions} were passed, and the line after it only
+when \code{instructions} were. Other nouez sessions in the same
 repository follow \emph{``Other consultants in this repo:''}, and the user-session note appears
 only when there are user sessions; it is added to the ``Started'' result too.
 
@@ -789,9 +801,9 @@ they are. Setting \code{NOUEZ\_NO\_UPDATE\_CHECK=1} turns the lookup off.
 \begin{plain}[nouez to GitHub (HTTPS)]
 GET https://api.github.com/repos/jibarix/nouez/releases/latest
 Accept: application/vnd.github+json
-User-Agent: nouez/0.11.3
+User-Agent: nouez/0.12.0
 
-200 {"tag_name": "v0.12.0", ...}             (drafts and pre-releases are never "latest")
+200 {"tag_name": "v0.13.0", ...}             (drafts and pre-releases are never "latest")
 \end{plain}
 nouez keeps the version only if the tag reads \code{v}$n.n.n$; anything else, and any failure
 (offline, a proxy, a rate limit), means no notice. The notice appears once per server process,
@@ -802,7 +814,7 @@ control character gets no command: Claude is told to ask the user to run the pul
 isn't a git checkout, the notice points to the release page instead. Either way, Claude asks the
 user to reconnect only after the update worked:
 \begin{plain}[Result text: nouez update notice]
-nouez 0.12.0 is out; this server is 0.11.3. What changed: https://github.com/jibarix/nouez/releases/tag/v0.12.0. Tell the user and go ahead with the consultation. Only if the user asks you to update, run `git -C 'C:/Users/you/nouez' pull --ff-only` in a shell. If git fails (local changes, a conflict, no branch checked out), stop there: tell the user what git said, don't ask them to reconnect, and don't discard, stash or switch anything without the user's say. Only after the pull succeeds, ask the user to run /mcp and reconnect consultants, which loads the new version; the Codex consultants keep their sessions.
+nouez 0.13.0 is out; this server is 0.12.0. What changed: https://github.com/jibarix/nouez/releases/tag/v0.13.0. Tell the user and go ahead with the consultation. Only if the user asks you to update, run `git -C 'C:/Users/you/nouez' pull --ff-only` in a shell. If git fails (local changes, a conflict, no branch checked out), stop there: tell the user what git said, don't ask them to reconnect, and don't discard, stash or switch anything without the user's say. Only after the pull succeeds, ask the user to run /mcp and reconnect consultants, which loads the new version; the Codex consultants keep their sessions.
 \end{plain}
 
 % -----------------------------------------------------------------------------
@@ -904,6 +916,19 @@ Every message reaches Codex with a header naming the sender:
 \begin{wire}[daemon $\rightarrow$ nouez]
 {"id": 6, "result": {"turn": {"id": "01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31", ...}}}
 \end{wire}
+Two options add to the text, and only when passed. \code{owner\_words} is the user's own words,
+quoted as they typed them; they go first, marked off, and the rest is labelled as the sender's, so
+the consultant can tell the request from Claude's reading of it. \code{revision: true} adds a line
+after the header with the git commit, branch and number of uncommitted paths in the consultant's
+folder (from \code{git rev-parse} and \code{git status --porcelain}, run by nouez with a timeout)
+and asks the consultant to name that revision in its answer. Outside git the line says so.
+
+\begin{wire}[turn/start text with \code{"from": "lead"}, \code{owner\_words} and \code{"revision": true}]
+"[Message from lead via the consultants bridge]\n[Revision: commit 35729af on main, 2 uncommitted path(s). Name this revision in your answer.]\n
+The user's own words, as they typed them:\n<<<\nmake sure the new flag can't break old callers\n>>>\n\n
+The rest of this message is lead's.\n\nReview this diff for bugs: ..."
+\end{wire}
+
 \code{model} and \code{effort} change the consultant's Codex model or reasoning effort without
 starting a new session, so it keeps its context. nouez refuses only an empty value, blanks and control
 characters (provider ids such as \code{gpt-oss:20b} pass) and leaves Codex to reject one the model
@@ -938,10 +963,15 @@ Reply from codex-nouez-4d9f17:
 
 Two issues. 1) route() accepts float ids but ...
 
+(codex-nouez-4d9f17 runs on model gpt-5.6-sol, effort high.)
+
 (Opened codex-nouez-4d9f17 in a Windows Terminal split pane.)
 \end{plain}
+When the send didn't change \code{model} or \code{effort}, the result says what the consultant
+runs on: in a line after a reply, and in the ``started a new turn'' text. When it did, it says the
+new setting stays until changed instead.
 \begin{plain}[Result text: wait=0]
-Delivered to codex-nouez-4d9f17 (started a new turn, turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31). Don't wait for the reply. To be woken when it is ready, run this as a background command (in Claude Code: the Bash or PowerShell tool with run_in_background); it exits with the reply when the turn ends:
+Delivered to codex-nouez-4d9f17 (started a new turn on model gpt-5.6-sol, effort high, turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31). Don't wait for the reply. To be woken when it is ready, run this as a background command (in Claude Code: the Bash or PowerShell tool with run_in_background); it exits with the reply when the turn ends:
 C:/Python313/python.exe -I C:/Users/you/nouez/server.py wait 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31
 Then tell the user the consultation is under way and carry on with other work or end your turn. If you can't run background commands, read the reply later with GetConsultantReply (turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31).
 \end{plain}
@@ -964,12 +994,18 @@ Partial reply:
 Reading server.py ...
 If the message was folded into a later turn, read it with GetConsultantReply.
 \end{plain}
+\begin{plain}[Result text: the turn failed inside Codex]
+codex-nouez-4d9f17: turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31 failed. stream disconnected before completion
+Partial reply:
+(none)
+The turn failed inside Codex (the error above is Codex's), not in nouez, and the message got no answer. Sending the message again is safe: the consultant keeps its context, so say briefly that the last turn failed and ask again. If it fails the same way twice, start a new consultant (StartConsultant with new=true) and give it a short summary of what it needs.
+\end{plain}
 \begin{plain}[Result text: reply over 60,000 characters]
 Reply from codex-nouez-4d9f17:
 
 <first 60,000 characters>
 
-[Truncated: 18422 more characters. The full reply is saved in C:\Users\you\AppData\Local\Temp\nouez\01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31.md.]
+[Truncated: 18422 more characters. The full reply is saved in C:\Users\you\AppData\Local\Temp\nouez\01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31.md. Or read the rest with GetConsultantReply (turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31, offset 60000).]
 \end{plain}
 
 % -----------------------------------------------------------------------------
@@ -1027,6 +1063,32 @@ An interrupted turn followed by a newer turn adds:
 by omitting turn\_id.''} nouez does not check that the later turn holds the message here; the
 newer turn may be someone else's.
 
+\code{offset}, a whole number of characters, reads a finished reply from that point, up to 60,000
+characters at a time, and names the offset to read on from. It is how Claude reads the rest of a
+cut reply without opening the saved file. An offset past the end says so; on a running turn it is
+ignored and the usual ``still working'' result comes back.
+\begin{plain}[Result text: with \code{"offset": 60000}]
+Reply from codex-nouez-4d9f17 (turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31, completed), characters 60000-78422 of 78422:
+
+<the rest of the reply>
+\end{plain}
+
+\subsection{GetConsultantHistory}
+\label{sec:history}
+
+Lists a consultant's recent turns, newest first, one line each, from one
+\code{thread/turns/list} (\code{limit}, default 20, at most 100). Each line gives the turn id,
+status, when it started and how long it took, the sender (the \code{from} label in a bridge
+message's header, or ``someone in the Codex pane'' for text typed there), the first line of the
+message and of the reply, and how many messages steered the turn while it ran. For a bridge
+message the revision line and the \code{owner\_words} framing are skipped, so the line shows the
+sender's own text. It reads only, user sessions included.
+\begin{plain}[Result text]
+codex-nouez-4d9f17 (started 2026-11-10 09:14 (2 days ago)): its 2 most recent turn(s), newest first. Read a whole reply with GetConsultantReply and the turn id.
+- 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31 [completed, 2026-11-12 16:40 (35 min ago), took 212s] from Claude Code: "Review this diff for bugs:" (+1 more message(s) added while it ran) -> "Two issues. 1) route() accepts float ids but ..."
+- 01a1e902-77aa-7c10-9e2d-41b0c3d8a6f0 [completed, 2026-11-10 09:15 (2 days ago), took 48s] from someone in the Codex pane: "what does resolve() do?" -> "It lists sessions, then matches ..."
+\end{plain}
+
 % -----------------------------------------------------------------------------
 \subsection{The waiter command}
 
@@ -1066,6 +1128,25 @@ row, a count that each working connection resets, it prints \emph{``Stopped wait
 the Claude Code session that started it; the reply stays readable with \code{GetConsultantReply}.
 
 % -----------------------------------------------------------------------------
+\subsection{The doctor command}
+
+\code{server.py doctor} is a command line too, for checking a setup. It prints one line per check,
+marked \code{[ok]}, \code{[note]} or \code{[problem]}: nouez's version and path and the Python
+running it; the \code{codex} CLI on the PATH; whether the app-server daemon answers, with its
+version and any update notice (connecting may start it, as any consultation would); whether
+\code{settings.json} in Claude Code's config folder holds the waiter's allow rules; and, on
+Windows, whether Windows Terminal and \code{claude} are on the PATH. It changes nothing, and exits with code~1
+when a problem blocks consultations.
+\begin{plain}[Output]
+[ok] nouez 0.12.0 at C:\Users\you\nouez\server.py, Python 3.13.5 at C:\Python313\python.exe
+[ok] codex CLI 0.165.0 at C:\Users\you\AppData\Roaming\npm\codex.CMD
+[ok] the Codex app-server daemon answers (version 0.167.2)
+[ok] Claude Code allows the waiter command without asking
+[ok] Windows Terminal is installed: panes open beside Claude Code
+[ok] claude at C:\Users\you\.local\bin\claude.exe (for OpenClaudeSession)
+No problems found.
+\end{plain}
+
 \subsection{WatchConsultant}
 
 \begin{figure}[H]
@@ -1155,7 +1236,16 @@ opens and the result says the session may be waiting at the question.
 {"jsonrpc": "2.0", "id": 19, "method": "tools/call", "params": {"name": "OpenClaudeSession", "arguments": {"cwd": "C:\\Users\\me\\Projects\\other"}}}
 \end{wire}
 \begin{plain}[Result text]
-Opened a new Windows Terminal window in C:\Users\me\Projects\other running Claude Code (opus, medium effort) with Remote Control, named "other". It is a normal session: its transcript is saved and it can be resumed later. It appears in the Claude app's session list under that name once it connects, in a few seconds.
+Opened a new Windows Terminal window in C:\Users\me\Projects\other running Claude Code (opus, medium effort) with Remote Control, named "other". It is a normal session: its transcript is saved and it can be resumed later. It appears in the Claude app's session list under that name once it connects, in a few seconds. Checked: it is running and connected to Remote Control.
+\end{plain}
+Before opening, nouez reads the session registry (Section~\ref{sec:claude-tools}); after
+opening a trusted folder, it reads it once a second for up to 15 seconds, looking for a new pid in
+that folder, and ends the result with what it found. The window opens either way, and a registry it
+can't read only leaves the note out. A session already running in the folder is named too.
+\begin{plain}[Result text: other endings]
+... Note: another Claude Code session was already running in this folder: nouez-2a (pid 31940). Both can work there; they don't see each other's conversation. Checked: it is running and connected to Remote Control.
+... Checked: it is running, but hadn't connected to Remote Control after 15s. It may still be connecting, or waiting for an answer on the computer.
+... Checked: it hadn't shown up as a running session after 15s. It may still be starting, or waiting for an answer on the computer; ListClaudeSessions shows it once it runs.
 \end{plain}
 \begin{wire}[Claude Code $\rightarrow$ nouez: a new folder]
 {"jsonrpc": "2.0", "id": 20, "method": "tools/call", "params": {"name": "OpenClaudeSession", "arguments": {"cwd": "C:\\Users\\me\\Projects\\economic-recession", "create": true}}}

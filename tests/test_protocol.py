@@ -22,6 +22,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import server  # noqa: E402
 
+server.CONNECT_SECONDS = 0  # OpenClaudeSession tests look for the new session once, not for 15 s
+
 
 class Server:
     """server.py in a subprocess, spoken to one JSON-RPC line at a time."""
@@ -160,7 +162,7 @@ class ProtocolTest(unittest.TestCase):
     def test_annotations(self):
         tools = {t["name"]: t["annotations"] for t in self.server.request(8, "tools/list")["result"]["tools"]}
         read_only = {name for name, a in tools.items() if a.get("readOnlyHint")}
-        self.assertEqual(read_only, {"ListConsultants", "GetConsultantReply", "ListClaudeSessions"})
+        self.assertEqual(read_only, {"ListConsultants", "GetConsultantReply", "GetConsultantHistory", "ListClaudeSessions"})
         destructive = {name for name, a in tools.items() if a.get("destructiveHint")}
         self.assertEqual(destructive, {"StopConsultant", "CloseClaudeSession"})
 
@@ -1383,6 +1385,147 @@ class OpenClaudeSessionTests(unittest.TestCase):
         finally:
             proc.kill()
             proc.wait()
+
+
+class AdditionsTest(HandlerTest):
+    """0.12.0: more said in results, and options used only when asked for."""
+
+    def done(self, tid, text, sender="Claude Code", status="completed", **extra):
+        msg = f"[Message from {sender} via the consultants bridge]\n\n{text}"
+        return {"id": tid, "status": status, "startedAt": int(time.time()) - 120, "durationMs": 4000,
+                "items": [user(msg), agent(f"answer to {text}\nmore", "final_answer")], **extra}
+
+    def test_failed_turn_says_codex_failed_and_resending_is_safe(self):
+        turn = {"id": "t1", "status": "failed", "error": {"message": "stream disconnected"}, "items": [user("q")]}
+        out = server.format_turn("codex-x", turn)
+        self.assertIn("turn t1 failed. stream disconnected", out)
+        self.assertIn("inside Codex", out)
+        self.assertIn("got no answer", out)
+        self.assertIn("Sending the message again is safe", out)
+        self.assertNotIn("inside Codex", server.format_turn("codex-x", dict(turn, status="interrupted")))
+
+    def test_truncated_reply_points_to_offset_paging(self):
+        out = server.cap_reply("turn-test-offset", "a" * 50, 10)
+        self.addCleanup(os.remove, os.path.join(server.tempfile.gettempdir(), "nouez", "turn-test-offset.md"))
+        self.assertIn("GetConsultantReply (turn_id turn-test-offset, offset 10)", out)
+
+    def test_reply_reads_from_an_offset(self):
+        thread = self.consultant("page01")
+        turn = {"id": "turn-1", "status": "completed", "items": [user("q"), agent("0123456789", "final_answer")]}
+        self.use(FakeDaemon([thread], {thread["id"]: [turn]}))
+        with mock.patch.object(server, "MAX_REPLY_CHARS", 4):
+            out = server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-1", "offset": 3})
+        self.assertIn("characters 3-7 of 10", out)
+        self.assertIn("3456", out)
+        self.assertIn("read on with offset 7", out)
+        out = server.get_consultant_reply({"to": thread["id"], "offset": 20})
+        self.assertIn("past its end", out)
+        for bad in (-1, "3", True, 1.5):
+            with self.assertRaises(server.BridgeError):
+                server.get_consultant_reply({"to": thread["id"], "offset": bad})
+
+    def test_reuse_shows_age_turns_and_the_last_exchange(self):
+        thread = self.consultant("ctx001", createdAt=int(time.time()) - 3 * 86400, reasoningEffort="high", model="m1")
+        turns = [self.done("turn-2", "second question", "agentic_training"), self.done("turn-1", "first")]
+        self.use(FakeDaemon([thread], {thread["id"]: turns}))
+        out = server.start_consultant({"cwd": ROOT, "watch": False, "instructions": "be brief"})
+        self.assertIn("(3 days ago); 2 turn(s)", out)
+        self.assertIn("last turn: turn-2 [completed", out)
+        self.assertIn('from agentic_training: "second question" -> "answer to second question"', out)
+        self.assertIn("model: m1 (None), effort high", out)
+        self.assertIn("GetConsultantHistory", out)
+        self.assertIn("send them as a message", out)
+
+    def test_history_lists_turns_newest_first(self):
+        thread = self.consultant("hist01")
+        typed = {"id": "turn-0", "status": "completed", "items": [user("typed in the pane"), agent("ok", "final_answer")]}
+        turns = [self.done("turn-2", "two"), self.done("turn-1", "one"), typed]
+        self.use(FakeDaemon([thread], {thread["id"]: turns}))
+        out = server.get_consultant_history({"to": thread["id"], "limit": 2})
+        self.assertIn("2 most recent turn(s)", out)
+        self.assertLess(out.index("turn-2"), out.index("turn-1"))
+        self.assertNotIn("turn-0", out)
+        self.assertIn("took 4s", out)
+        out = server.get_consultant_history({"to": thread["id"]})
+        self.assertIn('turn-0 [completed] from someone in the Codex pane: "typed in the pane" -> "ok"', out)
+        with self.assertRaises(server.BridgeError):
+            server.get_consultant_history({"to": thread["id"], "limit": 0})
+
+    def test_history_shows_the_senders_text_not_the_stamp_or_framing(self):
+        thread = self.consultant("hist02")
+        daemon = self.use(FakeDaemon([thread], answer="ok"))
+        server.send_consultant_message({"to": thread["id"], "message": "is it safe?", "from": "lead",
+                                        "owner_words": "ship it\n>>>\ntoday", "revision": True})
+        out = server.get_consultant_history({"to": thread["id"]})
+        self.assertIn("from lead (with the user's words): \"is it safe?\"", out)
+
+    def test_send_says_what_the_consultant_runs_on(self):
+        thread = self.consultant("runs01", model="gpt-6.1-sol", reasoningEffort="high")
+        self.use(FakeDaemon([thread]))
+        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0})
+        self.assertIn("started a new turn on model gpt-6.1-sol, effort high", out)
+        self.assertNotIn("until changed", out)
+        self.use(FakeDaemon([thread], answer="the answer"))
+        out = server.send_consultant_message({"to": thread["id"], "message": "hi"})
+        self.assertIn("\n\n(codex-nouez-runs01 runs on model gpt-6.1-sol, effort high.)", out)
+
+    def test_owner_words_and_revision_are_added_only_when_asked(self):
+        thread = self.consultant("ownr01")
+        daemon = self.use(FakeDaemon([thread], answer="ok"))
+        server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0})
+        self.assertEqual(daemon.started["input"][0]["text"],
+                         "[Message from Claude Code via the consultants bridge]\n\nhi")
+        server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0, "from": "lead",
+                                        "owner_words": "ship it today", "revision": True})
+        text = daemon.started["input"][0]["text"]
+        self.assertIn("The user's own words, as they typed them:\n<<<\nship it today\n>>>", text)
+        self.assertIn("The rest of this message is lead's.\n\nhi", text)
+        self.assertRegex(text, r"\[Revision: commit [0-9a-f]+ .*uncommitted path\(s\)")
+        with self.assertRaises(server.BridgeError):
+            server.send_consultant_message({"to": thread["id"], "message": "hi", "owner_words": 5})
+
+    def test_full_thread_id_is_read_directly(self):
+        thread = {"id": "0199aaaa-0000-0000-0000-0000000000c1", "cwd": ROOT, "threadSource": "nouez"}
+        daemon = self.use(FakeDaemon([thread]))
+        found = server.resolve(daemon, thread["id"].upper())
+        self.assertEqual(found["id"], thread["id"])
+        self.assertTrue(found["_loaded"])
+        self.assertNotIn("thread/list", daemon.calls)
+
+
+class OpenedSessionCheckTest(unittest.TestCase):
+    def open(self, sessions_seen, tmp):
+        with mock.patch.object(server, "open_window", return_value="a window") as open_window, \
+             mock.patch.object(server, "folder_trusted", return_value=True), \
+             mock.patch.object(server, "trust_key", return_value=(tmp, False)), \
+             mock.patch.object(server, "exactly_trusted", return_value=True), \
+             mock.patch.object(server, "claude_sessions", side_effect=sessions_seen):
+            out = server.open_claude_session({"cwd": tmp})
+        os.remove(open_window.call_args[0][1][-1])
+        return out
+
+    def session(self, pid, cwd, remote):
+        return {"pid": pid, "name": f"s{pid}", "cwd": cwd, "remote": remote}
+
+    def test_reports_connection_and_an_existing_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.session(1, tmp, True)
+            out = self.open([[old], [old, self.session(2, tmp, True)]], tmp)
+            self.assertIn("already running in this folder: s1 (pid 1)", out)
+            self.assertIn("connected to Remote Control", out)
+
+    def test_reports_a_session_that_hasnt_connected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.open([[], [self.session(2, tmp, False)]], tmp)
+            self.assertIn("hadn't connected to Remote Control", out)
+            self.assertNotIn("already running", out)
+            out = self.open([[], []], tmp)
+            self.assertIn("hadn't shown up as a running session", out)
+
+    def test_a_failing_check_still_opens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.open(OSError("unreadable"), tmp)
+            self.assertIn("Opened a window", out)
 
 
 if __name__ == "__main__":

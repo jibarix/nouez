@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.11.3"
+SERVER_VERSION = "0.12.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -138,6 +138,19 @@ def wait_seconds(args, default):
         raise BridgeError(f"`wait` must be a number of seconds, 0 or more (0 = don't wait), or \"done\", "
                           f"not {reprlib.repr(value)}.") from None
     return min(seconds, MAX_WAIT_SECONDS)
+
+
+def count_arg(args, key, default, low=0, high=None):
+    """A whole-number argument from low to high (if given); anything else is an error."""
+    value = args.get(key, default)
+    if value is None:
+        return default
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value < low or (high is not None and value > high):
+        span = f"from {low} to {high}" if high is not None else f"{low} or more"
+        raise BridgeError(f"`{key}` must be a whole number {span}, not {reprlib.repr(value)}.")
+    return value
 
 
 def target(args):
@@ -422,16 +435,21 @@ def read_thread(client, tid):
         return None
 
 
-def load_consultants(client, include_all=False):
-    """Sessions loaded on the daemon, plus recent bridge consultants the daemon has unloaded.
-    The daemon unloads idle sessions with no subscriber after about a minute."""
+def loaded_ids(client):
+    """Ids of the sessions loaded on the daemon, in its order."""
     ids, cursor = [], None
     while True:
         page = client.request("thread/loaded/list", {"cursor": cursor} if cursor else {})
         ids += page.get("data", [])
         cursor = page.get("nextCursor")
         if not cursor:
-            break
+            return ids
+
+
+def load_consultants(client, include_all=False):
+    """Sessions loaded on the daemon, plus recent bridge consultants the daemon has unloaded.
+    The daemon unloads idle sessions with no subscriber after about a minute."""
+    ids = loaded_ids(client)
     consultants = []
     for tid in ids:
         thread = read_thread(client, tid)
@@ -454,9 +472,18 @@ def load_consultants(client, include_all=False):
     return consultants
 
 
+FULL_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
 def resolve(client, target, exact_only=False):
     """The session `target` names. exact_only (for destructive tools) skips id prefix/suffix matches."""
     target = target.strip().lower()
+    if FULL_ID.fullmatch(target):
+        # A full thread id names one session: read it directly instead of every recent one.
+        thread = read_thread(client, target)
+        if thread:
+            thread["_loaded"] = thread["id"] in loaded_ids(client)
+            return thread
     threads = load_consultants(client, include_all=True)
     exact = [t for t in threads if target in (t["id"].lower(), short_name(t))]
     if len(exact) == 1:
@@ -484,13 +511,18 @@ def resolve(client, target, exact_only=False):
 def ensure_loaded(client, thread):
     """(Re)load the session. Always resume rather than trust the loaded snapshot, which can go
     stale if the daemon unloads it meanwhile. Resume keeps its saved sandbox and approval policy."""
+    resumed = {}
     try:
-        client.request("thread/resume", {"threadId": thread["id"], "excludeTurns": True})
+        resumed = client.request("thread/resume", {"threadId": thread["id"], "excludeTurns": True}) or {}
     except BridgeError as e:
         # A session with no history can't be resumed; it is the freshly started, still-loaded one.
         if not any(s in str(e) for s in NO_HISTORY_ERRORS):
             raise
     thread["_loaded"] = True
+    # The model and effort its next turn runs on, if the daemon said.
+    for key in ("model", "reasoningEffort"):
+        if resumed.get(key):
+            thread[key] = resumed[key]
 
 
 def list_turns(client, thread_id, limit):
@@ -580,7 +612,8 @@ def cap_reply(turn_id, reply, limit=MAX_REPLY_CHARS):
     except OSError as e:
         where = f"The full reply could not be saved ({e}); read it in the consultant's pane."
     omitted = len(reply) - limit
-    return f"{reply[:limit]}\n\n[Truncated: {omitted} more characters. {where}]"
+    return (f"{reply[:limit]}\n\n[Truncated: {omitted} more characters. {where} Or read the rest with "
+            f"GetConsultantReply (turn_id {turn_id}, offset {limit}).]")
 
 
 def partial_output(turn):
@@ -652,10 +685,69 @@ def format_turn(name, turn, limit=MAX_REPLY_CHARS):
     reply = cap_reply(turn["id"], turn_reply(turn), limit)
     if turn["status"] != "completed":
         err = (turn.get("error") or {}).get("message", "")
-        hint = ("\nIf the message was folded into a later turn, read it with GetConsultantReply."
-                if turn["status"] == "interrupted" else "")
+        hint = ""
+        if turn["status"] == "interrupted":
+            hint = "\nIf the message was folded into a later turn, read it with GetConsultantReply."
+        elif turn["status"] == "failed":
+            hint = ("\nThe turn failed inside Codex (the error above is Codex's), not in nouez"
+                    + ("" if reply else ", and the message got no answer")
+                    + ". Sending the message again is safe: the consultant keeps its context, so say "
+                    "briefly that the last turn failed and ask again. If it fails the same way twice, "
+                    "start a new consultant (StartConsultant with new=true) and give it a short summary "
+                    "of what it needs.")
         return f"{name}: turn {turn['id']} {turn['status']}. {err}\nPartial reply:\n{reply or '(none)'}{hint}"
     return f"Reply from {name}:\n\n{reply or '(no text reply)'}"
+
+
+BRIDGE_HEADER = re.compile(r"\[Message from (.{1,200}?) via the consultants bridge\]")
+
+
+REVISION_STAMP = re.compile(r"\A\s*\[Revision: [^\]\n]*\]\n")
+OWNER_BLOCK = re.compile(r"\A\s*The user's own words, as they typed them:\n<<<\n.*?\n>>>\n\n"
+                         r"The rest of this message is [^\n]*'s\.\n\n", re.S)
+
+
+def first_line(text, limit=120):
+    line = next((l.strip() for l in (text or "").splitlines() if l.strip()), "")
+    return line if len(line) <= limit else line[:limit - 1] + "…"
+
+
+def when(ts, now=None):
+    """A Unix time as local date and time plus how long ago, or "" if unknown."""
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool) or ts <= 0:
+        return ""
+    ago = max(0, (now or time.time()) - ts)
+    if ago < 3600:
+        rel = f"{ago // 60:.0f} min ago"
+    elif ago < 2 * 86400:
+        rel = f"{ago // 3600:.0f} h ago"
+    else:
+        rel = f"{ago // 86400:.0f} days ago"
+    return f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(ts))} ({rel})"
+
+
+def describe_turn(turn, now=None):
+    """One line about a turn: status, when, who sent it, and the start of message and reply."""
+    texts = user_texts(turn)
+    sender, message = "someone in the Codex pane", texts[0] if texts else ""
+    header = BRIDGE_HEADER.match(message)
+    if header:
+        sender, message = header.group(1), message[header.end():]
+        # Show the sender's own text, not the revision stamp or the owner_words framing.
+        message = REVISION_STAMP.sub("", message, count=1)
+        owner = OWNER_BLOCK.match(message)
+        if owner:
+            sender, message = sender + " (with the user's words)", message[owner.end():]
+    parts = [turn.get("status", "?")]
+    started = when(turn.get("startedAt"), now)
+    if started:
+        parts.append(started)
+    if isinstance(turn.get("durationMs"), int):
+        parts.append(f"took {turn['durationMs'] // 1000}s")
+    reply = first_line(turn_reply(turn)) if turn.get("status") != "inProgress" else ""
+    extra = f" (+{len(texts) - 1} more message(s) added while it ran)" if len(texts) > 1 else ""
+    return (f"{turn.get('id')} [{', '.join(parts)}] from {sender}: \"{first_line(message)}\"{extra}"
+            + (f" -> \"{reply}\"" if reply else ""))
 
 
 def send_lock(tid):
@@ -1604,6 +1696,40 @@ def trust_folder(path):
                       f"{backup or trust_backup_dir()}. Try again, or answer the trust question on the computer.")
 
 
+CONNECT_SECONDS = 15  # how long OpenClaudeSession looks for the new session's Remote Control connection
+
+
+def same_folder(a, b):
+    try:
+        return os.path.normcase(os.path.abspath(a)).rstrip("\\/") == os.path.normcase(os.path.abspath(b)).rstrip("\\/")
+    except (TypeError, ValueError):
+        return False
+
+
+def connection_note(before, cwd, cancel=None):
+    """Whether a session new since `before` (pids) appeared in cwd with Remote Control, checked for
+    up to CONNECT_SECONDS. Only a report: the window is open either way."""
+    deadline, seen = time.monotonic() + CONNECT_SECONDS, None
+    while True:
+        try:
+            new = [s for s in claude_sessions() if s["pid"] not in before and same_folder(s["cwd"], cwd)]
+        except Exception as e:
+            log("claude_sessions:", repr(e))
+            new = []
+        seen = new or seen
+        if any(s["remote"] for s in new):
+            return "Checked: it is running and connected to Remote Control."
+        if time.monotonic() >= deadline:
+            break
+        check_cancel(cancel)
+        time.sleep(1)
+    if seen:
+        return (f"Checked: it is running, but hadn't connected to Remote Control after {CONNECT_SECONDS}s. "
+                "It may still be connecting, or waiting for an answer on the computer.")
+    return (f"Checked: it hadn't shown up as a running session after {CONNECT_SECONDS}s. It may still be "
+            "starting, or waiting for an answer on the computer; ListClaudeSessions shows it once it runs.")
+
+
 def open_claude_session(args, cancel=None, progress=None):
     cwd = args.get("cwd")
     if not isinstance(cwd, str) or not os.path.isabs(cwd):
@@ -1667,6 +1793,12 @@ def open_claude_session(args, cancel=None, progress=None):
         if os.path.isfile(os.path.join(project, ".mcp.json")):
             asks.append("its .mcp.json servers are approved separately, so Claude Code may ask before "
                         "connecting them")
+    try:
+        before = claude_sessions()
+    except Exception as e:  # only a check: never a reason not to open
+        log("claude_sessions:", repr(e))
+        before = []
+    already = [s for s in before if same_folder(s["cwd"], cwd)]
     fd, spec = tempfile.mkstemp(prefix="nouez-claude-", suffix=".json")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump({"cwd": cwd, "name": name, "prompt": prompt, "model": model, "effort": effort}, f)
@@ -1679,6 +1811,12 @@ def open_claude_session(args, cancel=None, progress=None):
         f"Opened {how} in {cwd} running Claude Code ({model}, {effort} effort) with Remote Control, named \"{name}\". It is a "
         "normal session: its transcript is saved and it can be resumed later. It appears in the "
         "Claude app's session list under that name once it connects, in a few seconds."])
+    if already:
+        out += (" Note: another Claude Code session was already running in this folder: "
+                + ", ".join(f"{s['name']} (pid {s['pid']})" for s in already)
+                + ". Both can work there; they don't see each other's conversation.")
+    if trusted is not False:
+        out += " " + connection_note({s["pid"] for s in before}, cwd, cancel)
     if trusted is False:
         out += (" Warning: Claude Code hasn't been trusted in this folder yet, so the new session is "
                 "waiting at the trust question on the computer and won't connect until someone answers it there.")
@@ -1902,7 +2040,8 @@ def format_threads(threads):
             f"- {short_name(t)}\n"
             f"    id: {t['id']}\n"
             f"    cwd: {t.get('cwd')}\n"
-            f"    model: {t.get('model')} ({t.get('modelProvider')})\n"
+            f"    model: {t.get('model')} ({t.get('modelProvider')})"
+            + (f", effort {t['reasoningEffort']}" if t.get("reasoningEffort") else "") + "\n"
             f"    status: {status_label(t)}\n"
             f"    started by: {'StartConsultant' if is_bridge(t) else 'user'}"
             + (f"\n    title: {t['name']}" if t.get("name") else "")
@@ -1954,7 +2093,8 @@ def start_consultant(args, cancel=None, progress=None):
             users = [t for t in found if not is_bridge(t)]
         if existing:
             thread = existing[0]
-            has_turns = bool(latest_turn(client, thread["id"]))
+            recent = list_turns(client, thread["id"], REPLY_LOOKBACK)
+            has_turns = bool(recent)
             info = client.info
         else:
             thread = client.request("thread/start", params)["thread"]
@@ -1996,19 +2136,49 @@ def start_consultant(args, cancel=None, progress=None):
             pane = f"Could not open a terminal: {e}"
     others = existing[1:]
     ignored = [k for k in ("model", "title", "instructions") if args.get(k)]
+    count = f"{len(recent)}{'+' if len(recent) >= REPLY_LOOKBACK else ''} turn(s)"
+    history = (f"    started: {when(thread.get('createdAt')) or 'unknown'}; {count}\n"
+               + (f"    last turn: {describe_turn(recent[0])}\n" if recent else "")
+               + ("    GetConsultantHistory lists its earlier turns.\n" if len(recent) > 1 else ""))
     return (
         f"Using {name}, which already works in {root}; nothing new was started.\n"
         + format_threads([thread]) + "\n"
+        + history
         + (pane + "\n" if pane else "")
         + (f"Ignored {', '.join(ignored)}: they apply only to a new session (new=true).\n" if ignored else "")
         + ("To change this consultant's model and keep its context, pass model to SendConsultantMessage.\n"
            if "model" in ignored else "")
+        + ("To give this consultant new standing instructions and keep its context, send them as a "
+           "message with SendConsultantMessage.\n" if "instructions" in ignored else "")
         + "Send it work with SendConsultantMessage."
         + (f"\nOther consultants in this repo:\n{format_threads(others)}" if others else "")
         + user_note
         + "\nOnly if the user asks for a separate consultant, call StartConsultant with new=true."
         + (f"\n{notice}" if notice else "")
     )
+
+
+def running_on(thread, prefix=""):
+    """The model and effort a session runs on, as the daemon reports them, or "" if unknown."""
+    parts = [f"model {thread['model']}"] if thread.get("model") else []
+    if thread.get("reasoningEffort"):
+        parts.append(f"effort {thread['reasoningEffort']}")
+    return prefix + ", ".join(parts) if parts else ""
+
+
+def revision_line(cwd):
+    """A line naming the commit and the number of uncommitted paths of the repo at cwd, so a
+    review can say which version it read. Read-only git commands; "" if git has nothing to say."""
+    if not cwd or not os.path.isdir(cwd):
+        return ""
+    head = run_text(["git", "-C", cwd, "rev-parse", "--short", "HEAD"], timeout=10).strip()
+    if not head:
+        return "[Revision: not a git repository, or no commits yet]\n"
+    branch = run_text(["git", "-C", cwd, "branch", "--show-current"], timeout=10).strip()
+    status = run_text(["git", "-C", cwd, "status", "--porcelain"], timeout=20)
+    dirty = sum(1 for line in status.splitlines() if line.strip())
+    return (f"[Revision: commit {head}" + (f" on {branch}" if branch else "")
+            + f", {dirty} uncommitted path(s). Name this revision in your answer.]\n")
 
 
 def send_consultant_message(args, cancel=None, progress=None):
@@ -2029,12 +2199,20 @@ def send_consultant_message(args, cancel=None, progress=None):
         overrides[key] = value
     settings = ", ".join(f"{k} {v}" for k, v in overrides.items())
     sender = args.get("from") or "Claude Code"
-    text = f"[Message from {sender} via the consultants bridge]\n\n{message}"
+    owner_words = args.get("owner_words") or ""
+    if not isinstance(owner_words, str):
+        raise BridgeError("`owner_words` must be a string: text the user typed, quoted as they wrote it.")
+    want_revision = flag(args, "revision")
+    if owner_words:
+        message = (f"The user's own words, as they typed them:\n<<<\n{owner_words}\n>>>\n\n"
+                   f"The rest of this message is {sender}'s.\n\n{message}")
 
     client = CodexClient()
     try:
         thread = resolve(client, to)
         tid, name = thread["id"], short_name(thread)
+        stamp = revision_line(thread.get("cwd")) if want_revision else ""
+        text = f"[Message from {sender} via the consultants bridge]\n{stamp}\n{message}"
         if not (is_bridge(thread) or allow_user):
             # Our consultants are read-only; a session the user opened has the user's permissions.
             raise BridgeError(
@@ -2068,6 +2246,8 @@ def send_consultant_message(args, cancel=None, progress=None):
                 turn_id, mode = started["turn"]["id"], "started a new turn"
                 if overrides:
                     mode += f" on {settings}, which the consultant keeps for later messages until changed"
+                else:
+                    mode += running_on(thread, " on ")
                 # turns/list lags turn/start. Hold the lock until the turn is listed, or a
                 # concurrent send would see the session idle and its turn/start would
                 # interrupt this one.
@@ -2097,7 +2277,9 @@ def send_consultant_message(args, cancel=None, progress=None):
                               f"failed: {e} Don't send the message again; read the reply with "
                               f"GetConsultantReply (turn_id {turn_id}).") from None
         if done:
-            changed = f"\n\n({name} now runs on {settings} until changed.)" if overrides else ""
+            now_on = running_on(thread)
+            changed = (f"\n\n({name} now runs on {settings} until changed.)" if overrides
+                       else f"\n\n({name} runs on {now_on}.)" if now_on else "")
             return format_turn(name, turn) + changed + (f"\n\n({watching.strip()})" if watching else "")
         return still_working(
             name, turn_id, turn,
@@ -2110,6 +2292,7 @@ def send_consultant_message(args, cancel=None, progress=None):
 def get_consultant_reply(args, cancel=None, progress=None):
     to = target(args)
     timeout = wait_seconds(args, 0)
+    offset = count_arg(args, "offset", 0)
     client = CodexClient()
     try:
         thread = resolve(client, to)
@@ -2132,6 +2315,14 @@ def get_consultant_reply(args, cancel=None, progress=None):
                                      f"{waiter_command(tid, turn['id'])}\nOr check again later with "
                                      f"turn_id {turn['id']}; pass wait=\"done\" only if the user wants "
                                      "you to wait for it.")
+        if offset:
+            reply = turn_reply(turn)
+            if offset >= len(reply):
+                return f"The reply from {name} (turn {turn['id']}) has {len(reply)} characters; offset {offset} is past its end."
+            end = min(len(reply), offset + MAX_REPLY_CHARS)
+            return (f"Reply from {name} (turn {turn['id']}, {turn['status']}), characters {offset}-{end} "
+                    f"of {len(reply)}:\n\n{reply[offset:end]}"
+                    + (f"\n\n[More: read on with offset {end}.]" if end < len(reply) else ""))
         out = format_turn(name, turn)
         latest = latest_turn(client, tid)
         if turn["status"] == "interrupted" and latest and latest["id"] != turn["id"]:
@@ -2140,6 +2331,28 @@ def get_consultant_reply(args, cancel=None, progress=None):
         return out
     finally:
         client.close()
+
+
+HISTORY_DEFAULT = 20
+
+
+def get_consultant_history(args, cancel=None, progress=None):
+    to = target(args)
+    limit = count_arg(args, "limit", HISTORY_DEFAULT, 1, REPLY_LOOKBACK)
+    client = CodexClient()
+    try:
+        thread = resolve(client, to)
+        turns = list_turns(client, thread["id"], limit)
+    finally:
+        client.close()
+    name = short_name(thread)
+    if not turns:
+        return f"{name} has no messages yet."
+    now = time.time()
+    rows = "\n".join(f"- {describe_turn(t, now)}" for t in turns)
+    return (f"{name} (started {when(thread.get('createdAt'), now) or 'at an unknown time'}): its "
+            f"{len(turns)} most recent turn(s), newest first. Read a whole reply with GetConsultantReply "
+            f"and the turn id.\n{rows}")
 
 
 def watch_consultant(args, cancel=None, progress=None):
@@ -2292,6 +2505,8 @@ TOOLS = [
                 "to": TO_SCHEMA,
                 "message": {"type": "string", "description": "The message to send."},
                 "from": {"type": "string", "description": "Sender label shown to Codex, e.g. your session name. Default 'Claude Code'."},
+                "owner_words": {"type": "string", "description": "Optional: text the user typed, quoted exactly as they wrote it (never a summary). Codex sees it in its own block, marked as the user's words, apart from your message."},
+                "revision": {"type": "boolean", "description": "Optional: add a line with the consultant's repository commit, branch and number of uncommitted paths, and ask it to name that revision in its answer. Default false."},
                 "model": {"type": "string", "description": "Codex model id for this message and later ones, e.g. gpt-6-astra. Default: unchanged. Set it when the user asks, or when the user's own rules call for another model."},
                 "effort": {"type": "string", "description": "Codex reasoning effort for this message and later ones, such as low, medium, high or xhigh; which levels exist depends on the model. Default: unchanged. Set it when the user asks, or when the user's own rules call for more or less effort."},
                 "wait": wait_schema(SEND_WAIT_SECONDS),
@@ -2317,11 +2532,30 @@ TOOLS = [
             "properties": {
                 "to": TO_SCHEMA,
                 "turn_id": {"type": "string", "description": "Turn id to read. Default: the latest turn."},
+                "offset": {"type": "integer", "minimum": 0, "description": "Start reading the reply at this character, for a long reply that was cut short; the result says where the next part starts. Default 0."},
                 "wait": wait_schema(0),
             },
             "required": ["to"],
         },
         # Its one write is nouez's own copy of an over-long reply in the temp folder.
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "GetConsultantHistory",
+        "description": (
+            "List a Codex session's recent turns, newest first, one line each: turn id, status, when it "
+            "started and how long it took, who sent the message, and the first line of the message and "
+            "of the reply. Read-only. Use it to see what a consultant has already been asked, or to "
+            "find a turn id for GetConsultantReply."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": TO_SCHEMA,
+                "limit": {"type": "integer", "minimum": 1, "maximum": REPLY_LOOKBACK, "description": f"How many turns to list. Default {HISTORY_DEFAULT}."},
+            },
+            "required": ["to"],
+        },
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     {
@@ -2411,6 +2645,7 @@ HANDLERS = {
     "ListConsultants": list_consultants,
     "SendConsultantMessage": send_consultant_message,
     "GetConsultantReply": get_consultant_reply,
+    "GetConsultantHistory": get_consultant_history,
     "WatchConsultant": watch_consultant,
     "StopConsultant": stop_consultant,
     "OpenClaudeSession": open_claude_session,
@@ -2611,6 +2846,61 @@ def run_waiter(thread_id, turn_id):
         return 0
 
 
+def run_doctor():
+    """`server.py doctor`: check what nouez needs and say what to fix. Reads only; connecting may
+    start the Codex daemon, as any consultation would. Exit code 1 if something blocks consultations."""
+    problems = 0
+
+    def say(ok, text):
+        nonlocal problems
+        problems += ok is False
+        print(f"[{'ok' if ok else 'problem' if ok is False else 'note'}] {text}")
+
+    say(True, f"nouez {SERVER_VERSION} at {os.path.abspath(__file__)}, Python {sys.version.split()[0]} "
+              f"at {sys.executable}")
+    exe = shutil.which("codex")
+    cli = codex_version(exe) if exe else None
+    say(bool(exe), f"codex CLI {cli or '(version unknown)'} at {exe}" if exe
+        else "codex is not on PATH: install the Codex CLI, then reconnect nouez in Claude Code (/mcp).")
+    if exe:
+        try:
+            client = CodexClient()
+            try:
+                daemon = version_of((client.info.get("userAgent") or "").split("/", 1)[-1])
+            finally:
+                client.close()
+            say(True, f"the Codex app-server daemon answers (version {daemon or 'unknown'})")
+            notice = update_notice(client.info)
+            if notice:
+                say(None, notice.split(" Tell the user")[0].strip())
+        except (BridgeError, OSError) as e:
+            say(False, f"can't reach the Codex app-server daemon: {e}")
+    settings = os.path.join(claude_config_dir(), "settings.json")
+    try:
+        with open(settings, encoding="utf-8") as f:
+            allow = ((json.load(f) or {}).get("permissions") or {}).get("allow") or []
+    except (OSError, ValueError, AttributeError) as e:
+        allow = None
+        say(None, f"couldn't read {settings} ({e}), so the waiter's allow rules weren't checked.")
+    if allow is not None:
+        missing = [r for r in allow_rules() if r not in allow]
+        if missing:
+            say(None, f"{settings} doesn't allow the waiter command, so Claude Code asks before each "
+                      "background wait (unless a project's settings allow it). To stop that, add to "
+                      "permissions.allow:\n    " + ",\n    ".join(json.dumps(r) for r in missing))
+        else:
+            say(True, "Claude Code allows the waiter command without asking")
+    if os.name == "nt":
+        wt = shutil.which("wt")
+        say(True if wt else None, "Windows Terminal is installed: panes open beside Claude Code" if wt
+            else "Windows Terminal isn't on PATH: consultant panes open as separate windows")
+        claude = find_program("claude", os.environ.get("PATH", ""))
+        say(True if claude else None, f"claude at {claude} (for OpenClaudeSession)" if claude
+            else "claude isn't on PATH, so OpenClaudeSession can't open sessions")
+    print("No problems found." if not problems else f"{problems} problem(s) found.")
+    return 1 if problems else 0
+
+
 def main():
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
@@ -2675,6 +2965,9 @@ if __name__ == "__main__":
         if len(sys.argv) != 3:
             sys.exit("usage: server.py claude <spec.json>  (written by OpenClaudeSession)")
         sys.exit(run_claude(sys.argv[2]))
+    if sys.argv[1:] == ["doctor"]:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.exit(run_doctor())
     if sys.argv[1:] == ["allow-rule"]:
         print("Add these to permissions.allow in ~/.claude/settings.json:")
         print(",\n".join(json.dumps(rule) for rule in allow_rules()))

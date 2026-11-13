@@ -6,6 +6,25 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-12
+
+Results say more: what a reused consultant has been doing, what it runs on, and whether an opened session connected. There is a history tool, a reply can be read in pieces, and two opt-in send options. Defaults and the server instructions are unchanged. Tested with Claude Code 2.1.322, Codex CLI 0.165.0 with app-server daemon 0.167.2, Python 3.13.5 on Windows 11.
+
+### Added
+- `GetConsultantHistory` (read-only) lists a consultant's recent turns, newest first, one line each: turn id, status, when it started and how long it took, who sent it (the `from` of a bridge message, or "someone in the Codex pane"), the first line of the message and of the reply, and how many messages were added while it ran. For a message sent with `revision` or `owner_words`, the line shows the sender's own text. `limit` sets how many (default 20, up to 100).
+- `GetConsultantReply` takes `offset`, a character position, and returns the reply from there, as much as fits, with the offset to read on from. A reply cut at 60,000 characters now names the turn id and offset to pass.
+- `SendConsultantMessage` takes `owner_words`: the user's own words, as they typed them. They go first in the message, marked off from the rest, which is labelled as the sender's, so the consultant can tell the request from Claude's reading of it. Without it the message is unchanged.
+- `SendConsultantMessage` takes `revision: true`: the message starts with a line giving the git commit, branch and number of uncommitted paths in the consultant's folder, and asks the consultant to name that revision in its answer. Without it the message is unchanged.
+- `server.py doctor` checks the setup and prints one line per check: Python and the nouez path, the `codex` CLI and the app-server daemon (with any update notice), the waiter allow rules in Claude Code's `settings.json`, Windows Terminal and `claude` on the `PATH`. It exits 1 when something needs fixing.
+- README: a brief and verdict template for consultant work, instead of the "skeptical senior reviewer" example.
+
+### Changed
+- When `StartConsultant` reuses a consultant, its result says when the consultant started and how many turns it has had, describes its last turn the way `GetConsultantHistory` does, and shows its reasoning effort next to its model. When `instructions` are ignored on reuse, it suggests sending them as a message, which keeps the context.
+- `SendConsultantMessage` says which model and effort the consultant runs on when the send doesn't change them: in the "started a new turn" line, and after a reply that came back within the wait.
+- A failed turn's result says that the turn failed inside Codex, not in nouez, and whether the message got no answer. It says sending again is safe because the consultant keeps its context, and that after a second failure of the same kind a new consultant with a short summary is the way on. An interrupted turn keeps its old wording.
+- After `OpenClaudeSession` opens a window in a trusted folder, it checks Claude Code's session list for up to 15 seconds and says whether the new session is running and connected to Remote Control. It also says when another Claude Code session was already running in that folder. The window opens either way; a failed check only leaves the note out.
+- A full thread id passed as `to` is read directly instead of being looked up in the thread list.
+
 ## [0.11.3] - 2026-11-12
 
 Security fixes from a review of 0.11.2. Nothing changes in normal use. Tested with Claude Code 2.1.322, Codex CLI 0.165.0 with app-server daemon 0.167.2, Python 3.13.5 on Windows 11.
@@ -228,7 +247,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.11.3...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/jibarix/nouez/compare/v0.11.3...v0.12.0
 [0.11.3]: https://github.com/jibarix/nouez/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/jibarix/nouez/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/jibarix/nouez/compare/v0.11.0...v0.11.1
