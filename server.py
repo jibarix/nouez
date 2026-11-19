@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.12.2"
+SERVER_VERSION = "0.12.3"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -1590,12 +1590,6 @@ def ran_here(path, cwd):
     return bool(ran_in) and same_folder(ran_in, cwd)
 
 
-def ran_elsewhere(path, cwd):
-    """The folder a transcript recorded, when that isn't cwd; None when it is, or recorded none."""
-    ran_in = transcript_cwd(path)
-    return ran_in if ran_in and not same_folder(ran_in, cwd) else None
-
-
 def mtime_text(mtime):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
 
@@ -1644,11 +1638,13 @@ def resume_target(value, cwd, running):
         if not others:
             raise BridgeError(f"No conversation {sid} was found in Claude Code's transcripts. Nothing was opened.")
         path = others[0]
-        if not transcript_cwd(path):
-            raise BridgeError(f"Conversation {sid} isn't among the transcripts kept for {cwd}, and its transcript "
-                              "doesn't say which folder it ran in. Nothing was opened.")
-    ran_in = ran_elsewhere(path, cwd)
-    if ran_in:
+    # Even in cwd's own transcript folder: folder names are lossy, so the file may be another folder's.
+    ran_in = transcript_cwd(path)
+    if not ran_in:
+        raise BridgeError(f"Conversation {sid}'s transcript doesn't say which folder it ran in, so it can't be "
+                          f"checked that it ran in {cwd}, the only folder Claude Code resumes it in. "
+                          "Nothing was opened.")
+    if not same_folder(ran_in, cwd):
         raise BridgeError(f"Conversation {sid} ran in {ran_in}, not {cwd}; Claude Code resumes it only "
                           f"there. Open the session with cwd {ran_in}. Nothing was opened.")
     return sid, f"It resumes conversation {sid}, last active {mtime_text(os.path.getmtime(path))}."
@@ -2218,7 +2214,7 @@ def start_consultant(args, cancel=None, progress=None):
             if args.get("title"):
                 try:
                     client.request("thread/name/set", {"threadId": thread["id"], "name": args["title"]})
-                except BridgeError as e:
+                except Exception as e:  # the thread exists either way: an error here mustn't lose it
                     title_note = f"Its title couldn't be set ({e}); it works without one."
         notice = "\n".join(n for n in (title_note, safe_nouez_update_notice(), update_notice(client.info)) if n)
     finally:

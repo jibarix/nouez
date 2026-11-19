@@ -6,6 +6,18 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-11-19
+
+Fixes from a third round of a consultant's review, of 0.12.2. Tested with Claude Code 2.1.328, Codex CLI 0.170.0 with app-server daemon 0.170.0, Python 3.11.9 on Windows 11.
+
+### Fixed
+- `OpenClaudeSession` `resume` with an explicit id now also needs the transcript to record this folder. In this folder's own transcripts, one that recorded none was still taken, though the folder name is lossy and it may be a twin folder's. All 57 transcripts inspected on one machine recorded their folder within their first ten lines; a transcript whose folder can't be established is now refused.
+- `StartConsultant` keeps a new consultant whatever error setting its `title` raises, including a broken pipe to the daemon, not just an error the daemon reports.
+- The `verify` skill:
+  - It recovers a consultant from a failed start only by this run's title, now made unique with a random suffix. It no longer takes "the one new consultant", which could stop someone else's consultant if the list call failed or another consultant started at the same time.
+  - Its session cleanup says what it checks: no `nouez-verify` session runs 60s after the last open. A session that registers later still is left running; a later run refuses to start if it has registered by then.
+  - Its TeX check reads comments out first, so a commented-out `\code{--x}` no longer fails, and `\\code` (a line break, then the word) isn't taken for the macro.
+
 ## [0.12.2] - 2026-11-19
 
 Fixes to resuming a conversation and to starting a consultant, found by two rounds of a consultant's review of 0.12.1, and a verification layer for changes to nouez. Tested with Claude Code 2.1.328, Codex CLI 0.170.0 with app-server daemon 0.170.0, Python 3.11.9 on Windows 11.
@@ -272,7 +284,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.12.3...HEAD
+[0.12.3]: https://github.com/jibarix/nouez/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/jibarix/nouez/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/jibarix/nouez/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/jibarix/nouez/compare/v0.11.3...v0.12.0

@@ -7,8 +7,10 @@
                                                          Claude Code session (opens a window)
 
 Exit code 0 when every check passed, 1 otherwise. The live checks start server.py from this
-working copy, so they test the code on disk, not the server Claude Code has loaded. Whatever they
-start (a consultant, Claude Code windows) is stopped or closed again, also when a check fails.
+working copy, so they test the code on disk, not the server Claude Code has loaded. What they
+start is stopped or closed again, also when a check fails: the consultant, found by this run's
+title if its start failed, and each nouez-verify session running up to 60s after the last open.
+A session that registers later still is left running; a later run refuses to start once it shows.
 """
 import ast
 import json
@@ -73,19 +75,42 @@ def check_shadowing(files):
     report(not bad, "no top-level name defined twice", "; ".join(bad))
 
 
+def strip_comments(text):
+    """The text as TeX reads it: from an unescaped % to the end of the line dropped, lines kept."""
+    out, i = [], 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+        elif c == "%":
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def code_spans(text):
-    """(line, content) of each \\code{...}: braces balanced, across lines, TeX comments left out."""
-    for m in re.finditer(r"(?<!\\)\\code\s*\{", text):
-        depth, i, content = 1, m.end(), []
+    """(line, content) of each \\code{...}: braces balanced, across lines, comments left out. One
+    pass reads a backslash with what follows, so \\\\code (a line break, then the word) isn't one."""
+    text = strip_comments(text)
+    i = 0
+    while i < len(text):
+        m = re.compile(r"\\(?:code\s*\{|[A-Za-z]+|.)", re.S).match(text, i)
+        if not m:
+            i += 1
+            continue
+        i = m.end()
+        if not m.group().startswith("\\code") or not m.group().endswith("{"):
+            continue
+        depth, content = 1, []
         while i < len(text) and depth:
             c = text[i]
             if c == "\\":
                 content.append(text[i:i + 2])
                 i += 2
-                continue
-            if c == "%":  # a comment runs to the end of the line, and TeX drops it
-                i = text.find("\n", i)
-                i = len(text) if i < 0 else i + 1
                 continue
             depth += {"{": 1, "}": -1}.get(c, 0)
             if depth:
@@ -193,35 +218,25 @@ def short(text, n=300):
     return text if len(text) <= n else text[:n] + "..."
 
 
-def consultants(client):
-    """{thread id: title or ""} of the consultants StartConsultant made in this repo."""
-    text, _ = client.call("ListConsultants", cwd=ROOT)
-    found = {}
-    for block in text.split("\n- "):
-        thread = re.search(r"^\s*id: (\S+)", block, re.M)
-        if thread and re.search(r"^\s*started by: StartConsultant\s*$", block, re.M):
-            title = re.search(r"^\s*title: (.*?)\s*$", block, re.M)
-            found[thread.group(1)] = title.group(1) if title else ""
-    return found
-
-
-def find_consultant(client, title, before):
-    """After a start that failed: the consultant with this title, or else the one new consultant
-    that appeared since (a start can make the thread and then fail before naming it)."""
+def find_consultant(client, title):
+    """After a start that failed or timed out: the consultant carrying this run's title, the only
+    proof that it is ours. A consultant without it is never guessed at (it may be someone else's);
+    StartConsultant keeps the id when naming fails, so an untitled one of ours is unlikely."""
     for _ in range(3):
-        now = consultants(client)
-        named = [t for t, name in now.items() if name == title]
-        new = [t for t in now if t not in before]
-        if named or len(new) == 1:
-            return (named or new)[0]
+        text, err = client.call("ListConsultants", cwd=ROOT)
+        if not err:
+            for block in text.split("\n- "):
+                if re.search(rf"^\s*title: {re.escape(title)}\s*$", block, re.M):
+                    match = re.search(r"^\s*id: (\S+)", block, re.M)
+                    if match:
+                        return match.group(1)
         time.sleep(5)
     return None
 
 
 def check_consultant(client):
-    token = time.strftime("verify-%Y%m%d-%H%M%S")
+    token = time.strftime("verify-%Y%m%d-%H%M%S-") + os.urandom(3).hex()
     title = f"nouez {token}"
-    before = consultants(client)
     text, err = client.call("StartConsultant", timeout=180, cwd=ROOT, new=True, watch=False, title=title,
                             instructions="You are a test. Answer in one word.")
     match = re.search(r"^\s*id: (\S+)", text, re.M) if text.startswith("Started ") else None
@@ -238,12 +253,13 @@ def check_consultant(client):
         report(not err and token in text, "GetConsultantHistory lists the turn", "" if token in text else short(text))
     finally:
         # A start that failed or timed out may still have made the consultant.
-        thread = thread or find_consultant(client, title, before)
+        thread = thread or find_consultant(client, title)
         if thread:
             text, err = client.call("StopConsultant", to=thread)
             report(not err, "StopConsultant stops it", "" if not err else short(text))
         elif err:
-            print(f"       If a consultant titled {title!r} is listed by ListConsultants, stop it.")
+            print(f"       No consultant titled {title!r} was found. If ListConsultants shows one this run "
+                  "started without a title, stop it; nothing else was stopped.")
 
 
 def verify_sessions():
@@ -290,13 +306,15 @@ def wait_for(test, seconds):
     return test()
 
 
-LATE_START_SECONDS = 60  # how long after an open a slow session may still show up
+LATE_START_SECONDS = 60  # how long after an open this keeps watching for a slow session to show up
 last_open = [0.0]
 
 
 def close_verify_sessions(client):
-    """Close every nouez-verify session, including one that starts late: until LATE_START_SECONDS
-    after the last open, keep looking, so absence is only trusted once a late start can't happen."""
+    """Close every nouez-verify session, and keep watching for LATE_START_SECONDS after the last open
+    for one that starts late. That bounds the wait; it doesn't prove no later start: nothing ties a
+    window to the session it will become. A session registering later still is left running; a
+    later run refuses to start if it has registered by then."""
     closed = set()
     while True:
         for s in verify_sessions():
@@ -307,7 +325,8 @@ def close_verify_sessions(client):
         if time.monotonic() >= last_open[0] + LATE_START_SECONDS:
             break
         time.sleep(2)
-    return report(bool(wait_for(lambda: not verify_sessions(), 30)), "no nouez-verify session is left running")
+    return report(bool(wait_for(lambda: not verify_sessions(), 30)),
+                  f"no nouez-verify session runs {LATE_START_SECONDS}s after the last open")
 
 
 def open_and_check(client, what, **args):

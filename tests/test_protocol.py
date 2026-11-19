@@ -912,18 +912,21 @@ class HandlerTest(unittest.TestCase):
         self.assertIn(server.short_name(mine), out)
 
     def test_start_keeps_the_consultant_when_its_title_cant_be_set(self):
-        daemon = self.use(FakeDaemon([]))
-        plain = daemon.request
+        # A daemon error, and a proxy pipe that broke after thread/start.
+        for error in (server.BridgeError("thread/name/set timed out after 15s."), BrokenPipeError(32, "Broken pipe")):
+            with self.subTest(error=type(error).__name__):
+                daemon = self.use(FakeDaemon([]))
+                plain = daemon.request
 
-        def request(method, params):
-            if method == "thread/name/set":
-                raise server.BridgeError("thread/name/set timed out after 15s.")
-            return plain(method, params)
-        daemon.request = request
-        out = server.start_consultant({"cwd": ROOT, "watch": False, "title": "t"})
-        self.assertTrue(out.startswith("Started "))
-        self.assertIn("0199ffff-0000-0000-0000-000000new001", out)
-        self.assertIn("title couldn't be set", out)
+                def request(method, params, plain=plain, error=error):
+                    if method == "thread/name/set":
+                        raise error
+                    return plain(method, params)
+                daemon.request = request
+                out = server.start_consultant({"cwd": ROOT, "watch": False, "title": "t"})
+                self.assertTrue(out.startswith("Started "))
+                self.assertIn("0199ffff-0000-0000-0000-000000new001", out)
+                self.assertIn("title couldn't be set", out)
 
     def test_start_reuses_its_own_consultant(self):
         ours = {"id": "0199aaaa-0000-0000-0000-000000ours01", "cwd": ROOT, "threadSource": "nouez"}
@@ -1371,6 +1374,9 @@ class OpenClaudeSessionTests(unittest.TestCase):
             os.utime(path, (3000, 3000))
             spec, out = self.open_resumed(config, "latest", [busy])
             self.assertEqual(spec["resume"], newest)
+            # Nor by its id: in this shared folder it may be the twin's.
+            with self.assertRaisesRegex(server.BridgeError, "doesn't say which folder it ran in"):
+                self.open_resumed(config, unknown)
 
     def test_resume_is_refused_when_running_sessions_cant_be_read(self):
         sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
