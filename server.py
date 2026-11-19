@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.12.1"
+SERVER_VERSION = "0.12.2"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -1584,6 +1584,18 @@ def transcript_cwd(path):
     return None
 
 
+def ran_here(path, cwd):
+    """Whether a transcript recorded cwd as the folder its conversation ran in."""
+    ran_in = transcript_cwd(path)
+    return bool(ran_in) and same_folder(ran_in, cwd)
+
+
+def ran_elsewhere(path, cwd):
+    """The folder a transcript recorded, when that isn't cwd; None when it is, or recorded none."""
+    ran_in = transcript_cwd(path)
+    return ran_in if ran_in and not same_folder(ran_in, cwd) else None
+
+
 def mtime_text(mtime):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
 
@@ -1601,19 +1613,23 @@ def resume_target(value, cwd, running):
         except OSError:
             found = []
         found = sorted((m, i) for m, i in found if CLAUDE_SESSION_ID.fullmatch(i))
-        skipped = [i for _, i in found if i.lower() in in_use]
-        found = [(m, i) for m, i in found if i.lower() not in in_use]
-        if not found:
+        # Folder names are encoded lossily (C:\a-b and C:\a_b share one), so take only a transcript
+        # that recorded this folder.
+        pick = next(((m, i) for m, i in reversed(found) if i.lower() not in in_use
+                     and ran_here(os.path.join(transcript_folder(cwd), i + ".jsonl"), cwd)), None)
+        if not pick:
+            busy = any(i.lower() in in_use for _, i in found)
             raise BridgeError(f"No earlier conversation in {cwd} to resume"
-                              + (" that isn't open in a running session" if skipped else "")
+                              + (" that isn't open in a running session" if busy else "")
                               + ". Nothing was opened.")
-        mtime, sid = found[-1]
+        mtime, sid = pick
+        skipped = [i for m, i in found if i.lower() in in_use and (m, i) > pick]
         note = f"It resumes the latest conversation in this folder, {sid}, last active {mtime_text(mtime)}."
         if skipped:
             note += (f" Skipped {len(skipped)} newer one(s) already open in a running session: "
                      + ", ".join(f"{in_use[i.lower()]['name']} (pid {in_use[i.lower()]['pid']})" for i in skipped) + ".")
         return sid, note
-    sid = value.strip()
+    sid = value.strip().lower()
     if not CLAUDE_SESSION_ID.fullmatch(sid):
         raise BridgeError("resume must be a session id (such as 4b4f3c8c-0010-4e93-a427-9db7032f2be3) or "
                           "\"latest\". Nothing was opened.")
@@ -1625,13 +1641,16 @@ def resume_target(value, cwd, running):
     path = os.path.join(transcript_folder(cwd), sid + ".jsonl")
     if not os.path.isfile(path):
         others = glob.glob(os.path.join(glob.escape(os.path.join(claude_config_dir(), "projects")), "*", sid + ".jsonl"))
-        ran_in = transcript_cwd(others[0]) if others else None
-        if ran_in and not same_folder(ran_in, cwd):
-            raise BridgeError(f"Conversation {sid} ran in {ran_in}, not {cwd}; Claude Code resumes it only "
-                              f"there. Open the session with cwd {ran_in}. Nothing was opened.")
         if not others:
             raise BridgeError(f"No conversation {sid} was found in Claude Code's transcripts. Nothing was opened.")
         path = others[0]
+        if not transcript_cwd(path):
+            raise BridgeError(f"Conversation {sid} isn't among the transcripts kept for {cwd}, and its transcript "
+                              "doesn't say which folder it ran in. Nothing was opened.")
+    ran_in = ran_elsewhere(path, cwd)
+    if ran_in:
+        raise BridgeError(f"Conversation {sid} ran in {ran_in}, not {cwd}; Claude Code resumes it only "
+                          f"there. Open the session with cwd {ran_in}. Nothing was opened.")
     return sid, f"It resumes conversation {sid}, last active {mtime_text(os.path.getmtime(path))}."
 
 
@@ -1883,8 +1902,11 @@ def open_claude_session(args, cancel=None, progress=None):
                         "connecting them")
     try:
         before = claude_sessions()
-    except Exception as e:  # only a check: never a reason not to open
+    except Exception as e:  # only a check: never a reason not to open a new conversation
         log("claude_sessions:", repr(e))
+        if args.get("resume"):
+            raise BridgeError("Couldn't read the list of running Claude Code sessions, so it can't be checked "
+                              "that this conversation isn't already open in one. Nothing was opened.") from None
         before = []
     already = [s for s in before if same_folder(s["cwd"], cwd)]
     resume = None
@@ -2175,6 +2197,7 @@ def start_consultant(args, cancel=None, progress=None):
 
     watch, new = flag(args, "watch", True), flag(args, "new")
     existing, users, has_turns = [], [], False
+    title_note = ""
     client = CodexClient()
     try:
         if not new:
@@ -2193,8 +2216,11 @@ def start_consultant(args, cancel=None, progress=None):
         else:
             thread = client.request("thread/start", params)["thread"]
             if args.get("title"):
-                client.request("thread/name/set", {"threadId": thread["id"], "name": args["title"]})
-        notice = "\n".join(n for n in (safe_nouez_update_notice(), update_notice(client.info)) if n)
+                try:
+                    client.request("thread/name/set", {"threadId": thread["id"], "name": args["title"]})
+                except BridgeError as e:
+                    title_note = f"Its title couldn't be set ({e}); it works without one."
+        notice = "\n".join(n for n in (title_note, safe_nouez_update_notice(), update_notice(client.info)) if n)
     finally:
         client.close()
 

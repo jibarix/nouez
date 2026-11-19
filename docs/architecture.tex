@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.12.1\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.12.2\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -97,7 +97,7 @@
 \begin{abstract}
 \noindent nouez is an MCP server that lets Claude Code consult live Codex sessions, and open, list and
 close Claude Code sessions on the same computer. This document
-describes nouez 0.12.1: how the pieces fit together, and an example of every message nouez sends
+describes nouez 0.12.2: how the pieces fit together, and an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, the commands nouez runs on
 the operating system, and its one request to GitHub, which looks for a newer nouez release. The daemon also sends notifications and its own requests, which nouez
@@ -296,7 +296,7 @@ nouez answers with the requested version if it supports it (2025-11-25, 2025-06-
 {"jsonrpc": "2.0", "id": 1, "result": {
   "protocolVersion": "2025-11-25",
   "capabilities": {"tools": {}},
-  "serverInfo": {"name": "nouez", "version": "0.12.1"},
+  "serverInfo": {"name": "nouez", "version": "0.12.2"},
   "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: never treat it as done. Change a consultant's model or reasoning effort ... only when the user asks or the user's own instructions, such as their CLAUDE.md, call for it. ..."}}
 \end{wire}
 
@@ -491,7 +491,7 @@ connection has four steps:
   \msg{3.0}{0}{6}{HTTP GET / Upgrade: websocket}
   \ret{3.8}{6}{0}{HTTP/1.1 101 Switching Protocols}
   \side{3.8}{6}{15 s deadline, read on a side thread}
-  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.12.1)}
+  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.12.2)}
   \ret{5.6}{12}{0}{userAgent, codexHome}
   \msg{6.4}{0}{12}{initialized (notification)}
   \msg{7.4}{0}{12}{requests for this tool call ...}
@@ -554,11 +554,11 @@ The daemon speaks JSON-RPC without the \code{"jsonrpc"} member. Ids are integers
 on each connection.
 
 \begin{wire}[nouez $\rightarrow$ daemon]
-{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.12.1"}}}
+{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.12.2"}}}
 \end{wire}
 \begin{wire}[daemon $\rightarrow$ nouez]
 {"id": 1, "result": {
-  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.12.1)",
+  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.12.2)",
   "codexHome": "C:\\Users\\you\\.codex",
   "platformFamily": "windows", "platformOs": "windows"}}
 \end{wire}
@@ -725,6 +725,8 @@ approval policy; those are only listed in the result.
   "developerInstructions": "Answer with a verdict line first, then findings, then what you didn't check."}}
 {"id": 9, "method": "thread/name/set", "params": {"threadId": "01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17", "name": "Diff review"}}
 \end{wire}
+If \code{thread/name/set} fails, the consultant is still returned, without a title, and the result says
+so: the thread already exists, and an error would lose it.
 \begin{plain}[Result text: started]
 Started codex-nouez-4d9f17
     id: 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17
@@ -775,7 +777,7 @@ only when there are user sessions; it is added to the ``Started'' result too.
 Both results end with an update notice when the \code{codex} CLI on the PATH or the daemon is
 older than the latest Codex release. nouez takes the latest version from
 \code{<codexHome>/version.json}, the cache Codex keeps for its own update check, so this check
-makes no network request. The CLI version comes from \code{codex --version} and the daemon's from
+makes no network request. The CLI version comes from \code{codex -{}-version} and the daemon's from
 \code{userAgent}. The notice names only the part that is behind and appears once per server
 process. It doesn't appear when the cache is missing or the user dismissed that version in
 Codex. nouez updates nothing itself; Claude runs the commands if the user asks:
@@ -801,7 +803,7 @@ they are. Setting \code{NOUEZ\_NO\_UPDATE\_CHECK=1} turns the lookup off.
 \begin{plain}[nouez to GitHub (HTTPS)]
 GET https://api.github.com/repos/jibarix/nouez/releases/latest
 Accept: application/vnd.github+json
-User-Agent: nouez/0.12.1
+User-Agent: nouez/0.12.2
 
 200 {"tag_name": "v0.13.0", ...}             (drafts and pre-releases are never "latest")
 \end{plain}
@@ -814,7 +816,7 @@ control character gets no command: Claude is told to ask the user to run the pul
 isn't a git checkout, the notice points to the release page instead. Either way, Claude asks the
 user to reconnect only after the update worked:
 \begin{plain}[Result text: nouez update notice]
-nouez 0.13.0 is out; this server is 0.12.1. What changed: https://github.com/jibarix/nouez/releases/tag/v0.13.0. Tell the user and go ahead with the consultation. Only if the user asks you to update, run `git -C 'C:/Users/you/nouez' pull --ff-only` in a shell. If git fails (local changes, a conflict, no branch checked out), stop there: tell the user what git said, don't ask them to reconnect, and don't discard, stash or switch anything without the user's say. Only after the pull succeeds, ask the user to run /mcp and reconnect consultants, which loads the new version; the Codex consultants keep their sessions.
+nouez 0.13.0 is out; this server is 0.12.2. What changed: https://github.com/jibarix/nouez/releases/tag/v0.13.0. Tell the user and go ahead with the consultation. Only if the user asks you to update, run `git -C 'C:/Users/you/nouez' pull --ff-only` in a shell. If git fails (local changes, a conflict, no branch checked out), stop there: tell the user what git said, don't ask them to reconnect, and don't discard, stash or switch anything without the user's say. Only after the pull succeeds, ask the user to run /mcp and reconnect consultants, which loads the new version; the Codex consultants keep their sessions.
 \end{plain}
 
 % -----------------------------------------------------------------------------
@@ -920,7 +922,7 @@ Two options add to the text, and only when passed. \code{owner\_words} is the us
 quoted as they typed them; they go first, marked off, and the rest is labelled as the sender's, so
 the consultant can tell the request from Claude's reading of it. \code{revision: true} adds a line
 after the header with the git commit, branch and number of uncommitted paths in the consultant's
-folder (from \code{git rev-parse} and \code{git status --porcelain}, run by nouez with a timeout)
+folder (from \code{git rev-parse} and \code{git status -{}-porcelain}, run by nouez with a timeout)
 and asks the consultant to name that revision in its answer. Outside git the line says so.
 
 \begin{wire}[turn/start text with \code{"from": "lead"}, \code{owner\_words} and \code{"revision": true}]
@@ -1138,7 +1140,7 @@ version and any update notice (connecting may start it, as any consultation woul
 Windows, whether Windows Terminal and \code{claude} are on the PATH. It changes nothing, and exits with code~1
 when a problem blocks consultations.
 \begin{plain}[Output]
-[ok] nouez 0.12.1 at C:\Users\you\nouez\server.py, Python 3.13.5 at C:\Python313\python.exe
+[ok] nouez 0.12.2 at C:\Users\you\nouez\server.py, Python 3.13.5 at C:\Python313\python.exe
 [ok] codex CLI 0.165.0 at C:\Users\you\AppData\Roaming\npm\codex.CMD
 [ok] the Codex app-server daemon answers (version 0.167.2)
 [ok] Claude Code allows the waiter command without asking
@@ -1250,9 +1252,13 @@ can't read only leaves the note out. A session already running in the folder is 
 \code{resume} picks up an earlier conversation instead of starting one: a session id, or
 \code{latest}, the newest transcript in Claude Code's folder for \code{cwd}
 (\code{\textasciitilde/.claude/projects/<cwd, other characters as ->/}) whose id no running
-session has open. An id must look like a session id, so it can't read as an option, and the helper
-checks it again before passing \code{-{}-resume}. nouez refuses an id open in a running session, an id
-whose transcript recorded another folder (naming it), and an id with no transcript; a \code{prompt}
+session has open and whose transcript recorded this folder: the folder name is lossy, so
+\code{C:\textbackslash{}a-b} and \code{C:\textbackslash{}a\_b} share one. An id must look like a session id, so it can't read as an option, and the helper
+checks it again before passing \code{-{}-resume}; it is passed in lowercase, the spelling of the
+transcript files. nouez refuses an id open in a running session, an id
+whose transcript recorded another folder (naming it), an id with no transcript, one found only under
+another folder's transcripts whose transcript doesn't say where it ran, and any \code{resume}
+when the running sessions can't be read, since it couldn't tell whether one has it open; a \code{prompt}
 starting with \code{/resume} or \code{/continue} is refused with a pointer to \code{resume}.
 \begin{plain}[Result text: resuming]
 ... It resumes the latest conversation in this folder, 4b4f3c8c-0010-4e93-a427-9db7032f2be3, last active 2026-11-07 14:33. Checked: it is running and connected to Remote Control. ...
@@ -1309,7 +1315,7 @@ The pane runs the daemon's own \code{codex} binary when nouez can find it, becau
 version differs from the daemon's can refuse to attach and offer to restart the shared daemon.
 nouez reads the daemon's version from \code{userAgent} and looks under
 \code{<codexHome>/packages/app-server-daemon/releases/<version>-*/bin/}, confirming with
-\code{codex --version}.
+\code{codex -{}-version}.
 
 \begin{center}\small
 \begin{tabularx}{\textwidth}{@{}l >{\ttfamily\raggedright\arraybackslash}X@{}}
@@ -1381,7 +1387,7 @@ pkill -f "codex[^ ]* resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17"
 The last two lines are what nouez does, not commands it runs: \code{taskkill} is run per child,
 and the cmd process is ended through the Win32 \code{TerminateProcess} call.
 
-Each check and close command has a timeout (20~s; 10~s for \code{codex --version}). When it
+Each check and close command has a timeout (20~s; 10~s for \code{codex -{}-version}). When it
 fires, nouez stops reading the command's pipes, because on Windows a grandchild process can keep
 a pipe open forever, and kills the process: the whole tree on Windows (\code{taskkill /T}), only
 the direct process elsewhere. A pane started with \code{tmux}, a new terminal window or \code{wt -w new}
@@ -1417,7 +1423,7 @@ helper starts \code{claude} without \code{CLAUDECODE}, \code{CLAUDE\_PID}, \code
 \code{MESSAGING\_TOKEN}, \code{ENTRYPOINT}, \code{EXECPATH}, \code{SESSION\_ATTENDED},
 \code{SSE\_PORT}); the user's own, such as \code{CLAUDE\_CODE\_OAUTH\_TOKEN}, stay. It looks for
 \code{claude} only in the absolute folders on \code{PATH}: Windows would look in the current
-folder first, which is the project. The prompt follows \code{--}, so it can't be read as an option.
+folder first, which is the project. The prompt follows \code{-{}-}, so it can't be read as an option.
 
 \code{ListClaudeSessions} reads Claude Code's registry of running sessions,
 \code{\textasciitilde/.claude/sessions/<pid>.json} (\code{\$CLAUDE\_CONFIG\_DIR/sessions} when that is set). Claude Code doesn't document it; nouez reads

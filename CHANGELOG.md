@@ -6,6 +6,20 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-11-19
+
+Fixes to resuming a conversation and to starting a consultant, found by two rounds of a consultant's review of 0.12.1, and a verification layer for changes to nouez. Tested with Claude Code 2.1.328, Codex CLI 0.170.0 with app-server daemon 0.170.0, Python 3.11.9 on Windows 11.
+
+### Fixed
+- `OpenClaudeSession` `resume` checks the folder each transcript recorded, for `latest` as well as an explicit id. Claude Code names its transcript folders lossily (`C:\a-b` and `C:\a_b` share one), so `latest` could pick a conversation that ran in another folder. `latest` now takes only a transcript that recorded this folder, and an explicit id from another folder is refused with that folder named, as is one kept for another folder whose transcript doesn't say where it ran.
+- A session id passed to `resume` is used in lowercase, the spelling of Claude Code's transcript files, so an uppercase id is found on case-sensitive file systems too.
+- `resume` is refused when the running Claude Code sessions can't be read, instead of treating every conversation as free, which could open one twice. A new conversation still opens.
+- With `latest`, the note lists only busy conversations newer than the one resumed as skipped.
+- When `StartConsultant` can't set a new consultant's `title`, it still returns the consultant, which works without one, and says so. Before, the error lost a consultant the daemon had already started.
+
+### Added
+- For working on nouez: a `verify` skill (`.claude/skills/verify/`) with static checks on the diff, and live checks that run this working copy against the real Codex daemon and, with `--sessions`, open, close and resume a real Claude Code session; and `REVIEW.md`, a checklist of past incidents, each with a trigger read from the diff.
+
 ## [0.12.1] - 2026-11-19
 
 Resuming a conversation from the phone works without a `/resume` prompt, and the connection check after opening a session is clearer. Tested with Claude Code 2.1.328, Codex CLI 0.170.0 with app-server daemon 0.170.0, Python 3.11.9 on Windows 11.
@@ -258,7 +272,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/jibarix/nouez/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/jibarix/nouez/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/jibarix/nouez/compare/v0.11.3...v0.12.0
 [0.11.3]: https://github.com/jibarix/nouez/compare/v0.11.2...v0.11.3

@@ -911,6 +911,20 @@ class HandlerTest(unittest.TestCase):
         self.assertIn("were not used", out)
         self.assertIn(server.short_name(mine), out)
 
+    def test_start_keeps_the_consultant_when_its_title_cant_be_set(self):
+        daemon = self.use(FakeDaemon([]))
+        plain = daemon.request
+
+        def request(method, params):
+            if method == "thread/name/set":
+                raise server.BridgeError("thread/name/set timed out after 15s.")
+            return plain(method, params)
+        daemon.request = request
+        out = server.start_consultant({"cwd": ROOT, "watch": False, "title": "t"})
+        self.assertTrue(out.startswith("Started "))
+        self.assertIn("0199ffff-0000-0000-0000-000000new001", out)
+        self.assertIn("title couldn't be set", out)
+
     def test_start_reuses_its_own_consultant(self):
         ours = {"id": "0199aaaa-0000-0000-0000-000000ours01", "cwd": ROOT, "threadSource": "nouez"}
         daemon = self.use(FakeDaemon([ours]))
@@ -1303,7 +1317,7 @@ class OpenClaudeSessionTests(unittest.TestCase):
             self.assertEqual(spec["resume"], old)
             self.assertIn("busy (pid 41)", out)
             spec, out = self.open_resumed(config, old.upper())
-            self.assertEqual(spec["resume"], old.upper())
+            self.assertEqual(spec["resume"], old)
             for bad, running in (("--fork-session", ()), (new, [busy]),
                                  ("33333333-3333-3333-3333-333333333333", ()), (5, ())):
                 with self.assertRaises(server.BridgeError):
@@ -1317,6 +1331,58 @@ class OpenClaudeSessionTests(unittest.TestCase):
                 self.open_resumed(config, third)
             with self.assertRaisesRegex(server.BridgeError, "pass resume"):
                 self.open_resumed(config, None, prompt="/resume " + old)
+
+    def test_resume_checks_the_folder_each_transcript_recorded(self):
+        # C:\a-b and C:\a_b share a transcript folder, so a file there can belong to another folder.
+        mine, theirs = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "ffffffff-1111-2222-3333-444444444444"
+        with tempfile.TemporaryDirectory() as config:
+            with mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": config}):
+                folder = server.transcript_folder(os.path.abspath(ROOT))
+            os.makedirs(folder)
+            for i, (sid, ran_in) in enumerate(((mine, ROOT), (theirs, ROOT + "_twin"))):
+                path = os.path.join(folder, sid + ".jsonl")
+                with open(path, "w") as f:
+                    f.write(json.dumps({"cwd": ran_in}) + "\n")
+                os.utime(path, (1000 + i, 1000 + i))
+            spec, out = self.open_resumed(config, "latest")
+            self.assertEqual(spec["resume"], mine)
+            spec, out = self.open_resumed(config, mine.upper())
+            self.assertEqual(spec["resume"], mine)
+            with self.assertRaisesRegex(server.BridgeError, "ran in .*_twin"):
+                self.open_resumed(config, theirs)
+            # With this folder's only conversation busy, the other folder's isn't picked instead.
+            busy = dict(self.session("busy", 42), session_id=mine)
+            with self.assertRaisesRegex(server.BridgeError, "isn't open in a running session"):
+                self.open_resumed(config, "latest", [busy])
+            # A busy conversation older than the one picked wasn't skipped, so it isn't reported.
+            newest = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+            path = os.path.join(folder, newest + ".jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({"cwd": ROOT}) + "\n")
+            os.utime(path, (2000, 2000))
+            spec, out = self.open_resumed(config, "latest", [busy])
+            self.assertEqual(spec["resume"], newest)
+            self.assertNotIn("Skipped", out)
+            # A transcript that doesn't say where it ran isn't taken for latest.
+            unknown = "cccccccc-dddd-eeee-ffff-000000000000"
+            path = os.path.join(folder, unknown + ".jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({"type": "summary"}) + "\n")
+            os.utime(path, (3000, 3000))
+            spec, out = self.open_resumed(config, "latest", [busy])
+            self.assertEqual(spec["resume"], newest)
+
+    def test_resume_is_refused_when_running_sessions_cant_be_read(self):
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        with mock.patch.object(server, "open_window") as open_window, \
+                mock.patch.object(server, "folder_trusted", return_value=True), \
+                mock.patch.object(server, "claude_sessions", side_effect=OSError("registry unreadable")):
+            with self.assertRaisesRegex(server.BridgeError, "already open"):
+                server.open_claude_session({"cwd": ROOT, "resume": sid})
+            open_window.assert_not_called()
+            open_window.return_value = "a window"
+            server.open_claude_session({"cwd": ROOT})  # a new conversation still opens
+        os.remove(open_window.call_args[0][1][-1])
 
     def test_helper_exits_cleanly_when_closed_on_purpose(self):
         self.assertEqual(self.run_helper("", returncode=1, closed=True)[1], 0)
