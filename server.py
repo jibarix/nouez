@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.12.0"
+SERVER_VERSION = "0.12.1"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -1435,6 +1435,12 @@ def run_claude(spec_path):
     if spec.get("effort"):
         argv += ["--effort", spec["effort"]]
         env["CLAUDE_CODE_EFFORT_LEVEL"] = spec["effort"]  # it outranks --effort, so one inherited can't win
+    if spec.get("resume"):
+        if not CLAUDE_SESSION_ID.fullmatch(str(spec["resume"])):
+            print("This session id can't be passed to claude safely. Open a terminal and run claude --resume yourself.")
+            input("Press Enter to close.")
+            return 1
+        argv += ["--resume", spec["resume"]]
     if spec.get("prompt"):
         argv += ["--", spec["prompt"]]  # so a prompt starting with "-" can't pass for an option
     child = subprocess.Popen(argv, cwd=spec["cwd"], env=env)
@@ -1552,6 +1558,81 @@ def session_name_from(folder):
     name = re.sub(r"[^\w .-]", "-", folder)
     name = re.sub(r"^[\W_]+", "", name)[:64].rstrip()
     return name if CLAUDE_SESSION_NAME.fullmatch(name) else "claude"
+
+
+CLAUDE_SESSION_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def transcript_folder(cwd):
+    """The folder where Claude Code keeps the transcripts of conversations held in cwd."""
+    return os.path.join(claude_config_dir(), "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
+
+
+def transcript_cwd(path):
+    """The folder a transcript's conversation ran in, from the first entries that record one."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for _, line in zip(range(200), f):
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and isinstance(entry.get("cwd"), str):
+                    return entry["cwd"]
+    except OSError:
+        pass
+    return None
+
+
+def mtime_text(mtime):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+
+
+def resume_target(value, cwd, running):
+    """The conversation OpenClaudeSession's `resume` names: (session id, note). `value` is a session id
+    or "latest", the newest conversation held in cwd that no running session has open."""
+    if not isinstance(value, str):
+        raise BridgeError("resume must be a session id or \"latest\".")
+    in_use = {str(s.get("session_id") or "").lower(): s for s in running}
+    if value.strip().lower() == "latest":
+        try:
+            found = [(os.path.getmtime(p), os.path.basename(p)[:-6]) for p in
+                     glob.glob(os.path.join(glob.escape(transcript_folder(cwd)), "*.jsonl"))]
+        except OSError:
+            found = []
+        found = sorted((m, i) for m, i in found if CLAUDE_SESSION_ID.fullmatch(i))
+        skipped = [i for _, i in found if i.lower() in in_use]
+        found = [(m, i) for m, i in found if i.lower() not in in_use]
+        if not found:
+            raise BridgeError(f"No earlier conversation in {cwd} to resume"
+                              + (" that isn't open in a running session" if skipped else "")
+                              + ". Nothing was opened.")
+        mtime, sid = found[-1]
+        note = f"It resumes the latest conversation in this folder, {sid}, last active {mtime_text(mtime)}."
+        if skipped:
+            note += (f" Skipped {len(skipped)} newer one(s) already open in a running session: "
+                     + ", ".join(f"{in_use[i.lower()]['name']} (pid {in_use[i.lower()]['pid']})" for i in skipped) + ".")
+        return sid, note
+    sid = value.strip()
+    if not CLAUDE_SESSION_ID.fullmatch(sid):
+        raise BridgeError("resume must be a session id (such as 4b4f3c8c-0010-4e93-a427-9db7032f2be3) or "
+                          "\"latest\". Nothing was opened.")
+    if sid.lower() in in_use:
+        s = in_use[sid.lower()]
+        raise BridgeError(f"Conversation {sid} is already open in a running session, {s['name']} (pid {s['pid']}), "
+                          "so nothing was opened. The user can carry on there; if it's stuck, close it with "
+                          "CloseClaudeSession first, once the user says so.")
+    path = os.path.join(transcript_folder(cwd), sid + ".jsonl")
+    if not os.path.isfile(path):
+        others = glob.glob(os.path.join(glob.escape(os.path.join(claude_config_dir(), "projects")), "*", sid + ".jsonl"))
+        ran_in = transcript_cwd(others[0]) if others else None
+        if ran_in and not same_folder(ran_in, cwd):
+            raise BridgeError(f"Conversation {sid} ran in {ran_in}, not {cwd}; Claude Code resumes it only "
+                              f"there. Open the session with cwd {ran_in}. Nothing was opened.")
+        if not others:
+            raise BridgeError(f"No conversation {sid} was found in Claude Code's transcripts. Nothing was opened.")
+        path = others[0]
+    return sid, f"It resumes conversation {sid}, last active {mtime_text(os.path.getmtime(path))}."
 
 
 CLAUDE_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,99}")  # an alias or full name, never an option
@@ -1696,7 +1777,7 @@ def trust_folder(path):
                       f"{backup or trust_backup_dir()}. Try again, or answer the trust question on the computer.")
 
 
-CONNECT_SECONDS = 15  # how long OpenClaudeSession looks for the new session's Remote Control connection
+CONNECT_SECONDS = 30  # how long OpenClaudeSession looks for the new session's Remote Control connection
 
 
 def same_folder(a, b):
@@ -1718,7 +1799,9 @@ def connection_note(before, cwd, cancel=None):
             new = []
         seen = new or seen
         if any(s["remote"] for s in new):
-            return "Checked: it is running and connected to Remote Control."
+            return ("Checked: it is running and connected to Remote Control. If the user doesn't see it in "
+                    "the Claude app yet, the app's list can lag: ask them to refresh it, and don't open "
+                    "another session for this.")
         if time.monotonic() >= deadline:
             break
         check_cancel(cancel)
@@ -1727,7 +1810,9 @@ def connection_note(before, cwd, cancel=None):
         return (f"Checked: it is running, but hadn't connected to Remote Control after {CONNECT_SECONDS}s. "
                 "It may still be connecting, or waiting for an answer on the computer.")
     return (f"Checked: it hadn't shown up as a running session after {CONNECT_SECONDS}s. It may still be "
-            "starting, or waiting for an answer on the computer; ListClaudeSessions shows it once it runs.")
+            "starting (resuming a long conversation takes longer), or waiting for an answer on the computer. "
+            "Call ListClaudeSessions in a moment to see it, before telling the user it failed or opening "
+            "another session.")
 
 
 def open_claude_session(args, cancel=None, progress=None):
@@ -1756,6 +1841,9 @@ def open_claude_session(args, cancel=None, progress=None):
     prompt = args.get("prompt") or ""
     if not isinstance(prompt, str):
         raise BridgeError("name and prompt must be strings.")
+    if re.match(r"\s*/(resume|continue)\b", prompt):
+        raise BridgeError("To pick up an earlier conversation, pass resume (its session id, or \"latest\") "
+                          "instead of a /resume prompt. Nothing was opened.")
     model = args.get("model") or CLAUDE_MODEL
     effort = args.get("effort") or CLAUDE_EFFORT
     if not isinstance(model, str) or not CLAUDE_MODEL_NAME.fullmatch(model):
@@ -1799,9 +1887,13 @@ def open_claude_session(args, cancel=None, progress=None):
         log("claude_sessions:", repr(e))
         before = []
     already = [s for s in before if same_folder(s["cwd"], cwd)]
+    resume = None
+    if args.get("resume"):
+        resume, resume_note = resume_target(args["resume"], cwd, before)
     fd, spec = tempfile.mkstemp(prefix="nouez-claude-", suffix=".json")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump({"cwd": cwd, "name": name, "prompt": prompt, "model": model, "effort": effort}, f)
+        json.dump({"cwd": cwd, "name": name, "prompt": prompt, "model": model, "effort": effort,
+                   **({"resume": resume} if resume else {})}, f)
     try:
         how = open_window(cwd, [sys.executable, "-I", os.path.abspath(__file__), "claude", spec], f"Claude: {name}")
     except Exception:
@@ -1811,6 +1903,8 @@ def open_claude_session(args, cancel=None, progress=None):
         f"Opened {how} in {cwd} running Claude Code ({model}, {effort} effort) with Remote Control, named \"{name}\". It is a "
         "normal session: its transcript is saved and it can be resumed later. It appears in the "
         "Claude app's session list under that name once it connects, in a few seconds."])
+    if resume:
+        out += " " + resume_note
     if already:
         out += (" Note: another Claude Code session was already running in this folder: "
                 + ", ".join(f"{s['name']} (pid {s['pid']})" for s in already)
@@ -2588,7 +2682,8 @@ TOOLS = [
             "their phone or the web. Use when the user asks for a new Claude Code session, for "
             "example for another project. The session starts as if the user had typed `claude` in a "
             "fresh terminal: its transcript is saved, unlike a `claude` started from your own shell, "
-            "which inherits this session's environment. If Claude Code hasn't been trusted in the "
+            "which inherits this session's environment. To pick up an earlier conversation, pass "
+            "resume (a session id, or \"latest\"). If Claude Code hasn't been trusted in the "
             "folder, nothing is opened and the result says what to ask the user. Only when the user says "
             "they trust the folder, pass trust=true: nouez records that in Claude Code's settings as its "
             "trust dialog would, after backing the file up."
@@ -2604,6 +2699,7 @@ TOOLS = [
                 "effort": {"type": "string", "enum": list(CLAUDE_EFFORTS), "description": "Effort level. Default: medium. Set it only when the user asks for another."},
                 "name": {"type": "string", "description": "Session name, shown in the Claude app's session list: letters, digits, spaces, '.', '_' and '-', starting with a letter or digit, up to 64 characters. Default: the folder's name."},
                 "prompt": {"type": "string", "description": "Optional first message for the new session. Leave it out unless the user gave one."},
+                "resume": {"type": "string", "description": "Pick up an earlier conversation held in cwd instead of starting a new one: its session id (the transcript's file name without .jsonl), or \"latest\" for the newest one no running session has open. Use it when the user asks to resume or continue a session. A prompt, if given, is sent to it as the next message."},
             },
             "required": ["cwd"],
         },

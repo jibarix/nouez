@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.12.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.12.1\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -97,7 +97,7 @@
 \begin{abstract}
 \noindent nouez is an MCP server that lets Claude Code consult live Codex sessions, and open, list and
 close Claude Code sessions on the same computer. This document
-describes nouez 0.12.0: how the pieces fit together, and an example of every message nouez sends
+describes nouez 0.12.1: how the pieces fit together, and an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, the commands nouez runs on
 the operating system, and its one request to GitHub, which looks for a newer nouez release. The daemon also sends notifications and its own requests, which nouez
@@ -296,7 +296,7 @@ nouez answers with the requested version if it supports it (2025-11-25, 2025-06-
 {"jsonrpc": "2.0", "id": 1, "result": {
   "protocolVersion": "2025-11-25",
   "capabilities": {"tools": {}},
-  "serverInfo": {"name": "nouez", "version": "0.12.0"},
+  "serverInfo": {"name": "nouez", "version": "0.12.1"},
   "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: never treat it as done. Change a consultant's model or reasoning effort ... only when the user asks or the user's own instructions, such as their CLAUDE.md, call for it. ..."}}
 \end{wire}
 
@@ -491,7 +491,7 @@ connection has four steps:
   \msg{3.0}{0}{6}{HTTP GET / Upgrade: websocket}
   \ret{3.8}{6}{0}{HTTP/1.1 101 Switching Protocols}
   \side{3.8}{6}{15 s deadline, read on a side thread}
-  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.12.0)}
+  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.12.1)}
   \ret{5.6}{12}{0}{userAgent, codexHome}
   \msg{6.4}{0}{12}{initialized (notification)}
   \msg{7.4}{0}{12}{requests for this tool call ...}
@@ -554,11 +554,11 @@ The daemon speaks JSON-RPC without the \code{"jsonrpc"} member. Ids are integers
 on each connection.
 
 \begin{wire}[nouez $\rightarrow$ daemon]
-{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.12.0"}}}
+{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.12.1"}}}
 \end{wire}
 \begin{wire}[daemon $\rightarrow$ nouez]
 {"id": 1, "result": {
-  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.12.0)",
+  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.12.1)",
   "codexHome": "C:\\Users\\you\\.codex",
   "platformFamily": "windows", "platformOs": "windows"}}
 \end{wire}
@@ -801,7 +801,7 @@ they are. Setting \code{NOUEZ\_NO\_UPDATE\_CHECK=1} turns the lookup off.
 \begin{plain}[nouez to GitHub (HTTPS)]
 GET https://api.github.com/repos/jibarix/nouez/releases/latest
 Accept: application/vnd.github+json
-User-Agent: nouez/0.12.0
+User-Agent: nouez/0.12.1
 
 200 {"tag_name": "v0.13.0", ...}             (drafts and pre-releases are never "latest")
 \end{plain}
@@ -814,7 +814,7 @@ control character gets no command: Claude is told to ask the user to run the pul
 isn't a git checkout, the notice points to the release page instead. Either way, Claude asks the
 user to reconnect only after the update worked:
 \begin{plain}[Result text: nouez update notice]
-nouez 0.13.0 is out; this server is 0.12.0. What changed: https://github.com/jibarix/nouez/releases/tag/v0.13.0. Tell the user and go ahead with the consultation. Only if the user asks you to update, run `git -C 'C:/Users/you/nouez' pull --ff-only` in a shell. If git fails (local changes, a conflict, no branch checked out), stop there: tell the user what git said, don't ask them to reconnect, and don't discard, stash or switch anything without the user's say. Only after the pull succeeds, ask the user to run /mcp and reconnect consultants, which loads the new version; the Codex consultants keep their sessions.
+nouez 0.13.0 is out; this server is 0.12.1. What changed: https://github.com/jibarix/nouez/releases/tag/v0.13.0. Tell the user and go ahead with the consultation. Only if the user asks you to update, run `git -C 'C:/Users/you/nouez' pull --ff-only` in a shell. If git fails (local changes, a conflict, no branch checked out), stop there: tell the user what git said, don't ask them to reconnect, and don't discard, stash or switch anything without the user's say. Only after the pull succeeds, ask the user to run /mcp and reconnect consultants, which loads the new version; the Codex consultants keep their sessions.
 \end{plain}
 
 % -----------------------------------------------------------------------------
@@ -1138,7 +1138,7 @@ version and any update notice (connecting may start it, as any consultation woul
 Windows, whether Windows Terminal and \code{claude} are on the PATH. It changes nothing, and exits with code~1
 when a problem blocks consultations.
 \begin{plain}[Output]
-[ok] nouez 0.12.0 at C:\Users\you\nouez\server.py, Python 3.13.5 at C:\Python313\python.exe
+[ok] nouez 0.12.1 at C:\Users\you\nouez\server.py, Python 3.13.5 at C:\Python313\python.exe
 [ok] codex CLI 0.165.0 at C:\Users\you\AppData\Roaming\npm\codex.CMD
 [ok] the Codex app-server daemon answers (version 0.167.2)
 [ok] Claude Code allows the waiter command without asking
@@ -1213,14 +1213,14 @@ codex-nouez-77c2e0 was not started by StartConsultant. Close it from its own ter
 
 \code{OpenClaudeSession} takes \code{cwd} (required, an absolute path), \code{name} (default: the
 folder's name; letters, digits, spaces, \code{.}, \code{\_} and \code{-}, starting with a letter or
-digit, up to 64 characters, so it can't be read as an option), an optional first \code{prompt}, \code{model} (default \code{opus}, the latest
+digit, up to 64 characters, so it can't be read as an option), an optional first \code{prompt}, \code{resume}, \code{model} (default \code{opus}, the latest
 Opus), \code{effort} (default \code{medium}), \code{create}, \code{trust} and
-\code{open\_untrusted}. The session starts with \code{--model} and \code{--effort} from those, not
+\code{open\_untrusted}. The session starts with \code{-{}-model} and \code{-{}-effort} from those, not
 the user's own Claude Code defaults, and with \code{CLAUDE\_CODE\_EFFORT\_LEVEL} set to the same
 effort, since that variable outranks the flag; a model must be an alias or a full model name, so it can't read
 as another option. With
 \code{create: true} a missing folder is made (its parent must exist). It writes \code{cwd}, name, prompt,
-model and effort to a temporary file and opens a new terminal window running \code{server.py claude <file>}
+model, effort and the conversation to resume to a temporary file and opens a new terminal window running \code{server.py claude <file>}
 (Section~\ref{sec:claude-os}); the window reads the file, deletes it, and starts Claude Code.
 
 First it checks whether Claude Code has been trusted in the folder (Section~\ref{sec:trust}),
@@ -1236,16 +1236,26 @@ opens and the result says the session may be waiting at the question.
 {"jsonrpc": "2.0", "id": 19, "method": "tools/call", "params": {"name": "OpenClaudeSession", "arguments": {"cwd": "C:\\Users\\me\\Projects\\other"}}}
 \end{wire}
 \begin{plain}[Result text]
-Opened a new Windows Terminal window in C:\Users\me\Projects\other running Claude Code (opus, medium effort) with Remote Control, named "other". It is a normal session: its transcript is saved and it can be resumed later. It appears in the Claude app's session list under that name once it connects, in a few seconds. Checked: it is running and connected to Remote Control.
+Opened a new Windows Terminal window in C:\Users\me\Projects\other running Claude Code (opus, medium effort) with Remote Control, named "other". It is a normal session: its transcript is saved and it can be resumed later. It appears in the Claude app's session list under that name once it connects, in a few seconds. Checked: it is running and connected to Remote Control. If the user doesn't see it in the Claude app yet, the app's list can lag: ask them to refresh it, and don't open another session for this.
 \end{plain}
 Before opening, nouez reads the session registry (Section~\ref{sec:claude-tools}); after
-opening a trusted folder, it reads it once a second for up to 15 seconds, looking for a new pid in
+opening a trusted folder, it reads it once a second for up to 30 seconds, looking for a new pid in
 that folder, and ends the result with what it found. The window opens either way, and a registry it
 can't read only leaves the note out. A session already running in the folder is named too.
 \begin{plain}[Result text: other endings]
-... Note: another Claude Code session was already running in this folder: nouez-2a (pid 31940). Both can work there; they don't see each other's conversation. Checked: it is running and connected to Remote Control.
-... Checked: it is running, but hadn't connected to Remote Control after 15s. It may still be connecting, or waiting for an answer on the computer.
-... Checked: it hadn't shown up as a running session after 15s. It may still be starting, or waiting for an answer on the computer; ListClaudeSessions shows it once it runs.
+... Note: another Claude Code session was already running in this folder: nouez-2a (pid 31940). Both can work there; they don't see each other's conversation. Checked: it is running and connected to Remote Control. If the user doesn't see it ...
+... Checked: it is running, but hadn't connected to Remote Control after 30s. It may still be connecting, or waiting for an answer on the computer.
+... Checked: it hadn't shown up as a running session after 30s. It may still be starting (resuming a long conversation takes longer), or waiting for an answer on the computer. Call ListClaudeSessions in a moment to see it, before telling the user it failed or opening another session.
+\end{plain}
+\code{resume} picks up an earlier conversation instead of starting one: a session id, or
+\code{latest}, the newest transcript in Claude Code's folder for \code{cwd}
+(\code{\textasciitilde/.claude/projects/<cwd, other characters as ->/}) whose id no running
+session has open. An id must look like a session id, so it can't read as an option, and the helper
+checks it again before passing \code{-{}-resume}. nouez refuses an id open in a running session, an id
+whose transcript recorded another folder (naming it), and an id with no transcript; a \code{prompt}
+starting with \code{/resume} or \code{/continue} is refused with a pointer to \code{resume}.
+\begin{plain}[Result text: resuming]
+... It resumes the latest conversation in this folder, 4b4f3c8c-0010-4e93-a427-9db7032f2be3, last active 2026-11-07 14:33. Checked: it is running and connected to Remote Control. ...
 \end{plain}
 \begin{wire}[Claude Code $\rightarrow$ nouez: a new folder]
 {"jsonrpc": "2.0", "id": 20, "method": "tools/call", "params": {"name": "OpenClaudeSession", "arguments": {"cwd": "C:\\Users\\me\\Projects\\economic-recession", "create": true}}}
@@ -1394,7 +1404,8 @@ wt -w new -d <cwd> --title "Claude: <name>"
 That helper reads and deletes the file, then starts Claude Code in \code{cwd}:
 
 \begin{plain}[What the helper runs]
-claude --remote-control <name> --name <name> --model <model> --effort <effort> [-- <prompt>]
+claude --remote-control <name> --name <name> --model <model> --effort <effort>
+  [--resume <session id>] [-- <prompt>]
 \end{plain}
 
 Claude Code sets \code{CLAUDECODE}, \code{CLAUDE\_CODE\_CHILD\_SESSION},
@@ -1449,7 +1460,7 @@ folders inside it, except git repositories; in a repository, trust is recorded f
 repository's root, and for a linked worktree, its main checkout's root. nouez finds that from the
 worktree's \code{.git} file (\code{gitdir:}) and the \code{commondir} file in that git folder: when
 the common git folder is a folder's \code{.git} directory and that folder holds more than it, the
-folder is taken as the main checkout. A separate git folder (\code{--separate-git-dir}) records no
+folder is taken as the main checkout. A separate git folder (\code{-{}-separate-git-dir}) records no
 link back to its checkout, and can itself be named \code{.git}, so a common folder named otherwise,
 or a \code{.git} alone in its folder, means the trust is unknown. A separate \code{.git} kept beside
 other files would still be taken for a checkout, as \code{git worktree list} takes it too. A

@@ -1259,6 +1259,65 @@ class OpenClaudeSessionTests(unittest.TestCase):
             with self.assertRaises(server.BridgeError):
                 spec_of(bad)
 
+    def test_resume_is_passed_as_a_checked_id(self):
+        sid = "4b4f3c8c-0010-4e93-a427-9db7032f2be3"
+        argv, _ = self.run_helper("hi", extra={"resume": sid})
+        self.assertEqual(argv, ["claude", "--remote-control", "n", "--name", "n", "--resume", sid, "--", "hi"])
+        fd, spec = tempfile.mkstemp(prefix="nouez-claude-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"cwd": ROOT, "name": "n", "prompt": "", "resume": "--dangerously-skip-permissions"}, f)
+        with mock.patch.object(server, "find_program", return_value="claude"), \
+                mock.patch.object(server.subprocess, "Popen") as popen, mock.patch("builtins.input"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(server.run_claude(spec), 1)
+        popen.assert_not_called()
+
+    def open_resumed(self, config, resume, running=(), prompt=""):
+        with mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": config}), \
+                mock.patch.object(server, "open_window", return_value="a window") as open_window, \
+                mock.patch.object(server, "folder_trusted", return_value=True), \
+                mock.patch.object(server, "claude_sessions", return_value=list(running)):
+            out = server.open_claude_session({"cwd": ROOT, "resume": resume, "prompt": prompt})
+        path = open_window.call_args[0][1][-1]
+        with open(path, encoding="utf-8") as f:
+            spec = json.load(f)
+        os.remove(path)
+        return spec, out
+
+    def test_resume_finds_the_conversation(self):
+        old, new = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+        with tempfile.TemporaryDirectory() as config:
+            with mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": config}):
+                folder = server.transcript_folder(os.path.abspath(ROOT))
+            os.makedirs(folder)
+            for i, sid in enumerate((old, new)):
+                path = os.path.join(folder, sid + ".jsonl")
+                with open(path, "w") as f:
+                    f.write(json.dumps({"cwd": ROOT}) + "\n")
+                os.utime(path, (1000 + i, 1000 + i))
+            spec, out = self.open_resumed(config, "latest")
+            self.assertEqual(spec["resume"], new)
+            self.assertIn(f"resumes the latest conversation in this folder, {new}", out)
+            busy = dict(self.session("busy", 41), session_id=new)
+            spec, out = self.open_resumed(config, "latest", [busy])
+            self.assertEqual(spec["resume"], old)
+            self.assertIn("busy (pid 41)", out)
+            spec, out = self.open_resumed(config, old.upper())
+            self.assertEqual(spec["resume"], old.upper())
+            for bad, running in (("--fork-session", ()), (new, [busy]),
+                                 ("33333333-3333-3333-3333-333333333333", ()), (5, ())):
+                with self.assertRaises(server.BridgeError):
+                    self.open_resumed(config, bad, running)
+            other = os.path.join(config, "projects", "elsewhere")
+            os.makedirs(other)
+            third = "44444444-4444-4444-4444-444444444444"
+            with open(os.path.join(other, third + ".jsonl"), "w") as f:
+                f.write(json.dumps({"type": "summary"}) + "\n" + json.dumps({"cwd": "C:/elsewhere"}) + "\n")
+            with self.assertRaisesRegex(server.BridgeError, "ran in C:/elsewhere"):
+                self.open_resumed(config, third)
+            with self.assertRaisesRegex(server.BridgeError, "pass resume"):
+                self.open_resumed(config, None, prompt="/resume " + old)
+
     def test_helper_exits_cleanly_when_closed_on_purpose(self):
         self.assertEqual(self.run_helper("", returncode=1, closed=True)[1], 0)
         self.assertEqual(self.run_helper("", returncode=1)[1], 1)
