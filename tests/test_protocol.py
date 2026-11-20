@@ -1129,6 +1129,306 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("pipe closed", out)
 
+    def restarted(self, tag, cont_status="completed"):
+        """A consultant whose turn-1 a daemon restart cut off, carried on by Codex as turn-2."""
+        thread = self.consultant(tag)
+        cut = {"id": "turn-1", "status": "interrupted", "rootTurnId": "turn-1", "items": [user("q")]}
+        cont = {"id": "turn-2", "status": cont_status, "rootTurnId": "turn-1",
+                "items": [agent("carried-on answer", "final_answer")]}
+        return thread, self.use(FakeDaemon([thread], {thread["id"]: [cont, cut]}))
+
+    def appear_after(self, daemon, tid, lists, turn):
+        """Make `turn` the newest turn of `tid` once thread/turns/list has been called `lists` times."""
+        plain, seen = daemon.request, []
+
+        def request(method, params):
+            if method == "thread/turns/list":
+                seen.append(1)
+                if len(seen) == lists:
+                    daemon.turns[tid].insert(0, turn)
+            return plain(method, params)
+        daemon.request = request
+
+    def test_waiter_follows_a_turn_codex_carried_on(self):
+        thread, _ = self.restarted("cont01")
+        code, out = self.run_waiter(thread["id"], "turn-1")
+        self.assertEqual(code, 0)
+        self.assertIn("turn turn-2)", out)
+        self.assertIn("carried-on answer", out)
+        self.assertIn("Turn turn-1 was interrupted and Codex carried it on as turn turn-2", out)
+
+    def test_waiter_follows_a_continuation_that_starts_late(self):
+        thread = self.consultant("cont02")
+        cut = {"id": "turn-1", "status": "interrupted", "items": [user("q")]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [cut]}))
+        self.appear_after(daemon, thread["id"], 4, {"id": "turn-2", "status": "completed", "rootTurnId": "turn-1",
+                                                     "items": [agent("late answer", "final_answer")]})
+        with mock.patch.object(server.time, "sleep"):
+            code, out = self.run_waiter(thread["id"], "turn-1")
+        self.assertIn("late answer", out)
+
+    def test_waiter_follows_an_old_chain_to_its_end(self):
+        # turn-1 cut off, carried on as turn-2, cut off again long ago, carried on as turn-3.
+        thread = self.consultant("cont03")
+        turns = [{"id": "turn-3", "status": "completed", "rootTurnId": "turn-1", "items": [agent("third", "final_answer")]},
+                 {"id": "turn-2", "status": "interrupted", "rootTurnId": "turn-1", "items": [], "completedAt": 1000},
+                 {"id": "turn-1", "status": "interrupted", "items": [user("q")]}]
+        self.use(FakeDaemon([thread], {thread["id"]: turns}))
+        with mock.patch.object(server.time, "sleep") as sleep:
+            code, out = self.run_waiter(thread["id"], "turn-1")
+        sleep.assert_not_called()
+        self.assertIn("third", out)
+        self.assertIn("carried it on as turn turn-3", out)
+
+    def test_waiter_returns_an_interrupted_turn_at_once_once_a_later_turn_exists(self):
+        # No timestamps, but a later turn that doesn't carry it on: no continuation can come now.
+        thread = self.consultant("cont04")
+        cut = {"id": "turn-1", "status": "interrupted", "items": [user("q")]}
+        other = {"id": "turn-2", "status": "completed", "rootTurnId": "turn-2", "items": [user("new"), agent("other", "final_answer")]}
+        self.use(FakeDaemon([thread], {thread["id"]: [other, cut]}))
+        with mock.patch.object(server.time, "sleep") as sleep:
+            code, out = self.run_waiter(thread["id"], "turn-1")
+        sleep.assert_not_called()
+        self.assertNotIn("turn-2", out)
+        self.assertIn("turn-1 interrupted", out)
+
+    def test_waiter_returns_an_old_interrupted_turn_at_once(self):
+        thread = self.consultant("cont05")
+        cut = {"id": "turn-1", "status": "interrupted", "items": [user("q")], "startedAt": 1000, "durationMs": 5000}
+        self.use(FakeDaemon([thread], {thread["id"]: [cut]}))
+        with mock.patch.object(server.time, "sleep") as sleep:
+            code, out = self.run_waiter(thread["id"], "turn-1")
+        sleep.assert_not_called()
+        self.assertIn("turn-1 interrupted", out)
+
+    def test_waiter_gives_up_on_a_continuation_after_the_grace(self):
+        thread = self.consultant("cont06")
+        cut = {"id": "turn-1", "status": "interrupted", "items": [user("q")]}  # no timestamps: maybe just now
+        self.use(FakeDaemon([thread], {thread["id"]: [cut]}))
+        with mock.patch.object(server, "CONTINUATION_GRACE", 0.05):
+            code, out = self.run_waiter(thread["id"], "turn-1")
+        self.assertEqual(code, 0)
+        self.assertIn("turn-1 interrupted", out)
+
+    def test_a_shared_root_alone_is_not_a_continuation(self):
+        # turn-3 shares turn-2's root but doesn't come right after it, and turn-x isn't in the chain.
+        thread = self.consultant("cont07")
+        turns = [{"id": "turn-3", "status": "completed", "rootTurnId": "turn-1", "items": [user("other work"), agent("wrong", "final_answer")]},
+                 {"id": "turn-x", "status": "completed", "rootTurnId": "turn-x", "items": [user("x"), agent("x", "final_answer")]},
+                 {"id": "turn-2", "status": "interrupted", "rootTurnId": "turn-1", "items": []},
+                 {"id": "turn-1", "status": "interrupted", "items": [user("q")]}]
+        self.use(FakeDaemon([thread], {thread["id"]: turns}))
+        code, out = self.run_waiter(thread["id"], "turn-2")
+        self.assertNotIn("wrong", out)
+        self.assertIn("turn-2 interrupted", out)
+        self.assertEqual(server.next_in_chain(turns, turns[2]), None)
+
+    def test_waiter_keeps_a_followed_turn_across_a_dropped_connection(self):
+        thread = self.consultant("cont08")
+        running = {"id": "turn-1", "status": "inProgress", "items": [user("q")]}
+        cut = dict(running, status="interrupted")
+        cont = {"id": "turn-2", "status": "inProgress", "rootTurnId": "turn-1", "items": []}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        plain, lists = daemon.request, []
+
+        def request(method, params):
+            if method == "thread/turns/list":
+                lists.append(1)
+                if len(lists) == 2:  # mid-wait, a restart cuts turn-1 off and Codex carries it on
+                    daemon.turns[thread["id"]] = [cont, cut]
+                if len(lists) == 3:  # after following turn-1 to turn-2, the connection drops
+                    # and by the time it's back, turn-1 has left the listing
+                    daemon.turns[thread["id"]] = [dict(cont, status="completed", items=[agent("kept", "final_answer")])]
+                    raise BrokenPipeError("pipe closed")
+            return plain(method, params)
+        daemon.request = request
+        with mock.patch.object(server.time, "sleep"):
+            code, out = self.run_waiter(thread["id"], "turn-1")
+        self.assertEqual(code, 0)
+        self.assertIn("kept", out)
+        self.assertIn("Turn turn-1 was interrupted and Codex carried it on as turn turn-2", out)
+        self.assertIn("connection to the Codex daemon dropped", out)
+
+    def test_waiter_says_when_the_daemon_was_updated(self):
+        thread, daemon = self.restarted("cont09")
+        final = daemon.turns[thread["id"]]
+        daemon.turns[thread["id"]] = [{"id": "turn-1", "status": "inProgress", "items": [user("q")]}]
+        plain, lists, versions = daemon.request, [], iter(["0.170.0", "0.171.0"])
+
+        def request(method, params):
+            if method == "thread/turns/list":
+                lists.append(1)
+                if len(lists) == 2:  # the update restarts the daemon mid-wait; Codex carries turn-1 on
+                    daemon.turns[thread["id"]] = final
+                    raise BrokenPipeError("pipe closed")
+            return plain(method, params)
+        daemon.request = request
+
+        def connect():
+            daemon.info = {"userAgent": f"codex_app_server/{next(versions)}"}
+            return daemon
+        self.use(connect)
+        with mock.patch.object(server.time, "sleep"):
+            code, out = self.run_waiter(thread["id"], "turn-1")
+        self.assertEqual(code, 0)
+        self.assertIn("carried-on answer", out)
+        self.assertIn("changed version during the wait (0.170.0 -> 0.171.0)", out)
+
+    def test_send_follows_its_message_into_a_continuation(self):
+        thread = self.consultant("cont10")
+        daemon = self.use(FakeDaemon([thread]))
+        plain = daemon.request
+
+        def request(method, params):
+            out = plain(method, params)
+            if method == "turn/start":  # the turn is cut off and our message carried into a new one
+                turns = daemon.turns[thread["id"]]
+                turns[0]["status"] = "interrupted"
+                turns.insert(0, {"id": "turn-cont", "status": "completed",
+                                 "items": [user(params["input"][0]["text"]), agent("steered answer", "final_answer")]})
+            return out
+        daemon.request = request
+        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 5})
+        self.assertIn("steered answer", out)
+
+    def test_send_wait_bounds_the_grace(self):
+        thread = self.consultant("cont11")
+        daemon = self.use(FakeDaemon([thread]))
+        plain = daemon.request
+
+        def request(method, params):
+            out = plain(method, params)
+            if method == "turn/start":  # cut off at once, and never carried on
+                daemon.turns[thread["id"]][0]["status"] = "interrupted"
+            return out
+        daemon.request = request
+        started = time.monotonic()
+        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0.1})
+        self.assertLess(time.monotonic() - started, 0.45)
+        self.assertIn("turn-new interrupted", out)
+        self.assertIn("GetConsultantReply with turn_id turn-new follows it there", out)
+
+    def test_an_adjacent_turn_with_its_own_message_is_not_a_continuation(self):
+        # turn-3 comes right after turn-2 and shares its root, but someone started it with other work.
+        thread = self.consultant("cont18")
+        turns = [{"id": "turn-3", "status": "completed", "rootTurnId": "turn-1", "items": [user("other work"), agent("wrong", "final_answer")]},
+                 {"id": "turn-2", "status": "interrupted", "rootTurnId": "turn-1", "items": []},
+                 {"id": "turn-1", "status": "interrupted", "items": [user("q")]}]
+        self.use(FakeDaemon([thread], {thread["id"]: turns}))
+        self.assertIsNone(server.next_in_chain(turns, turns[1]))
+        self.assertIsNone(server.next_in_chain(turns, turns[1], "not there"))  # a send whose text is absent
+        code, out = self.run_waiter(thread["id"], "turn-2")
+        self.assertNotIn("wrong", out)
+        out = server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-2"})
+        self.assertNotIn("wrong", out)
+
+    def test_waiter_keeps_a_continuation_that_a_message_steers_later(self):
+        thread = self.consultant("cont19")
+        cut = {"id": "turn-1", "status": "interrupted", "items": [user("q")]}
+        cont = {"id": "turn-2", "status": "inProgress", "rootTurnId": "turn-1", "items": []}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [cont, cut]}))
+        plain, lists = daemon.request, []
+
+        def request(method, params):
+            if method == "thread/turns/list":
+                lists.append(1)
+                if len(lists) == 3:  # after the waiter followed turn-2, a message steers it, then it ends
+                    cont.update(status="completed", items=[user("steer"), agent("steered on", "final_answer")])
+            return plain(method, params)
+        daemon.request = request
+        with mock.patch.object(server.time, "sleep"):
+            code, out = self.run_waiter(thread["id"], "turn-1")
+        self.assertIn("steered on", out)
+        self.assertIn("carried it on as turn turn-2", out)
+
+    def test_reply_wait_finds_a_turn_pushed_out_of_the_newest_ten(self):
+        thread = self.consultant("cont20")
+        running = {"id": "turn-1", "status": "inProgress", "items": [user("q")]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        plain, lists = daemon.request, []
+
+        def request(method, params):
+            if method == "thread/turns/list":
+                lists.append(1)
+                if len(lists) == 2:  # cut off and carried on, then a dozen other turns arrive
+                    cont = {"id": "turn-2", "status": "completed", "rootTurnId": "turn-1",
+                            "items": [agent("found it", "final_answer")]}
+                    newer = [{"id": f"turn-n{n}", "status": "completed", "items": [user("x"), agent("x", "final_answer")]}
+                             for n in range(12)]
+                    daemon.turns[thread["id"]] = newer + [cont, dict(running, status="interrupted")]
+            return plain(method, params)
+        daemon.request = request
+        with mock.patch.object(server.time, "sleep"):
+            out = server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-1", "wait": 5})
+        self.assertIn("found it", out)
+
+    def test_reply_shows_the_turn_codex_carried_on(self):
+        thread, _ = self.restarted("cont12")
+        out = server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-1"})
+        self.assertIn("Turn turn-1 was interrupted and Codex carried it on as turn turn-2", out)
+        self.assertIn("carried-on answer", out)
+
+    def test_reply_finds_a_continuation_among_older_turns(self):
+        thread, daemon = self.restarted("cont13")
+        newer = [{"id": f"turn-n{n}", "status": "completed", "items": [user("x"), agent("x", "final_answer")]} for n in range(12)]
+        daemon.turns[thread["id"]] = newer + daemon.turns[thread["id"]]
+        out = server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-1"})
+        self.assertIn("carried-on answer", out)
+
+    def test_reply_with_a_wait_follows_a_continuation_that_starts_late(self):
+        thread = self.consultant("cont14")
+        cut = {"id": "turn-1", "status": "interrupted", "items": [user("q")]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [cut]}))
+        self.appear_after(daemon, thread["id"], 3, {"id": "turn-2", "status": "completed", "rootTurnId": "turn-1",
+                                                     "items": [agent("late answer", "final_answer")]})
+        out = server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-1", "wait": 5})
+        self.assertIn("late answer", out)
+        self.assertIn("carried it on as turn turn-2", out)
+
+    def test_reply_without_a_wait_returns_an_interrupted_turn_at_once(self):
+        thread = self.consultant("cont15")
+        cut = {"id": "turn-1", "status": "interrupted", "items": [user("q")]}
+        self.use(FakeDaemon([thread], {thread["id"]: [cut]}))
+        with mock.patch.object(server.time, "sleep") as sleep:
+            out = server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-1"})
+        sleep.assert_not_called()
+        self.assertIn("turn-1 interrupted", out)
+
+    def test_reply_names_the_turn_it_ends_on(self):
+        # turn-1 was carried on as turn-2, which is cut off in turn during the wait and carried on as turn-3.
+        thread = self.consultant("cont16")
+        cut = {"id": "turn-1", "status": "interrupted", "items": [user("q")]}
+        running = {"id": "turn-2", "status": "inProgress", "rootTurnId": "turn-1", "items": []}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running, cut]}))
+        plain, lists = daemon.request, []
+
+        def request(method, params):
+            if method == "thread/turns/list":
+                lists.append(1)
+                if len(lists) == 3:
+                    running["status"] = "interrupted"
+                    daemon.turns[thread["id"]].insert(0, {"id": "turn-3", "status": "completed", "rootTurnId": "turn-1",
+                                                          "items": [agent("final words", "final_answer")]})
+            return plain(method, params)
+        daemon.request = request
+        out = server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-1", "wait": 5})
+        self.assertIn("final words", out)
+        self.assertIn("carried it on as turn turn-3", out)
+        self.assertNotIn("as turn turn-2", out)
+
+    def test_history_names_a_turn_codex_carried_on(self):
+        thread, daemon = self.restarted("cont17")
+        out = server.get_consultant_history({"to": thread["id"]})
+        self.assertIn("turn-2 [completed] Codex carrying on the work of turn turn-1, with no new message "
+                      "-> \"carried-on answer\"", out)
+        self.assertNotIn("someone in the Codex pane", out.splitlines()[1])
+        daemon.turns[thread["id"]][0]["items"].insert(0, user(
+            "[Message from lead via the consultants bridge]\nand also this"))
+        daemon.turns[thread["id"]].append({"id": "turn-0", "status": "completed", "items": []})
+        out = server.get_consultant_history({"to": thread["id"]})
+        self.assertIn('from lead: "and also this" (Codex carrying on the work of turn turn-1)', out)
+        self.assertIn("turn-0 [completed] with no message", out)
+
     def test_waits_report_progress(self):
         thread = self.consultant("prog01")
         self.use(FakeDaemon([thread]))

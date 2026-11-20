@@ -43,11 +43,12 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.12.3"
+SERVER_VERSION = "0.12.4"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
 POLL_SECONDS = 1.5
+CONTINUATION_GRACE = 15  # seconds to wait for Codex to carry on an interrupted turn (a restarted daemon took 8s)
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 RECENT_SAVED_THREADS = 50  # how far back to look for unloaded bridge consultants
 REPLY_LOOKBACK = 100  # how many recent turns GetConsultantReply searches for a turn id
@@ -551,16 +552,66 @@ def user_texts(turn):
             for c in (i.get("content") or [])]
 
 
-def continuation(client, tid, turn_id, text):
-    """The turn that carried on an interrupted one, if it visibly contains our message.
-    A steer that lands early can interrupt a turn and continue in a new one; matching on
-    our own text avoids returning a reply meant for someone else."""
-    newer = []
-    for t in list_turns(client, tid, 10):  # newest first
-        if t["id"] == turn_id:
+def continued_from(turn):
+    """The first turn of the chain of work this turn belongs to (its rootTurnId), or None if it
+    starts its own chain. A restarted daemon that carries on a turn the restart cut off names that
+    turn; a root by itself shows only shared ancestry, not continuation."""
+    root = turn.get("rootTurnId")
+    return root if isinstance(root, str) and root and root != turn.get("id") else None
+
+
+def next_in_chain(turns, turn, text=None):
+    """In `turns` (newest first, `turn` among them), the turn that carried an interrupted `turn`
+    on, or None. Given `text` (our message), the oldest newer turn that visibly contains it: a steer
+    that lands early can interrupt a turn and continue in a new one, and matching our own text
+    avoids returning a reply meant for someone else. Otherwise only the turn right after it, only
+    if its rootTurnId names `turn` or, when `turn` itself carries an earlier turn on, that one, and
+    only if it holds no message: Codex starts the continuation of a cut-off turn next, as the
+    restarted daemon's first turn, with no message. A root shows ancestry, so a turn with a message
+    of its own may be other work, and a later turn that merely shares the root is not taken. A
+    continuation that a message steered later is no longer recognised here; a waiter that followed
+    it before then tracks it by id."""
+    ids = [t.get("id") for t in turns]
+    if turn.get("id") not in ids:
+        return None
+    newer = turns[:ids.index(turn["id"])][::-1]  # oldest first
+    if text:
+        hit = next((t for t in newer if any(text in u for u in user_texts(t))), None)
+        if hit:
+            return hit
+    if (newer and continued_from(newer[0]) in {turn["id"], continued_from(turn)} - {None}
+            and not user_texts(newer[0])):
+        return newer[0]
+    return None
+
+
+def follow_chain(turns, turn, text=None, hops=10):
+    """The turn in `turns` that finally carried `turn` on, hop by hop, or `turn` itself."""
+    for _ in range(hops):
+        nxt = next_in_chain(turns, turn, text) if turn.get("status") == "interrupted" else None
+        if not nxt:
             break
-        newer.append(t)
-    return next((t for t in reversed(newer) if any(text in u for u in user_texts(t))), None)
+        turn = nxt
+    return turn
+
+
+def may_be_carried_on(turns, turn):
+    """Whether Codex may yet carry an interrupted turn on: it is the thread's newest turn (the
+    continuation would come right after it) and, as far as its timestamps tell, ended just now.
+    A turn a restart cut off has no timestamps."""
+    return (turn.get("status") == "interrupted" and bool(turns) and turns[0].get("id") == turn.get("id")
+            and not ended_long_ago(turn, CONTINUATION_GRACE))
+
+
+def ended_long_ago(turn, seconds):
+    """Whether the turn ended more than `seconds` ago, as far as its timestamps tell."""
+    end = turn.get("completedAt")
+    if not isinstance(end, (int, float)) or isinstance(end, bool):
+        start, ms = turn.get("startedAt"), turn.get("durationMs")
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (start, ms)):
+            return False
+        end = start + ms / 1000
+    return time.time() - end > seconds
 
 
 def turn_reply(turn):
@@ -569,33 +620,45 @@ def turn_reply(turn):
     return "\n\n".join(finals or [m.get("text", "") for m in messages[-1:]])
 
 
-def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None, on_poll=None):
+def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None, on_poll=None, on_follow=None):
     """Poll until the turn finishes. Returns (done, turn_id, turn): on timeout, done is False and
-    turn is the last snapshot seen (or None). With `text` (the message we sent), follow an
-    interrupted turn into its continuation; turn_id is then the continuation's id. on_poll(turn_id,
-    turn) is called with each snapshot of a turn still running."""
+    turn is the last snapshot seen (or None). An interrupted turn is followed into its continuation
+    (see next_in_chain); turn_id is then the continuation's id, and on_follow(turn_id) is called.
+    While Codex may yet carry an interrupted turn on, it is given up to CONTINUATION_GRACE to do
+    so, within `timeout`; then the interrupted turn is returned as done. on_poll(turn_id, turn) is
+    called with each snapshot of a turn still running."""
     deadline = time.monotonic() + timeout
-    grace = None  # an interrupted turn's continuation may take a moment to be listed
+    grace = None  # when to stop waiting for an interrupted turn's continuation to start
     while True:
-        turn = find_turn(client, tid, turn_id)
-        if on_poll and turn and turn.get("status") == "inProgress":
+        turns = list_turns(client, tid, 10)
+        turn = next((t for t in turns if t.get("id") == turn_id), None)
+        if not turn:  # newer turns pushed it out of the newest 10
+            turns = list_turns(client, tid, REPLY_LOOKBACK)
+            turn = next((t for t in turns if t.get("id") == turn_id), None)
+        if turn and turn.get("status") == "interrupted":
+            nxt = follow_chain(turns, turn, text)
+            if nxt is not turn:
+                turn_id, turn, grace = nxt["id"], nxt, None
+                if on_follow:
+                    on_follow(turn_id)
+        status = turn.get("status") if turn else None
+        if on_poll and status == "inProgress":
             on_poll(turn_id, turn)
-        if turn and turn.get("status") == "interrupted" and text:
-            nxt = continuation(client, tid, turn_id, text)
-            if nxt:
-                turn_id, grace = nxt["id"], None
-                continue
-            grace = grace or time.monotonic() + 5
-            if time.monotonic() < grace:
+        now = time.monotonic()
+        if status == "interrupted":
+            grace = grace or now + CONTINUATION_GRACE
+            until = min(grace, deadline)
+            if may_be_carried_on(turns, turn) and now < until:
                 check_cancel(cancel)
-                time.sleep(0.5)
+                time.sleep(min(0.5, until - now))
                 continue
-        if turn and turn.get("status") != "inProgress":
             return True, turn_id, turn
-        if time.monotonic() >= deadline:
+        if turn and status != "inProgress":
+            return True, turn_id, turn
+        if now >= deadline:
             return False, turn_id, turn
         check_cancel(cancel)
-        time.sleep(POLL_SECONDS)
+        time.sleep(min(POLL_SECONDS, deadline - now))
 
 
 def cap_reply(turn_id, reply, limit=MAX_REPLY_CHARS):
@@ -687,7 +750,10 @@ def format_turn(name, turn, limit=MAX_REPLY_CHARS):
         err = (turn.get("error") or {}).get("message", "")
         hint = ""
         if turn["status"] == "interrupted":
-            hint = "\nIf the message was folded into a later turn, read it with GetConsultantReply."
+            hint = (f"\nIf Codex carries this turn on (as after a daemon restart), GetConsultantReply with turn_id "
+                    f"{turn['id']} follows it there, unless a message has since been sent into that turn; then "
+                    f"GetConsultantHistory lists it as \"Codex carrying on the work of turn ...\": read it by its "
+                    f"own turn_id. If the message was folded into a later turn, read that one.")
         elif turn["status"] == "failed":
             hint = ("\nThe turn failed inside Codex (the error above is Codex's), not in nouez"
                     + ("" if reply else ", and the message got no answer")
@@ -729,6 +795,7 @@ def when(ts, now=None):
 def describe_turn(turn, now=None):
     """One line about a turn: status, when, who sent it, and the start of message and reply."""
     texts = user_texts(turn)
+    root = continued_from(turn)
     sender, message = "someone in the Codex pane", texts[0] if texts else ""
     header = BRIDGE_HEADER.match(message)
     if header:
@@ -745,9 +812,14 @@ def describe_turn(turn, now=None):
     if isinstance(turn.get("durationMs"), int):
         parts.append(f"took {turn['durationMs'] // 1000}s")
     reply = first_line(turn_reply(turn)) if turn.get("status") != "inProgress" else ""
+    reply = f" -> \"{reply}\"" if reply else ""
+    head = f"{turn.get('id')} [{', '.join(parts)}]"
+    carried = f"Codex carrying on the work of turn {root}" if root else ""
+    if not texts:  # nobody's message: say whose turn it is, not that someone sent ""
+        return f"{head} {carried + ', with no new message' if root else 'with no message'}{reply}"
     extra = f" (+{len(texts) - 1} more message(s) added while it ran)" if len(texts) > 1 else ""
-    return (f"{turn.get('id')} [{', '.join(parts)}] from {sender}: \"{first_line(message)}\"{extra}"
-            + (f" -> \"{reply}\"" if reply else ""))
+    extra += f" ({carried})" if root else ""
+    return f"{head} from {sender}: \"{first_line(message)}\"{extra}{reply}"
 
 
 def send_lock(tid):
@@ -2405,6 +2477,13 @@ def send_consultant_message(args, cancel=None, progress=None):
         client.close()
 
 
+def carried_note(asked, turn):
+    """A line saying the turn shown carries on the turn asked for, or "" if it is that turn."""
+    if turn["id"] == asked:
+        return ""
+    return f"(Turn {asked} was interrupted and Codex carried it on as turn {turn['id']}, shown here.)\n\n"
+
+
 def get_consultant_reply(args, cancel=None, progress=None):
     to = target(args)
     timeout = wait_seconds(args, 0)
@@ -2414,32 +2493,37 @@ def get_consultant_reply(args, cancel=None, progress=None):
         thread = resolve(client, to)
         tid, name = thread["id"], short_name(thread)
         turn_id = args.get("turn_id")
-        turn = find_turn(client, tid, turn_id, REPLY_LOOKBACK) if turn_id else latest_turn(client, tid)
+        turns = list_turns(client, tid, REPLY_LOOKBACK if turn_id else 1)
+        turn = next((t for t in turns if t.get("id") == turn_id), None) if turn_id else (turns or [None])[0]
         if not turn:
             if turn_id:
                 return f"{name} has no turn {turn_id} among its {REPLY_LOOKBACK} most recent turns."
             return f"{name} has no messages yet."
-        if turn.get("status") == "inProgress":
+        asked = turn["id"]
+        turn = follow_chain(turns, turn)
+        if turn.get("status") == "inProgress" or (timeout > 0 and may_be_carried_on(turns, turn)):
             done = False
             if timeout > 0:
                 done, _, last = wait_for_turn(client, tid, turn["id"], timeout, cancel,
                                               on_poll=progress_reporter(progress, name))
                 turn = last or turn  # the newest snapshot, for the partial output
             if not done:
-                return still_working(name, turn["id"], turn,
-                                     f"To be woken when it is ready, run in the background:\n"
-                                     f"{waiter_command(tid, turn['id'])}\nOr check again later with "
-                                     f"turn_id {turn['id']}; pass wait=\"done\" only if the user wants "
-                                     "you to wait for it.")
+                return carried_note(asked, turn) + still_working(
+                    name, turn["id"], turn,
+                    f"To be woken when it is ready, run in the background:\n"
+                    f"{waiter_command(tid, turn['id'])}\nOr check again later with "
+                    f"turn_id {turn['id']}; pass wait=\"done\" only if the user wants "
+                    "you to wait for it.")
+        carried = carried_note(asked, turn)
         if offset:
             reply = turn_reply(turn)
             if offset >= len(reply):
                 return f"The reply from {name} (turn {turn['id']}) has {len(reply)} characters; offset {offset} is past its end."
             end = min(len(reply), offset + MAX_REPLY_CHARS)
-            return (f"Reply from {name} (turn {turn['id']}, {turn['status']}), characters {offset}-{end} "
+            return carried + (f"Reply from {name} (turn {turn['id']}, {turn['status']}), characters {offset}-{end} "
                     f"of {len(reply)}:\n\n{reply[offset:end]}"
                     + (f"\n\n[More: read on with offset {end}.]" if end < len(reply) else ""))
-        out = format_turn(name, turn)
+        out = carried + format_turn(name, turn)
         latest = latest_turn(client, tid)
         if turn["status"] == "interrupted" and latest and latest["id"] != turn["id"]:
             out += (f"\nA later turn exists ({latest['id']}, {latest['status']}). If your message "
@@ -2927,26 +3011,41 @@ def run_waiter(thread_id, turn_id):
     few failed connections, such as a daemon restart, rather than give up on a long turn."""
     deadline = time.monotonic() + WAITER_SECONDS
     failures = 0  # in a row: reset by each connection that works
+    asked, dropped, daemons = turn_id, False, []  # daemons: the versions seen, in order
+
+    def moved(new_id):  # keeps a followed continuation even if the connection then drops
+        nonlocal turn_id
+        turn_id = new_id
     while True:
         try:
             client = CodexClient()
             try:
+                daemon = version_of(((client.info or {}).get("userAgent") or "").split("/", 1)[-1])
+                if daemon and daemon not in daemons:
+                    daemons.append(daemon)
                 thread = resolve(client, thread_id, exact_only=True)
                 tid, name = thread["id"], short_name(thread)
                 failures = 0
-                turn = find_turn(client, tid, turn_id, REPLY_LOOKBACK)
+                turns = list_turns(client, tid, REPLY_LOOKBACK)
+                turn = next((t for t in turns if t.get("id") == turn_id), None)
                 if not turn:
                     print(f"{name} has no turn {turn_id} among its {REPLY_LOOKBACK} most recent turns.")
                     return 1
-                if turn.get("status") == "inProgress":  # a running turn is among the newest few
+                turn = follow_chain(turns, turn)  # however far Codex has carried it on already
+                turn_id = turn["id"]
+                # A running turn is among the newest few, and so is an interrupted one that
+                # Codex may yet carry on.
+                if turn.get("status") == "inProgress" or may_be_carried_on(turns, turn):
                     done, turn_id, turn = wait_for_turn(client, tid, turn_id,
-                                                        max(0, deadline - time.monotonic()), None)
+                                                        max(0, deadline - time.monotonic()), None,
+                                                        on_follow=moved)
                 else:
                     done = True
             finally:
                 client.close()
         except (BridgeError, OSError) as e:
             failures += 1
+            dropped = True
             left = deadline - time.monotonic()
             if failures > WAITER_RETRIES or left <= 0:
                 print(f"Stopped waiting for turn {turn_id}: {e} Read the reply with GetConsultantReply "
@@ -2961,6 +3060,17 @@ def run_waiter(thread_id, turn_id):
             return 0
         print(f"The consultant's turn has ended (thread {tid}, turn {turn_id}).\n")
         print(format_turn(name, turn, WAITER_REPLY_CHARS))
+        notes = []
+        if turn_id != asked:
+            notes.append(f"Turn {asked} was interrupted and Codex carried it on as turn {turn_id}, "
+                         "whose reply is above.")
+        if len(daemons) > 1:
+            notes.append(f"The Codex daemon changed version during the wait ({' -> '.join(daemons)}): "
+                         "it was updated and restarted, which interrupts running turns.")
+        elif dropped:
+            notes.append("The connection to the Codex daemon dropped during the wait, as when it restarts.")
+        if notes:
+            print("\n" + " ".join(notes))
         return 0
 
 

@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.12.3\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.12.4\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -97,7 +97,7 @@
 \begin{abstract}
 \noindent nouez is an MCP server that lets Claude Code consult live Codex sessions, and open, list and
 close Claude Code sessions on the same computer. This document
-describes nouez 0.12.3: how the pieces fit together, and an example of every message nouez sends
+describes nouez 0.12.4: how the pieces fit together, and an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, the commands nouez runs on
 the operating system, and its one request to GitHub, which looks for a newer nouez release. The daemon also sends notifications and its own requests, which nouez
@@ -296,7 +296,7 @@ nouez answers with the requested version if it supports it (2025-11-25, 2025-06-
 {"jsonrpc": "2.0", "id": 1, "result": {
   "protocolVersion": "2025-11-25",
   "capabilities": {"tools": {}},
-  "serverInfo": {"name": "nouez", "version": "0.12.3"},
+  "serverInfo": {"name": "nouez", "version": "0.12.4"},
   "instructions": "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your working directory, even if you don't remember one being open (earlier context may have been compacted). It reuses a consultant it started earlier in this repo, ... A result that says 'still working' is not a reply, even if it shows output so far: never treat it as done. Change a consultant's model or reasoning effort ... only when the user asks or the user's own instructions, such as their CLAUDE.md, call for it. ..."}}
 \end{wire}
 
@@ -491,7 +491,7 @@ connection has four steps:
   \msg{3.0}{0}{6}{HTTP GET / Upgrade: websocket}
   \ret{3.8}{6}{0}{HTTP/1.1 101 Switching Protocols}
   \side{3.8}{6}{15 s deadline, read on a side thread}
-  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.12.3)}
+  \msg{4.8}{0}{12}{initialize (clientInfo nouez 0.12.4)}
   \ret{5.6}{12}{0}{userAgent, codexHome}
   \msg{6.4}{0}{12}{initialized (notification)}
   \msg{7.4}{0}{12}{requests for this tool call ...}
@@ -554,11 +554,11 @@ The daemon speaks JSON-RPC without the \code{"jsonrpc"} member. Ids are integers
 on each connection.
 
 \begin{wire}[nouez $\rightarrow$ daemon]
-{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.12.3"}}}
+{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nouez", "version": "0.12.4"}}}
 \end{wire}
 \begin{wire}[daemon $\rightarrow$ nouez]
 {"id": 1, "result": {
-  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.12.3)",
+  "userAgent": "codex-tui/0.162.0 (Windows 10.0.26200; x86_64) WindowsTerminal (nouez; 0.12.4)",
   "codexHome": "C:\\Users\\you\\.codex",
   "platformFamily": "windows", "platformOs": "windows"}}
 \end{wire}
@@ -593,6 +593,7 @@ The consultant's name is derived, not stored: \code{codex-} + the last folder of
 {"id": "01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31",
  "status": "completed",                  // "inProgress" | "completed" | "interrupted" | "failed"
  "error": null,                          // may be {"message": "..."} when failed or interrupted
+ "rootTurnId": "01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31",  // its own id, or the turn it carries on
  "items": [
    {"type": "userMessage", "content": [{"type": "text",
      "text": "[Message from Claude Code via the consultants bridge]\n\nReview this diff ..."}]},
@@ -608,6 +609,22 @@ after the turn's latest \code{userMessage}, whatever its phase, keeping the last
 characters. A steered message adds a \code{userMessage} to the running turn, so output written
 before it arrived is not shown as if it answered it. This is the snapshot from the latest poll;
 nouez polls instead of following streamed events, so it may lag the session by one poll.
+
+\code{rootTurnId} names the first turn of the chain of work that led to a turn, the turn's own id
+for a turn that starts one. It shows ancestry, not by itself continuation: a client may start new
+work on behalf of an earlier turn. Codex uses it when a restarted daemon reloads a session whose
+turn the restart cut off: the old turn ends \code{interrupted}, with no timestamps, and the
+daemon's next turn there, started with no \code{userMessage}, goes on with the work and names the
+old turn as its root. On 2026-11-19 Codex's scheduled daemon update (0.170.0 to 0.171.0) did this,
+about 8 seconds after it stopped the old daemon. nouez takes a turn as the continuation of an
+interrupted turn, on the strength of its root alone, only if it is the next turn in the thread,
+holds no message, and its root is the interrupted turn, or that turn's own root when the
+interrupted turn is itself a continuation; a turn with a message of its own, or a later one that
+only shares the root, is not taken. (A send also follows a turn that holds its own text.) A
+continuation a message steered later is not recognised from the interrupted turn any more, but a
+waiter that already followed it keeps it. It follows such chains wherever it waits for or reads a turn, and
+the history names a turn with no message as Codex's, not as someone's empty message. nouez never
+sends a continuation, so it can't refuse one.
 
 \subsection{Request reference}
 
@@ -803,7 +820,7 @@ they are. Setting \code{NOUEZ\_NO\_UPDATE\_CHECK=1} turns the lookup off.
 \begin{plain}[nouez to GitHub (HTTPS)]
 GET https://api.github.com/repos/jibarix/nouez/releases/latest
 Accept: application/vnd.github+json
-User-Agent: nouez/0.12.3
+User-Agent: nouez/0.12.4
 
 200 {"tag_name": "v0.13.0", ...}             (drafts and pre-releases are never "latest")
 \end{plain}
@@ -816,7 +833,7 @@ control character gets no command: Claude is told to ask the user to run the pul
 isn't a git checkout, the notice points to the release page instead. Either way, Claude asks the
 user to reconnect only after the update worked:
 \begin{plain}[Result text: nouez update notice]
-nouez 0.13.0 is out; this server is 0.12.3. What changed: https://github.com/jibarix/nouez/releases/tag/v0.13.0. Tell the user and go ahead with the consultation. Only if the user asks you to update, run `git -C 'C:/Users/you/nouez' pull --ff-only` in a shell. If git fails (local changes, a conflict, no branch checked out), stop there: tell the user what git said, don't ask them to reconnect, and don't discard, stash or switch anything without the user's say. Only after the pull succeeds, ask the user to run /mcp and reconnect consultants, which loads the new version; the Codex consultants keep their sessions.
+nouez 0.13.0 is out; this server is 0.12.4. What changed: https://github.com/jibarix/nouez/releases/tag/v0.13.0. Tell the user and go ahead with the consultation. Only if the user asks you to update, run `git -C 'C:/Users/you/nouez' pull --ff-only` in a shell. If git fails (local changes, a conflict, no branch checked out), stop there: tell the user what git said, don't ask them to reconnect, and don't discard, stash or switch anything without the user's say. Only after the pull succeeds, ask the user to run /mcp and reconnect consultants, which loads the new version; the Codex consultants keep their sessions.
 \end{plain}
 
 % -----------------------------------------------------------------------------
@@ -890,7 +907,7 @@ doesn't block other senders.
   \msg{13.8}{5}{10.5}{thread/turns/list limit 10}
   \ret{14.5}{10.5}{5}{turn status}
   \ret{15.3}{5}{0}{progress, at most every 10 s}
-  \side{16.1}{5}{interrupted: follow the turn that carries our text}
+  \side{16.1}{5}{interrupted: follow the turn that carries it on}
   \ret{17.9}{5}{0}{reply / partial / "not a reply"}
 \end{tikzpicture}
 \caption{SendConsultantMessage with a \code{wait} above zero (the default is 5 seconds). Before the lock, a
@@ -986,7 +1003,14 @@ Output so far (a snapshot of the running turn; it may change and is not the fina
 Reading server.py ... route() looks fine; checking dispatch next.
 \end{plain}
 The ``Output so far'' block is left out when the turn has written nothing since the message
-arrived. If an interrupted turn carried on in a new one, the turn id given is the new one's.
+arrived. If an interrupted turn carried on in a new one, the turn id given is the new one's: a
+turn that holds our text (a steer that landed early), or Codex's continuation after a daemon
+restart (above). While an interrupted turn is still the newest in the thread and its timestamps,
+if any, show it ended within \code{CONTINUATION\_GRACE} (15~s), nouez waits up to that long for a
+continuation to appear before reporting the turn interrupted. It never sleeps past the caller's
+\code{wait}, though the last poll's round trip to the daemon can add to it. A turn a restart cut off has no timestamps, and neither may one stopped with Esc or
+StopConsultant, so such a stop can take up to 15~s longer to report. Each poll reads the newest 10 turns,
+and the newest 100 when later turns have pushed the awaited one out of the 10.
 \begin{plain}[Result text: waiting failed after delivery (isError true)]
 Delivered to codex-nouez-4d9f17 (started a new turn, turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31), but waiting for the reply failed: thread/turns/list timed out after 15s. Don't send the message again; read the reply with GetConsultantReply (turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31).
 \end{plain}
@@ -994,7 +1018,7 @@ Delivered to codex-nouez-4d9f17 (started a new turn, turn 01a1f3c4-8b20-7d55-b1e
 codex-nouez-4d9f17: turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31 interrupted.
 Partial reply:
 Reading server.py ...
-If the message was folded into a later turn, read it with GetConsultantReply.
+If Codex carries this turn on (as after a daemon restart), GetConsultantReply with turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31 follows it there, unless a message has since been sent into that turn; then GetConsultantHistory lists it as "Codex carrying on the work of turn ...": read it by its own turn_id. If the message was folded into a later turn, read that one.
 \end{plain}
 \begin{plain}[Result text: the turn failed inside Codex]
 codex-nouez-4d9f17: turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31 failed. stream disconnected before completion
@@ -1060,7 +1084,12 @@ codex-nouez-4d9f17 has no messages yet.
 codex-nouez-4d9f17 has no turn 01a1ffff-... among its 100 most recent turns.
 \end{plain}
 
-An interrupted turn followed by a newer turn adds:
+An interrupted turn that Codex carried on (see the turn fields above; chains of up to ten
+continuations are followed among the same 100 turns) is read through to the turn that carried it
+on. With a \code{wait} above zero, nouez also waits for a continuation that hasn't started yet,
+as a send does; with \code{wait: 0} it doesn't. The result then starts with
+\emph{``(Turn 01a1f3c4-\ldots\ was interrupted and Codex carried it on as turn 01a1f3c6-\ldots,
+shown here.)''} Otherwise an interrupted turn followed by a newer turn adds:
 \emph{``A later turn exists (01a1f3c6-..., completed). If your message continued there, read it
 by omitting turn\_id.''} nouez does not check that the later turn holds the message here; the
 newer turn may be someone else's.
@@ -1082,7 +1111,11 @@ Lists a consultant's recent turns, newest first, one line each, from one
 \code{thread/turns/list} (\code{limit}, default 20, at most 100). Each line gives the turn id,
 status, when it started and how long it took, the sender (the \code{from} label in a bridge
 message's header, or ``someone in the Codex pane'' for text typed there), the first line of the
-message and of the reply, and how many messages steered the turn while it ran. For a bridge
+message and of the reply, and how many messages steered the turn while it ran. A turn with no
+message at all names no sender: one Codex started to carry on another turn's work reads
+\emph{``Codex carrying on the work of turn \ldots, with no new message''}, naming its
+\code{rootTurnId}, any other \emph{``with no message''}; a turn with a message and another turn as
+its root says \emph{``(Codex carrying on the work of turn \ldots)''} after it. For a bridge
 message the revision line and the \code{owner\_words} framing are skipped, so the line shows the
 sender's own text. It reads only, user sessions included.
 \begin{plain}[Result text]
@@ -1114,14 +1147,24 @@ broad interpreter rules; without them it asks before each waiter, or auto mode m
 
 The waiter opens its own connection, resolves the thread by exact id, and looks for the turn among
 its \code{REPLY\_LOOKBACK} (100) most recent turns. A turn that is missing ends it with exit
-code~1. A turn that has already ended is printed at once; a running one, which is always among the
-newest, is polled with \code{wait\_for\_turn} for up to \code{WAITER\_SECONDS} (25 minutes).
+code~1. An interrupted turn that Codex carried on is replaced by the last turn of its chain. A
+turn that has already ended is printed at once; a running one, which is always among the newest,
+and an interrupted one that Codex may yet carry on (as a send waits for one), are polled with
+\code{wait\_for\_turn} for up to \code{WAITER\_SECONDS} (25 minutes). That is how the waiter
+outlives a daemon restart: the restart breaks its connection and ends the turn
+\code{interrupted}, the waiter reconnects, and it follows the continuation the new daemon starts.
+A continuation followed during the wait is kept across a dropped connection, so the waiter
+reconnects to it even after the turn it started with has left the newest 100.
 Claude Code stops a background command after 30 minutes by default, so at that point the waiter
 exits with code~0 and the \emph{still working} result, including the output so far and the same
 command to run again; Claude starts a new waiter. When the turn ends, the waiter prints
 \emph{``The consultant's turn has ended (thread \ldots, turn \ldots).''} and the turn formatted as
 \code{GetConsultantReply} would, with the reply cut at \code{WAITER\_REPLY\_CHARS} (20,000)
 characters and the rest saved to a file, and exits with code~0. Its standard output is UTF-8.
+After the reply it says when it followed a continuation (\emph{``Turn \ldots\ was interrupted and
+Codex carried it on as turn \ldots, whose reply is above.''}), when the daemon's version changed
+during the wait (\emph{``The Codex daemon changed version during the wait (0.170.0 -> 0.171.0): it
+was updated and restarted, which interrupts running turns.''}), or else when a connection dropped.
 
 A failed connection (\code{BridgeError}, or an \code{OSError} such as a broken pipe) is retried
 10 seconds later, never past the 25-minute deadline. After \code{WAITER\_RETRIES} (3) failures in a
@@ -1140,7 +1183,7 @@ version and any update notice (connecting may start it, as any consultation woul
 Windows, whether Windows Terminal and \code{claude} are on the PATH. It changes nothing, and exits with code~1
 when a problem blocks consultations.
 \begin{plain}[Output]
-[ok] nouez 0.12.3 at C:\Users\you\nouez\server.py, Python 3.13.5 at C:\Python313\python.exe
+[ok] nouez 0.12.4 at C:\Users\you\nouez\server.py, Python 3.13.5 at C:\Python313\python.exe
 [ok] codex CLI 0.165.0 at C:\Users\you\AppData\Roaming\npm\codex.CMD
 [ok] the Codex app-server daemon answers (version 0.167.2)
 [ok] Claude Code allows the waiter command without asking
@@ -1505,6 +1548,7 @@ The read-back catches the second; the backups are there for the first.
 \code{SANDBOX} & \code{read-only} & sandbox of every started consultant \\
 \code{BRIDGE\_SOURCE} & \code{nouez} & \code{threadSource} tag on started sessions \\
 \code{POLL\_SECONDS} & 1.5 s & turn polling interval \\
+\code{CONTINUATION\_GRACE} & 15 s & wait for Codex to carry on an interrupted turn \\
 \code{PROGRESS\_SECONDS} & 10 s & least time between progress notifications \\
 \code{MAX\_WAIT\_SECONDS} & 4 h & cap on polling for a turn, \code{wait: "done"} included \\
 \code{MAX\_REPLY\_CHARS} & 60,000 & longer replies are cut and saved to a file \\

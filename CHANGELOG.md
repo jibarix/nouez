@@ -6,6 +6,20 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-11-19
+
+nouez follows a turn that Codex carries on after a daemon restart. Tested with Claude Code 2.1.329, Codex CLI 0.170.0 with app-server daemon 0.171.0, Python 3.11.9 on Windows 11.
+
+### Fixed
+- A consultant's turn cut off by a daemon restart is followed to the turn Codex carries it on in. Codex's scheduled daemon update (0.170.0 to 0.171.0) stopped the daemon in the middle of a turn. The restarted daemon reloaded the session and, 8 seconds later, carried the turn on in its next turn, started with no message, whose `rootTurnId` names the old one. The waiter reported "interrupted" and stopped there, though the work went on. The waiter, `GetConsultantReply` and a waiting `SendConsultantMessage` now follow an interrupted turn to such a continuation, through chains of them. Going by the root, a continuation is only the next turn in the thread, with no message, whose root is the interrupted turn (or that turn's own root, for a continuation cut off again); a turn with a message of its own, or a later turn that only shares the root, isn't taken. A continuation that a message steered later isn't recognised from the interrupted turn any more; a waiter that already followed it keeps it. A send still also follows a turn that holds its own text, as before.
+  - While the interrupted turn is still the newest and, as far as its timestamps tell, ended just now, they wait up to 15 seconds for a continuation to start, sleeping no later than the end of the caller's `wait` (the last poll's round trip can add to it). `GetConsultantReply` with `wait: 0` doesn't wait. A turn stopped with Esc or `StopConsultant` may take up to 15 seconds longer to report.
+  - The waiter says after the reply that it followed a continuation, and names the daemon's versions when they changed during the wait. A continuation followed during the wait is kept across a dropped connection.
+  - `GetConsultantReply` looks for continuations among the same 100 turns it searches for `turn_id`, and its note names the turn finally shown. A wait whose turn is pushed out of the newest 10 by later turns looks for it among the newest 100.
+- `GetConsultantHistory` no longer lists a turn with no message as an empty message "from someone in the Codex pane". A continuation reads "Codex carrying on the work of turn …, with no new message", naming its root, and any other turn without a message reads "with no message". nouez never sends a continuation, so it can't refuse one.
+
+### Added
+- `REVIEW.md` item 10, for code that reads a turn's status or messages.
+
 ## [0.12.3] - 2026-11-19
 
 Fixes from a third round of a consultant's review, of 0.12.2. Tested with Claude Code 2.1.328, Codex CLI 0.170.0 with app-server daemon 0.170.0, Python 3.11.9 on Windows 11.
@@ -284,7 +298,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.12.3...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.12.4...HEAD
+[0.12.4]: https://github.com/jibarix/nouez/compare/v0.12.3...v0.12.4
 [0.12.3]: https://github.com/jibarix/nouez/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/jibarix/nouez/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/jibarix/nouez/compare/v0.12.0...v0.12.1
