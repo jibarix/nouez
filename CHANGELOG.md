@@ -6,6 +6,16 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-22
+
+`ConsultantBudget`, for choosing a consultant's model and effort by the usage left and how strong each model is. Tested with Claude Code 2.1.330, Codex CLI 0.170.0 with app-server daemon 0.171.0, Python 3.11.9 on Windows 11. After updating, reconnect `consultants` with `/mcp` in each open Claude Code session; open sessions keep running the old server until then.
+
+### Added
+- `ConsultantBudget` (read-only) shows, in one call: each usage window on the Codex subscription, with the percentage used, the reset time and where the current pace lands at the reset (or when it runs out first), and any free full resets, from `account/rateLimits/read`; the Codex models and their effort levels, from `model/list`; Claude Code's own 5-hour and weekly windows, from a file the user's status line saves, with its age; and the Artificial Analysis Intelligence Index, price and speed of the top 8 OpenAI, Google and Anthropic models, credited to Artificial Analysis. A failure in one part is reported in its place and the rest still shows.
+  - Model scores need `ARTIFICIAL_ANALYSIS_API_KEY` (a free key). On Windows it is also read from the user's saved environment variables, so a key saved after Claude Code started works without a restart. The list is fetched about once a week and kept in `nouez/aa-models.json` in the user's cache folder; a failed fetch waits 6 hours and the old list stays in use. `refresh: true` fetches again if the list is over an hour old.
+  - nouez reports and doesn't choose: the result says to go by the user's own rules. The README's new "Choosing a consultant" section shows the status line addition that saves Claude Code's usage and outlines a `consult` skill.
+- The latest-release cache and the new files are written through one helper that replaces each file whole.
+
 ## [0.12.4] - 2026-11-19
 
 nouez follows a turn that Codex carries on after a daemon restart. Tested with Claude Code 2.1.329, Codex CLI 0.170.0 with app-server daemon 0.171.0, Python 3.11.9 on Windows 11.
@@ -298,7 +308,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.12.4...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/jibarix/nouez/compare/v0.12.4...v0.13.0
 [0.12.4]: https://github.com/jibarix/nouez/compare/v0.12.3...v0.12.4
 [0.12.3]: https://github.com/jibarix/nouez/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/jibarix/nouez/compare/v0.12.1...v0.12.2

@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.12.4\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.13.0\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -356,6 +356,7 @@ StopConsultant & false & true & \code{openWorldHint: false} \\
 OpenClaudeSession & false & false & \code{openWorldHint: false} \\
 ListClaudeSessions & true & & \code{openWorldHint: false} \\
 CloseClaudeSession & false & true & \code{openWorldHint: false} \\
+ConsultantBudget & true & & \code{openWorldHint: true} \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -644,6 +645,8 @@ thread/turns/list\textsuperscript{*} & \code{threadId}, \code{limit}, \code{sort
 turn/start & \code{threadId}, \code{input}, \code{sandboxPolicy}, \code{approvalPolicy}\textsuperscript{\dag}, opt.\ \code{model}, \code{effort} & \code{turn.id} & send to an idle session \\
 turn/steer & \code{threadId}, \code{expectedTurnId}, \code{input} & \code{turnId} (not read) & send to a busy session \\
 thread/archive & \code{threadId} & -- & StopConsultant \\
+account/rateLimits/read & -- & \code{rateLimits}, \code{rateLimitResetCredits} & ConsultantBudget \\
+model/list & \code{\{\}} & \code{data}: models & ConsultantBudget \\
 \bottomrule
 \end{tabularx}
 \end{center}
@@ -1253,6 +1256,77 @@ Stopped codex-nouez-4d9f17 (archived). Closed 1 terminal window(s) showing it. T
 codex-nouez-77c2e0 was not started by StartConsultant. Close it from its own terminal.
 \end{plain}
 
+\subsection{ConsultantBudget}
+\label{sec:budget}
+
+\code{ConsultantBudget} gathers the facts for choosing a consultant's model and effort, and changes
+nothing. It makes two requests to the Codex daemon, reads one file the user's status line saves, and
+asks Artificial Analysis for model scores about once a week. Each part fails on its own: an
+unreachable daemon or a missing file is reported in its place, and the rest still shows.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[x=0.92cm,y=0.7cm]
+  \lifelines{0/Claude Code/cc, 5/nouez/nz, 10.5/Codex daemon/cx, 15.5/Files and web/os}{6.6}
+  \msg{1.2}{0}{5}{tools/call ConsultantBudget}
+  \msg{2.1}{5}{10.5}{account/rateLimits/read}
+  \msg{3.0}{5}{10.5}{model/list}
+  \msg{3.9}{5}{15.5}{read claude-usage.json}
+  \msg{4.8}{5}{15.5}{if a week old: GET models/free}
+  \ret{5.8}{5}{0}{usage, models, scores}
+\end{tikzpicture}
+\caption{ConsultantBudget. The Artificial Analysis list is kept in \code{aa-models.json}; a failed
+fetch waits 6 hours, with the old list still shown.}
+\end{figure}
+
+\begin{wire}[nouez $\rightarrow$ daemon]
+{"id": 2, "method": "account/rateLimits/read"}
+{"id": 3, "method": "model/list", "params": {}}
+\end{wire}
+
+nouez reads these fields:
+
+\begin{itemize}
+\item \code{rateLimits}: \code{planType}; and for each of \code{primary} and \code{secondary}, its
+  \code{usedPercent}, \code{windowDurationMins} and \code{resetsAt}.
+\item \code{rateLimitResetCredits}: \code{availableCount}.
+\item \code{model/list}: each model that isn't \code{hidden}, with its supported efforts
+  (\code{supportedReasoningEfforts}).
+\end{itemize}
+
+A window whose numbers are missing, or whose reset is past, is left out. The pace is the rate of
+use so far: the percentage used, divided by the time gone since the window started. It is shown
+once 5\% of the window has gone.
+
+Claude Code tells only its status line command how much of its usage windows is used
+(\code{rate\_limits.five\_hour} and \code{seven\_day}, each \code{used\_percentage} and
+\code{resets\_at}). The README shows a status line addition that saves them to
+\code{claude-usage.json} with the time; nouez reads that file and never writes it.
+
+Model scores come from \code{https://artificialanalysis.ai/api/v2/language/models/free}, with the key
+from \code{ARTIFICIAL\_ANALYSIS\_API\_KEY} in an \code{x-api-key} header, page by page while
+\code{pagination.has\_more} is true. nouez keeps each model's name, maker, release date,
+\code{artificial\_analysis\_intelligence\_index}, input and output price per million tokens, and
+output speed, and shows the top 8 by index for OpenAI, Google and Anthropic.
+
+\begin{plain}[Result text]
+Consultation budget, Sun Nov 22 00:48:
+
+Codex (prolite plan):
+  - weekly window: 8% used, resets Wed Nov 25 06:07 (in 3d 5h); at this rate about 15% by the reset
+  - 3 free full reset(s) available (only the user decides to use one)
+  Models:
+    gpt-6.2-sol (default): effort low, medium, high, xhigh, max, ultra (default low). Fast, ...
+
+Claude Code (from the status line, saved 2 min ago):
+  - 5-hour window: 40% used, resets Sun Nov 22 02:49 (in 1h 59m); at this rate about 67% by the reset
+
+Model scores: Artificial Analysis Intelligence Index v4, fetched 2d 3h ago. Source: Artificial Analysis (https://artificialanalysis.ai); credit it when you show these.
+  ...
+
+Usage counts against the user's subscriptions. Choose by the user's own routing rules (their CLAUDE.md or consult skill); without rules, show this and let the user decide.
+\end{plain}
+
 \subsection{Claude Code sessions}
 \label{sec:claude-tools}
 
@@ -1563,6 +1637,10 @@ Default \code{wait} & 5 s / 0 s & SendConsultantMessage / GetConsultantReply \\
 \code{WAITER\_REPLY\_CHARS} & 20,000 & longest reply the waiter prints \\
 \code{WAITER\_RETRIES} & 3 & failed connections the waiter rides out \\
 \code{WAITER\_SECONDS} & 25 min & one waiter run, under Claude Code's limit \\
+\code{AA\_REFRESH\_SECONDS} & 7 days & age at which model scores are fetched again \\
+\code{AA\_RETRY\_SECONDS} & 6 h & wait after a failed fetch of model scores \\
+\code{AA\_SHOWN} & 8 & top-scoring models shown per maker \\
+\code{CLAUDE\_USAGE\_STALE} & 30 min & age at which Claude Code's saved usage is flagged \\
 \bottomrule
 \end{tabular}
 \end{center}

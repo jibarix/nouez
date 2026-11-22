@@ -25,8 +25,8 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.12.4 |
-| Claude Code | 2.1.329 |
+| nouez | 0.13.0 |
+| Claude Code | 2.1.330 |
 | Codex CLI | 0.170.0 |
 | Codex app-server daemon | 0.171.0 |
 | Python | 3.11.9 |
@@ -152,6 +152,43 @@ To have Claude route work this way without being asked, write your rules in `~/.
   the defaults again once the hard part is done.
 ```
 
+### Choosing a consultant
+
+`ConsultantBudget` gathers what a choice of model and effort depends on, in one call that changes nothing:
+
+- **Codex usage.** Each usage window on your Codex subscription (5-hour, weekly) with the percentage used, when it resets, and where the current pace lands at the reset, or when it runs out first. Also any free full resets your plan has; only you decide to use one. And the models your account offers, with their effort levels.
+- **Claude Code's own usage.** Claude Code tells only its status line how much of its 5-hour and weekly windows is used, so nouez reads a file the status line saves (below). Without it this part says "not known".
+- **Model scores.** The [Artificial Analysis](https://artificialanalysis.ai) Intelligence Index for the top OpenAI, Google and Anthropic models, with API price and speed. Higher is smarter. Data from Artificial Analysis; credit it when you share it.
+
+nouez reports; it doesn't choose. Your rules decide, in `~/.claude/CLAUDE.md` (see [Choosing model and effort](#choosing-model-and-effort)) or a skill. A `consult` skill to start from would sort consultations by kind (quick check, review, bug hunt, plan critique, research), give each a starting model and effort, then move up or down by what `ConsultantBudget` shows: for instance, one effort level down when Codex is on pace for over 90% of its week, and no consulting on a window that runs out before its reset.
+
+**Model scores need a free Artificial Analysis key.** Create an account at [artificialanalysis.ai](https://artificialanalysis.ai) and an API key (free tier, 100 requests a day). Set it as `ARTIFICIAL_ANALYSIS_API_KEY` in the environment Claude Code starts nouez from, for example as a user environment variable on Windows, or in the server's `env` when you register it:
+
+```sh
+claude mcp add consultants --scope user -e ARTIFICIAL_ANALYSIS_API_KEY=<your key> -- python /path/to/nouez/server.py
+```
+
+On Windows, nouez also reads the key from your saved user environment variables, so a key saved while Claude Code is running works once you reconnect `consultants` in `/mcp`; no restart needed.
+
+nouez then asks `artificialanalysis.ai/api/v2/language/models/free` (two or so pages) about once a week, with the key and `nouez/<version>` as the client name and nothing from your projects. The list is kept in `nouez/aa-models.json` in your cache folder. A failed attempt waits 6 hours before the next and the old list stays in use. `refresh: true` fetches again if the list is over an hour old; Claude passes it only when you ask for fresh scores.
+
+**Claude Code's usage needs one addition to your status line.** Claude Code passes `rate_limits` to the status line command as JSON (on Pro and Max plans, after a session's first reply). Have your status line script save it, with the time, to `nouez/claude-usage.json` in your cache folder: `{"saved": <unix seconds>, "rate_limits": <as received>}`. Write it to a temporary file and rename it, so nouez never reads half a file, and never let a failure here break the status line. In PowerShell:
+
+```powershell
+if ($null -ne $data.rate_limits -and $env:LOCALAPPDATA) {
+    try {
+        $dir = Join-Path $env:LOCALAPPDATA 'nouez'
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+        $json = @{ saved = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); rate_limits = $data.rate_limits } | ConvertTo-Json -Depth 5 -Compress
+        $tmp = Join-Path $dir "claude-usage.$PID.tmp"
+        [IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding $false))
+        Move-Item -Force $tmp (Join-Path $dir 'claude-usage.json')
+    } catch { if ($tmp) { Remove-Item -Force -ErrorAction SilentlyContinue $tmp } }
+}
+```
+
+Here `$data` is the status line's input (`$data = [Console]::In.ReadToEnd() | ConvertFrom-Json`). The status line runs only while a Claude Code session is open, so the numbers are as of the last update; nouez shows how old they are and flags them after 30 minutes.
+
 ### A brief and a verdict
 
 A template for `instructions`, or for the start of a message. Adapt it; it is only a starting point:
@@ -197,6 +234,7 @@ A verdict line first makes the reply easy to act on, and "what you didn't check"
 | `OpenClaudeSession` | Opens a new terminal window running an interactive Claude Code session with Remote Control in `cwd` (required), named `name` (default: the folder's name), optionally with a first `prompt`, or picking up an earlier conversation held in that folder with `resume` (a session id, or `latest`). It starts on Opus (`model`, default `opus`, the latest Opus) at medium effort (`effort`: `low`, `medium`, `high`, `xhigh` or `max`); Claude passes others only when you ask. The session saves its transcript like one you started yourself. `create: true` makes the folder if it doesn't exist. In a folder Claude Code hasn't been trusted in, it opens nothing unless `trust: true` is given (you said you trust the folder: nouez records that, after a backup) or `open_untrusted: true` (it opens a session that waits at the trust question). In a trusted folder it then checks for up to 30 seconds that the new session is running and connected to Remote Control, and says if another session was already running in that folder. |
 | `ListClaudeSessions` | Lists the interactive Claude Code sessions registered in your Claude Code config folder: name, process id, folder, status, Remote Control, and which one is the caller. |
 | `CloseClaudeSession` | Closes one of them by `name` (or `pid` when names repeat), keeping its transcript. Never the caller. |
+| `ConsultantBudget` | Shows the usage left on your Codex subscription and Claude Code's own, with reset times and pace, the Codex models and effort levels, and Artificial Analysis model scores. Reads only; see [Choosing a consultant](#choosing-a-consultant). |
 | `StopConsultant` | Archives a session that `StartConsultant` started and closes any terminal window watching it. Needs the exact name or full thread id. Refuses sessions you opened yourself. |
 
 `StartConsultant` arguments (all optional):
@@ -308,6 +346,7 @@ python -m unittest discover tests
 - `CloseClaudeSession` can end **any** Claude Code session running under your account on the computer, including ones you started yourself; only its caller is refused. Claude is told to close only sessions you pick from the list. The transcript is kept, but work in progress in that session (a running command, an unsent message) is lost.
 - `OpenClaudeSession` starts Claude Code with your normal settings and permissions in the folder you name. Its first prompt, if any, is passed through a temporary file that the new window deletes once it has read it, so it stays off Windows Terminal's command line (it still becomes an argument of the `claude` process).
 - Trusting a folder lets its Claude Code settings, hooks and MCP servers run. `OpenClaudeSession` records trust only with `trust: true`, which Claude is told to pass only when you've said you trust that folder; it never approves MCP servers. It changes nothing else in `~/.claude.json`, but Claude Code sessions rewrite that file all the time, and nothing outside Claude Code can lock it: nouez checks the file hasn't changed just before replacing it and reads the change back after, but a session saving in that same instant could still lose a setting. That's what the dated backups are for.
+- `ConsultantBudget` sends your Artificial Analysis key, if you set one, to `artificialanalysis.ai` over HTTPS about once a week. It reads `nouez/claude-usage.json` from your cache folder but never writes it.
 - The `nouez` tag is a guard against mistakes, not a security boundary. Any local program that can reach the Codex daemon can set the same tag, and can archive sessions directly anyway.
 
 ## Limitations
@@ -319,8 +358,9 @@ python -m unittest discover tests
 - Telling the caller's own session apart is thorough only on Windows, where nouez walks the whole chain of parent processes. Elsewhere it knows only its immediate parent, so if a wrapper sits between Claude Code and nouez, `CloseClaudeSession` may not recognise the caller.
 - Nothing can start a session on the computer from your phone unless something there is already running and connected: an open Claude Code session with Remote Control, for instance.
 - The trust check reads git's files, not Claude Code's code. For a worktree whose git data was moved out with `--separate-git-dir`, it says it can't tell, except when that git folder is named `.git` and sits beside other files: then nouez, like `git worktree list`, takes that folder for the main checkout.
+- `ConsultantBudget` names models as Artificial Analysis does ("GPT-6.2 Sol (high)"), not by Codex model id; matching them is left to Claude. Artificial Analysis scores API access at set effort levels, which may differ from a subscription's. Google's usage windows (Antigravity) aren't shown.
 - Only the 50 most recent saved sessions are checked for unloaded consultants. Older ones can still be reached by their full thread id.
-- Uses the experimental Codex app-server protocol (`thread/start`, `thread/resume`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/name/set`, `thread/turns/list`, `thread/archive`, `turn/start`, `turn/steer`), which may change between Codex releases. See [Tested with](#tested-with).
+- Uses the experimental Codex app-server protocol (`thread/start`, `thread/resume`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/name/set`, `thread/turns/list`, `thread/archive`, `turn/start`, `turn/steer`, `account/rateLimits/read`, `model/list`), which may change between Codex releases. See [Tested with](#tested-with).
 
 ## Versioning
 

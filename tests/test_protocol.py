@@ -162,7 +162,8 @@ class ProtocolTest(unittest.TestCase):
     def test_annotations(self):
         tools = {t["name"]: t["annotations"] for t in self.server.request(8, "tools/list")["result"]["tools"]}
         read_only = {name for name, a in tools.items() if a.get("readOnlyHint")}
-        self.assertEqual(read_only, {"ListConsultants", "GetConsultantReply", "GetConsultantHistory", "ListClaudeSessions"})
+        self.assertEqual(read_only, {"ListConsultants", "GetConsultantReply", "GetConsultantHistory", "ListClaudeSessions",
+                                     "ConsultantBudget"})
         destructive = {name for name, a in tools.items() if a.get("destructiveHint")}
         self.assertEqual(destructive, {"StopConsultant", "CloseClaudeSession"})
 
@@ -1957,6 +1958,184 @@ class OpenedSessionCheckTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = self.open(OSError("unreadable"), tmp)
             self.assertIn("Opened a window", out)
+
+
+class BudgetTest(unittest.TestCase):
+    """ConsultantBudget: usage windows, the status line's file, and the Artificial Analysis cache."""
+
+    NOW = 1_800_000_000
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.aa = os.path.join(self.dir, "aa-models.json")
+
+    def test_window_pace(self):
+        week = 7 * 86400
+        # half the week gone, 30% used: lands at about 60%
+        text = server.window_text("weekly", 30, self.NOW + week / 2, week, self.NOW)
+        self.assertIn("30% used", text)
+        self.assertIn("about 60% by the reset", text)
+        # half gone, 80% used: runs out after another 1/8 week, before the reset
+        text = server.window_text("weekly", 80, self.NOW + week / 2, week, self.NOW)
+        self.assertIn("runs out in about 21h 0m, before the reset", text)
+        self.assertIn("used up", server.window_text("weekly", 100, self.NOW + 60, week, self.NOW))
+        # too early in the window to project
+        self.assertNotIn("rate", server.window_text("weekly", 5, self.NOW + week - 60, week, self.NOW))
+        for used, resets in ((None, self.NOW + 60), (True, self.NOW + 60), (5, self.NOW - 1), (5, float("nan"))):
+            self.assertIsNone(server.window_text("weekly", used, resets, week, self.NOW))
+
+    def test_span_and_label(self):
+        self.assertEqual(server.span_text(3 * 86400 + 5 * 3600 + 59), "3d 5h")
+        self.assertEqual(server.span_text(4 * 3600 + 600), "4h 10m")
+        self.assertEqual(server.span_text(-5), "0 min")
+        self.assertEqual(server.window_label(300 * 60), "5-hour")
+        self.assertEqual(server.window_label(10080 * 60), "weekly")
+
+    def test_codex_budget(self):
+        answers = {
+            "account/rateLimits/read": {
+                "rateLimits": {"planType": "pro",
+                               "primary": {"usedPercent": 40, "windowDurationMins": 300, "resetsAt": self.NOW + 3600},
+                               "secondary": {"usedPercent": "x", "windowDurationMins": 10080, "resetsAt": 1}},
+                "rateLimitResetCredits": {"availableCount": 2}},
+            "model/list": {"data": [
+                {"id": "m-1", "isDefault": True, "defaultReasoningEffort": "low",
+                 "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}]},
+                {"id": "m-hidden", "hidden": True}, "junk"]},
+        }
+        client = mock.Mock()
+        client.request.side_effect = lambda method, params: answers[method]
+        text = "\n".join(server.codex_budget(client, self.NOW))
+        self.assertIn("Codex (pro plan):", text)
+        self.assertIn("5-hour window: 40% used", text)
+        self.assertNotIn("weekly", text)
+        self.assertIn("2 free full reset(s)", text)
+        self.assertIn("m-1 (default): effort low, high (default low)", text)
+        self.assertNotIn("m-hidden", text)
+
+    def test_codex_budget_without_models(self):
+        def request(method, params):
+            if method == "model/list":
+                raise server.BridgeError("no")
+            return {}
+        client = mock.Mock()
+        client.request.side_effect = request
+        self.assertEqual(server.codex_budget(client, self.NOW), ["Codex:", "  - no usage windows reported"])
+
+    def test_claude_budget(self):
+        path = os.path.join(self.dir, "claude-usage.json")
+        self.assertIn("not known", server.claude_budget(self.NOW, path)[0])
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertIn("can't be read", server.claude_budget(self.NOW, path)[0])
+        with open(path, "w", encoding="utf-8-sig") as f:
+            json.dump({"saved": self.NOW - 3600, "rate_limits": {
+                "five_hour": {"used_percentage": 12.5, "resets_at": self.NOW + 600},
+                "seven_day": {"used_percentage": 50, "resets_at": self.NOW - 10}}}, f)
+        lines = server.claude_budget(self.NOW, path)
+        self.assertIn("saved 1h 0m ago) (old", lines[0])
+        self.assertEqual(len(lines), 2)
+        self.assertIn("5-hour window: 12.5% used", lines[1])
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"saved": self.NOW, "rate_limits": {}}, f)
+        self.assertIn("no current usage window", server.claude_budget(self.NOW, path)[0])
+
+    def entry(self, name, creator, index, **extra):
+        return {"name": name, "model_creator": {"name": creator},
+                "evaluations": {"artificial_analysis_intelligence_index": index}, **extra}
+
+    def test_aa_model_keeps_only_valid_fields(self):
+        m = server.aa_model(self.entry("X", "OpenAI", 50.5, pricing={"price_1m_input_tokens": "1"},
+                                       performance_v3={"mean_output_tokens_per_second": 80},
+                                       release_date="2026-01-02T00:00"))
+        self.assertEqual((m["name"], m["creator"], m["index"], m["input"], m["speed"], m["release"]),
+                         ("X", "OpenAI", 50.5, None, 80, "2026-01-02"))
+        self.assertIsNone(server.aa_model({"name": 3}))
+
+    def test_aa_needs_a_key(self):
+        fetch = mock.Mock()
+        cache, note = server.aa_scores(self.NOW, env={}, path=self.aa, fetch=fetch)
+        self.assertIn(server.AA_KEY_VARIABLE, note)
+        fetch.assert_not_called()
+
+    def test_aa_key_saved_after_start(self):
+        # Not in this process's environment, but saved in the user's variables since it started.
+        fetch = mock.Mock(return_value=(5, [server.aa_model(self.entry("GPT A", "OpenAI", 60))]))
+        with mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch.object(server, "saved_user_variable", return_value="saved") as saved:
+            os.environ.pop(server.AA_KEY_VARIABLE, None)
+            cache, note = server.aa_scores(self.NOW, path=self.aa, fetch=fetch)
+        saved.assert_called_once_with(server.AA_KEY_VARIABLE)
+        fetch.assert_called_once_with("saved")
+        self.assertIsNone(note)
+        # A test passing env never reads the saved variables.
+        with mock.patch.object(server, "saved_user_variable") as saved:
+            server.aa_scores(self.NOW, env={}, path=self.aa, fetch=fetch)
+        saved.assert_not_called()
+
+    def test_saved_user_variable_off_windows(self):
+        with mock.patch.object(server.os, "name", "posix"):
+            self.assertIsNone(server.saved_user_variable("X"))
+
+    def test_aa_fetch_cache_and_retry(self):
+        env = {server.AA_KEY_VARIABLE: " k "}
+        models = [server.aa_model(self.entry("GPT A", "OpenAI", 60)),
+                  server.aa_model(self.entry("Gem B", "Google", 55)),
+                  server.aa_model(self.entry("Other", "Meta", 70))]
+        fetch = mock.Mock(return_value=(4, models))
+        cache, note = server.aa_scores(self.NOW, env=env, path=self.aa, fetch=fetch)
+        fetch.assert_called_once_with("k")
+        self.assertIsNone(note)
+        # kept for a week
+        server.aa_scores(self.NOW + 86400, env=env, path=self.aa, fetch=fetch)
+        self.assertEqual(fetch.call_count, 1)
+        text = "\n".join(server.aa_lines(server.read_aa_cache(self.aa), None, self.NOW + 86400))
+        self.assertIn("Intelligence Index v4, fetched 1d 0h ago", text)
+        self.assertIn("https://artificialanalysis.ai", text)
+        self.assertIn("60.0  GPT A", text)
+        self.assertNotIn("Other", text)
+        # a week later the fetch fails: the old list stays, and the next try waits
+        later = self.NOW + server.AA_REFRESH_SECONDS
+        err = OSError("down")
+        err.code = 429
+        fetch.side_effect = err
+        cache, note = server.aa_scores(later, env=env, path=self.aa, fetch=fetch)
+        self.assertIn("daily request limit", note)
+        self.assertEqual(len(cache["models"]), 3)
+        server.aa_scores(later + 60, env=env, path=self.aa, fetch=fetch)
+        self.assertEqual(fetch.call_count, 2)
+        # refresh skips the wait
+        server.aa_scores(later + 60, refresh=True, env=env, path=self.aa, fetch=fetch)
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["aa-models.json"])
+
+    def test_aa_refresh_waits_an_hour(self):
+        env = {server.AA_KEY_VARIABLE: "k"}
+        fetch = mock.Mock(return_value=(None, [server.aa_model(self.entry("A", "Google", 1))]))
+        server.aa_scores(self.NOW, env=env, path=self.aa, fetch=fetch)
+        server.aa_scores(self.NOW + 60, refresh=True, env=env, path=self.aa, fetch=fetch)
+        self.assertEqual(fetch.call_count, 1)
+        server.aa_scores(self.NOW + 3600, refresh=True, env=env, path=self.aa, fetch=fetch)
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_aa_cache_unreadable(self):
+        with open(self.aa, "w", encoding="utf-8") as f:
+            f.write('{"models": [1, {"name": "ok"}], "fetched": "x"}')
+        self.assertEqual(server.read_aa_cache(self.aa)["models"], [{"name": "ok"}])
+        with open(self.aa, "w", encoding="utf-8") as f:
+            f.write("[]")
+        self.assertEqual(server.read_aa_cache(self.aa), {})
+
+    def test_handler_reports_codex_failure_inline(self):
+        with mock.patch.object(server, "CodexClient", side_effect=server.BridgeError("daemon down")), \
+             mock.patch.object(server, "claude_budget", return_value=["Claude Code: x"]), \
+             mock.patch.object(server, "aa_scores", return_value=({}, "no key")):
+            out = server.consultant_budget({})
+        self.assertIn("Codex: usage unavailable (daemon down).", out)
+        self.assertIn("Claude Code: x", out)
+        self.assertIn("Model scores: no key.", out)
+
 
 
 if __name__ == "__main__":

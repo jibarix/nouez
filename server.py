@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.12.4"
+SERVER_VERSION = "0.13.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -933,13 +933,18 @@ def update_check_off(env=None):
     return value not in ("", "0", "false", "no")
 
 
-def release_cache_file():
-    """Where the latest release looked up is kept, in the user's own cache folder."""
+def nouez_cache_dir():
+    """nouez's folder in the user's own cache folder."""
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(os.path.join("~", "AppData", "Local"))
     else:
         base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser(os.path.join("~", ".cache"))
-    return os.path.join(base, "nouez", "latest-release.json")
+    return os.path.join(base, "nouez")
+
+
+def release_cache_file():
+    """Where the latest release looked up is kept, in the user's own cache folder."""
+    return os.path.join(nouez_cache_dir(), "latest-release.json")
 
 
 def fetch_latest_release():
@@ -975,25 +980,31 @@ def read_release_cache(path, now):
         return False, None
 
 
-def save_release_cache(path, now, latest):
-    """Write the cache through a temporary file of its own, so servers starting together
-    don't write into the same file; a failure leaves no temporary file behind."""
+def write_json_atomic(path, value):
+    """Write value as JSON through a temporary file of its own, so servers writing together
+    don't write into the same file; a failure leaves no temporary file behind. True if written."""
     tmp = None
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix="latest-release.", suffix=".tmp", dir=os.path.dirname(path))
+        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path)[:-len(".json")] + ".", suffix=".tmp",
+                                   dir=os.path.dirname(path))
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"checked": now, "latest": latest}, f)
+            json.dump(value, f)
         os.replace(tmp, path)
         tmp = None
-    except OSError:
-        pass
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
     finally:
         if tmp:
             try:
                 os.remove(tmp)
             except OSError:
                 pass
+
+
+def save_release_cache(path, now, latest):
+    write_json_atomic(path, {"checked": now, "latest": latest})
 
 
 def latest_release(now=None):
@@ -2600,6 +2611,308 @@ def stop_consultant(args, cancel=None, progress=None):
             f"then codex resume {thread['id']}.")
 
 
+# --- Consultation budget: usage left and model scores ------------------------
+
+AA_MODELS_URL = "https://artificialanalysis.ai/api/v2/language/models/free"
+AA_KEY_VARIABLE = "ARTIFICIAL_ANALYSIS_API_KEY"
+AA_REFRESH_SECONDS = 7 * 24 * 60 * 60  # model scores are fetched about once a week
+AA_RETRY_SECONDS = 6 * 60 * 60  # after a failed fetch; the free tier allows 100 requests a day
+AA_MAX_PAGES = 5  # a full list was 2 pages of 200 when written
+AA_TIMEOUT = 10  # seconds per page
+AA_PAGE_BYTES = 8 * 1024 * 1024
+AA_CACHE_BYTES = 8 * 1024 * 1024
+AA_CREATORS = ("OpenAI", "Google", "Anthropic")  # makers of the models nouez consults or runs beside
+AA_SHOWN = 8  # top-scoring models shown per maker
+CLAUDE_USAGE_FILE = "claude-usage.json"  # written by the user's status line, see README
+CLAUDE_USAGE_STALE = 30 * 60  # status line data older than this is flagged as old
+CLAUDE_WINDOWS = (("five_hour", 5 * 60 * 60), ("seven_day", 7 * 24 * 60 * 60))
+
+
+def number(value):
+    """value if it's a real finite number (not a bool), else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return value
+
+
+def span_text(seconds):
+    """A duration as "3d 5h", "4h 10m" or "12 min"."""
+    seconds = max(0, int(seconds))
+    days, hours, mins = seconds // 86400, seconds % 86400 // 3600, seconds % 3600 // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins} min"
+
+
+def window_label(length):
+    return {5 * 3600: "5-hour", 86400: "daily", 7 * 86400: "weekly"}.get(length) or span_text(length)
+
+
+def window_text(label, used, resets_at, length, now):
+    """One usage window: how much is used, when it resets, and the pace: where the current rate
+    of use lands at the reset, or when it runs out first. None if used or resets_at is unusable."""
+    used, resets_at, length = number(used), number(resets_at), number(length)
+    if used is None or resets_at is None or resets_at <= now:
+        return None
+    left = resets_at - now
+    text = (f"{label} window: {used:g}% used, resets "
+            f"{time.strftime('%a %b %d %H:%M', time.localtime(resets_at))} (in {span_text(left)})")
+    if length and left < length:
+        gone = (length - left) / length
+        if used >= 100:
+            text += "; used up"
+        elif gone >= 0.05:
+            rate = used / (length - left)  # percent per second so far
+            if rate > 0 and (100 - used) / rate < left:
+                text += f"; at this rate it runs out in about {span_text((100 - used) / rate)}, before the reset"
+            else:
+                text += f"; at this rate about {used / gone:.0f}% by the reset"
+    return text
+
+
+def codex_budget(client, now):
+    """Lines on the Codex account's usage windows and the models it offers."""
+    lines = []
+    limits = client.request("account/rateLimits/read", None)
+    limits = limits if isinstance(limits, dict) else {}
+    snap = limits.get("rateLimits")
+    plan = snap.get("planType") if isinstance(snap, dict) else None
+    lines.append(f"Codex{f' ({plan} plan)' if isinstance(plan, str) else ''}:")
+    if isinstance(snap, dict):
+        for key in ("primary", "secondary"):
+            w = snap.get(key)
+            if isinstance(w, dict):
+                mins = number(w.get("windowDurationMins"))
+                length = mins * 60 if mins else None
+                text = window_text(window_label(length) if length else "usage", w.get("usedPercent"),
+                                   w.get("resetsAt"), length, now)
+                if text:
+                    lines.append(f"  - {text}")
+        if isinstance(snap.get("rateLimitReachedType"), str):
+            lines.append(f"  - limit reached: {snap['rateLimitReachedType']}")
+        credits = snap.get("credits")
+        if isinstance(credits, dict) and (credits.get("unlimited") is True or credits.get("hasCredits") is True):
+            balance = "unlimited" if credits.get("unlimited") is True else credits.get("balance")
+            lines.append(f"  - credits: {balance}")
+    if len(lines) == 1:
+        lines.append("  - no usage windows reported")
+    resets = limits.get("rateLimitResetCredits")
+    count = number(resets.get("availableCount")) if isinstance(resets, dict) else None
+    if count:
+        lines.append(f"  - {count:g} free full reset(s) available (only the user decides to use one)")
+    try:
+        models = client.request("model/list", {})
+        models = models.get("data") if isinstance(models, dict) else None
+    except BridgeError:
+        models = None
+    shown = []
+    for m in models if isinstance(models, list) else []:
+        if not isinstance(m, dict) or m.get("hidden") or not isinstance(m.get("id"), str):
+            continue
+        efforts = [e.get("reasoningEffort") for e in m.get("supportedReasoningEfforts") or []
+                   if isinstance(e, dict) and isinstance(e.get("reasoningEffort"), str)]
+        desc = m["id"] + (" (default)" if m.get("isDefault") is True else "")
+        if efforts:
+            desc += f": effort {', '.join(efforts)}"
+            if isinstance(m.get("defaultReasoningEffort"), str):
+                desc += f" (default {m['defaultReasoningEffort']})"
+        if isinstance(m.get("description"), str):
+            desc += f". {first_line(m['description'], 100)}"
+        shown.append(f"    {desc}")
+    if shown:
+        lines.append("  Models:")
+        lines.extend(shown)
+    return lines
+
+
+def claude_budget(now, path=None):
+    """Lines on Claude Code's own usage windows, from the file the user's status line saves."""
+    path = path or os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE)
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            saved = json.loads(f.read(65536))
+    except FileNotFoundError:
+        return ["Claude Code: not known. Its usage reaches nouez only through the status line; "
+                "see Choosing a consultant in nouez's README."]
+    except (OSError, ValueError):
+        return ["Claude Code: the saved usage file can't be read."]
+    limits = saved.get("rate_limits") if isinstance(saved, dict) else None
+    at = number(saved.get("saved")) if isinstance(saved, dict) else None
+    lines = []
+    if isinstance(limits, dict):
+        for key, length in CLAUDE_WINDOWS:
+            w = limits.get(key)
+            if isinstance(w, dict):
+                text = window_text(window_label(length), w.get("used_percentage"), w.get("resets_at"), length, now)
+                if text:
+                    lines.append(f"  - {text}")
+    if not lines:
+        return ["Claude Code: no current usage window saved (a window is dropped once it resets, and "
+                "none is reported before a session's first reply)."]
+    age = f", saved {span_text(now - at)} ago" if at else ""
+    old = " (old: may be out of date)" if at and now - at > CLAUDE_USAGE_STALE else ""
+    return [f"Claude Code (from the status line{age}){old}:"] + lines
+
+
+def aa_model(item):
+    """The fields nouez keeps from one Artificial Analysis model entry, or None."""
+    if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+        return None
+    creator = item.get("model_creator")
+    creator = creator.get("name") if isinstance(creator, dict) else None
+    evals = item.get("evaluations") if isinstance(item.get("evaluations"), dict) else {}
+    price = item.get("pricing") if isinstance(item.get("pricing"), dict) else {}
+    perf = item.get("performance_v3") if isinstance(item.get("performance_v3"), dict) else {}
+    return {
+        "name": item["name"][:120],
+        "creator": creator[:60] if isinstance(creator, str) else None,
+        "release": item["release_date"][:10] if isinstance(item.get("release_date"), str) else None,
+        "index": number(evals.get("artificial_analysis_intelligence_index")),
+        "input": number(price.get("price_1m_input_tokens")),
+        "output": number(price.get("price_1m_output_tokens")),
+        "speed": number(perf.get("mean_output_tokens_per_second")),
+    }
+
+
+def fetch_aa_models(key):
+    """(index version, models) from Artificial Analysis's free models list, all pages."""
+    models, version = [], None
+    for page in range(1, AA_MAX_PAGES + 1):
+        req = urllib.request.Request(f"{AA_MODELS_URL}?page={page}", headers={
+            "x-api-key": key, "Accept": "application/json", "User-Agent": f"nouez/{SERVER_VERSION}"})
+        with urllib.request.urlopen(req, timeout=AA_TIMEOUT) as r:
+            data = json.loads(r.read(AA_PAGE_BYTES).decode("utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            raise BridgeError("Artificial Analysis sent an unexpected answer")
+        version = number(data.get("intelligence_index_version")) or version
+        models.extend(m for m in map(aa_model, data["data"]) if m)
+        paging = data.get("pagination")
+        if not (isinstance(paging, dict) and paging.get("has_more") is True):
+            break
+    if not models:
+        raise BridgeError("Artificial Analysis listed no models")
+    return version, models
+
+
+def read_aa_cache(path):
+    """The saved Artificial Analysis list, or {} if there's none or it isn't readable."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read(AA_CACHE_BYTES + 1)
+        cache = json.loads(text) if len(text) <= AA_CACHE_BYTES else None
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(cache, dict):
+        return {}
+    models = cache.get("models")
+    cache["models"] = [m for m in models if isinstance(m, dict) and isinstance(m.get("name"), str)] \
+        if isinstance(models, list) else []
+    return cache
+
+
+def saved_user_variable(name):
+    """A user environment variable as Windows has it saved now (HKCU\\Environment), for one set
+    after this process started; None elsewhere or if it isn't set."""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
+            value, kind = winreg.QueryValueEx(k, name)
+    except OSError:
+        return None
+    return value if isinstance(value, str) and kind in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) else None
+
+
+def aa_scores(now, refresh=False, env=None, path=None, fetch=None):
+    """(cache, note): the saved Artificial Analysis list, fetched again once it is a week old, or
+    on refresh if it is over an hour old, and a note on anything that went wrong. A failed fetch
+    is recorded so the next one waits AA_RETRY_SECONDS (refresh skips the wait); the old list
+    stays in use meanwhile. Without env, the key comes from this process's environment, or else
+    from the user's saved variables on Windows, so a key saved after Claude Code started works."""
+    path = path or os.path.join(nouez_cache_dir(), "aa-models.json")
+    fetch = fetch or fetch_aa_models
+    cache = read_aa_cache(path)
+    if env is None:
+        key = (os.environ.get(AA_KEY_VARIABLE) or saved_user_variable(AA_KEY_VARIABLE) or "").strip()
+    else:
+        key = (env.get(AA_KEY_VARIABLE) or "").strip()
+    if not key:
+        return cache, (f"no Artificial Analysis key: set {AA_KEY_VARIABLE} for the MCP server to get "
+                       "model scores (a free key; see Choosing a consultant in nouez's README)")
+    fetched = number(cache.get("fetched")) or 0
+    failed = number(cache.get("failed")) or 0
+    due = now - fetched >= AA_REFRESH_SECONDS or (refresh and now - fetched >= 3600)
+    if not due or (now - failed < AA_RETRY_SECONDS and not refresh):
+        return cache, None
+    try:
+        version, models = fetch(key)
+    except Exception as e:  # offline, a bad key, the daily limit: keep the old list
+        cache["failed"] = now
+        write_json_atomic(path, cache)
+        reason = {401: "the key was refused", 403: "the key's tier doesn't cover the models list",
+                  429: "the daily request limit is used up"}.get(getattr(e, "code", None), type(e).__name__)
+        return cache, f"Artificial Analysis couldn't be reached ({reason}); scores are from the last fetch, if any"
+    cache = {"fetched": now, "version": version, "models": models}
+    write_json_atomic(path, cache)
+    return cache, None
+
+
+def aa_lines(cache, note, now):
+    """The top-scoring models of each maker in AA_CREATORS, with the attribution the data needs."""
+    lines = []
+    models = cache.get("models") or []
+    if models:
+        fetched = number(cache.get("fetched"))
+        version = number(cache.get("version"))
+        lines.append("Model scores: Artificial Analysis Intelligence Index"
+                     f"{f' v{version:g}' if version else ''}"
+                     f"{f', fetched {span_text(now - fetched)} ago' if fetched else ''}. "
+                     "Source: Artificial Analysis (https://artificialanalysis.ai); credit it when you show these.")
+        lines.append("  Higher is smarter. Price is USD per 1M input/output tokens at API rates "
+                     "(subscriptions count usage windows instead); speed is output tokens per second.")
+        for maker in AA_CREATORS:
+            mine = sorted((m for m in models if m.get("creator") == maker and number(m.get("index")) is not None),
+                          key=lambda m: -m["index"])[:AA_SHOWN]
+            if not mine:
+                continue
+            lines.append(f"  {maker}:")
+            for m in mine:
+                extra = []
+                if number(m.get("input")) is not None and number(m.get("output")) is not None:
+                    extra.append(f"${m['input']:g}/${m['output']:g}")
+                if number(m.get("speed")) is not None:
+                    extra.append(f"{m['speed']:.0f} tok/s")
+                lines.append(f"    {m['index']:.1f}  {m['name']}" + (f"  · {' · '.join(extra)}" if extra else ""))
+    if note:
+        lines.append(f"Model scores: {note}.")
+    return lines
+
+
+def consultant_budget(args, cancel=None, progress=None):
+    now = time.time()
+    out = [f"Consultation budget, {time.strftime('%a %b %d %H:%M', time.localtime(now))}:", ""]
+    try:
+        client = CodexClient()
+        try:
+            out += codex_budget(client, now)
+        finally:
+            client.close()
+    except BridgeError as e:
+        out.append(f"Codex: usage unavailable ({e}).")
+    out.append("")
+    out += claude_budget(now)
+    out.append("")
+    check_cancel(cancel)
+    cache, note = aa_scores(now, refresh=flag(args, "refresh"))
+    out += aa_lines(cache, note, now)
+    out += ["", "Usage counts against the user's subscriptions. Choose by the user's own routing rules "
+            "(their CLAUDE.md or consult skill); without rules, show this and let the user decide."]
+    return "\n".join(out)
+
+
 # --- MCP stdio server --------------------------------------------------------
 
 INSTRUCTIONS = (
@@ -2621,7 +2934,9 @@ INSTRUCTIONS = (
     "far: never treat it as done. Change a consultant's model or reasoning effort (SendConsultantMessage "
     "model and effort) only when the user asks or the user's own instructions, such as their CLAUDE.md, "
     "call for it. The change keeps the consultant's context and stays for later messages, so once the "
-    "harder part is done, send the usual values again."
+    "harder part is done, send the usual values again. ConsultantBudget shows the usage left on "
+    "each subscription, with reset times, and model scores, for choosing a consultant's model and "
+    "effort by the user's own rules."
 )
 
 TO_SCHEMA = {"type": "string", "description": "Consultant name, thread id, or unique id prefix/suffix."}
@@ -2840,6 +3155,25 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     },
+    {
+        "name": "ConsultantBudget",
+        "description": (
+            "Show what a consultation would cost and what each model scores, to choose a consultant's "
+            "model and effort: the usage used on the Codex subscription and Claude Code's own (each "
+            "window with its reset time and where the current pace lands), the Codex models and their "
+            "effort levels, and Artificial Analysis Intelligence Index scores for OpenAI, Google and "
+            "Anthropic models (fetched about weekly and kept; credit Artificial Analysis when you show "
+            "them). Call it before choosing a model or effort for a consultation when the user's own "
+            "rules say to weigh usage or scores. It changes nothing."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "refresh": {"type": "boolean", "description": "Fetch the model scores again now if the saved ones are over an hour old. Default false; pass true only when the user asks for fresh scores."},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+    },
 ]
 
 HANDLERS = {
@@ -2853,6 +3187,7 @@ HANDLERS = {
     "OpenClaudeSession": open_claude_session,
     "ListClaudeSessions": list_claude_sessions,
     "CloseClaudeSession": close_claude_session,
+    "ConsultantBudget": consultant_budget,
 }
 
 
