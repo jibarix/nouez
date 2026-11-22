@@ -54,7 +54,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.15.2"
+SERVER_VERSION = "0.16.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -3080,12 +3080,12 @@ def window_pace(used, resets_at, length, now):
     """Where a usage window is heading: ("used up", None), ("runs out", seconds until it does,
     before the reset), ("at reset", the percent the current rate reaches by the reset), or None
     when too little of the window has gone to tell. Arguments as window_text has them, checked."""
+    if used >= 100:
+        return ("used up", None)
     left = resets_at - now
     if not length or left >= length:
         return None
     gone = (length - left) / length
-    if used >= 100:
-        return ("used up", None)
     if gone < 0.05:
         return None
     rate = used / (length - left)  # percent per second so far
@@ -3444,9 +3444,9 @@ VERDICTS = (  # read from a reply's first non-empty line; the first match wins
     ("changes", re.compile(r"\bCHANGES\b")),  # the word in capitals, as many briefs ask for it
     ("changes", re.compile(r"\b(with changes|changes (requested|needed|required)|needs? (some )?changes|"
                            r"request changes)\b", re.I)),
-    ("no", re.compile(r"\b(no[- ]go|not ready|blocked|block|reject(ed)?|do not (merge|ship|commit))\b|"
-                      r"\bverdict\W*no\b|^\W*no\b", re.I)),
-    ("yes", re.compile(r"\b(go|ready|approved?|lgtm|ship it)\b|\bverdict\W*yes\b|^\W*yes\b", re.I)),
+    ("no", re.compile(r"\b(no[- ]go|not (ready|approved?|ok(ay)?)|blocked|block|reject(ed)?|"
+                      r"do not (merge|ship|commit))\b|\bverdict\W*no\b|^\W*no\b", re.I)),
+    ("yes", re.compile(r"\b(go|ready|approved?|lgtm|ship it)\b|\bverdict\W*yes\b|^\W*yes\b|^\W*ok(ay)?\W*$", re.I)),
 )
 
 
@@ -3654,19 +3654,29 @@ def weekly_tokens(state):
 
 
 def read_usage_log(path=None):
-    """The usage log's events, oldest first; lines that can't be read are skipped."""
-    events = []
+    """The usage log's events, oldest first, with the files it was rotated into (named with their
+    date, beside it); lines that can't be read are skipped."""
+    path = path or usage_log_file()
+    stem = path[:-len(".jsonl")] if path.endswith(".jsonl") else path
     try:
-        with open(path or usage_log_file(), encoding="utf-8") as f:
-            for line in f:
-                try:
-                    e = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(e, dict) and number(e.get("ts")) is not None:
-                    events.append(e)
+        folder, base = os.path.split(stem)
+        rotated = sorted(os.path.join(folder, n) for n in os.listdir(folder or ".")
+                         if re.fullmatch(re.escape(base) + r"-\d{8}-\d{6}\.jsonl", n))
     except OSError:
-        pass
+        rotated = []
+    events = []
+    for name in [*rotated, path]:
+        try:
+            with open(name, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(e, dict) and number(e.get("ts")) is not None:
+                        events.append(e)
+        except OSError:
+            pass
     return events
 
 
@@ -3680,55 +3690,88 @@ def median(values):
 
 def log_summary(events, since=None):
     """Counts for the status screen from the usage log's events since a time (all if None)."""
-    events = [e for e in events if since is None or e["ts"] >= since]
-    sends = [e for e in events if e.get("event") == "send"]
-    replies = {}
+    # A turn's reply as first read (a later read, by the waiter or GetConsultantReply, doesn't move
+    # it to another period), and the week a turn belongs to: when its message was sent.
+    first_reply, sent_at = {}, {}
     for e in events:
         if e.get("event") == "reply" and e.get("turn"):
-            replies[e["turn"]] = e  # the same turn read twice (waiter, then GetConsultantReply): keep one
-    replies = list(replies.values())
+            first_reply.setdefault(e["turn"], e)
+        elif e.get("event") == "send" and e.get("turn"):
+            sent_at.setdefault(e["turn"], e["ts"])
+    everything = list(first_reply.values())
+    all_sends = [e for e in events if e.get("event") == "send"]
+    events = [e for e in events if since is None or e["ts"] >= since]
+    sends = [e for e in events if e.get("event") == "send"]
+    turns = {e.get("turn") for e in sends if e.get("turn")}
+    # Replies to this period's messages; the verdicts and reply times come from these alone.
+    replies = [first_reply[t] for t in dict.fromkeys(e.get("turn") for e in sends) if t in first_reply]
+    other = sum(1 for r in everything if r["turn"] not in turns and (since is None or r["ts"] >= since))
     count = collections.Counter
     by_thread = collections.defaultdict(list)
     for e in sends:
-        by_thread[e.get("thread")].append(e)
+        if e.get("turn") not in by_thread[e.get("thread")]:  # a message steered into a turn isn't a round
+            by_thread[e.get("thread")].append(e.get("turn"))
     verdict_by_turn = {r["turn"]: r.get("verdict") for r in replies}
+    last = {e.get("thread"): e for e in sends}
     loops = []
     for tid, items in by_thread.items():
         streak = best = 0
-        for e in items:
-            streak = streak + 1 if verdict_by_turn.get(e.get("turn")) == "changes" else 0
+        for turn in items:
+            streak = streak + 1 if verdict_by_turn.get(turn) == "changes" else 0
             best = max(best, streak)
-        loops.append({"thread": tid, "consultant": items[-1].get("consultant"),
-                      "project": items[-1].get("project"), "rounds": len(items), "changes_streak": best})
+        loops.append({"thread": tid, "consultant": last[tid].get("consultant"),
+                      "project": last[tid].get("project"), "rounds": len(items), "changes_streak": best})
     times = [r["ms"] / 1000 for r in replies if r.get("status") == "completed" and number(r.get("ms"))]
+
+    def model_name(e):
+        model, effort = e.get("model") or "?", e.get("effort") or ""
+        if e.get("provider") == "antigravity":
+            if effort and model.endswith("-" + effort):
+                model = model[:-len(effort) - 1]  # an agy id carries its level: show it once
+            if not model.startswith("gemini"):
+                model += " (AG)"  # on Google's quota, not Codex's
+        return f"{model} {effort}".strip()
     return {
         "sends": len(sends),
+        "other_replies": other,
+        "first_ts": min((e["ts"] for e in sends), default=None),
+        "routes": count((e.get("kind") or "not given", model_name(e)) for e in sends),
         "starts": sum(1 for e in events if e.get("event") == "start"),
         "new_consultants": sum(1 for e in events if e.get("event") == "start" and e.get("new")),
         "replies": len(replies),
         "steered": sum(1 for e in sends if e.get("mode") == "steer"),
         "changed": sum(1 for e in sends if e.get("changed")),
         "changed_what": count(k for e in sends for k in e.get("changed") or []),
-        "models": count(f"{e.get('model') or '?'} {e.get('effort') or ''}".strip() for e in sends),
+        "models": count(model_name(e) for e in sends),
         "kinds": count(e.get("kind") or "not given" for e in sends),
-        "reasons": count(e["reason"] for e in sends if e.get("reason")),
+        "reasons": count(e["reason"] for e in reversed(sends) if e.get("reason")),  # ties: latest first
         "projects": count(e.get("project") or "?" for e in sends),
         "verdicts": count(r.get("verdict") or "none" for r in replies),
         "statuses": count(r.get("status") or "?" for r in replies),
         "loops": sorted(loops, key=lambda x: -x["rounds"]),
         "reply_seconds": (median(times), sorted(times)[int(len(times) * 0.9)] if times else None),
         "per_week": count(week_of(e["ts"]) for e in sends),
-        "gemini_week": gemini_weeks(replies),
+        "gemini_week": gemini_weeks(everything, sent_at),
+        "gemini_unknown": {week_of(sent_at.get(r["turn"], r["ts"])) for r in everything
+                           if r.get("provider") == "antigravity" and agy_output(r) is None}
+        | {week_of(e["ts"]) for e in all_sends if e.get("provider") == "antigravity"
+           and agy_output(first_reply.get(e.get("turn")) or {}) is None},
     }
 
 
-def gemini_weeks(replies):
-    """Output tokens per week of the Antigravity consultants' turns, from their reply events."""
+def agy_output(reply):
+    tokens = reply.get("tokens")
+    return number(tokens.get("output_tokens")) if isinstance(tokens, dict) else None
+
+
+def gemini_weeks(replies, sent_at=None):
+    """Output tokens per week of the Antigravity consultants' turns, from their reply events, in
+    the week each turn's message was sent."""
     weeks = collections.Counter()
     for r in replies:
-        out = number((r.get("tokens") or {}).get("output_tokens")) if isinstance(r.get("tokens"), dict) else None
+        out = agy_output(r)
         if r.get("provider") == "antigravity" and out:
-            weeks[week_of(r["ts"])] += int(out)
+            weeks[week_of((sent_at or {}).get(r.get("turn"), r["ts"]))] += int(out)
     return weeks
 
 
@@ -3777,27 +3820,35 @@ def fit(line, width):
     return "".join(out)
 
 
+TOP_BAR = 12  # a window's bar: the line fits in 100 columns
+
+
 def bar(pct, width=20):
     filled = round(max(0.0, min(100.0, pct)) / 100 * width)
     return "█" * filled + "░" * (width - filled)
 
 
-def window_row(scr, owner, label, used, resets_at, length, now):
-    """One subscription window as a line with a bar, or None if its numbers can't be used."""
+def window_row(scr, owner, label, used, resets_at, length, now, sampled=None):
+    """One subscription window as a line with a bar, or None if its numbers can't be used. A
+    reading saved at `sampled` gives its pace as of then; an old one gives none."""
     used, resets_at, length = number(used), number(resets_at), number(length)
     if used is None or resets_at is None or resets_at <= now:
         return None
-    pace = window_pace(used, resets_at, length, now)
-    if pace and pace[0] == "used up":
+    at = min(number(sampled) or now, now)
+    pace = window_pace(used, resets_at, length, at)
+    if now - at > CLAUDE_USAGE_STALE:
+        outlook, colour = ("used up at the last reading", "31") if used >= 100 else ("pace not known: an old reading", "32")
+    elif pace and pace[0] == "used up":
         outlook, colour = "used up", "31"
     elif pace and pace[0] == "runs out":
-        outlook, colour = f"runs out in ~{span_text(pace[1])}, before the reset", "31"
+        outlook, colour = f"runs out in ~{span_text(at + pace[1] - now)}", "31"
     elif pace:
         outlook, colour = f"pace: ~{pace[1]:.0f}% by the reset", "33" if pace[1] > 90 else "32"
     else:
-        outlook, colour = "too early to tell the pace", "32"
+        outlook, colour = "too early for a pace", "32"
     reset = time.strftime("%a %H:%M", time.localtime(resets_at))
-    return (f"  {owner:<16}{label:<8}{scr.paint(bar(used), colour)} {used:>4.0f}%  resets {reset} "
+    shown = "<1%" if 0 < used < 0.5 else f"{used:.0f}%"
+    return (f"  {owner[:15]:<16}{label:<8}{scr.paint(bar(used, TOP_BAR), colour)} {shown:>4}  resets {reset} "
             f"(in {span_text(resets_at - now)})  {scr.dim(outlook)}")
 
 
@@ -3824,8 +3875,8 @@ def subscription_rows(scr, now, codex_live, codex_saved, claude_path=None, agy_l
             w = codex_saved.get(key)
             if isinstance(w, dict):
                 mins = number(w.get("window_minutes"))
-                row = window_row(scr, owner, window_label(mins * 60) if mins else "usage",
-                                 w.get("used_percent"), w.get("resets_at"), mins * 60 if mins else None, now)
+                row = window_row(scr, owner, window_label(mins * 60) if mins else "usage", w.get("used_percent"),
+                                 w.get("resets_at"), mins * 60 if mins else None, now, codex_saved.get("ts"))
                 if row:
                     rows.append(row)
                     owner = ""
@@ -3842,14 +3893,15 @@ def subscription_rows(scr, now, codex_live, codex_saved, claude_path=None, agy_l
         saved = None
     limits = saved.get("rate_limits") if isinstance(saved, dict) else None
     owner, before = "Claude Code", len(rows)
+    at = number(saved.get("saved")) if isinstance(saved, dict) else None
     for key, length in CLAUDE_WINDOWS:
         w = limits.get(key) if isinstance(limits, dict) else None
         if isinstance(w, dict):
-            row = window_row(scr, owner, window_label(length), w.get("used_percentage"), w.get("resets_at"), length, now)
+            row = window_row(scr, owner, window_label(length), w.get("used_percentage"), w.get("resets_at"),
+                             length, now, at)
             if row:
                 rows.append(row)
                 owner = ""
-    at = number(saved.get("saved")) if isinstance(saved, dict) else None
     if len(rows) > before:
         if at:
             old = " - old, may be out of date" if now - at > CLAUDE_USAGE_STALE else ""
@@ -3869,6 +3921,8 @@ def agy_rows(scr, now, agy_live):
     """Antigravity's quota groups, from `agy -p /usage`. Nothing at all when agy isn't installed."""
     if agy_live is None:
         return []
+    if agy_live.get("checking"):
+        return [f"  {'Antigravity':<16}" + scr.dim("checking (agy -p /usage takes a while)…")]
     if not isinstance(agy_live.get("groups"), list):
         return [f"  {'Antigravity':<16}" + scr.dim(f"usage not known: {agy_live.get('error') or 'agy gave no quota'}")]
     rows = []
@@ -3876,7 +3930,7 @@ def agy_rows(scr, now, agy_live):
         if not isinstance(group, dict) or not isinstance(group.get("buckets"), list):
             continue
         name = group.get("name") if isinstance(group.get("name"), str) else "?"
-        owner = AGY_GROUPS.get(name, f"AG {name}"[:15])
+        owner = "  " + AGY_GROUPS.get(name, f"AG {name}")[3:][:13]  # under the Antigravity line
         for b in group["buckets"]:
             left = number(b.get("remaining_fraction")) if isinstance(b, dict) else None
             if left is None:
@@ -3888,8 +3942,8 @@ def agy_rows(scr, now, agy_live):
                 rows.append(row)
                 owner = ""
     if rows:
-        rows.append(scr.dim(f"  {'':<16}(Antigravity; AG Claude+GPT runs Claude and GPT models on Google's quota, "
-                            "not Claude Code's)"))
+        rows.insert(0, f"  {'Antigravity':<16}" + scr.dim("(Google's quota: Claude+GPT is Claude and GPT run "
+                                                         "there, not Claude Code's)"))
     return rows or [f"  {'Antigravity':<16}" + scr.dim("no current quota window reported")]
 
 
@@ -4557,6 +4611,7 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
                         if rec.get("instructions") else "")
             text = f"{AGY_PREAMBLE}\n\n{standing}{shown}"
         turn_id = agy_start_turn(rec, text, model, conversation, shown)
+        rec_before = rec
         changed, kept = model != rec.get("model"), True
         if changed:
             rec = {**rec, "model": model}
@@ -4570,7 +4625,9 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
     if not usage_log_off():
         event = {"event": "send", "consultant": name, "thread": cid, "turn": turn_id, "provider": "antigravity",
                  "project": os.path.basename(os.path.normpath(rec.get("cwd") or "")) or None, "mode": "new",
-                 "model": model, "effort": agy_level(model), "changed": ["model"] if changed else None,
+                 "model": model, "effort": agy_level(model),
+                 "changed": [k for k, f in (("model", agy_base), ("effort", agy_level))
+                             if f(model) != f(rec_before.get("model") or "")] or None if changed else None,
                  "kind": kind, "reason": reason, "chars": len(message), "owner_words": bool(owner_words) or None}
         sent_at = time.time()
 
@@ -4788,51 +4845,60 @@ def agy_model_families(ids):
                      for base, levels in families.items())
 
 
-def columns(blocks, width=26):
-    """Side-by-side lists: each block is (title, [(label, count)...])."""
+def columns(blocks, widths=26):
+    """Side-by-side lists: each block is (title, [(label, count)...]), each column `widths` wide
+    (one width for all, or one per block)."""
+    widths = [widths] * len(blocks) if isinstance(widths, int) else list(widths)
     height = max((len(items) for _, items in blocks), default=0)
-    lines = ["  " + "".join(f"{title:<{width}}" for title, _ in blocks)]
+    lines = ["  " + "".join(f"{title:<{w}}" for (title, _), w in zip(blocks, widths))]
     for i in range(height):
         cells = []
-        for _, items in blocks:
+        for (_, items), width in zip(blocks, widths):
             if i < len(items):
                 label, n = items[i]
                 label = label if len(label) <= width - 7 else label[:width - 8] + "…"
                 cells.append(f"{label:<{width - 6}}{n:>4}  ")
             else:
                 cells.append(" " * width)
-        lines.append("  " + "".join(cells))
+        lines.append("  " + "".join(cells).rstrip())
     return lines
 
 
-def consultation_rows(scr, summary, days):
+def consultation_rows(scr, summary, days, compact=False):
     period = f"last {days} day{'s' if days != 1 else ''}" if days else "all logged"
-    if not summary["sends"]:
+    if not summary["sends"] and not summary["other_replies"]:
         return [scr.dim(f"  No consultations logged ({period}). nouez logs them from 0.14.0 on; "
                         "the consult skill adds each one's kind and reason.")]
     s = summary
     changed = ", ".join(f"{k} {n}" for k, n in s["changed_what"].most_common())
-    head = (f"  {scr.bold(str(s['sends']))} messages ({period}) · {s['replies']} replies read · "
-            f"{s['steered']} steered into a running turn · {s['changed']} changed model or effort"
-            + (f" ({changed})" if changed else "")
-            + f" · {s['new_consultants']} new consultant(s)")
-    rows = [head, ""]
+    unfinished = ", ".join(f"{n} {k}" for k, n in s["statuses"].most_common() if k != "completed")
+    rows = [f"  {scr.bold(str(s['sends']))} messages ({period}) · {s['replies']} of their replies read"
+            + (scr.paint(f" ({unfinished})", "33") if unfinished else "")
+            + (f" · {s['other_replies']} other replies read" if s["other_replies"] else "")]
+    if not s["sends"]:  # replies read to earlier messages, and nothing sent
+        return rows
+    rows += [f"  {s['steered']} steered into a running turn · {s['changed']} changed model/effort"
+             + (f" ({changed})" if changed else "") + f" · {s['new_consultants']} new consultants", ""]
     top = 6
     rows += columns([("by model and effort", s["models"].most_common(top)),
                      ("by kind", s["kinds"].most_common(top)),
                      ("verdicts", s["verdicts"].most_common(top)),
-                     ("by project", s["projects"].most_common(top))])
-    if s["reasons"]:
-        rows += ["", "  reasons given"]
-        rows += [f"  {n:>4}  {first_line(r, 90)}" for r, n in s["reasons"].most_common(5)]
+                     ("by project", s["projects"].most_common(top))], (26, 20, 14, 28))
+    if not compact:
+        rows += ["", "  which kind went where"]
+        rows += [f"  {n:>4}  {kind} → {model}" for (kind, model), n in s["routes"].most_common(4)]
+    if s["reasons"] and not compact:
+        rows += ["", "  reasons given (latest first)"]
+        rows += [f"  {n:>4}  {first_line(r, 90)}" for r, n in s["reasons"].most_common(3)]
     loops = s["loops"]
     if loops:
         rounds = [x["rounds"] for x in loops]
         longest = loops[0]
         over = sum(1 for x in loops if x["changes_streak"] >= 3)
-        rows += ["", f"  loops: {len(loops)} consultant(s) messaged · median {median(rounds):g} "
-                     f"message(s) each · most {longest['rounds']} ({longest['consultant']}, {longest['project']})"
-                     + (scr.paint(f" · {over} went past 3 CHANGES rounds in a row", "33") if over else "")]
+        rows += ["", f"  loops: {len(loops)} consultant(s) · median {median(rounds):g} turn(s) each · "
+                     f"most {longest['rounds']} ({longest['consultant']}, {longest['project']})"]
+        if over:
+            rows.append(scr.paint(f"  {over} consultant(s) had 3+ CHANGES rounds in a row", "33"))
     mid, p90 = s["reply_seconds"]
     if mid is not None:
         rows.append(f"  reply time: median {span_text(mid) if mid >= 60 else f'{mid:.0f}s'}"
@@ -4840,28 +4906,36 @@ def consultation_rows(scr, summary, days):
     return rows
 
 
-def offload_rows(scr, weeks, per_week, scanning, gemini=None):
+def offload_rows(scr, weeks, per_week, scanning, gemini=None, logged_from=None, unknown=(), last=None,
+                 notes=True):
     """Output tokens by week, and the share made outside Claude Code: Codex consultants and the
     user's own Codex sessions from their files, Antigravity consultants (on Google's quota, whatever
     model they run) from the usage log."""
     gemini = gemini or {}
     empty = {"claude": 0, "subagents": 0, "consultants": 0, "codex": 0, "models": {}}
-    weeks = {**{w: empty for w in gemini}, **weeks}
+    if scanning and not weeks:
+        return [scr.dim("  Reading transcripts for the first time…")]
+    weeks = {**{w: empty for w in [*gemini, *per_week]}, **weeks}
     if not weeks:
-        return [scr.dim("  Reading transcripts for the first time…" if scanning else
-                        "  No Claude Code or Codex sessions in the last weeks.")]
-    rows = [f"  {'week of':<11}{'Claude':>9}{'subagents':>11}{'consultants':>13}{'own Codex':>11}"
-            f"{'Antigravity':>13}{'messages':>10}   not Claude Code"]
-    for week in sorted(weeks)[-TOP_WEEKS:]:
+        return [scr.dim("  No Claude Code or Codex sessions in the last weeks.")]
+    rows = [f"  {'week of':<11}{'Claude':>9}{'subagents':>11}{'Codex consultants':>18}{'own Codex':>10}"
+            f"{'Antigravity':>12}{'sends':>7}   share"]
+    first = week_of(logged_from) if logged_from else None
+    for week in sorted(weeks)[-(last or TOP_WEEKS):]:
         w = weeks[week]
         g = gemini.get(week, 0)
         total = w["claude"] + w["subagents"] + w["consultants"] + w["codex"] + g
         other = w["consultants"] + w["codex"] + g
         share = 100 * other / total if total else 0
+        sends = str(per_week.get(week, 0)) if first and week >= first else "—"  # before the log began
+        ag = token_text(g)
+        if week in unknown:  # turns that reported no tokens: none known, or only some
+            ag = token_text(g) + "+" if g else "—"
         rows.append(f"  {week:<11}{token_text(w['claude']):>9}{token_text(w['subagents']):>11}"
-                    f"{token_text(w['consultants']):>13}{token_text(w['codex']):>11}{token_text(g):>13}"
-                    f"{per_week.get(week, 0):>10}"
-                    f"   {scr.paint(bar(share, 12), '36')} {share:>3.0f}%")
+                    f"{token_text(w['consultants']):>18}{token_text(w['codex']):>10}{ag:>12}{sends:>7}"  # no output: no share
+                    + (f"   {scr.paint(bar(share, 10), '36')} {share:>3.0f}%" if total else f"   {'':10} {'—':>4}"))
+    if not notes:
+        return rows
     recent = sorted(weeks)[-4:]
     models = collections.Counter()
     for week in recent:
@@ -4870,24 +4944,42 @@ def offload_rows(scr, weeks, per_week, scanning, gemini=None):
     if total:
         parts = [f"{m.replace('claude-', '')} {100 * n / total:.0f}%" for m, n in models.most_common(5) if n]
         rows += ["", f"  Claude output by model, last {len(recent)} weeks: " + " · ".join(parts)]
-    rows.append(scr.dim("  Output tokens, from the transcripts on this computer; Antigravity from the usage log's "
-                        "Antigravity replies. \"messages\" counts consultations logged that week."))
+    rows.append(scr.dim("  Output tokens, from the transcripts on this computer; Antigravity from its replies in the"))
+    rows.append(scr.dim("  usage log, so a share is of the output known. \"sends\": messages logged that week;"))
+    rows.append(scr.dim("  — nothing recorded; + some Antigravity turns reported no tokens."))
     return rows
 
 
-def top_frame(scr, now, days, codex_live, scan, events, scanning, width=100, agy_live=None):
-    """All of the status screen as lines."""
+def top_frame(scr, now, days, codex_live, scan, events, scanning, width=100, agy_live=None, height=None):
+    """All of the status screen as lines; on a screen under `height` lines, the optional lists go
+    first, then older weeks, so the latest week stays in view."""
+    lines = _top_frame(scr, now, days, codex_live, scan, events, scanning, width, agy_live, False, None)
+    if height and len(lines) > height:
+        lines = _top_frame(scr, now, days, codex_live, scan, events, scanning, width, agy_live, True, None)
+        if len(lines) > height:
+            weeks = max(1, TOP_WEEKS - (len(lines) - height))
+            lines = _top_frame(scr, now, days, codex_live, scan, events, scanning, width, agy_live, True, weeks)
+        offload = next((i for i, x in enumerate(lines) if ANSI.sub("", x).startswith("OFFLOAD")), None)
+        if len(lines) > height and offload is not None and height >= len(lines) - offload:
+            lines = lines[:height - (len(lines) - offload)] + lines[offload:]  # the lines just above go
+    return lines
+
+
+def _top_frame(scr, now, days, codex_live, scan, events, scanning, width, agy_live, compact, last):
     since = now - days * 86400 if days else None
     summary = log_summary(events, since)
     keys = "  ".join(f"[{k}] {'all' if v is None else f'{v}d'}" for k, v in TOP_PERIODS.items())
     lines = [scr.bold(f"nouez {SERVER_VERSION} · usage") + scr.dim(f"   {time.strftime('%a %b %d %H:%M:%S', time.localtime(now))}"
                                                             f"   {keys}  [r] refresh  [q] quit"), ""]
     lines += [scr.bold("SUBSCRIPTIONS")] + subscription_rows(scr, now, codex_live, scan.get("codex_limits"), agy_live=agy_live)
-    lines += ["", scr.bold("CONSULTATIONS")] + consultation_rows(scr, summary, days)
-    lines += ["", scr.bold("OFFLOAD") + scr.dim("  (work done by consultants and Codex instead of Claude Code)")]
+    lines += ["", scr.bold("CONSULTATIONS")] + consultation_rows(scr, summary, days, compact)
+    lines += ["", scr.bold("OFFLOAD") + scr.dim("  (share: known output made outside Claude Code, by consultants and your own Codex)")]
     everything = log_summary(events)
-    lines += offload_rows(scr, weekly_tokens(scan), everything["per_week"], scanning, everything["gemini_week"])
-    lines += ["", scr.dim(f"  log: {usage_log_file()}")]
+    lines += offload_rows(scr, weekly_tokens(scan), everything["per_week"], scanning, everything["gemini_week"],
+                          min((e["ts"] for e in events), default=None), everything["gemini_unknown"], last,
+                          not compact)
+    if not compact:
+        lines += ["", scr.dim(f"  log: {usage_log_file()}")]
     return [fit(line, width) for line in lines]
 
 
@@ -5099,7 +5191,8 @@ def run_top(argv):
         return 2
     state_path = os.path.join(nouez_cache_dir(), SCAN_STATE_FILE)
     state = read_scan_state(state_path)
-    shared = {"scan": json.loads(json.dumps(state)), "scanning": True, "codex": None, "agy": None}
+    shared = {"scan": json.loads(json.dumps(state)), "scanning": True, "codex": None,
+              "agy": {"checking": True} if agy_command() else None}
     guard = threading.Lock()
 
     def scan_once():
@@ -5121,15 +5214,24 @@ def run_top(argv):
                                   read_usage_log(), False, width, shared["agy"])))
         return 0
 
-    stop = threading.Event()
+    stop, refresh = threading.Event(), {"codex": threading.Event(), "agy": threading.Event()}
+
+    def antigravity():  # agy -p /usage can take a minute: on its own, so Codex and the scan don't wait
+        while not stop.is_set():
+            agy = read_agy_usage()
+            with guard:
+                shared["agy"] = agy
+            refresh["agy"].wait(TOP_CODEX_SECONDS)
+            refresh["agy"].clear()
 
     def background():
         last_scan = last_codex = 0.0
         while not stop.is_set():
-            if time.monotonic() - last_codex >= TOP_CODEX_SECONDS:
-                codex, agy = read_codex_usage(), read_agy_usage()
+            if time.monotonic() - last_codex >= TOP_CODEX_SECONDS or refresh["codex"].is_set():
+                refresh["codex"].clear()
+                codex = read_codex_usage()
                 with guard:
-                    shared["codex"], shared["agy"] = codex, agy
+                    shared["codex"] = codex
                 last_codex = time.monotonic()
             if time.monotonic() - last_scan >= TOP_SCAN_SECONDS:
                 try:
@@ -5143,6 +5245,8 @@ def run_top(argv):
 
     scr = Screen(enable_ansi())
     threading.Thread(target=background, daemon=True).start()
+    if shared["agy"] is not None:
+        threading.Thread(target=antigravity, daemon=True).start()
     source = os.path.abspath(__file__)
     if os.name != "nt" and "--screen" in argv:  # ended by its supervisor: restore the terminal first
         def ended(signum, frame):
@@ -5166,7 +5270,8 @@ def run_top(argv):
             size = shutil.get_terminal_size((120, 40))
             with guard:
                 codex, scan, scanning, agy = shared["codex"], shared["scan"], shared["scanning"], shared["agy"]
-            lines = top_frame(scr, time.time(), days, codex, scan, read_usage_log(), scanning, size.columns, agy)
+            lines = top_frame(scr, time.time(), days, codex, scan, read_usage_log(), scanning, size.columns, agy,
+                              size.lines - 1)
             sys.stdout.write("\x1b[H" + "".join(f"{line}\x1b[K\n" for line in lines[:size.lines - 1]) + "\x1b[J")
             sys.stdout.flush()
             key = read_key(TOP_REFRESH)
@@ -5174,10 +5279,9 @@ def run_top(argv):
                 return quit_code
             if key in TOP_PERIODS:
                 days = TOP_PERIODS[key]
-            elif key in ("r", "R"):
-                codex, agy = read_codex_usage(), read_agy_usage()
-                with guard:
-                    shared["codex"], shared["agy"] = codex, agy
+            elif key in ("r", "R"):  # read again in the background; the screen keeps answering keys
+                refresh["codex"].set()
+                refresh["agy"].set()
     except KeyboardInterrupt:
         return quit_code
     finally:

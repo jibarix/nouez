@@ -2173,7 +2173,9 @@ class UsageLogTest(HandlerTest):
                            ("Verdict: no, the plan assumes X", "no"), ("Yes with changes: see 2", "changes"),
                            ("\n\n  Blocked on the schema", "no"), ("Let me look at this.", None),
                            ("I made changes to the plan", None), ("", None), (None, None),
-                           ("Looks fine.\nVerdict: no", None)):  # only the first line counts
+                           ("Looks fine.\nVerdict: no", None),  # only the first line counts
+                           ("Not approved: see 1", "no"), ("not ok yet", "no"), ("OK.", "yes"),
+                           ("Okay, ship it", "yes"), ("OK, I will inspect the patch", None)):
             with self.subTest(text=text):
                 self.assertEqual(server.verdict_of(text), want)
 
@@ -2232,7 +2234,9 @@ class UsageLogTest(HandlerTest):
         with mock.patch.object(server, "USAGE_LOG_BYTES", 10):
             server.record_usage({"event": "a", "pad": "x" * 20}, self.log)
             server.record_usage({"event": "b"}, self.log)
-        self.assertEqual([e["event"] for e in self.events()], ["b"])
+        self.assertEqual([e["event"] for e in self.events()], ["a", "b"])  # 0.16.0: the rotated file too
+        with open(self.log, encoding="utf-8") as f:
+            self.assertEqual([json.loads(x)["event"] for x in f], ["b"])
         self.assertEqual(len(glob.glob(os.path.join(self.dir, "usage-log-*.jsonl"))), 1)
         with mock.patch.object(server, "open", side_effect=OSError("disk full"), create=True):
             server.record_usage({"event": "c"}, self.log)  # logged to stderr, not raised
@@ -2264,8 +2268,68 @@ class UsageLogTest(HandlerTest):
         scr = server.Screen(False)
         text = "\n".join(server.consultation_rows(scr, s, 7))
         self.assertIn("4 messages (last 7 days)", text)
-        self.assertIn("1 went past 3 CHANGES rounds in a row", text)
+        self.assertIn("1 consultant(s) had 3+ CHANGES rounds in a row", text)
         self.assertIn("No consultations logged", "\n".join(server.consultation_rows(scr, server.log_summary([]), None)))
+
+    def test_summary_counts_replies_to_the_periods_messages(self):
+        """0.16.0: replies are those to the period's messages, read once; steering isn't a round."""
+        t = self.NOW
+
+        def send(ts, turn, **kw):
+            return {"ts": t + ts, "event": "send", "thread": "A", "turn": turn, "consultant": "ca",
+                    "project": "p", "model": "m", "effort": "high", "mode": "new", **kw}
+
+        def reply(ts, turn, verdict="changes", **kw):
+            return {"ts": t + ts, "event": "reply", "turn": turn, "status": "completed", "ms": 1000,
+                    "verdict": verdict, **kw}
+        ev = [send(0, "0"), reply(1, "0", "yes"), send(5, "5"), reply(20, "5", "yes"),
+              send(10, "1", reason="old"), send(11, "1", mode="steer"), send(12, "1", mode="steer"),
+              reply(13, "1"), reply(30, "0", "no"),  # turn 0 read again later: the first read stands
+              send(14, "2", reason="new"), reply(15, "2", status="interrupted"),
+              send(16, "3", model="gemini-4-neon-low", effort="low", provider="antigravity", kind="review"),
+              send(17, "4", model="claude-x", effort="", provider="antigravity")]
+        s = server.log_summary(ev, since=t + 10)
+        self.assertEqual((s["sends"], s["replies"], s["other_replies"]), (6, 2, 1))
+        self.assertEqual(dict(s["verdicts"]), {"changes": 2})
+        self.assertEqual(s["statuses"]["interrupted"], 1)
+        self.assertEqual(s["loops"][0]["rounds"], 4)  # turns 1, 2, 3, 4: the steers are turn 1
+        self.assertEqual(s["loops"][0]["changes_streak"], 2)
+        self.assertEqual(list(s["reasons"]), ["new", "old"])
+        self.assertEqual(s["models"]["gemini-4-neon low"], 1)
+        self.assertEqual(s["models"]["claude-x (AG)"], 1)
+        self.assertEqual(s["routes"][("review", "gemini-4-neon low")], 1)
+        self.assertEqual(s["first_ts"], t + 10)
+        text = "\n".join(server.consultation_rows(server.Screen(False), s, 7))
+        self.assertIn("6 messages (last 7 days) · 2 of their replies read (1 interrupted)", text)
+        self.assertIn("1 other replies read", text)
+        only = server.log_summary(ev, since=t + 18)  # replies, no messages
+        self.assertEqual("\n".join(server.consultation_rows(server.Screen(False), only, 7)),
+                         "  0 messages (last 7 days) · 0 of their replies read · 1 other replies read")
+        self.assertIn("review → gemini-4-neon low", text)
+        self.assertNotIn("reasons given", "\n".join(server.consultation_rows(server.Screen(False), s, 7, True)))
+
+    def test_rotated_logs_are_read_in_order(self):
+        rotated = os.path.join(self.dir, "usage-log-20261101-000000.jsonl")
+        self.write(rotated, ['{"ts": 1, "event": "old"}\n'])
+        self.write(os.path.join(self.dir, "usage-log-other.jsonl"), ['{"ts": 2, "event": "not ours"}\n'])
+        self.write(self.log, ['{"ts": 3, "event": "new"}\n'])
+        self.assertEqual([e["event"] for e in self.events()], ["old", "new"])
+
+    def test_window_rows_fit_and_use_the_sample_time(self):
+        scr, now = server.Screen(False), self.NOW
+        self.assertEqual(server.window_pace(100, now + 3600, 7 * 86400, now - 86400 * 30), ("used up", None))
+        row = server.window_row(scr, "Codex prolite", "weekly", 0.2, now + 3.5 * 86400, 7 * 86400, now)
+        self.assertIn(" <1%", row)
+        self.assertLessEqual(len(row), 100)
+        # saved at half the window with 50% used: ~100% by the reset, whatever the clock says now
+        fresh = server.window_row(scr, "Claude Code", "weekly", 40, now + 3 * 86400, 7 * 86400, now, now - 60)
+        self.assertIn("pace: ~", fresh)
+        old = server.window_row(scr, "Claude Code", "weekly", 40, now + 3 * 86400, 7 * 86400, now, now - 7200)
+        self.assertIn("pace not known: an old reading", old)
+        old = server.window_row(scr, "Claude Code", "weekly", 100, now + 3 * 86400, 7 * 86400, now, now - 7200)
+        self.assertIn("used up at the last reading", old)
+        fast = server.window_row(scr, "Codex", "weekly", 90, now + 3 * 86400, 7 * 86400, now)
+        self.assertRegex(fast, r"runs out in ~\d")
 
     def write(self, path, lines, mode="w"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2327,6 +2391,24 @@ class UsageLogTest(HandlerTest):
                                                                "resetsAt": now + 3.5 * 86400}}}
         frame = "\n".join(server.top_frame(server.Screen(False), now, 7, live, {}, [], True, 200))
         self.assertIn("Codex pro", frame)
+        checking = server.top_frame(server.Screen(False), now, 7, live, {}, [], True, 100, {"checking": True})
+        self.assertTrue(any("Antigravity" in x and "checking" in x for x in checking))
+        # a short screen drops the optional lists first and keeps the latest week
+        week = server.week_of(now)
+        scan = {}
+        ev = [{"ts": now, "event": "send", "turn": str(i), "thread": "A", "reason": f"r{i}", "kind": "review",
+               "model": "m"} for i in range(5)]
+        full = server.top_frame(server.Screen(False), now, 7, live, scan, ev, False, 100)
+        short = server.top_frame(server.Screen(False), now, 7, live, scan, ev, False, 100, None, len(full) - 3)
+        self.assertLessEqual(len(short), len(full) - 3)
+        self.assertNotIn("  reasons given (latest first)", short)
+        self.assertIn("OFFLOAD", "\n".join(short))
+        tiny = server.top_frame(server.Screen(False), now, 7, live, scan, ev, False, 100, None, 12)
+        self.assertLessEqual(len(tiny), 12)
+        self.assertRegex(tiny[-1], server.week_of(now) + " ")  # the latest week, last
+        exact = server.top_frame(server.Screen(False), now, 7, live, scan, ev, False, 100, None, 3)
+        self.assertEqual(len(exact), 3)  # just OFFLOAD: its title, header and latest week
+        self.assertRegex(exact[-1], server.week_of(now) + " ")
         self.assertIn("pace: ~60% by the reset", frame)
         self.assertIn("Claude Code     usage not known", frame)
         self.assertIn("Reading transcripts for the first time", frame)
@@ -2367,14 +2449,14 @@ class UsageLogTest(HandlerTest):
             {"name": "New group", "buckets": [
                 {"window": "daily", "remaining_fraction": 0.5, "reset_time": reset(600)}]}]}
         text = "\n".join(server.agy_rows(scr, now, live))
-        self.assertRegex(text, r"AG Gemini +weekly .* 75%")
+        self.assertRegex(text, r"^  Antigravity +\(Google's quota")
+        self.assertRegex(text, r"\n    Gemini +weekly .* 75%")
         self.assertRegex(text, r"pace: ~8[78]% by the reset")  # 75% used in 6 of 7 days
         self.assertRegex(text, r"\n +5-hour .*  0%")
-        self.assertNotRegex(text, r"AG Claude\+GPT +weekly")
-        self.assertRegex(text, r"AG New group +usage .* 50%")
-        self.assertIn("Google's quota", text)
+        self.assertNotRegex(text, r"Claude\+GPT +weekly")
+        self.assertRegex(text, r"\n    New group +usage .* 50%")
         frame = "\n".join(server.top_frame(scr, now, 7, None, {}, [], False, 200, live))
-        self.assertIn("AG Gemini", frame)
+        self.assertIn("    Gemini", frame)
 
     def test_read_agy_usage(self):
         groups = [{"name": "Gemini Models", "buckets": []}]
@@ -2568,7 +2650,7 @@ class AgyTest(unittest.TestCase):
         sends = [e for e in events if e["event"] == "send"]
         self.assertEqual([(e["provider"], e["model"], e["effort"]) for e in sends],
                          [("antigravity", "gemini-4-neon-high", "high"), ("antigravity", "gemini-4-neon-low", "low")])
-        self.assertEqual(sends[1]["changed"], ["model"])
+        self.assertEqual(sends[1]["changed"], ["effort"])  # 0.16.0: high to low is the level, not the model
         reply = [e for e in events if e["event"] == "reply"][0]
         self.assertEqual((reply["provider"], reply["tokens"]["output_tokens"], reply["ms"]), ("antigravity", 120, 7500))
         with open(self.log, encoding="utf-8") as f:
@@ -2865,8 +2947,21 @@ class AgyTest(unittest.TestCase):
         weeks = {week: {"claude": 9000, "subagents": 0, "consultants": 0, "codex": 0, "models": {}}}
         rows = "\n".join(server.offload_rows(scr, weeks, {}, False, summary["gemini_week"]))
         self.assertIn("Antigravity", rows)
-        self.assertIn("not Claude Code", rows)
-        self.assertRegex(rows, week + r" .* 3k .* 25%")
+        self.assertRegex(rows, r"sends +share")
+        self.assertRegex(rows, week + r" .* 3k +— .* 25%")  # no log before this week: sends not known
+        self.assertTrue(all(len(x) <= 100 for x in rows.splitlines()))
+        rows = "\n".join(server.offload_rows(scr, weeks, {week: 2}, False, {}, now, {week}))
+        self.assertRegex(rows, week + r" .* — +2 ")  # Antigravity replies that reported no tokens
+        rows = "\n".join(server.offload_rows(scr, weeks, {week: 2}, False, {week: 3000}, now, {week}))
+        self.assertRegex(rows, week + r" .* 3k\+ +2 ")  # some did, some didn't
+        rows = "\n".join(server.offload_rows(scr, {}, {week: 2}, False, {}, now))
+        self.assertRegex(rows, "(?m)" + week + r" .* 2 +—$")  # a week with messages only is shown, with no share
+        sent = [{"event": "send", "ts": now, "turn": "t8", "provider": "antigravity"}]  # no reply yet
+        self.assertEqual(server.log_summary(sent)["gemini_unknown"], {week})
+        # the tokens go to the week the message was sent, not the week its reply was read
+        later = [{"event": "send", "ts": now - 8 * 86400, "turn": "t9"},
+                 {"event": "reply", "ts": now, "turn": "t9", "provider": "antigravity", "tokens": {"output_tokens": 5}}]
+        self.assertEqual(server.log_summary(later)["gemini_week"], {server.week_of(now - 8 * 86400): 5})
         only = "\n".join(server.offload_rows(scr, {}, {}, False, {week: 1000}))
         self.assertRegex(only, week + r" .*100%")
 
@@ -3099,7 +3194,7 @@ class PaneTest(unittest.TestCase):
 
 
 class TopReloadTest(unittest.TestCase):
-    """0.15.2: the status screen starts again on an updated server.py."""
+    """0.16.0: the status screen starts again on an updated server.py."""
 
     def test_reload_waits_for_a_finished_file_that_compiles(self):
         folder = tempfile.mkdtemp()

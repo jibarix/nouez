@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.15.2\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.16.0\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -1353,14 +1353,22 @@ Every line also has \code{ts} (Unix seconds). No line holds the text of a messag
 \code{kind} and \code{reason} are \code{SendConsultantMessage} arguments; an unknown \code{kind}
 is refused before anything is sent. The verdict is read from the first line of the reply that
 isn't blank: ``no changes'' or ``no blockers'' is \code{yes}; then \code{CHANGES}, ``changes
-needed'' and the like are \code{changes}; then ``no-go'', ``blocked'', ``reject'' or a leading
-``no'' are \code{no}; then ``go'', ``ready'', ``approved'', ``LGTM'' or a leading ``yes'' are
-\code{yes}. Anything else has no verdict.
+needed'' and the like are \code{changes}; then ``no-go'', ``not approved'', ``not ok'',
+``blocked'', ``reject'' or a leading ``no'' are \code{no}; then ``go'', ``ready'', ``approved'',
+``LGTM'', a leading ``yes'' or a line that is just ``OK'' are \code{yes}. Anything else has no verdict.
 
 \code{server.py top} draws a status screen from that log and from files already on the computer,
 with ANSI colours and the terminal's alternate screen. It redraws every 5 seconds, reads Codex's
-usage from the daemon every 60 and reads the transcripts again every 300, each in a background
-thread.
+usage from the daemon every 60 and the transcripts again every 300 in one background thread, and
+Antigravity's quota every 60 in another, since \code{agy -p /usage} can take a minute; until its
+first reading the Antigravity line says it is checking, and \code{r} only wakes both threads. The
+log is read with the files it was rotated into. A period's replies are those to the messages
+sent in it, each turn as it was first read; replies to earlier messages are counted apart.
+Verdicts, reply times and review loops come from those replies, and a loop counts each turn once,
+however many messages steered it. A saved Codex or Claude Code reading gives its pace as of when
+it was saved, and none once it is over 30 minutes old. On a screen too short for it all, the
+``which kind went where'' and ``reasons given'' lists go first, then the offload table's notes
+and oldest weeks, then the lines just above it, so the latest week stays in view.
 
 The screen keeps to the \code{server.py} on disk. Before each redraw it compares the file's
 modification time and size with those of the version it runs; once they have changed and stayed
@@ -1706,7 +1714,7 @@ read again under it, so all end on one key, and written in full under a name of 
 is moved into place; if it can't be read or made, a server uses a key of its own, and only it finds
 its panes). A shell the user opened can't hold the token,
 whatever they type; a pane whose \code{codex} runs through npm's \code{node}, or has already
-exited, still counts. Panes from before 0.15.2 carry no token and are left open.
+exited, still counts. Panes from before 0.16.0 carry no token and are left open.
 
 \begin{plain}[Is a viewer already running? Which panes did nouez open? (Windows)]
 codex.exe 72832: C:\...\codex.exe resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17 -c ...
