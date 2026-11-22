@@ -4,6 +4,7 @@ Run from the repo root: python -m unittest discover tests
 """
 
 import contextlib
+import glob
 import io
 import json
 import os
@@ -21,6 +22,9 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import server  # noqa: E402
+
+# Tests never write to the user's usage log; the log's own tests turn it back on for a temp file.
+os.environ["NOUEZ_NO_USAGE_LOG"] = "1"
 
 server.CONNECT_SECONDS = 0  # OpenClaudeSession tests look for the new session once, not for 15 s
 
@@ -2137,6 +2141,205 @@ class BudgetTest(unittest.TestCase):
         self.assertIn("Model scores: no key.", out)
 
 
+
+class UsageLogTest(HandlerTest):
+    """0.14.0: the usage log and the `top` status screen."""
+
+    NOW = 1_800_000_000
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        patcher = mock.patch.object(server, "nouez_cache_dir", return_value=self.dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        self.log = os.path.join(self.dir, server.USAGE_LOG_FILE)
+
+    def events(self):
+        return server.read_usage_log(self.log)
+
+    def test_verdicts(self):
+        for text, want in (("Verdict: yes", "yes"), ("**Verdict:** CHANGES - two fixes", "changes"),
+                           ("No changes needed, ready.", "yes"), ("GO", "yes"), ("NO-GO: tests fail", "no"),
+                           ("Verdict: no, the plan assumes X", "no"), ("Yes with changes: see 2", "changes"),
+                           ("\n\n  Blocked on the schema", "no"), ("Let me look at this.", None),
+                           ("I made changes to the plan", None), ("", None), (None, None),
+                           ("Looks fine.\nVerdict: no", None)):  # only the first line counts
+            with self.subTest(text=text):
+                self.assertEqual(server.verdict_of(text), want)
+
+    def test_kind_and_reason_are_checked(self):
+        self.assertEqual(server.kind_and_reason({}), (None, None))
+        self.assertEqual(server.kind_and_reason({"kind": "review", "reason": "  a\n b  "}), ("review", "a b"))
+        self.assertEqual(len(server.kind_and_reason({"reason": "x" * 900})[1]), server.REASON_CHARS)
+        with self.assertRaisesRegex(server.BridgeError, "`kind` must be one of"):
+            server.kind_and_reason({"kind": "chat"})
+        with self.assertRaisesRegex(server.BridgeError, "`reason` must be a string"):
+            server.kind_and_reason({"reason": 5})
+
+    def test_a_bad_kind_sends_nothing(self):
+        thread = self.consultant("kind01")
+        daemon = self.use(FakeDaemon([thread]))
+        with self.assertRaises(server.BridgeError):
+            server.send_consultant_message({"to": thread["id"], "message": "hi", "kind": "nope"})
+        self.assertNotIn("turn/start", daemon.calls)
+        self.assertEqual(self.events(), [])
+
+    def test_send_and_reply_are_logged(self):
+        with open(os.path.join(self.dir, server.CLAUDE_USAGE_FILE), "w", encoding="utf-8") as f:
+            json.dump({"rate_limits": {"seven_day": {"used_percentage": 41, "resets_at": self.NOW}}}, f)
+        thread = self.consultant("log001", model="gpt-a", reasoningEffort="high")
+        daemon = self.use(FakeDaemon([thread], answer="Verdict: CHANGES\n1. fix x"))
+        plain = daemon.request
+
+        def request(method, params):
+            if method == "account/rateLimits/read":
+                return {"rateLimits": {"primary": {"usedPercent": 12, "windowDurationMins": 10080}}}
+            return plain(method, params)
+        daemon.request = request
+        out = server.send_consultant_message({"to": thread["id"], "message": "review this", "model": "gpt-b",
+                                              "effort": "high", "kind": "review", "reason": "diff before commit"})
+        self.assertIn("Verdict: CHANGES", out)
+        send, reply = self.events()
+        self.assertEqual(send["event"], "send")
+        self.assertEqual((send["model"], send["effort"], send["changed"]), ("gpt-b", "high", ["model"]))
+        self.assertEqual((send["kind"], send["reason"], send["mode"]), ("review", "diff before commit", "new"))
+        self.assertEqual(send["usage"], {"codex": {"weekly": 12}, "claude": {"weekly": 41}})
+        self.assertEqual(send["chars"], len("review this"))
+        self.assertNotIn("review this", json.dumps(send))  # never the message itself
+        self.assertEqual((reply["event"], reply["turn"], reply["verdict"]), ("reply", send["turn"], "changes"))
+        self.assertNotIn("fix x", json.dumps(reply))
+
+    def test_start_is_logged_and_the_log_can_be_turned_off(self):
+        self.use(FakeDaemon([]))
+        server.start_consultant({"cwd": ROOT, "watch": False})
+        (start,) = self.events()
+        self.assertEqual((start["event"], start["new"]), ("start", True))
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": "1"}):
+            server.record_usage({"event": "x"}, self.log)
+        self.assertEqual(len(self.events()), 1)
+
+    def test_log_is_rotated_and_never_raises(self):
+        with mock.patch.object(server, "USAGE_LOG_BYTES", 10):
+            server.record_usage({"event": "a", "pad": "x" * 20}, self.log)
+            server.record_usage({"event": "b"}, self.log)
+        self.assertEqual([e["event"] for e in self.events()], ["b"])
+        self.assertEqual(len(glob.glob(os.path.join(self.dir, "usage-log-*.jsonl"))), 1)
+        with mock.patch.object(server, "open", side_effect=OSError("disk full"), create=True):
+            server.record_usage({"event": "c"}, self.log)  # logged to stderr, not raised
+
+    def test_log_summary(self):
+        t = self.NOW
+        ev = [{"ts": t, "event": "start", "new": True},
+              {"ts": t + 1, "event": "send", "thread": "A", "turn": "1", "consultant": "ca", "project": "p",
+               "model": "m", "effort": "high", "kind": "review", "reason": "r1", "mode": "new", "changed": ["effort"]},
+              {"ts": t + 2, "event": "reply", "turn": "1", "status": "completed", "ms": 60000, "verdict": "changes"},
+              {"ts": t + 3, "event": "reply", "turn": "1", "status": "completed", "ms": 60000, "verdict": "changes"},
+              {"ts": t + 4, "event": "send", "thread": "A", "turn": "2", "consultant": "ca", "project": "p",
+               "model": "m", "effort": "high", "kind": "re-check", "mode": "new"},
+              {"ts": t + 5, "event": "reply", "turn": "2", "status": "completed", "ms": 120000, "verdict": "changes"},
+              {"ts": t + 6, "event": "send", "thread": "A", "turn": "3", "consultant": "ca", "project": "p",
+               "model": "m", "effort": "high", "mode": "steer"},
+              {"ts": t + 7, "event": "reply", "turn": "3", "status": "completed", "ms": 30000, "verdict": "changes"},
+              {"ts": t + 8, "event": "send", "thread": "B", "turn": "9", "consultant": "cb", "project": "q",
+               "model": "n", "mode": "new"}]
+        s = server.log_summary(ev)
+        self.assertEqual((s["sends"], s["replies"], s["steered"], s["changed"], s["new_consultants"]), (4, 3, 1, 1, 1))
+        self.assertEqual(s["models"]["m high"], 3)
+        self.assertEqual(s["kinds"]["not given"], 2)
+        self.assertEqual(s["verdicts"]["changes"], 3)
+        self.assertEqual(s["loops"][0], {"thread": "A", "consultant": "ca", "project": "p", "rounds": 3,
+                                         "changes_streak": 3})
+        self.assertEqual(s["reply_seconds"][0], 60)
+        self.assertEqual(server.log_summary(ev, since=t + 6)["sends"], 2)
+        scr = server.Screen(False)
+        text = "\n".join(server.consultation_rows(scr, s, 7))
+        self.assertIn("4 messages (last 7 days)", text)
+        self.assertIn("1 went past 3 CHANGES rounds in a row", text)
+        self.assertIn("No consultations logged", "\n".join(server.consultation_rows(scr, server.log_summary([]), None)))
+
+    def write(self, path, lines, mode="w"):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, mode, encoding="utf-8", newline="\n") as f:
+            f.write("".join(lines))
+
+    def test_scan_counts_tokens_once_and_reads_on(self):
+        claude, codex = os.path.join(self.dir, "claude"), os.path.join(self.dir, "codex")
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 60))
+
+        def reply(mid, out, model="claude-opus-5-5"):
+            return json.dumps({"type": "assistant", "timestamp": stamp,
+                               "message": {"id": mid, "model": model, "usage": {"output_tokens": out}}}) + "\n"
+        main = os.path.join(claude, "proj", "s1.jsonl")
+        self.write(main, [reply("m1", 100), reply("m1", 100), reply("m2", 50, "claude-haiku-5-5"),
+                          '{"type":"user"}\n', reply("m3", 7)[:-1]])  # m1 written twice; m3 not finished
+        self.write(os.path.join(claude, "proj", "s1", "subagents", "a.jsonl"), [reply("s1", 30)])
+
+        def tokens(out, source=None):
+            if source:
+                return json.dumps({"timestamp": stamp, "type": "session_meta",
+                                   "payload": {"thread_source": source}}) + "\n"
+            return json.dumps({"timestamp": stamp, "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {"input_tokens": 10 * out, "output_tokens": out}},
+                "rate_limits": {"plan_type": "pro", "primary": {"used_percent": 8.0, "window_minutes": 10080,
+                                                                 "resets_at": time.time() + 86400}}}}) + "\n"
+        ours = os.path.join(codex, "sessions", "2026", "rollout-a.jsonl")
+        self.write(ours, [tokens(0, "nouez"), tokens(40), tokens(40), tokens(100)])  # running totals
+        self.write(os.path.join(codex, "archived_sessions", "rollout-b.jsonl"), [tokens(0, "vscode"), tokens(25)])
+        state = server.scan_usage({}, time.time(), claude, codex)
+        (week,) = server.weekly_tokens(state).values()
+        self.assertEqual((week["claude"], week["subagents"], week["consultants"], week["codex"]), (150, 30, 100, 25))
+        self.assertEqual(week["models"], {"claude-opus-5-5": 130, "claude-haiku-5-5": 50})
+        self.assertEqual(state["codex_limits"]["plan"], "pro")
+        # read on from where it stopped: m3 finished, m1 again (split across the scan), new lines
+        self.write(main, ["\n", reply("m1", 100), reply("m4", 5)], "a")
+        self.write(ours, [tokens(130)], "a")
+        state = server.scan_usage(state, time.time(), claude, codex)
+        (week,) = server.weekly_tokens(state).values()
+        self.assertEqual((week["claude"], week["consultants"]), (162, 130))
+        # a rewritten (shorter) file is read again from the start
+        self.write(main, [reply("x1", 9)])
+        state = server.scan_usage(state, time.time(), claude, codex)
+        (week,) = server.weekly_tokens(state).values()
+        self.assertEqual(week["claude"], 9)
+        # a file that's gone drops out
+        os.remove(ours)
+        state = server.scan_usage(state, time.time(), claude, codex)
+        self.assertEqual(server.weekly_tokens(state)[server.week_of(time.time() - 60)]["consultants"], 0)
+
+    def test_frame_and_once(self):
+        scr = server.Screen(True)
+        line = scr.paint("abcdef", "31") + "ghi"
+        self.assertEqual(server.fit(line, 4), "\x1b[31mabcd\x1b[0m")
+        self.assertEqual(server.ANSI.sub("", server.fit(line, 100)), "abcdefghi")
+        self.assertEqual(server.bar(50, 4), "██░░")
+        now = time.time()
+        live = {"rateLimits": {"planType": "pro", "primary": {"usedPercent": 30, "windowDurationMins": 10080,
+                                                               "resetsAt": now + 3.5 * 86400}}}
+        frame = "\n".join(server.top_frame(server.Screen(False), now, 7, live, {}, [], True, 200))
+        self.assertIn("Codex pro", frame)
+        self.assertIn("pace: ~60% by the reset", frame)
+        self.assertIn("Claude Code     usage not known", frame)
+        self.assertIn("Reading transcripts for the first time", frame)
+        saved = {"ts": now - 600, "plan": "pro", "primary": {"used_percent": 95, "window_minutes": 300,
+                                                             "resets_at": now + 3600}}
+        frame = "\n".join(server.top_frame(server.Screen(False), now, None, None, {"codex_limits": saved}, [],
+                                           False, 200))
+        self.assertIn("runs out in", frame)
+        self.assertIn("from Codex's last session file, 10 min ago", frame)
+        self.assertIn("No Claude Code or Codex sessions", frame)
+        # the command itself, on empty folders
+        with mock.patch.object(server, "read_codex_usage", return_value=None), \
+                mock.patch.object(server, "claude_config_dir", return_value=os.path.join(self.dir, "none")), \
+                mock.patch.object(server, "codex_home", return_value=os.path.join(self.dir, "none")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(server.run_top(["--once", "--days", "30"]), 0)
+            self.assertEqual(server.run_top(["--days", "x"]), 2)
+        self.assertIn("No consultations logged (last 30 days)", out.getvalue())
+        self.assertTrue(os.path.exists(os.path.join(self.dir, server.SCAN_STATE_FILE)))
 
 if __name__ == "__main__":
     unittest.main()

@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.13.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.14.0\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -1326,6 +1326,60 @@ Model scores: Artificial Analysis Intelligence Index v4, fetched 2d 3h ago. Sour
 
 Usage counts against the user's subscriptions. Choose by the user's own routing rules (their CLAUDE.md or consult skill); without rules, show this and let the user decide.
 \end{plain}
+
+\subsection{Usage log and status screen}
+\label{sec:usage}
+
+nouez appends one JSON line per event to \code{usage-log.jsonl} in its cache folder, under a lock,
+and never lets a failure there fail the tool call (it is written to stderr instead). The file is
+renamed \code{usage-log-}\textit{date}\code{.jsonl} once it passes 20\,MB.
+\code{NOUEZ\_NO\_USAGE\_LOG=1} turns it off; the unit tests and the live checks set it.
+
+\begin{itemize}
+\item \code{start}: \code{consultant}, \code{thread}, \code{new}, \code{project} (the folder's
+  name) and \code{model}.
+\item \code{send}: \code{consultant}, \code{thread}, \code{turn}, \code{project}, \code{mode}
+  (\code{new} or \code{steer}), \code{model} and \code{effort} in effect, \code{changed} (those of
+  the two the message changed), \code{kind}, \code{reason}, \code{chars}, \code{owner\_words},
+  \code{user\_session}, and \code{usage}: each window's percentage used on Codex (from
+  \code{account/rateLimits/read}) and Claude Code (from \code{claude-usage.json}).
+\item \code{reply}: \code{consultant}, \code{thread}, \code{turn}, \code{status}, \code{ms},
+  \code{chars} and \code{verdict}. It is written when a waiting send, the waiter or
+  \code{GetConsultantReply} sees the turn end, so a turn can have more than one; readers keep one
+  per turn.
+\end{itemize}
+
+Every line also has \code{ts} (Unix seconds). No line holds the text of a message or reply.
+\code{kind} and \code{reason} are \code{SendConsultantMessage} arguments; an unknown \code{kind}
+is refused before anything is sent. The verdict is read from the first line of the reply that
+isn't blank: ``no changes'' or ``no blockers'' is \code{yes}; then \code{CHANGES}, ``changes
+needed'' and the like are \code{changes}; then ``no-go'', ``blocked'', ``reject'' or a leading
+``no'' are \code{no}; then ``go'', ``ready'', ``approved'', ``LGTM'' or a leading ``yes'' are
+\code{yes}. Anything else has no verdict.
+
+\code{server.py top} draws a status screen from that log and from files already on the computer,
+with ANSI colours and the terminal's alternate screen. It redraws every 5 seconds, reads Codex's
+usage from the daemon every 60 and reads the transcripts again every 300, each in a background
+thread.
+
+Token counts per week (weeks start on Monday, local time):
+
+\begin{itemize}
+\item \textbf{Claude Code:} \code{\textasciitilde/.claude/projects/**/*.jsonl}, the
+  \code{message.usage.output\_tokens} of each \code{assistant} line, counted once per
+  \code{message.id} (Claude Code writes one message over several lines). Files under a
+  \code{subagents} folder count as subagents.
+\item \textbf{Codex:} \code{rollout-*.jsonl} under \code{\textasciitilde/.codex/sessions} and
+  \code{archived\_sessions}. \code{token\_count} events carry running totals
+  (\code{info.total\_token\_usage}); nouez counts the growth since the last one. A file whose
+  \code{session\_meta} has \code{thread\_source: "nouez"} is a consultant's. The latest
+  \code{rate\_limits} seen stand in for the daemon when it can't be reached.
+\end{itemize}
+
+Only files changed in the last 13 weeks are read. For each, \code{usage-weeks.json} keeps the byte
+offset read to (only whole lines count), the last 20 message ids, and its counts per week, so a
+later scan reads only what was added. A file that got shorter is read again from the start; a file
+that's gone drops out.
 
 \subsection{Claude Code sessions}
 \label{sec:claude-tools}

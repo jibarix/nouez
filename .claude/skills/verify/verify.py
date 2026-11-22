@@ -169,7 +169,8 @@ class Client:
 
     def __init__(self):
         self.proc = subprocess.Popen([sys.executable, SERVER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, text=True, encoding="utf-8", cwd=ROOT)
+                                     stderr=subprocess.DEVNULL, text=True, encoding="utf-8", cwd=ROOT,
+                                     env={**os.environ, "NOUEZ_NO_USAGE_LOG": "1"})  # checks aren't usage
         self.next_id, self.replies, self.lock = 0, {}, threading.Condition()
         threading.Thread(target=self._read, daemon=True).start()
 

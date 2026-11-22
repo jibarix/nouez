@@ -25,7 +25,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.13.0 |
+| nouez | 0.14.0 |
 | Claude Code | 2.1.330 |
 | Codex CLI | 0.170.0 |
 | Codex app-server daemon | 0.171.0 |
@@ -221,6 +221,30 @@ A verdict line first makes the reply easy to act on, and "what you didn't check"
 - **Idle consultants.** After about a minute without activity, the Codex daemon unloads a consultant. It still appears in `ListConsultants`, and the next message reloads it with the same sandbox and history.
 - **Clean up.** Ask Claude to stop consultants when you're done, so they don't pile up in your Codex session list. Stopping archives a session rather than deleting it, and closes its watch window. On Windows, only windows the bridge opened are closed. On macOS and Linux, any `codex resume <id>` process for that session is ended, and a macOS Terminal window stays open at a shell prompt.
 
+### Usage log and status screen
+
+nouez notes each consultation in `nouez/usage-log.jsonl` in your cache folder (`%LOCALAPPDATA%` on Windows, `~/.cache` elsewhere), one JSON line per event:
+
+- **start:** a consultant started or reused, with its project and model.
+- **send:** a message: the consultant, project, model and effort, which of those it changed, whether it steered a running turn, `kind` and `reason` if Claude gave them, its length in characters, whether it quoted your words, and each subscription's usage at that moment (as `ConsultantBudget` would show it).
+- **reply:** how the turn ended: status, time taken, length, and the verdict read from the reply's first line (`yes`, `changes` or `no`).
+
+It never holds the text of a message or reply. Past 20 MB it is renamed with the date and a new one starts. Set `NOUEZ_NO_USAGE_LOG=1` in nouez's environment to turn it off.
+
+To see it, with the usage of each subscription, run in a terminal:
+
+```sh
+python /path/to/nouez/server.py top
+```
+
+It shows:
+
+- **Usage:** each Codex and Claude Code window, with a bar, the reset, and where the pace lands at the reset (red when used up or running out first, yellow over 90%). Codex is read live from the daemon once a minute; without the daemon, from Codex's last session file. Claude Code's comes from the status line file (see [Choosing a consultant](#choosing-a-consultant)).
+- **Consultations:** messages sent, steered and with a changed model or effort; counts by model, kind, project and verdict; the median and slowest reply times; and review loops that went past three CHANGES rounds in a row.
+- **Offload:** for each of the last 8 weeks, the output tokens of Claude Code (and its subagents) beside those of nouez consultants and of your own Codex sessions, and the share that wasn't Anthropic's; then Claude Code's output by model. These come from the Claude Code transcripts (`~/.claude/projects`) and Codex session files (`~/.codex/sessions`) on this computer. The first run reads the last 13 weeks of them, which can take a minute; the counts are kept in `nouez/usage-weeks.json` and later runs read only what was added.
+
+Keys: `1`, `7`, `3` or `a` to show 1, 7 or 30 days of consultations or all of them; `r` to refresh now; `q` or Esc to quit. `--days N` picks the period to start with, and `--once` prints one screen and exits. Nothing leaves your computer.
+
 ## Tools
 
 | Tool | What it does |
@@ -261,6 +285,8 @@ A verdict line first makes the reply easy to act on, and "what you didn't check"
 | `effort` | no | unchanged | Codex reasoning effort (such as `low`, `medium`, `high` or `xhigh`; the levels depend on the model) for this message and later ones; send the usual value again to go back. Refused, with nothing sent, while nouez sees the consultant mid-turn |
 | `wait` | no | `5` | How long to wait for the reply: seconds (`0` returns once the message is delivered), or `"done"` to wait until the turn ends. Capped at 4 hours |
 | `allow_user_session` | no | `false` | Allow sending to a session you opened yourself. Claude sets it only when you ask |
+| `kind` | no | | What the consultation is for: `quick-check`, `re-check`, `review`, `bug-hunt`, `plan-critique`, `research`, `fact-check` or `other`. Kept only in the [usage log](#usage-log-and-status-screen); anything else is refused, with nothing sent |
+| `reason` | no | | A short sentence on why this model and effort, for the usage log (cut at 300 characters) |
 
 `GetConsultantReply` takes `to`, an optional `turn_id` (default: the latest turn; looked up among the 100 most recent turns), an optional `wait` like `SendConsultantMessage`'s, but defaulting to `0`, which returns at once if the turn is still running, and an optional `offset`: a character position in a finished reply to read from. A reply read with `offset` comes back in pieces of up to 60,000 characters, each ending with the offset to read on from.
 
@@ -359,6 +385,7 @@ python -m unittest discover tests
 - Nothing can start a session on the computer from your phone unless something there is already running and connected: an open Claude Code session with Remote Control, for instance.
 - The trust check reads git's files, not Claude Code's code. For a worktree whose git data was moved out with `--separate-git-dir`, it says it can't tell, except when that git folder is named `.git` and sits beside other files: then nouez, like `git worktree list`, takes that folder for the main checkout.
 - `ConsultantBudget` names models as Artificial Analysis does ("GPT-6.2 Sol (high)"), not by Codex model id; matching them is left to Claude. Artificial Analysis scores API access at set effort levels, which may differ from a subscription's. Google's usage windows (Antigravity) aren't shown.
+- `server.py top` counts tokens from Claude Code's transcripts and Codex's session files, which neither documents; an update to either could change them. Output tokens only: a reply's input and cached tokens aren't counted.
 - Only the 50 most recent saved sessions are checked for unloaded consultants. Older ones can still be reached by their full thread id.
 - Uses the experimental Codex app-server protocol (`thread/start`, `thread/resume`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/name/set`, `thread/turns/list`, `thread/archive`, `turn/start`, `turn/steer`, `account/rateLimits/read`, `model/list`), which may change between Codex releases. See [Tested with](#tested-with).
 

@@ -6,6 +6,16 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-22
+
+A local usage log and `python server.py top`, a status screen for Codex and Claude Code usage and how much work goes to consultants. Tested with Claude Code 2.1.330, Codex CLI 0.170.0 with app-server daemon 0.171.0, Python 3.11.9 on Windows 11. After updating, reconnect `consultants` with `/mcp` in each open Claude Code session; open sessions keep running the old server until then.
+
+### Added
+
+- nouez keeps a usage log, `nouez/usage-log.jsonl` in your cache folder: one line per consultant started, message sent and reply finished. A send records the consultant, project, model and effort (and which of them the message changed), whether it steered a running turn, its kind and reason, its length, and the usage of each subscription at that moment. A reply records its status, time and verdict. Neither records the message or reply text. The log moves aside past 20 MB. `NOUEZ_NO_USAGE_LOG=1` turns it off.
+- `SendConsultantMessage` takes `kind` (`quick-check`, `re-check`, `review`, `bug-hunt`, `plan-critique`, `research`, `fact-check` or `other`) and `reason` (a short sentence on why this model and effort), both optional and kept only in the log. An unknown `kind` is refused, with nothing sent.
+- `python server.py top`: each subscription's usage windows with a bar and pace, the consultations logged (by model, kind, project and verdict, with review loops that ran past three CHANGES rounds), and per week the Claude Code output tokens beside the tokens consultants and your own Codex sessions spent. It reads the Claude Code transcripts and Codex session files on this computer, keeps its counts in `nouez/usage-weeks.json` and reads only what was added since. Keys: `1`, `7`, `3`, `a` for 1, 7 or 30 days or all; `r` to refresh; `q` to quit. `--once` prints one screen and exits.
+
 ## [0.13.0] - 2026-11-22
 
 `ConsultantBudget`, for choosing a consultant's model and effort by the usage left and how strong each model is. Tested with Claude Code 2.1.330, Codex CLI 0.170.0 with app-server daemon 0.171.0, Python 3.11.9 on Windows 11. After updating, reconnect `consultants` with `/mcp` in each open Claude Code session; open sessions keep running the old server until then.
@@ -308,7 +318,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/jibarix/nouez/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/jibarix/nouez/compare/v0.12.4...v0.13.0
 [0.12.4]: https://github.com/jibarix/nouez/compare/v0.12.3...v0.12.4
 [0.12.3]: https://github.com/jibarix/nouez/compare/v0.12.2...v0.12.3

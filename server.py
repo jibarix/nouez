@@ -23,6 +23,8 @@ socket, which speaks JSON-RPC over WebSocket. Standard library only.
 """
 
 import base64
+import collections
+import datetime
 import glob
 import json
 import math
@@ -43,7 +45,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.13.0"
+SERVER_VERSION = "0.14.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -2304,6 +2306,9 @@ def start_consultant(args, cancel=None, progress=None):
         client.close()
 
     name = short_name(thread)
+    record_usage({"event": "start", "consultant": name, "thread": thread["id"], "new": not existing,
+                  "project": os.path.basename(os.path.normpath(thread.get("cwd") or cwd)) or None,
+                  "model": thread.get("model")})
     # The latest StartConsultant call decides whether the session gets an automatic pane.
     with _send_locks_guard:
         (_unwatched.discard if watch else _unwatched.add)(thread["id"])
@@ -2402,6 +2407,7 @@ def send_consultant_message(args, cancel=None, progress=None):
     if not isinstance(owner_words, str):
         raise BridgeError("`owner_words` must be a string: text the user typed, quoted as they wrote it.")
     want_revision = flag(args, "revision")
+    kind, reason = kind_and_reason(args)
     if owner_words:
         message = (f"The user's own words, as they typed them:\n<<<\n{owner_words}\n>>>\n\n"
                    f"The rest of this message is {sender}'s.\n\n{message}")
@@ -2465,6 +2471,16 @@ def send_consultant_message(args, cancel=None, progress=None):
                     watching = f" {shown}" if shown else ""
                 except (BridgeError, OSError) as e:
                     watching = f" Could not open a terminal: {e}"
+        if not usage_log_off():  # the snapshot asks the daemon, so only when it will be kept
+            was = {"model": thread.get("model"), "effort": thread.get("reasoningEffort")}
+            record_usage({
+                "event": "send", "consultant": name, "thread": tid, "turn": turn_id,
+                "project": os.path.basename(os.path.normpath(thread.get("cwd") or "")) or None,
+                "mode": "steer" if mode.startswith("steered") else "new",
+                "model": overrides.get("model") or was["model"], "effort": overrides.get("effort") or was["effort"],
+                "changed": sorted(k for k, v in overrides.items() if v != was[k]) or None,
+                "kind": kind, "reason": reason, "chars": len(message), "owner_words": bool(owner_words) or None,
+                "user_session": not is_bridge(thread) or None, "usage": usage_snapshot(client)})
         if not timeout:
             return f"Delivered to {name} ({mode}, turn {turn_id}).{watching} {read_later(tid, turn_id)}"
         try:
@@ -2476,6 +2492,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                               f"failed: {e} Don't send the message again; read the reply with "
                               f"GetConsultantReply (turn_id {turn_id}).") from None
         if done:
+            record_reply(tid, name, turn)
             now_on = running_on(thread)
             changed = (f"\n\n({name} now runs on {settings} until changed.)" if overrides
                        else f"\n\n({name} runs on {now_on}.)" if now_on else "")
@@ -2526,6 +2543,7 @@ def get_consultant_reply(args, cancel=None, progress=None):
                     f"turn_id {turn['id']}; pass wait=\"done\" only if the user wants "
                     "you to wait for it.")
         carried = carried_note(asked, turn)
+        record_reply(tid, name, turn)
         if offset:
             reply = turn_reply(turn)
             if offset >= len(reply):
@@ -2650,6 +2668,24 @@ def window_label(length):
     return {5 * 3600: "5-hour", 86400: "daily", 7 * 86400: "weekly"}.get(length) or span_text(length)
 
 
+def window_pace(used, resets_at, length, now):
+    """Where a usage window is heading: ("used up", None), ("runs out", seconds until it does,
+    before the reset), ("at reset", the percent the current rate reaches by the reset), or None
+    when too little of the window has gone to tell. Arguments as window_text has them, checked."""
+    left = resets_at - now
+    if not length or left >= length:
+        return None
+    gone = (length - left) / length
+    if used >= 100:
+        return ("used up", None)
+    if gone < 0.05:
+        return None
+    rate = used / (length - left)  # percent per second so far
+    if rate > 0 and (100 - used) / rate < left:
+        return ("runs out", (100 - used) / rate)
+    return ("at reset", used / gone)
+
+
 def window_text(label, used, resets_at, length, now):
     """One usage window: how much is used, when it resets, and the pace: where the current rate
     of use lands at the reset, or when it runs out first. None if used or resets_at is unusable."""
@@ -2659,16 +2695,13 @@ def window_text(label, used, resets_at, length, now):
     left = resets_at - now
     text = (f"{label} window: {used:g}% used, resets "
             f"{time.strftime('%a %b %d %H:%M', time.localtime(resets_at))} (in {span_text(left)})")
-    if length and left < length:
-        gone = (length - left) / length
-        if used >= 100:
-            text += "; used up"
-        elif gone >= 0.05:
-            rate = used / (length - left)  # percent per second so far
-            if rate > 0 and (100 - used) / rate < left:
-                text += f"; at this rate it runs out in about {span_text((100 - used) / rate)}, before the reset"
-            else:
-                text += f"; at this rate about {used / gone:.0f}% by the reset"
+    pace = window_pace(used, resets_at, length, now)
+    if pace and pace[0] == "used up":
+        text += "; used up"
+    elif pace and pace[0] == "runs out":
+        text += f"; at this rate it runs out in about {span_text(pace[1])}, before the reset"
+    elif pace:
+        text += f"; at this rate about {pace[1]:.0f}% by the reset"
     return text
 
 
@@ -2913,6 +2946,727 @@ def consultant_budget(args, cancel=None, progress=None):
     return "\n".join(out)
 
 
+# --- Usage log ----------------------------------------------------------------
+# One JSON line per consultation event in nouez/usage-log.jsonl, on this computer only, for
+# `server.py top` and for later analysis: which consultant, model and effort, why, the usage
+# left when it was chosen, and how the reply came out. Never the message or reply text.
+
+USAGE_LOG_FILE = "usage-log.jsonl"
+USAGE_LOG_BYTES = 20 * 1024 * 1024  # past this the log is renamed with its date and a new one begun
+CONSULT_KINDS = ("quick-check", "re-check", "review", "bug-hunt", "plan-critique", "research",
+                 "fact-check", "other")
+REASON_CHARS = 300
+_usage_log_lock = threading.Lock()
+
+
+def usage_log_off(env=None):
+    return (os.environ if env is None else env).get("NOUEZ_NO_USAGE_LOG", "").strip() == "1"
+
+
+def usage_log_file():
+    return os.path.join(nouez_cache_dir(), USAGE_LOG_FILE)
+
+
+def record_usage(event, path=None, now=None):
+    """Append one event to the usage log. Never raises: the log must not fail a consultation."""
+    if usage_log_off():
+        return
+    try:
+        path = path or usage_log_file()
+        line = json.dumps({"ts": round(now or time.time(), 3), **event}, ensure_ascii=False) + "\n"
+        with _usage_log_lock:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            try:
+                if os.path.getsize(path) > USAGE_LOG_BYTES:
+                    stem = path[:-len(".jsonl")] if path.endswith(".jsonl") else path
+                    os.replace(path, f"{stem}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
+            except OSError:
+                pass  # no log yet, or it can't be rotated now: append to it as it is
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception as e:
+        log("usage log:", e)
+
+
+def kind_and_reason(args):
+    """The optional `kind` and `reason` of a consultation, checked."""
+    kind, reason = args.get("kind"), args.get("reason")
+    if kind not in (None, "") and kind not in CONSULT_KINDS:
+        raise BridgeError(f"`kind` must be one of {', '.join(CONSULT_KINDS)}, not {kind!r}.")
+    if reason not in (None, "") and not isinstance(reason, str):
+        raise BridgeError("`reason` must be a string: why this consultant, model and effort.")
+    reason = " ".join(reason.split())[:REASON_CHARS] if reason else None
+    return kind or None, reason
+
+
+def usage_snapshot(client):
+    """The share used of each subscription window now, for the log: Codex from the daemon (if it
+    answers), Claude Code from the file its status line saves. Missing parts are left out."""
+    snap = {}
+    try:
+        limits = client.request("account/rateLimits/read", None)
+        rl = limits.get("rateLimits") if isinstance(limits, dict) else None
+        codex = {}
+        for key in ("primary", "secondary"):
+            w = rl.get(key) if isinstance(rl, dict) else None
+            if isinstance(w, dict) and number(w.get("usedPercent")) is not None:
+                mins = number(w.get("windowDurationMins"))
+                codex[window_label(mins * 60) if mins else key] = w["usedPercent"]
+        if codex:
+            snap["codex"] = codex
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE), encoding="utf-8-sig") as f:
+            limits = json.loads(f.read(65536)).get("rate_limits")
+        claude = {window_label(length): limits[key]["used_percentage"] for key, length in CLAUDE_WINDOWS
+                  if isinstance(limits.get(key), dict) and number(limits[key].get("used_percentage")) is not None}
+        if claude:
+            snap["claude"] = claude
+    except Exception:
+        pass
+    return snap
+
+
+VERDICTS = (  # read from a reply's first non-empty line; the first match wins
+    ("yes", re.compile(r"\bno (further |more |other )?(changes|blockers?|issues|findings)\b", re.I)),
+    ("changes", re.compile(r"\bCHANGES\b")),  # the word in capitals, as many briefs ask for it
+    ("changes", re.compile(r"\b(with changes|changes (requested|needed|required)|needs? (some )?changes|"
+                           r"request changes)\b", re.I)),
+    ("no", re.compile(r"\b(no[- ]go|not ready|blocked|block|reject(ed)?|do not (merge|ship|commit))\b|"
+                      r"\bverdict\W*no\b|^\W*no\b", re.I)),
+    ("yes", re.compile(r"\b(go|ready|approved?|lgtm|ship it)\b|\bverdict\W*yes\b|^\W*yes\b", re.I)),
+)
+
+
+def verdict_of(reply):
+    """yes, changes or no, from a reply's first non-empty line, or None when it gives no verdict."""
+    first = next((line for line in (reply or "").splitlines() if line.strip()), "")[:300]
+    for name, pattern in VERDICTS:
+        if pattern.search(first):
+            return name
+    return None
+
+
+def record_reply(thread_id, name, turn, path=None):
+    """Log how a finished turn came out (the TUI keeps one line per turn)."""
+    if not isinstance(turn, dict) or turn.get("status") in (None, "inProgress"):
+        return
+    reply = turn_reply(turn)
+    record_usage({"event": "reply", "consultant": name, "thread": thread_id, "turn": turn.get("id"),
+                  "status": turn.get("status"), "ms": number(turn.get("durationMs")),
+                  "chars": len(reply), "verdict": verdict_of(reply)}, path)
+
+
+# --- Status screen: `server.py top` ---------------------------------------------
+# Reads, never writes, everything but its own cache: the usage log, Claude Code's status line
+# file, Codex's usage from the daemon, and token counts from the Claude Code transcripts and
+# Codex session files on this computer. Nothing leaves the computer.
+
+TOP_REFRESH = 5           # seconds between redraws
+TOP_CODEX_SECONDS = 60    # between live reads of Codex usage
+TOP_SCAN_SECONDS = 300    # between transcript scans
+TOP_WEEKS = 8             # weeks shown in the offload table
+SCAN_WEEKS = 13           # transcripts last changed longer ago than this aren't read
+SCAN_STATE_FILE = "usage-weeks.json"
+SCAN_STATE_VERSION = 1
+SCAN_IDS_KEPT = 20        # message ids kept per transcript, to skip a reply split across a scan
+TOP_PERIODS = {"1": 1, "7": 7, "3": 30, "a": None}  # key: days the consultation counts cover
+
+
+def iso_seconds(text):
+    """An ISO 8601 time ("2026-11-22T05:17:23.207Z") as epoch seconds, or None."""
+    if not isinstance(text, str):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def week_of(ts):
+    """The local date of the Monday starting ts's week, as YYYY-MM-DD."""
+    day = datetime.date.fromtimestamp(ts)
+    return (day - datetime.timedelta(days=day.weekday())).isoformat()
+
+
+def new_lines(path, entry):
+    """Complete lines added to a file since entry["offset"], advancing it."""
+    size = os.path.getsize(path)
+    offset = entry.get("offset", 0)
+    if size == offset:
+        return
+    with open(path, "rb") as f:
+        f.seek(offset)
+        for line in f:
+            if not line.endswith(b"\n"):
+                break  # still being written: read it next time
+            offset += len(line)
+            yield line
+    entry["offset"] = offset
+
+
+def scan_claude_file(path, entry):
+    """Add a Claude Code transcript's new replies to entry["weeks"]: output tokens of the main
+    conversation and of subagents, and output by model."""
+    weeks = entry.setdefault("weeks", {})
+    ids = entry.get("ids") or []
+    seen = set(ids)
+    in_subagent = f"{os.sep}subagents{os.sep}" in path or "/subagents/" in path
+    for line in new_lines(path, entry):
+        if b'"assistant"' not in line or b'"usage"' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        m = o.get("message") if isinstance(o, dict) else None
+        if o.get("type") != "assistant" or not isinstance(m, dict) or not isinstance(m.get("usage"), dict):
+            continue
+        mid = m.get("id")
+        if mid in seen:
+            continue  # one reply is written as several lines, each with its usage
+        if mid:
+            seen.add(mid)
+            ids.append(mid)
+        out = number(m["usage"].get("output_tokens")) or 0
+        ts = iso_seconds(o.get("timestamp"))
+        if ts is None:
+            continue
+        w = weeks.setdefault(week_of(ts), {"main": 0, "sub": 0, "calls": 0, "models": {}})
+        w["sub" if in_subagent or o.get("isSidechain") else "main"] += out
+        w["calls"] += 1
+        model = m.get("model") if isinstance(m.get("model"), str) else "?"
+        w["models"][model] = w["models"].get(model, 0) + out
+    entry["ids"] = ids[-SCAN_IDS_KEPT:]
+
+
+def scan_codex_file(path, entry, state):
+    """Add a Codex session file's new token use to entry["weeks"] (from the running totals in its
+    token_count events), note whose session it is, and keep the newest usage it reports."""
+    weeks = entry.setdefault("weeks", {})
+    for line in new_lines(path, entry):
+        if b'"session_meta"' not in line and b'"token_count"' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        p = o.get("payload") if isinstance(o, dict) else None
+        if not isinstance(p, dict):
+            continue
+        if o.get("type") == "session_meta":
+            entry["source"] = p.get("thread_source") or p.get("originator")
+            continue
+        info = p.get("info") if p.get("type") == "token_count" else None
+        total = info.get("total_token_usage") if isinstance(info, dict) else None
+        ts = iso_seconds(o.get("timestamp"))
+        if isinstance(total, dict) and ts is not None:
+            prev = entry.get("prev") or {}
+            w = weeks.setdefault(week_of(ts), {"in": 0, "out": 0})
+            for key, short in (("input_tokens", "in"), ("output_tokens", "out")):
+                value = number(total.get(key)) or 0
+                w[short] += max(0, value - prev.get(short, 0))
+                prev[short] = value
+            entry["prev"] = prev
+        limits = p.get("rate_limits")
+        if isinstance(limits, dict) and ts is not None and ts >= (state.get("codex_limits") or {}).get("ts", 0):
+            state["codex_limits"] = {"ts": ts, "plan": limits.get("plan_type"),
+                                     **{k: limits[k] for k in ("primary", "secondary") if isinstance(limits.get(k), dict)}}
+
+
+def codex_home(env=None):
+    env = os.environ if env is None else env
+    return env.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+
+
+def scan_usage(state, now, claude_root=None, codex_root=None):
+    """Bring the token counts in state up to date with the transcripts changed in the last
+    SCAN_WEEKS weeks. Files are read from where the last scan stopped."""
+    since = now - SCAN_WEEKS * 7 * 86400
+    files = state.setdefault("files", {})
+    claude_root = claude_root or os.path.join(claude_config_dir(), "projects")
+    codex_root = codex_root or codex_home()
+    found = [("claude", p) for p in glob.glob(os.path.join(claude_root, "**", "*.jsonl"), recursive=True)]
+    for folder in ("sessions", "archived_sessions"):
+        found += [("codex", p) for p in
+                  glob.glob(os.path.join(codex_root, folder, "**", "rollout-*.jsonl"), recursive=True)]
+    seen = set()
+    for kind, path in found:
+        try:
+            if os.path.getmtime(path) < since:
+                continue
+            seen.add(path)
+            entry = files.get(path)
+            if entry is None or os.path.getsize(path) < entry.get("offset", 0):
+                entry = files[path] = {"kind": kind}  # new, or rewritten shorter: read from the start
+            if kind == "claude":
+                scan_claude_file(path, entry)
+            else:
+                scan_codex_file(path, entry, state)
+        except OSError:
+            continue
+    for path in [p for p in files if p not in seen]:
+        del files[path]  # gone, or too old to show
+    state["scanned"] = now
+    return state
+
+
+def read_scan_state(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return {"version": SCAN_STATE_VERSION}
+    if not isinstance(state, dict) or state.get("version") != SCAN_STATE_VERSION:
+        return {"version": SCAN_STATE_VERSION}
+    return state
+
+
+def weekly_tokens(state):
+    """Output tokens per week: Claude Code's main conversations and subagents, nouez consultants,
+    and the user's own Codex sessions; with Claude's output by model."""
+    weeks = {}
+    for entry in (state.get("files") or {}).values():
+        for week, v in (entry.get("weeks") or {}).items():
+            w = weeks.setdefault(week, {"claude": 0, "subagents": 0, "consultants": 0, "codex": 0, "models": {}})
+            if entry.get("kind") == "claude":
+                w["claude"] += v.get("main", 0)
+                w["subagents"] += v.get("sub", 0)
+                for model, out in (v.get("models") or {}).items():
+                    w["models"][model] = w["models"].get(model, 0) + out
+            else:
+                w["consultants" if entry.get("source") == BRIDGE_SOURCE else "codex"] += v.get("out", 0)
+    return weeks
+
+
+def read_usage_log(path=None):
+    """The usage log's events, oldest first; lines that can't be read are skipped."""
+    events = []
+    try:
+        with open(path or usage_log_file(), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and number(e.get("ts")) is not None:
+                    events.append(e)
+    except OSError:
+        pass
+    return events
+
+
+def median(values):
+    values = sorted(values)
+    if not values:
+        return None
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
+def log_summary(events, since=None):
+    """Counts for the status screen from the usage log's events since a time (all if None)."""
+    events = [e for e in events if since is None or e["ts"] >= since]
+    sends = [e for e in events if e.get("event") == "send"]
+    replies = {}
+    for e in events:
+        if e.get("event") == "reply" and e.get("turn"):
+            replies[e["turn"]] = e  # the same turn read twice (waiter, then GetConsultantReply): keep one
+    replies = list(replies.values())
+    count = collections.Counter
+    by_thread = collections.defaultdict(list)
+    for e in sends:
+        by_thread[e.get("thread")].append(e)
+    verdict_by_turn = {r["turn"]: r.get("verdict") for r in replies}
+    loops = []
+    for tid, items in by_thread.items():
+        streak = best = 0
+        for e in items:
+            streak = streak + 1 if verdict_by_turn.get(e.get("turn")) == "changes" else 0
+            best = max(best, streak)
+        loops.append({"thread": tid, "consultant": items[-1].get("consultant"),
+                      "project": items[-1].get("project"), "rounds": len(items), "changes_streak": best})
+    times = [r["ms"] / 1000 for r in replies if r.get("status") == "completed" and number(r.get("ms"))]
+    return {
+        "sends": len(sends),
+        "starts": sum(1 for e in events if e.get("event") == "start"),
+        "new_consultants": sum(1 for e in events if e.get("event") == "start" and e.get("new")),
+        "replies": len(replies),
+        "steered": sum(1 for e in sends if e.get("mode") == "steer"),
+        "changed": sum(1 for e in sends if e.get("changed")),
+        "changed_what": count(k for e in sends for k in e.get("changed") or []),
+        "models": count(f"{e.get('model') or '?'} {e.get('effort') or ''}".strip() for e in sends),
+        "kinds": count(e.get("kind") or "not given" for e in sends),
+        "reasons": count(e["reason"] for e in sends if e.get("reason")),
+        "projects": count(e.get("project") or "?" for e in sends),
+        "verdicts": count(r.get("verdict") or "none" for r in replies),
+        "statuses": count(r.get("status") or "?" for r in replies),
+        "loops": sorted(loops, key=lambda x: -x["rounds"]),
+        "reply_seconds": (median(times), sorted(times)[int(len(times) * 0.9)] if times else None),
+        "per_week": count(week_of(e["ts"]) for e in sends),
+    }
+
+
+def token_text(n):
+    n = n or 0
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f}k"
+    return f"{n:.0f}"
+
+
+class Screen:
+    """Text with optional colour, for a terminal or plain output."""
+    def __init__(self, color):
+        self.color = color
+
+    def paint(self, text, code):
+        return f"\x1b[{code}m{text}\x1b[0m" if self.color else text
+
+    def bold(self, text):
+        return self.paint(text, "1")
+
+    def dim(self, text):
+        return self.paint(text, "2")
+
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def fit(line, width):
+    """line cut to width visible characters, keeping its colour codes whole."""
+    out, shown, i = [], 0, 0
+    while i < len(line):
+        m = ANSI.match(line, i)
+        if m:
+            out.append(m.group())
+            i = m.end()
+            continue
+        if shown >= width:
+            i += 1
+            continue
+        out.append(line[i])
+        shown += 1
+        i += 1
+    return "".join(out)
+
+
+def bar(pct, width=20):
+    filled = round(max(0.0, min(100.0, pct)) / 100 * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def window_row(scr, owner, label, used, resets_at, length, now):
+    """One subscription window as a line with a bar, or None if its numbers can't be used."""
+    used, resets_at, length = number(used), number(resets_at), number(length)
+    if used is None or resets_at is None or resets_at <= now:
+        return None
+    pace = window_pace(used, resets_at, length, now)
+    if pace and pace[0] == "used up":
+        outlook, colour = "used up", "31"
+    elif pace and pace[0] == "runs out":
+        outlook, colour = f"runs out in ~{span_text(pace[1])}, before the reset", "31"
+    elif pace:
+        outlook, colour = f"pace: ~{pace[1]:.0f}% by the reset", "33" if pace[1] > 90 else "32"
+    else:
+        outlook, colour = "too early to tell the pace", "32"
+    reset = time.strftime("%a %H:%M", time.localtime(resets_at))
+    return (f"  {owner:<16}{label:<8}{scr.paint(bar(used), colour)} {used:>4.0f}%  resets {reset} "
+            f"(in {span_text(resets_at - now)})  {scr.dim(outlook)}")
+
+
+def subscription_rows(scr, now, codex_live, codex_saved, claude_path=None):
+    """The subscriptions section: Codex from the daemon (or its last session file), Claude Code
+    from its status line file."""
+    rows = []
+    limits = codex_live.get("rateLimits") if isinstance(codex_live, dict) else None
+    if isinstance(limits, dict):
+        plan = limits.get("planType")
+        owner = f"Codex {plan}" if isinstance(plan, str) else "Codex"
+        for key in ("primary", "secondary"):
+            w = limits.get(key)
+            if isinstance(w, dict):
+                mins = number(w.get("windowDurationMins"))
+                row = window_row(scr, owner, window_label(mins * 60) if mins else "usage",
+                                 w.get("usedPercent"), w.get("resetsAt"), mins * 60 if mins else None, now)
+                if row:
+                    rows.append(row)
+                    owner = ""
+    elif isinstance(codex_saved, dict):
+        owner = f"Codex {codex_saved.get('plan') or ''}".strip()
+        for key in ("primary", "secondary"):
+            w = codex_saved.get(key)
+            if isinstance(w, dict):
+                mins = number(w.get("window_minutes"))
+                row = window_row(scr, owner, window_label(mins * 60) if mins else "usage",
+                                 w.get("used_percent"), w.get("resets_at"), mins * 60 if mins else None, now)
+                if row:
+                    rows.append(row)
+                    owner = ""
+        if rows:
+            rows.append(scr.dim(f"  {'':<16}(from Codex's last session file, {span_text(now - codex_saved['ts'])} "
+                                "ago; the daemon didn't answer)"))
+    if not rows:
+        rows.append(f"  {'Codex':<16}" + scr.dim("usage not known: the daemon didn't answer and no recent session reports it"))
+    path = claude_path or os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE)
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            saved = json.loads(f.read(65536))
+    except (OSError, ValueError):
+        saved = None
+    limits = saved.get("rate_limits") if isinstance(saved, dict) else None
+    owner, before = "Claude Code", len(rows)
+    for key, length in CLAUDE_WINDOWS:
+        w = limits.get(key) if isinstance(limits, dict) else None
+        if isinstance(w, dict):
+            row = window_row(scr, owner, window_label(length), w.get("used_percentage"), w.get("resets_at"), length, now)
+            if row:
+                rows.append(row)
+                owner = ""
+    at = number(saved.get("saved")) if isinstance(saved, dict) else None
+    if len(rows) > before:
+        if at:
+            old = " - old, may be out of date" if now - at > CLAUDE_USAGE_STALE else ""
+            rows.append(scr.dim(f"  {'':<16}(from the status line, saved {span_text(now - at)} ago{old})"))
+    else:
+        rows.append(f"  {'Claude Code':<16}" + scr.dim(
+            "usage not known: it reaches nouez through the status line (README, Choosing a consultant)"
+            if saved is None else "no current window saved yet"))
+    return rows
+
+
+def columns(blocks, width=26):
+    """Side-by-side lists: each block is (title, [(label, count)...])."""
+    height = max((len(items) for _, items in blocks), default=0)
+    lines = ["  " + "".join(f"{title:<{width}}" for title, _ in blocks)]
+    for i in range(height):
+        cells = []
+        for _, items in blocks:
+            if i < len(items):
+                label, n = items[i]
+                label = label if len(label) <= width - 7 else label[:width - 8] + "…"
+                cells.append(f"{label:<{width - 6}}{n:>4}  ")
+            else:
+                cells.append(" " * width)
+        lines.append("  " + "".join(cells))
+    return lines
+
+
+def consultation_rows(scr, summary, days):
+    period = f"last {days} day{'s' if days != 1 else ''}" if days else "all logged"
+    if not summary["sends"]:
+        return [scr.dim(f"  No consultations logged ({period}). nouez logs them from 0.14.0 on; "
+                        "the consult skill adds each one's kind and reason.")]
+    s = summary
+    changed = ", ".join(f"{k} {n}" for k, n in s["changed_what"].most_common())
+    head = (f"  {scr.bold(str(s['sends']))} messages ({period}) · {s['replies']} replies read · "
+            f"{s['steered']} steered into a running turn · {s['changed']} changed model or effort"
+            + (f" ({changed})" if changed else "")
+            + f" · {s['new_consultants']} new consultant(s)")
+    rows = [head, ""]
+    top = 6
+    rows += columns([("by model and effort", s["models"].most_common(top)),
+                     ("by kind", s["kinds"].most_common(top)),
+                     ("verdicts", s["verdicts"].most_common(top)),
+                     ("by project", s["projects"].most_common(top))])
+    if s["reasons"]:
+        rows += ["", "  reasons given"]
+        rows += [f"  {n:>4}  {first_line(r, 90)}" for r, n in s["reasons"].most_common(5)]
+    loops = s["loops"]
+    if loops:
+        rounds = [x["rounds"] for x in loops]
+        longest = loops[0]
+        over = sum(1 for x in loops if x["changes_streak"] >= 3)
+        rows += ["", f"  loops: {len(loops)} consultant(s) messaged · median {median(rounds):g} "
+                     f"message(s) each · most {longest['rounds']} ({longest['consultant']}, {longest['project']})"
+                     + (scr.paint(f" · {over} went past 3 CHANGES rounds in a row", "33") if over else "")]
+    mid, p90 = s["reply_seconds"]
+    if mid is not None:
+        rows.append(f"  reply time: median {span_text(mid) if mid >= 60 else f'{mid:.0f}s'}"
+                    f" · slowest tenth over {span_text(p90) if p90 >= 60 else f'{p90:.0f}s'}")
+    return rows
+
+
+def offload_rows(scr, weeks, per_week, scanning):
+    """Output tokens by week, and the share made by models that aren't Anthropic's."""
+    if not weeks:
+        return [scr.dim("  Reading transcripts for the first time…" if scanning else
+                        "  No Claude Code or Codex sessions in the last weeks.")]
+    rows = [f"  {'week of':<11}{'Claude':>9}{'subagents':>11}{'consultants':>13}{'own Codex':>11}"
+            f"{'messages':>10}   not Anthropic"]
+    for week in sorted(weeks)[-TOP_WEEKS:]:
+        w = weeks[week]
+        total = w["claude"] + w["subagents"] + w["consultants"] + w["codex"]
+        other = w["consultants"] + w["codex"]
+        share = 100 * other / total if total else 0
+        rows.append(f"  {week:<11}{token_text(w['claude']):>9}{token_text(w['subagents']):>11}"
+                    f"{token_text(w['consultants']):>13}{token_text(w['codex']):>11}{per_week.get(week, 0):>10}"
+                    f"   {scr.paint(bar(share, 12), '36')} {share:>3.0f}%")
+    recent = sorted(weeks)[-4:]
+    models = collections.Counter()
+    for week in recent:
+        models.update(weeks[week]["models"])
+    total = sum(models.values())
+    if total:
+        parts = [f"{m.replace('claude-', '')} {100 * n / total:.0f}%" for m, n in models.most_common(5) if n]
+        rows += ["", f"  Claude output by model, last {len(recent)} weeks: " + " · ".join(parts)]
+    rows.append(scr.dim("  Output tokens, from the transcripts on this computer. \"messages\" counts consultations "
+                        "logged that week."))
+    return rows
+
+
+def top_frame(scr, now, days, codex_live, scan, events, scanning, width=100):
+    """All of the status screen as lines."""
+    since = now - days * 86400 if days else None
+    summary = log_summary(events, since)
+    keys = "  ".join(f"[{k}] {'all' if v is None else f'{v}d'}" for k, v in TOP_PERIODS.items())
+    lines = [scr.bold(f"nouez {SERVER_VERSION} · usage") + scr.dim(f"   {time.strftime('%a %b %d %H:%M:%S', time.localtime(now))}"
+                                                            f"   {keys}  [r] refresh  [q] quit"), ""]
+    lines += [scr.bold("SUBSCRIPTIONS")] + subscription_rows(scr, now, codex_live, scan.get("codex_limits"))
+    lines += ["", scr.bold("CONSULTATIONS")] + consultation_rows(scr, summary, days)
+    lines += ["", scr.bold("OFFLOAD") + scr.dim("  (work done by consultants and Codex instead of Claude Code)")]
+    lines += offload_rows(scr, weekly_tokens(scan), log_summary(events)["per_week"], scanning)
+    lines += ["", scr.dim(f"  log: {usage_log_file()}")]
+    return [fit(line, width) for line in lines]
+
+
+def read_codex_usage():
+    """Codex's usage windows from the daemon, or None if it can't be reached."""
+    try:
+        client = CodexClient()
+        try:
+            result = client.request("account/rateLimits/read", None)
+            return result if isinstance(result, dict) else None
+        finally:
+            client.close()
+    except (BridgeError, OSError):
+        return None
+
+
+def enable_ansi():
+    """Turn on colour codes in a Windows console; elsewhere they already work."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except (AttributeError, OSError):
+        return False
+
+
+def read_key(timeout):
+    """A key pressed within timeout seconds, or None."""
+    if os.name == "nt":
+        import msvcrt
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if msvcrt.kbhit():
+                return msvcrt.getwch()
+            time.sleep(0.05)
+        return None
+    import select
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    return sys.stdin.read(1) if ready else None
+
+
+def run_top(argv):
+    """`server.py top [--once] [--days N]`: the usage status screen."""
+    once, days = "--once" in argv, 7
+    if "--days" in argv:
+        i = argv.index("--days")
+        try:
+            days = int(argv[i + 1])
+            days = days if days > 0 else None
+        except (IndexError, ValueError):
+            print("usage: server.py top [--once] [--days N]  (N = 0 for everything logged)")
+            return 2
+    state_path = os.path.join(nouez_cache_dir(), SCAN_STATE_FILE)
+    state = read_scan_state(state_path)
+    shared = {"scan": json.loads(json.dumps(state)), "scanning": True, "codex": None}
+    guard = threading.Lock()
+
+    def scan_once():
+        scan_usage(state, time.time())
+        try:
+            write_json_atomic(state_path, state)
+        except OSError as e:
+            log("usage scan cache:", e)
+        with guard:
+            shared["scan"], shared["scanning"] = json.loads(json.dumps(state)), False
+
+    if once:
+        shared["codex"] = read_codex_usage()
+        scan_once()
+        tty_out = sys.stdout.isatty()
+        scr = Screen(tty_out and enable_ansi())
+        width = shutil.get_terminal_size().columns if tty_out else 1000  # a file or pipe gets whole lines
+        print("\n".join(top_frame(scr, time.time(), days, shared["codex"], shared["scan"],
+                                  read_usage_log(), False, width)))
+        return 0
+
+    stop = threading.Event()
+
+    def background():
+        last_scan = last_codex = 0.0
+        while not stop.is_set():
+            if time.monotonic() - last_codex >= TOP_CODEX_SECONDS:
+                codex = read_codex_usage()
+                with guard:
+                    shared["codex"] = codex
+                last_codex = time.monotonic()
+            if time.monotonic() - last_scan >= TOP_SCAN_SECONDS:
+                try:
+                    scan_once()
+                except Exception as e:  # a bad file mustn't end the screen
+                    log("usage scan:", e)
+                    with guard:
+                        shared["scanning"] = False
+                last_scan = time.monotonic()
+            stop.wait(1)
+
+    scr = Screen(enable_ansi())
+    threading.Thread(target=background, daemon=True).start()
+    posix_tty = None
+    if os.name != "nt" and sys.stdin.isatty():
+        import termios
+        import tty
+        posix_tty = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin)
+    sys.stdout.write("\x1b[?1049h\x1b[?25l")  # own screen, no cursor
+    try:
+        while True:
+            size = shutil.get_terminal_size((120, 40))
+            with guard:
+                codex, scan, scanning = shared["codex"], shared["scan"], shared["scanning"]
+            lines = top_frame(scr, time.time(), days, codex, scan, read_usage_log(), scanning, size.columns)
+            sys.stdout.write("\x1b[H" + "".join(f"{line}\x1b[K\n" for line in lines[:size.lines - 1]) + "\x1b[J")
+            sys.stdout.flush()
+            key = read_key(TOP_REFRESH)
+            if key in ("q", "Q", "\x1b", "\x03"):
+                return 0
+            if key in TOP_PERIODS:
+                days = TOP_PERIODS[key]
+            elif key in ("r", "R"):
+                with guard:
+                    shared["codex"] = read_codex_usage()
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        stop.set()
+        sys.stdout.write("\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+        if posix_tty is not None:
+            import termios
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, posix_tty)
+
+
 # --- MCP stdio server --------------------------------------------------------
 
 INSTRUCTIONS = (
@@ -3024,6 +3778,8 @@ TOOLS = [
                 "revision": {"type": "boolean", "description": "Optional: add a line with the consultant's repository commit, branch and number of uncommitted paths, and ask it to name that revision in its answer. Default false."},
                 "model": {"type": "string", "description": "Codex model id for this message and later ones, e.g. gpt-6-astra. Default: unchanged. Set it when the user asks, or when the user's own rules call for another model."},
                 "effort": {"type": "string", "description": "Codex reasoning effort for this message and later ones, such as low, medium, high or xhigh; which levels exist depends on the model. Default: unchanged. Set it when the user asks, or when the user's own rules call for more or less effort."},
+                "kind": {"type": "string", "enum": list(CONSULT_KINDS), "description": "Optional: what kind of consultation this is, for the user's usage log (nouez/usage-log.jsonl on this computer). Default: not recorded."},
+                "reason": {"type": "string", "description": f"Optional: one line on why this consultant, model and effort, for the same log (up to {REASON_CHARS} characters). Never the message itself."},
                 "wait": wait_schema(SEND_WAIT_SECONDS),
                 "allow_user_session": {"type": "boolean", "description": "Allow sending to a Codex session the user opened (not started by StartConsultant). Default false. Set it only when the user asked you to message that session."},
             },
@@ -3393,6 +4149,7 @@ def run_waiter(thread_id, turn_id):
                                 "waiting, run the same command again in the background:\n"
                                 f"{waiter_command(tid, turn_id)}"))
             return 0
+        record_reply(tid, name, turn)
         print(f"The consultant's turn has ended (thread {tid}, turn {turn_id}).\n")
         print(format_turn(name, turn, WAITER_REPLY_CHARS))
         notes = []
@@ -3528,6 +4285,9 @@ if __name__ == "__main__":
         if len(sys.argv) != 3:
             sys.exit("usage: server.py claude <spec.json>  (written by OpenClaudeSession)")
         sys.exit(run_claude(sys.argv[2]))
+    if sys.argv[1:2] == ["top"]:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.exit(run_top(sys.argv[2:]))
     if sys.argv[1:] == ["doctor"]:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.exit(run_doctor())
