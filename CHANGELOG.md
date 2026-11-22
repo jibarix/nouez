@@ -6,6 +6,28 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-22
+
+A new look for the status screen, from a design review. A running screen restarts on it by itself. Reconnect `consultants` with `/mcp` in each open Claude Code session so it reports the new version.
+
+### Changed
+
+- `server.py top` draws its parts in boxed panels, under a top bar with the version, the period, the time and a badge for each subscription: a dot in the colour of its most pressing window and that window's use, named when it isn't the weekly one (`● Claude 95% 5-hour`, `● AG Claude+GPT 82%`). The keys are in a bar on the bottom line.
+- Each usage bar has a mark (`┊`) where the window's time has got to, so a bar filled past it is being used faster than evenly. The pace stays as text beside it.
+- From 149 columns, each subscription is a card in a column on the left, with shorter outlooks (`~23% pace`, `out ~5h`), beside the consultations and the offload table. Below that the panels stack, at most 104 columns wide.
+- With the 7- or 30-day period, CONSULTATIONS shows the messages sent each day as a line of small bars.
+- `?` opens a help page on what the marks and columns mean, with the log's path; `?` or Esc goes back. Those notes no longer take lines under the offload table, and `--once` prints them at the end.
+- On a short screen, whole lines are dropped by panel, so every box closes: the optional lists first, then weeks down to three, then the consultations' tables, then the rest of the weeks and whole panels. Before, the lines just above the offload table were cut one at a time.
+- `--once` to a file or pipe prints one column 104 wide instead of lines up to 1000 long.
+- Faint text uses bright black, which older consoles show, instead of the faint attribute. A Windows console other than Windows Terminal, ConEmu, or one that names itself gets square corners and `|` for the mark.
+
+### Fixed
+
+- Line widths were counted in characters, so a wide character (a CJK project name, for example) pushed a line past the screen's edge. They are now counted in terminal cells.
+- An arrow or function key was read as two keys on Windows, and as Esc (quit) followed by letters elsewhere. It is now read whole and does nothing.
+- The screen waited up to 5 seconds to fit a resized terminal. It now redraws at once.
+- A line as wide as the terminal could wrap on consoles that wrap at the last column, and the last line's newline could scroll the screen. Lines now stop one column short, and the last one has no newline.
+
 ## [0.16.0] - 2026-11-22
 
 The status screen follows updates and gets fixes from a review of its numbers and layout, plus fixes from a review of 0.15.1's Codex panes and Antigravity stops. Close a status screen started before this version and run `server.py top` again once; from then on it follows updates by itself. Reconnect `consultants` with `/mcp` in each open Claude Code session.
@@ -408,7 +430,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/jibarix/nouez/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/jibarix/nouez/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/jibarix/nouez/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/jibarix/nouez/compare/v0.14.1...v0.15.0

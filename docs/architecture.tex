@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.16.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.17.0\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -1358,7 +1358,19 @@ needed'' and the like are \code{changes}; then ``no-go'', ``not approved'', ``no
 ``LGTM'', a leading ``yes'' or a line that is just ``OK'' are \code{yes}. Anything else has no verdict.
 
 \code{server.py top} draws a status screen from that log and from files already on the computer,
-with ANSI colours and the terminal's alternate screen. It redraws every 5 seconds, reads Codex's
+with ANSI colours and the terminal's alternate screen: a top bar with each subscription's most
+pressing window (the highest of used up, running out first, on pace past 90\%, then the most
+used), boxed panels, and a bar of keys on the bottom line, which is written without a newline so
+the screen never scrolls; lines stop one column short of the edge, for consoles that wrap at the
+last one. Widths are counted in terminal cells (\code{unicodedata}: wide characters take two,
+combining marks none). Below 149 columns the panels stack, at most 104 wide; from 149, the
+subscriptions are cards 50 wide on the left. Colours are the 16 standard ones, with bright black
+for the faint parts; a Windows console that isn't Windows Terminal, ConEmu or one that sets
+\code{TERM} or \code{TERM\_PROGRAM} gets square corners and \code{|} for the bar's mark of time gone.
+\code{read\_key} returns early when the terminal is resized, and reads an arrow or function key
+whole (on Windows the two characters after \code{\textbackslash x00} or \code{\textbackslash xe0}, elsewhere an
+escape sequence) so it does nothing. \code{?} shows a help page; Esc goes back from it and quits
+otherwise. It redraws every 5 seconds, reads Codex's
 usage from the daemon every 60 and the transcripts again every 300 in one background thread, and
 Antigravity's quota every 60 in another, since \code{agy -p /usage} can take a minute; until its
 first reading the Antigravity line says it is checking, and \code{r} only wakes both threads. The
@@ -1367,8 +1379,11 @@ sent in it, each turn as it was first read; replies to earlier messages are coun
 Verdicts, reply times and review loops come from those replies, and a loop counts each turn once,
 however many messages steered it. A saved Codex or Claude Code reading gives its pace as of when
 it was saved, and none once it is over 30 minutes old. On a screen too short for it all, the
-``which kind went where'' and ``reasons given'' lists go first, then the offload table's notes
-and oldest weeks, then the lines just above it, so the latest week stays in view.
+layout is tried at levels until one fits: the ``which kind went where'' and ``reasons given''
+lists and the offload notes go first, then weeks down to three, then the consultations' tables,
+then all but their first line and weeks down to one, then the consultations and the
+subscriptions panels; each box closes, and the latest week stays in view. Below that, the
+screen is cut, keeping the key bar.
 
 The screen keeps to the \code{server.py} on disk. Before each redraw it compares the file's
 modification time and size with those of the version it runs; once they have changed and stayed

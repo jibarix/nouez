@@ -2391,8 +2391,15 @@ class UsageLogTest(HandlerTest):
         now = time.time()
         live = {"rateLimits": {"planType": "pro", "primary": {"usedPercent": 30, "windowDurationMins": 10080,
                                                                "resetsAt": now + 3.5 * 86400}}}
-        frame = "\n".join(server.top_frame(server.Screen(False), now, 7, live, {}, [], True, 200))
+        frame = "\n".join(server.top_frame(server.Screen(False), now, 7, live, {}, [], True, 120))
         self.assertIn("Codex pro", frame)
+        # 0.17.0: from 149 columns, a card per subscription beside the other panels
+        wide = server.top_frame(server.Screen(False), now, 7, live, {}, [], True, 200)
+        self.assertTrue(all(server.visible(x) <= 200 for x in wide))
+        self.assertRegex(wide[0], r"^nouez \S+   ● Codex 30%   ○ Claude \?")  # the top bar's badges
+        self.assertRegex(wide[1], r"^╭─ Codex pro ─+╮ ╭─ CONSULTATIONS")
+        self.assertRegex("\n".join(wide), r"│ weekly  .* 30%  ~60% pace  ")
+        self.assertIn("[?] help", wide[-1])
         checking = server.top_frame(server.Screen(False), now, 7, live, {}, [], True, 100, {"checking": True})
         self.assertTrue(any("Antigravity" in x and "checking" in x for x in checking))
         # a short screen drops the optional lists first and keeps the latest week
@@ -2407,17 +2414,22 @@ class UsageLogTest(HandlerTest):
         self.assertIn("OFFLOAD", "\n".join(short))
         tiny = server.top_frame(server.Screen(False), now, 7, live, scan, ev, False, 100, None, 12)
         self.assertLessEqual(len(tiny), 12)
-        self.assertRegex(tiny[-1], server.week_of(now) + " ")  # the latest week, last
+        self.assertRegex(tiny[-3], server.week_of(now) + " ")  # the latest week, in a closed box
+        self.assertTrue(tiny[-2].startswith("╰") and "[q] quit" in tiny[-1])
+        self.assertEqual(sum(x.startswith("╭") for x in tiny), sum(x.startswith("╰") for x in tiny))
+        least = server.top_frame(server.Screen(False), now, 7, live, scan, ev, False, 100, None, 6)
+        self.assertEqual(len(least), 6)  # just OFFLOAD: its title, header and latest week
+        self.assertRegex(least[3], server.week_of(now) + " ")
         exact = server.top_frame(server.Screen(False), now, 7, live, scan, ev, False, 100, None, 3)
-        self.assertEqual(len(exact), 3)  # just OFFLOAD: its title, header and latest week
-        self.assertRegex(exact[-1], server.week_of(now) + " ")
+        self.assertEqual(len(exact), 3)  # shorter still: cut, with the keys still last
+        self.assertIn("[q] quit", exact[-1])
         self.assertIn("pace: ~60% by the reset", frame)
         self.assertIn("Claude Code     usage not known", frame)
         self.assertIn("Reading transcripts for the first time", frame)
         saved = {"ts": now - 600, "plan": "pro", "primary": {"used_percent": 95, "window_minutes": 300,
                                                              "resets_at": now + 3600}}
         frame = "\n".join(server.top_frame(server.Screen(False), now, None, None, {"codex_limits": saved}, [],
-                                           False, 200))
+                                           False, 120))
         self.assertIn("runs out in", frame)
         self.assertIn("from Codex's last session file, 10 min ago", frame)
         self.assertIn("No Claude Code or Codex sessions", frame)
@@ -2430,6 +2442,8 @@ class UsageLogTest(HandlerTest):
             self.assertEqual(server.run_top(["--once", "--days", "30"]), 0)
             self.assertEqual(server.run_top(["--days", "x"]), 2)
         self.assertIn("No consultations logged (last 30 days)", out.getvalue())
+        self.assertIn("NOTES", out.getvalue())  # 0.17.0: what the marks mean, at the end
+        self.assertTrue(all(server.visible(x) <= server.TOP_PANEL for x in out.getvalue().splitlines()))
         self.assertTrue(os.path.exists(os.path.join(self.dir, server.SCAN_STATE_FILE)))
 
     def test_antigravity_rows(self):
@@ -2457,8 +2471,60 @@ class UsageLogTest(HandlerTest):
         self.assertRegex(text, r"\n +5-hour .*  0%")
         self.assertNotRegex(text, r"Claude\+GPT +weekly")
         self.assertRegex(text, r"\n    New group +usage .* 50%")
-        frame = "\n".join(server.top_frame(scr, now, 7, None, {}, [], False, 200, live))
-        self.assertIn("    Gemini", frame)
+        frame = "\n".join(server.top_frame(scr, now, 7, None, {}, [], False, 120, live))
+        self.assertIn("│   Gemini ", frame)
+        frame = server.top_frame(scr, now, 7, None, {}, [], False, 200, live)
+        self.assertIn("● Gemini 75%", frame[0])  # the weekly window is the most used
+        self.assertRegex("\n".join(frame), r"│ Gemini +│")  # a quota group's name on its own line in the card
+        self.assertRegex("\n".join(frame), r"│ weekly  .* 75%  ~8[78]% pace ")
+
+    def test_screen_parts(self):
+        """0.17.0: cell widths, the gauge's marker, the badges, panels, the help view and --once."""
+        scr, now = server.Screen(True), time.time()
+        self.assertEqual(server.visible("日本a\u0301"), 5)  # wide characters 2, a combining mark 0
+        self.assertEqual(server.fit("ab日本", 3), "ab")  # a wide character that doesn't fit goes whole
+        self.assertEqual(server.visible(server.pad(scr.paint("日本", "31"), 7)), 7)
+        self.assertEqual(server.unindent(scr.dim("  x")), "\x1b[90mx\x1b[0m")
+        bar = server.painted_bar(scr, 50, 10, "32", 7)
+        self.assertEqual(server.ANSI.sub("", bar), "█████░░┊░░")
+        self.assertIn("\x1b[32m█████\x1b[0m", bar)
+        state = server.window_state(30, now + 3.5 * 86400, 7 * 86400, now)
+        self.assertAlmostEqual(state["gone"], 0.5)
+        self.assertEqual((state["short"], state["colour"], state["rank"]), ("~60% pace", "32", 0))
+        self.assertEqual(server.window_state(95, now + 3 * 86400, 7 * 86400, now)["rank"], 2)  # runs out
+        self.assertEqual(server.window_state(100, now + 86400, 7 * 86400, now)["colour"], "31")
+        self.assertEqual(server.window_state(10, now + 3 * 86400, 7 * 86400, now, now - 7200)["short"], "old reading")
+        self.assertIsNone(server.window_state(10, now - 1, 7 * 86400, now))
+        busy = server.window_state(50, now + 3 * 86400, 7 * 86400, now)  # ~88%: green
+        late = server.window_state(80, now + 4 * 3600, 5 * 3600, now)  # runs out first
+        plain = server.Screen(False)
+        group = {"title": "Antigravity", "entries": [("Gemini", "weekly", busy), ("Claude+GPT", "5-hour", late)]}
+        self.assertEqual(server.badge(plain, group), "● AG Claude+GPT 80% 5-hour")
+        self.assertEqual(server.badge(plain, {"title": "Claude Code", "entries": [("", "weekly", busy)]}),
+                         "● Claude 50%")
+        self.assertEqual(server.badge(plain, {"title": "Antigravity", "entries": [], "checking": True}), "○ Gemini …")
+        self.assertTrue(server.badge(scr, group).startswith("\x1b[31m●"))
+        self.assertLessEqual(server.visible(server.compact_row(scr, "weekly", late)), server.TOP_CARD - 4)
+        box = server.panel(plain, "T", ["  ab", "日本"], 10)
+        self.assertEqual(box, ["╭─ T ────╮", "│ ab     │", "│ 日本   │", "╰────────╯"])
+        self.assertEqual(server.panel(server.Screen(False, False), "T", [], 7), ["┌─ T ─┐", "└─────┘"])
+        self.assertTrue(server.fancy_terminal({"WT_SESSION": "1"}))
+        self.assertEqual(server.fancy_terminal({}), os.name != "nt")
+        self.assertEqual(server.sends_per_day([{"ts": now - 86400 - 5, "event": "send"}, {"ts": now, "event": "send"},
+                                               {"ts": now, "event": "send", "mode": "steer"}], now, 3), [0, 1, 1])
+        self.assertEqual(server.spark(plain, [0, 1, 4]), "·▂█")
+        ev = [{"ts": now - 60, "event": "send", "turn": "1", "thread": "A", "kind": "review", "model": "m"}]
+        frame = server.top_frame(plain, now, 7, None, {}, ev, False, 100)
+        self.assertTrue(any(x.startswith("│ per day   ······▁") or x.startswith("│ per day   ······█")
+                            for x in frame))
+        helped = server.top_frame(plain, now, 7, None, {}, ev, False, 100, None, 40, "help")
+        self.assertTrue(helped[1].startswith("╭─ HELP"))
+        self.assertIn("[Esc] back", helped[-1])
+        self.assertIn("log    ", "\n".join(helped))
+        once = server.top_frame(plain, now, 7, None, {}, ev, False, server.TOP_PANEL, None, None, "once")
+        self.assertTrue(once[-1].startswith("╰") and any(x.startswith("╭─ NOTES") for x in once))
+        self.assertFalse(any("[q] quit" in x for x in once))  # nothing to press in a file
+        self.assertTrue(all(server.visible(x) <= server.TOP_PANEL for x in once))
 
     def test_read_agy_usage(self):
         groups = [{"name": "Gemini Models", "buckets": []}]

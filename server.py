@@ -41,8 +41,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 import uuid
@@ -54,7 +56,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.16.0"
+SERVER_VERSION = "0.17.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -3785,25 +3787,52 @@ def token_text(n):
 
 
 class Screen:
-    """Text with optional colour, for a terminal or plain output."""
-    def __init__(self, color):
-        self.color = color
+    """Text with optional colour, for a terminal or plain output. `fancy` draws rounded corners and
+    a dotted marker, which need a current terminal font; without it, characters every console
+    font has."""
+    def __init__(self, color, fancy=True):
+        self.color, self.fancy = color, fancy
+        self.box = "╭╮╰╯─│" if fancy else "┌┐└┘─│"
+        self.mark = "┊" if fancy else "|"
 
     def paint(self, text, code):
-        return f"\x1b[{code}m{text}\x1b[0m" if self.color else text
+        return f"\x1b[{code}m{text}\x1b[0m" if self.color and text else text
 
     def bold(self, text):
         return self.paint(text, "1")
 
     def dim(self, text):
-        return self.paint(text, "2")
+        return self.paint(text, "90")  # bright black: faint (2) is unreliable in older consoles
+
+    def reverse(self, text):
+        return self.paint(text, "7")  # the terminal's own colours swapped, on a light theme too
+
+
+def fancy_terminal(env=None):
+    """Whether the terminal's font has rounded corners and dotted lines: anywhere but a Windows
+    console that isn't Windows Terminal, ConEmu or another terminal that says what it is."""
+    env = os.environ if env is None else env
+    return os.name != "nt" or any(env.get(k) for k in ("WT_SESSION", "TERM_PROGRAM", "ConEmuPID", "TERM"))
 
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
+def cell_width(ch):
+    """Terminal cells a character takes: 2 for wide East Asian characters, 0 for marks that
+    combine with the one before, 1 otherwise."""
+    if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def visible(line):
+    """The cells a line takes on screen, colour codes left out."""
+    return sum(cell_width(ch) for ch in ANSI.sub("", line))
+
+
 def fit(line, width):
-    """line cut to width visible characters, keeping its colour codes whole."""
+    """line cut to width terminal cells, keeping its colour codes whole."""
     out, shown, i = [], 0, 0
     while i < len(line):
         m = ANSI.match(line, i)
@@ -3811,16 +3840,26 @@ def fit(line, width):
             out.append(m.group())
             i = m.end()
             continue
-        if shown >= width:
-            i += 1
-            continue
-        out.append(line[i])
-        shown += 1
+        w = cell_width(line[i])
+        if shown + w <= width:
+            out.append(line[i])
+            shown += w
+        else:
+            shown = width  # nothing after a character that didn't fit
         i += 1
     return "".join(out)
 
 
+def pad(line, width):
+    """line cut or filled with spaces to exactly width cells."""
+    line = fit(line, width)
+    return line + " " * (width - visible(line))
+
+
 TOP_BAR = 12  # a window's bar: the line fits in 100 columns
+TOP_PANEL = 104  # the widest a panel gets: its tables are 96 cells
+TOP_CARD = 50    # a subscription card beside the other panels
+TOP_WIDE = TOP_CARD + 1 + 98  # from this width, the cards go in a column on the left
 
 
 def bar(pct, width=20):
@@ -3828,70 +3867,109 @@ def bar(pct, width=20):
     return "█" * filled + "░" * (width - filled)
 
 
-def painted_bar(scr, pct, width, colour):
-    """A bar with only its filled part in colour, so an empty one doesn't look full."""
+def painted_bar(scr, pct, width, colour, mark=None):
+    """A bar with only its filled part in colour, so an empty one doesn't look full; `mark`, a cell
+    to draw the screen's marker in."""
     text = bar(pct, width)
     filled = text.count("█")
-    return (scr.paint(text[:filled], colour) if filled else "") + (scr.dim(text[filled:]) if filled < width else "")
+
+    def part(a, b):
+        f = max(a, min(b, filled))
+        return (scr.paint(text[a:f], colour) if f > a else "") + (scr.dim(text[f:b]) if b > f else "")
+    if mark is None or not 0 <= mark < width:
+        return part(0, width)
+    return part(0, mark) + scr.bold(scr.mark) + part(mark + 1, width)
 
 
-def window_row(scr, owner, label, used, resets_at, length, now, sampled=None):
-    """One subscription window as a line with a bar, or None if its numbers can't be used. A
-    reading saved at `sampled` gives its pace as of then; an old one gives none."""
+def window_state(used, resets_at, length, now, sampled=None):
+    """A usage window's numbers and outlook, or None if they can't be used. A reading saved at
+    `sampled` gives its pace as of then; an old one gives none. `rank` orders how pressing it is:
+    0 fine, 1 on pace past 90%, 2 runs out before the reset, 3 used up."""
     used, resets_at, length = number(used), number(resets_at), number(length)
     if used is None or resets_at is None or resets_at <= now:
         return None
     at = min(number(sampled) or now, now)
     pace = window_pace(used, resets_at, length, at)
     if now - at > CLAUDE_USAGE_STALE:
-        outlook, colour = ("used up at the last reading", "31") if used >= 100 else ("pace not known: an old reading", "32")
+        outlook = (("used up at the last reading", "used up", "31", 3) if used >= 100
+                   else ("pace not known: an old reading", "old reading", "32", 0))
     elif pace and pace[0] == "used up":
-        outlook, colour = "used up", "31"
+        outlook = ("used up", "used up", "31", 3)
     elif pace and pace[0] == "runs out":
-        outlook, colour = f"runs out in ~{span_text(at + pace[1] - now)}", "31"
+        left = span_text(at + pace[1] - now)
+        outlook = (f"runs out in ~{left}", f"out ~{left}", "31", 2)
     elif pace:
-        outlook, colour = f"pace: ~{pace[1]:.0f}% by the reset", "33" if pace[1] > 90 else "32"
+        busy = pace[1] > 90
+        outlook = (f"pace: ~{pace[1]:.0f}% by the reset", f"~{pace[1]:.0f}% pace", "33" if busy else "32", int(busy))
     else:
-        outlook, colour = "too early for a pace", "32"
-    reset = time.strftime("%a %H:%M", time.localtime(resets_at))
-    shown = "<1%" if 0 < used < 0.5 else f"{used:.0f}%"
-    return (f"  {owner[:15]:<16}{label:<8}{painted_bar(scr, used, TOP_BAR, colour)} {shown:>4}  resets {reset} "
-            f"(in {span_text(resets_at - now)})  {scr.dim(outlook)}")
+        outlook = ("too early for a pace", "early", "32", 0)
+    left = resets_at - now
+    gone = (length - left) / length if length and 0 < left <= length else None
+    return {"used": used, "resets_at": resets_at, "long": outlook[0], "short": outlook[1],
+            "colour": outlook[2], "rank": outlook[3], "gone": gone}
 
 
-def subscription_rows(scr, now, codex_live, codex_saved, claude_path=None, agy_live=None):
-    """The subscriptions section: Codex from the daemon (or its last session file), Claude Code
-    from its status line file, Antigravity from `agy`."""
-    rows = []
+def window_gauge(scr, state, width=TOP_BAR):
+    """The window's bar, with the marker where the time gone in the window has got to: a bar past
+    it uses the window faster than evenly."""
+    mark = min(width - 1, int(state["gone"] * width)) if state["gone"] is not None else None
+    shown = "<1%" if 0 < state["used"] < 0.5 else f"{state['used']:.0f}%"
+    return f"{painted_bar(scr, state['used'], width, state['colour'], mark)} {shown:>4}"
+
+
+def full_row(scr, owner, label, state, now):
+    reset = time.strftime("%a %H:%M", time.localtime(state["resets_at"]))
+    return (f"  {owner[:15]:<16}{label:<8}{window_gauge(scr, state)}  resets {reset} "
+            f"(in {span_text(state['resets_at'] - now)})  {scr.dim(state['long'])}")
+
+
+def compact_row(scr, label, state):
+    """A window in a narrow card: 45 cells."""
+    reset = time.strftime("%a %H:%M", time.localtime(state["resets_at"]))
+    return f"{label[:7]:<8}{window_gauge(scr, state, 10)}  " + scr.dim(f"{state['short'][:11]:<11}") + reset
+
+
+def window_row(scr, owner, label, used, resets_at, length, now, sampled=None):
+    """One subscription window as a line with a bar, or None if its numbers can't be used."""
+    state = window_state(used, resets_at, length, now, sampled)
+    return full_row(scr, owner, label, state, now) if state else None
+
+
+def subscription_groups(now, codex_live, codex_saved, claude_path=None, agy_live=None):
+    """Each subscription as a dict: its title; its windows as (quota group, label, state), the group
+    naming one of Antigravity's or ""; a note on where the numbers came from, long and short; or
+    why there are none. Codex from the daemon (or its last session file), Claude Code from its
+    status line file, Antigravity from `agy` (left out when it isn't installed)."""
+    groups = []
+    entries, note, short = [], None, None
     limits = codex_live.get("rateLimits") if isinstance(codex_live, dict) else None
+    title = "Codex"
     if isinstance(limits, dict):
         plan = limits.get("planType")
-        owner = f"Codex {plan}" if isinstance(plan, str) else "Codex"
+        title = f"Codex {plan}" if isinstance(plan, str) else "Codex"
         for key in ("primary", "secondary"):
             w = limits.get(key)
             if isinstance(w, dict):
                 mins = number(w.get("windowDurationMins"))
-                row = window_row(scr, owner, window_label(mins * 60) if mins else "usage",
-                                 w.get("usedPercent"), w.get("resetsAt"), mins * 60 if mins else None, now)
-                if row:
-                    rows.append(row)
-                    owner = ""
+                state = window_state(w.get("usedPercent"), w.get("resetsAt"), mins * 60 if mins else None, now)
+                if state:
+                    entries.append(("", window_label(mins * 60) if mins else "usage", state))
     elif isinstance(codex_saved, dict):
-        owner = f"Codex {codex_saved.get('plan') or ''}".strip()
+        title = f"Codex {codex_saved.get('plan') or ''}".strip()
         for key in ("primary", "secondary"):
             w = codex_saved.get(key)
             if isinstance(w, dict):
                 mins = number(w.get("window_minutes"))
-                row = window_row(scr, owner, window_label(mins * 60) if mins else "usage", w.get("used_percent"),
-                                 w.get("resets_at"), mins * 60 if mins else None, now, codex_saved.get("ts"))
-                if row:
-                    rows.append(row)
-                    owner = ""
-        if rows:
-            rows.append(scr.dim(f"  {'':<16}(from Codex's last session file, {span_text(now - codex_saved['ts'])} "
-                                "ago; the daemon didn't answer)"))
-    if not rows:
-        rows.append(f"  {'Codex':<16}" + scr.dim("usage not known: the daemon didn't answer and no recent session reports it"))
+                state = window_state(w.get("used_percent"), w.get("resets_at"), mins * 60 if mins else None, now,
+                                     codex_saved.get("ts"))
+                if state:
+                    entries.append(("", window_label(mins * 60) if mins else "usage", state))
+        if entries:
+            ago = span_text(now - codex_saved["ts"])
+            note = f"(from Codex's last session file, {ago} ago; the daemon didn't answer)"
+            short = f"from the last session file, {ago} ago"
+    groups.append({"title": title if entries else "Codex", "entries": entries, "note": note, "short": short,
+                   "empty": "usage not known: the daemon didn't answer and no recent session reports it"})
     path = claude_path or os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE)
     try:
         with open(path, encoding="utf-8-sig") as f:
@@ -3899,59 +3977,115 @@ def subscription_rows(scr, now, codex_live, codex_saved, claude_path=None, agy_l
     except (OSError, ValueError):
         saved = None
     limits = saved.get("rate_limits") if isinstance(saved, dict) else None
-    owner, before = "Claude Code", len(rows)
     at = number(saved.get("saved")) if isinstance(saved, dict) else None
+    entries, note, short = [], None, None
     for key, length in CLAUDE_WINDOWS:
         w = limits.get(key) if isinstance(limits, dict) else None
         if isinstance(w, dict):
-            row = window_row(scr, owner, window_label(length), w.get("used_percentage"), w.get("resets_at"),
-                             length, now, at)
-            if row:
-                rows.append(row)
-                owner = ""
-    if len(rows) > before:
-        if at:
-            old = " - old, may be out of date" if now - at > CLAUDE_USAGE_STALE else ""
-            rows.append(scr.dim(f"  {'':<16}(from the status line, saved {span_text(now - at)} ago{old})"))
-    else:
-        rows.append(f"  {'Claude Code':<16}" + scr.dim(
-            "usage not known: it reaches nouez through the status line (README, Choosing a consultant)"
-            if saved is None else "no current window saved yet"))
-    return rows + agy_rows(scr, now, agy_live)
+            state = window_state(w.get("used_percentage"), w.get("resets_at"), length, now, at)
+            if state:
+                entries.append(("", window_label(length), state))
+    if entries and at:
+        old = now - at > CLAUDE_USAGE_STALE
+        note = f"(from the status line, saved {span_text(now - at)} ago{' - old, may be out of date' if old else ''})"
+        short = f"status line, {span_text(now - at)} ago" + (" - old" if old else "")
+    groups.append({"title": "Claude Code", "entries": entries, "note": note, "short": short,
+                   "empty": "usage not known: it reaches nouez through the status line (README, Choosing a consultant)"
+                   if saved is None else "no current window saved yet"})
+    if agy_live is not None:
+        groups.append(agy_group(now, agy_live))
+    return groups
+
+
+def subscription_rows(scr, now, codex_live, codex_saved, claude_path=None, agy_live=None):
+    """The subscriptions as full-width lines."""
+    rows = []
+    for group in subscription_groups(now, codex_live, codex_saved, claude_path, agy_live):
+        rows += group_rows(scr, now, group)
+    return rows
+
+
+def group_rows(scr, now, group):
+    """One subscription as full-width lines: Antigravity's under a heading line, with its quota
+    groups' names; the others with their name on the first window."""
+    title, entries = group["title"], group["entries"]
+    if not entries:
+        return [f"  {title:<16}" + scr.dim(group["empty"])]
+    rows, header = [], any(sub for sub, _, _ in entries)
+    if header:
+        rows.append(f"  {title:<16}" + scr.dim(group["note"] or ""))
+    owner, last = title, None
+    for sub, label, state in entries:
+        if header:
+            owner = "  " + sub if sub != last else ""
+            last = sub
+        rows.append(full_row(scr, owner, label, state, now))
+        owner = ""
+    if group["note"] and not header:
+        rows.append(scr.dim(f"  {'':<16}{group['note']}"))
+    return rows
+
+
+def card_rows(scr, group, width=TOP_CARD - 4):
+    """One subscription in a narrow card: its quota groups' names on their own lines, and its notes
+    wrapped to the card."""
+    if not group["entries"]:
+        return [scr.dim(x) for x in textwrap.wrap(group["empty"], width)]
+    rows, last = [], None
+    for sub, label, state in group["entries"]:
+        if sub and sub != last:
+            rows.append(scr.dim(sub))
+            last = sub
+        rows.append(compact_row(scr, label, state))
+    if group["short"]:
+        rows += [scr.dim(x) for x in textwrap.wrap(group["short"], width)]
+    return rows
+
+
+def badge(scr, group):
+    """A subscription in the top bar: a dot in its most pressing window's colour, and that window's
+    use, with its name when it isn't the weekly one."""
+    name = {"Claude Code": "Claude", "Antigravity": "Gemini"}.get(group["title"], "Codex")
+    if not group["entries"]:
+        return scr.dim(f"○ {name}" + (" …" if group.get("checking") else " ?"))
+    sub, label, state = max(group["entries"], key=lambda e: (e[2]["rank"], e[2]["used"]))
+    if sub and sub != "Gemini":
+        name = f"AG {sub}"
+    shown = "<1%" if 0 < state["used"] < 0.5 else f"{state['used']:.0f}%"
+    return scr.paint("●", state["colour"]) + f" {name} {shown}" + (scr.dim(f" {label}") if label != "weekly" else "")
 
 
 AGY_GROUPS = {"Gemini Models": "AG Gemini", "Claude and GPT models": "AG Claude+GPT", "Gemini 4 Argon": "AG Argon"}
 AGY_WINDOWS = {"weekly": 7 * 86400, "5h": 5 * 3600}
 
 
-def agy_rows(scr, now, agy_live):
-    """Antigravity's quota groups, from `agy -p /usage`. Nothing at all when agy isn't installed."""
-    if agy_live is None:
-        return []
+def agy_group(now, agy_live):
+    """Antigravity's quota groups, from `agy -p /usage`, as a subscription for the screen."""
+    group = {"title": "Antigravity", "entries": [], "short": None,
+             "note": "(Google's quota: Claude+GPT is Claude and GPT run there, not Claude Code's)"}
     if agy_live.get("checking"):
-        return [f"  {'Antigravity':<16}" + scr.dim("checking (agy -p /usage takes a while)…")]
+        return {**group, "checking": True, "empty": "checking (agy -p /usage takes a while)…"}
     if not isinstance(agy_live.get("groups"), list):
-        return [f"  {'Antigravity':<16}" + scr.dim(f"usage not known: {agy_live.get('error') or 'agy gave no quota'}")]
-    rows = []
-    for group in agy_live["groups"]:
-        if not isinstance(group, dict) or not isinstance(group.get("buckets"), list):
+        return {**group, "empty": f"usage not known: {agy_live.get('error') or 'agy gave no quota'}"}
+    for quota in agy_live["groups"]:
+        if not isinstance(quota, dict) or not isinstance(quota.get("buckets"), list):
             continue
-        name = group.get("name") if isinstance(group.get("name"), str) else "?"
-        owner = "  " + AGY_GROUPS.get(name, f"AG {name}")[3:][:13]  # under the Antigravity line
-        for b in group["buckets"]:
+        name = quota.get("name") if isinstance(quota.get("name"), str) else "?"
+        sub = AGY_GROUPS.get(name, f"AG {name}")[3:][:13]
+        for b in quota["buckets"]:
             left = number(b.get("remaining_fraction")) if isinstance(b, dict) else None
             if left is None:
                 continue
             length = AGY_WINDOWS.get(b.get("window"))
-            row = window_row(scr, owner, window_label(length) if length else "usage", (1 - left) * 100,
-                             iso_seconds(b.get("reset_time")), length, now)
-            if row:
-                rows.append(row)
-                owner = ""
-    if rows:
-        rows.insert(0, f"  {'Antigravity':<16}" + scr.dim("(Google's quota: Claude+GPT is Claude and GPT run "
-                                                         "there, not Claude Code's)"))
-    return rows or [f"  {'Antigravity':<16}" + scr.dim("no current quota window reported")]
+            state = window_state((1 - left) * 100, iso_seconds(b.get("reset_time")), length, now)
+            if state:
+                group["entries"].append((sub, window_label(length) if length else "usage", state))
+    return {**group, "empty": "no current quota window reported"}
+
+
+def agy_rows(scr, now, agy_live):
+    """Antigravity's quota groups as full-width lines. Nothing at all when agy isn't installed."""
+    return [] if agy_live is None else group_rows(scr, now, agy_group(now, agy_live))
 
 
 # The actions agy can deny: file writes and edits (write_file covers every editing tool), commands,
@@ -4871,7 +5005,7 @@ def columns(blocks, widths=26):
     return lines
 
 
-def consultation_rows(scr, summary, days, compact=False):
+def consultation_rows(scr, summary, days, compact=False, table=True):
     period = f"last {days} day{'s' if days != 1 else ''}" if days else "all logged"
     if not summary["sends"] and not summary["other_replies"]:
         return [scr.dim(f"  No consultations logged ({period}). nouez logs them from 0.14.0 on; "
@@ -4885,9 +5019,9 @@ def consultation_rows(scr, summary, days, compact=False):
     if not s["sends"]:  # replies read to earlier messages, and nothing sent
         return rows
     rows += [f"  {s['steered']} steered into a running turn · {s['changed']} changed model/effort"
-             + (f" ({changed})" if changed else "") + f" · {s['new_consultants']} new consultants", ""]
+             + (f" ({changed})" if changed else "") + f" · {s['new_consultants']} new consultants"] + ([""] if table else [])
     top = 6
-    rows += columns([("by model and effort", s["models"].most_common(top)),
+    rows += [] if not table else columns([("by model and effort", s["models"].most_common(top)),
                      ("by kind", s["kinds"].most_common(top)),
                      ("verdicts", s["verdicts"].most_common(top)),
                      ("by project", s["projects"].most_common(top))], (30, 18, 14, 28))
@@ -4914,7 +5048,7 @@ def consultation_rows(scr, summary, days, compact=False):
 
 
 def offload_rows(scr, weeks, per_week, scanning, gemini=None, logged_from=None, unknown=(), last=None,
-                 notes=True):
+                 models=True, share_width=10):
     """Output tokens by week, and the share made outside Claude Code: Codex consultants and the
     user's own Codex sessions from their files, Antigravity consultants (on Google's quota, whatever
     model they run) from the usage log."""
@@ -4940,8 +5074,9 @@ def offload_rows(scr, weeks, per_week, scanning, gemini=None, logged_from=None, 
             ag = token_text(g) + "+" if g else "—"
         rows.append(f"  {week:<11}{token_text(w['claude']):>9}{token_text(w['subagents']):>11}"
                     f"{token_text(w['consultants']):>18}{token_text(w['codex']):>10}{ag:>12}{sends:>7}"  # no output: no share
-                    + (f"   {painted_bar(scr, share, 10, '36')} {share:>3.0f}%" if total else f"   {'':10} {'—':>4}"))
-    if not notes:
+                    + (f"   {painted_bar(scr, share, share_width, '36')} {share:>3.0f}%" if total
+                       else f"   {'':{share_width}} {'—':>4}"))
+    if not models:
         return rows
     recent = sorted(weeks)[-4:]
     models = collections.Counter()
@@ -4951,43 +5086,170 @@ def offload_rows(scr, weeks, per_week, scanning, gemini=None, logged_from=None, 
     if total:
         parts = [f"{m.replace('claude-', '')} {100 * n / total:.0f}%" for m, n in models.most_common(5) if n]
         rows += ["", f"  Claude output by model, last {len(recent)} weeks: " + " · ".join(parts)]
-    rows.append(scr.dim("  Output tokens, from the transcripts on this computer; Antigravity from its replies in the"))
-    rows.append(scr.dim("  usage log, so a share is of the output known. \"sends\": messages logged that week;"))
-    rows.append(scr.dim("  — nothing recorded; + some Antigravity turns reported no tokens."))
     return rows
 
 
-def top_frame(scr, now, days, codex_live, scan, events, scanning, width=100, agy_live=None, height=None):
-    """All of the status screen as lines; on a screen under `height` lines, the optional lists go
-    first, then older weeks, so the latest week stays in view."""
-    lines = _top_frame(scr, now, days, codex_live, scan, events, scanning, width, agy_live, False, None)
-    if height and len(lines) > height:
-        lines = _top_frame(scr, now, days, codex_live, scan, events, scanning, width, agy_live, True, None)
-        if len(lines) > height:
-            weeks = max(1, TOP_WEEKS - (len(lines) - height))
-            lines = _top_frame(scr, now, days, codex_live, scan, events, scanning, width, agy_live, True, weeks)
-        offload = next((i for i, x in enumerate(lines) if ANSI.sub("", x).startswith("OFFLOAD")), None)
-        if len(lines) > height and offload is not None and height >= len(lines) - offload:
-            keep = offload - 1 if offload and lines[offload - 1] == "" and height > len(lines) - offload else offload
-            lines = lines[:height - (len(lines) - keep)] + lines[keep:]  # the lines just above go, not the gap
-    return lines
+def sends_per_day(events, now, days):
+    """Messages sent on each of the last `days` days (24 hours each, the oldest first); steering a
+    running turn isn't a message."""
+    counts = [0] * days
+    for e in events:
+        ts = number(e.get("ts"))
+        if e.get("event") == "send" and e.get("mode") != "steer" and ts is not None:
+            back = int((now - ts) // 86400)
+            if 0 <= back < days:
+                counts[days - 1 - back] += 1
+    return counts
 
 
-def _top_frame(scr, now, days, codex_live, scan, events, scanning, width, agy_live, compact, last):
-    since = now - days * 86400 if days else None
-    summary = log_summary(events, since)
-    keys = "  ".join(f"[{k}] {'all' if v is None else f'{v}d'}" for k, v in TOP_PERIODS.items())
-    lines = [scr.bold(f"nouez {SERVER_VERSION} · usage") + scr.dim(f"   {time.strftime('%a %b %d %H:%M:%S', time.localtime(now))}"
-                                                            f"   {keys}  [r] refresh  [q] quit"), ""]
-    lines += [scr.bold("SUBSCRIPTIONS")] + subscription_rows(scr, now, codex_live, scan.get("codex_limits"), agy_live=agy_live)
-    lines += ["", scr.bold("CONSULTATIONS")] + consultation_rows(scr, summary, days, compact)
-    lines += ["", scr.bold("OFFLOAD") + scr.dim("  (share: known output made outside Claude Code, by consultants and your own Codex)")]
+def spark(scr, counts):
+    """Counts as one character each, from ▁ to █ by their share of the largest; · for none."""
+    peak = max(counts, default=0)
+    return "".join(scr.dim("·") if not n else scr.paint("▁▂▃▄▅▆▇█"[min(7, math.ceil(n / peak * 8) - 1)], "36")
+                   for n in counts)
+
+
+def unindent(line, n=2):
+    """line without its first n leading spaces, keeping colour codes."""
+    out, i = [], 0
+    while i < len(line) and n:
+        m = ANSI.match(line, i)
+        if m:
+            out.append(m.group())
+            i = m.end()
+        elif line[i] == " ":
+            i, n = i + 1, n - 1
+        else:
+            break
+    return "".join(out) + line[i:]
+
+
+def panel(scr, title, body, width):
+    """body's lines in a box `width` cells wide, with the title in its top border."""
+    tl, tr, bl, br, h, v = scr.box
+    title = fit(title, width - 6)
+    top = scr.dim(tl + h) + " " + title + " " + scr.dim(h * max(0, width - 5 - visible(title)) + tr)
+    rows = [scr.dim(v) + " " + pad(unindent(line), width - 4) + " " + scr.dim(v) for line in body]
+    return [top] + rows + [scr.dim(bl + h * (width - 2) + br)]
+
+
+def heading(scr, name, note=None):
+    return scr.paint(name, "1;36") + (scr.dim(f" · {note}") if note else "")
+
+
+def side_by_side(left, width, right):
+    return [pad(left[i] if i < len(left) else "", width) + " " + (right[i] if i < len(right) else "")
+            for i in range(max(len(left), len(right)))]
+
+
+def period_text(days):
+    return f"last {days} day{'s' if days != 1 else ''}" if days else "all logged"
+
+
+def top_bar(scr, groups, days, now, width):
+    left = scr.bold(f"nouez {SERVER_VERSION}") + "   " + "   ".join(badge(scr, g) for g in groups)
+    right = scr.dim(f"{period_text(days)} · {time.strftime('%a %b %d %H:%M:%S', time.localtime(now))}")
+    gap = width - visible(left) - visible(right)
+    return left + " " * gap + right if gap >= 2 else fit(left, width)
+
+
+def bottom_bar(scr, width, scanning, view):
+    if view == "help":
+        keys = " [?] or [Esc] back   [q] quit"
+    else:
+        periods = "  ".join(f"[{k}] {'all' if v is None else f'{v}d'}" for k, v in TOP_PERIODS.items())
+        keys = f" {periods}   [r] refresh   [?] help   [q] quit"
+    status = "reading transcripts… " if scanning else ""
+    gap = max(1, width - visible(keys) - visible(status))
+    return scr.reverse(pad(keys + " " * gap + status, width))
+
+
+def notes_rows(scr):
+    """What the screen's marks and columns mean: the help view, and the end of `top --once`."""
+    sample = bar(40, 5)[:2] + scr.mark + bar(40, 5)[3:]
+    return [f"  {sample}  a window's use. {scr.mark} marks how much of the window's time has gone: a bar past",
+            "         it is being used faster than evenly. Green: on pace; amber: on pace past 90% at the",
+            "         reset; red: runs out first, or used up.",
+            "  ●      in the top bar: each subscription's most pressing window, named when not the weekly one.",
+            "  share  output tokens, from the transcripts on this computer; Antigravity's from its replies in",
+            "         the usage log, so a share is of the output known.",
+            "  sends  messages logged that week; — nothing recorded; + some Antigravity turns reported no tokens.",
+            f"  log    {usage_log_file()}"]
+
+
+def help_rows(scr):
+    keys = [f"  [{k}]    consultations: {period_text(v)}" for k, v in TOP_PERIODS.items()]
+    return keys + ["  [r]    read Codex's and Antigravity's usage again now (otherwise every minute)",
+                   "  [?]    this help; [?] or [Esc] goes back",
+                   "  [q]    quit (Esc and Ctrl+C too)", ""] + notes_rows(scr)
+
+
+def top_data(now, days, codex_live, scan, events, agy_live):
+    """What the screen shows, read once for every layout tried."""
     everything = log_summary(events)
-    lines += offload_rows(scr, weekly_tokens(scan), everything["per_week"], scanning, everything["gemini_week"],
-                          min((e["ts"] for e in events), default=None), everything["gemini_unknown"], last,
-                          not compact)
-    if not compact:
-        lines += ["", scr.dim(f"  log: {usage_log_file()}")]
+    return {"summary": log_summary(events, now - days * 86400 if days else None), "everything": everything,
+            "groups": subscription_groups(now, codex_live, scan.get("codex_limits"), agy_live=agy_live),
+            "weeks": weekly_tokens(scan), "first": min((e["ts"] for e in events), default=None),
+            "per_day": sends_per_day(events, now, days) if days in (7, 30) else []}
+
+
+def top_frame(scr, now, days, codex_live, scan, events, scanning, width=100, agy_live=None, height=None,
+              view="screen"):
+    """All of the status screen as lines, at most `height`. On a short screen the optional lists go
+    first, then older weeks (down to 3), then the consultations' tables and detail, then the
+    remaining weeks and whole panels, so each box closes and the latest week stays. view: "screen", "help", or "once" (no keys, the notes at the end)."""
+    data = top_data(now, days, codex_live, scan, events, agy_live)
+    if view == "help":
+        lines = ([top_bar(scr, data["groups"], days, now, width)]
+                 + panel(scr, heading(scr, "HELP"), help_rows(scr), min(width, TOP_PANEL))
+                 + [bottom_bar(scr, width, scanning, view)])
+        lines = [fit(line, width) for line in lines]
+        return lines[:max(0, height - 1)] + lines[-1:] if height and len(lines) > height else lines
+    weeks = range(TOP_WEEKS, 0, -1)
+    levels = ([("full", TOP_WEEKS)] + [("compact", n) for n in weeks if n >= 3] + [("summary", n) for n in weeks if n >= 3]
+              + [(level, n) for level in ("brief", "no consultations", "offload") for n in weeks])
+    for level, last in levels:
+        lines = _top_frame(scr, now, days, data, scanning, width, level, last, view)
+        if not height or len(lines) <= height:
+            return lines
+    return lines[:max(0, height - 1)] + lines[-1:]  # a screen this short can only show a cut
+
+
+def _top_frame(scr, now, days, data, scanning, width, level, last, view):
+    compact, everything = level != "full", data["everything"]
+    consult = consultation_rows(scr, data["summary"], days, compact, level not in ("summary", "brief"))
+    if level == "brief":
+        consult = consult[:1]
+    elif any(data["per_day"]) and data["summary"]["sends"]:
+        consult.insert(1, f"  per day   {spark(scr, data['per_day'])}  " + scr.dim("(oldest to today)"))
+    wide = width >= TOP_WIDE
+    panel_width = min(width - TOP_CARD - 1, TOP_PANEL) if wide else min(width, TOP_PANEL)
+    offload = offload_rows(scr, data["weeks"], everything["per_week"], scanning, everything["gemini_week"],
+                           data["first"], everything["gemini_unknown"], last, not compact,
+                           10 if panel_width >= 100 else 8)  # the table takes 96 cells with a bar of 10
+    consult_title = heading(scr, "CONSULTATIONS", period_text(days))
+    offload_title = heading(scr, "OFFLOAD", "share: known output made outside Claude Code, by consultants and your own Codex")
+    if wide:
+        right_width = panel_width
+        left = []
+        for g in data["groups"]:
+            note = " · Google's quota" if g["title"] == "Antigravity" else ""
+            left += panel(scr, scr.bold(g["title"]) + scr.dim(note), card_rows(scr, g), TOP_CARD)
+        right = [] if level in ("no consultations", "offload") else panel(scr, consult_title, consult, right_width)
+        body = side_by_side(left, TOP_CARD, right + panel(scr, offload_title, offload, right_width))
+        notes_width = TOP_CARD + 1 + right_width
+    else:
+        notes_width = panel_width
+        body = [] if level == "offload" else panel(
+            scr, heading(scr, "SUBSCRIPTIONS"), [r for g in data["groups"] for r in group_rows(scr, now, g)], notes_width)
+        if level not in ("no consultations", "offload"):
+            body += panel(scr, consult_title, consult, notes_width)
+        body += panel(scr, offload_title, offload, notes_width)
+    if view == "once":
+        body += panel(scr, heading(scr, "NOTES"), notes_rows(scr), notes_width)
+    lines = [top_bar(scr, data["groups"], days, now, width)] + body
+    if view != "once":
+        lines.append(bottom_bar(scr, width, scanning, view))
     return [fit(line, width) for line in lines]
 
 
@@ -5021,18 +5283,41 @@ def enable_ansi():
 
 
 def read_key(timeout):
-    """A key pressed within timeout seconds, or None."""
+    """A key pressed within timeout seconds, or None; None at once when the terminal is resized, so
+    the screen is drawn again to fit. An arrow, function or other multi-character key is read whole
+    and comes back as ""."""
+    size, deadline = shutil.get_terminal_size(), time.monotonic() + timeout
     if os.name == "nt":
         import msvcrt
-        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if msvcrt.kbhit():
-                return msvcrt.getwch()
+                key = msvcrt.getwch()
+                if key in ("\x00", "\xe0"):  # the first half of an arrow or function key
+                    msvcrt.getwch()
+                    return ""
+                return key
+            if shutil.get_terminal_size() != size:
+                return None
             time.sleep(0.05)
         return None
     import select
-    ready, _, _ = select.select([sys.stdin], [], [], timeout)
-    return sys.stdin.read(1) if ready else None
+    fd = sys.stdin.fileno()
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        ready, _, _ = select.select([fd], [], [], min(left, 0.25))
+        if ready:
+            key = os.read(fd, 1)
+            if not key:  # input closed: wait out the time rather than spin
+                time.sleep(left)
+                return None
+            if key == b"\x1b" and select.select([fd], [], [], 0.05)[0]:
+                os.read(fd, 64)  # the rest of an escape sequence: not Esc on its own
+                return ""
+            return key.decode("ascii") if key.isascii() else ""
+        if shutil.get_terminal_size() != size:
+            return None
 
 
 # The screen's exit codes to its supervisor, small enough for any system: the user quit; start
@@ -5216,10 +5501,10 @@ def run_top(argv):
         shared["codex"], shared["agy"] = read_codex_usage(), read_agy_usage()
         scan_once()
         tty_out = sys.stdout.isatty()
-        scr = Screen(tty_out and enable_ansi())
-        width = shutil.get_terminal_size().columns if tty_out else 1000  # a file or pipe gets whole lines
+        scr = Screen(tty_out and enable_ansi(), fancy_terminal())
+        width = shutil.get_terminal_size().columns - 1 if tty_out else TOP_PANEL  # a file or pipe: one column
         print("\n".join(top_frame(scr, time.time(), days, shared["codex"], shared["scan"],
-                                  read_usage_log(), False, width, shared["agy"])))
+                                  read_usage_log(), False, width, shared["agy"], None, "once")))
         return 0
 
     stop, refresh = threading.Event(), {"codex": threading.Event(), "agy": threading.Event()}
@@ -5251,7 +5536,7 @@ def run_top(argv):
                 last_scan = time.monotonic()
             stop.wait(1)
 
-    scr = Screen(enable_ansi())
+    scr = Screen(enable_ansi(), fancy_terminal())
     threading.Thread(target=background, daemon=True).start()
     if shared["agy"] is not None:
         threading.Thread(target=antigravity, daemon=True).start()
@@ -5263,7 +5548,7 @@ def run_top(argv):
     # The version this screen runs: as the process that started it saw the file, or as Python
     # loaded it. A change after that, even one made while starting, restarts it.
     started = seen = since or LOADED_STAMP or source_stamp(source)
-    reload, posix_tty, given = False, None, days
+    reload, posix_tty, given, view = False, None, days, "screen"
     try:
         if os.name != "nt" and sys.stdin.isatty():
             import termios
@@ -5278,15 +5563,20 @@ def run_top(argv):
             size = shutil.get_terminal_size((120, 40))
             with guard:
                 codex, scan, scanning, agy = shared["codex"], shared["scan"], shared["scanning"], shared["agy"]
-            lines = top_frame(scr, time.time(), days, codex, scan, read_usage_log(), scanning, size.columns, agy,
-                              size.lines - 1)
-            sys.stdout.write("\x1b[H" + "".join(f"{line}\x1b[K\n" for line in lines[:size.lines - 1]) + "\x1b[J")
+            # One column short of the edge, so no line wraps on a console that wraps at the last one.
+            lines = top_frame(scr, time.time(), days, codex, scan, read_usage_log(), scanning, size.columns - 1,
+                              agy, size.lines, view)[:size.lines]
+            lines[-1:-1] = [""] * (size.lines - len(lines))  # the key bar on the bottom line
+            # The last line has no newline, so the screen never scrolls.
+            sys.stdout.write("\x1b[H" + "\n".join(f"{line}\x1b[K" for line in lines) + "\x1b[J")
             sys.stdout.flush()
             key = read_key(TOP_REFRESH)
-            if key in ("q", "Q", "\x1b", "\x03"):
+            if key == "?" or (key == "\x1b" and view == "help"):
+                view = "screen" if view == "help" else "help"
+            elif key in ("q", "Q", "\x1b", "\x03"):
                 return quit_code
-            if key in TOP_PERIODS:
-                days = TOP_PERIODS[key]
+            elif key in TOP_PERIODS:
+                days, view = TOP_PERIODS[key], "screen"
             elif key in ("r", "R"):  # read again in the background; the screen keeps answering keys
                 refresh["codex"].set()
                 refresh["agy"].set()
