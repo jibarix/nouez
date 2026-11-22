@@ -3828,6 +3828,13 @@ def bar(pct, width=20):
     return "█" * filled + "░" * (width - filled)
 
 
+def painted_bar(scr, pct, width, colour):
+    """A bar with only its filled part in colour, so an empty one doesn't look full."""
+    text = bar(pct, width)
+    filled = text.count("█")
+    return (scr.paint(text[:filled], colour) if filled else "") + (scr.dim(text[filled:]) if filled < width else "")
+
+
 def window_row(scr, owner, label, used, resets_at, length, now, sampled=None):
     """One subscription window as a line with a bar, or None if its numbers can't be used. A
     reading saved at `sampled` gives its pace as of then; an old one gives none."""
@@ -3848,7 +3855,7 @@ def window_row(scr, owner, label, used, resets_at, length, now, sampled=None):
         outlook, colour = "too early for a pace", "32"
     reset = time.strftime("%a %H:%M", time.localtime(resets_at))
     shown = "<1%" if 0 < used < 0.5 else f"{used:.0f}%"
-    return (f"  {owner[:15]:<16}{label:<8}{scr.paint(bar(used, TOP_BAR), colour)} {shown:>4}  resets {reset} "
+    return (f"  {owner[:15]:<16}{label:<8}{painted_bar(scr, used, TOP_BAR, colour)} {shown:>4}  resets {reset} "
             f"(in {span_text(resets_at - now)})  {scr.dim(outlook)}")
 
 
@@ -4883,7 +4890,7 @@ def consultation_rows(scr, summary, days, compact=False):
     rows += columns([("by model and effort", s["models"].most_common(top)),
                      ("by kind", s["kinds"].most_common(top)),
                      ("verdicts", s["verdicts"].most_common(top)),
-                     ("by project", s["projects"].most_common(top))], (26, 20, 14, 28))
+                     ("by project", s["projects"].most_common(top))], (30, 18, 14, 28))
     if not compact:
         rows += ["", "  which kind went where"]
         rows += [f"  {n:>4}  {kind} → {model}" for (kind, model), n in s["routes"].most_common(4)]
@@ -4933,7 +4940,7 @@ def offload_rows(scr, weeks, per_week, scanning, gemini=None, logged_from=None, 
             ag = token_text(g) + "+" if g else "—"
         rows.append(f"  {week:<11}{token_text(w['claude']):>9}{token_text(w['subagents']):>11}"
                     f"{token_text(w['consultants']):>18}{token_text(w['codex']):>10}{ag:>12}{sends:>7}"  # no output: no share
-                    + (f"   {scr.paint(bar(share, 10), '36')} {share:>3.0f}%" if total else f"   {'':10} {'—':>4}"))
+                    + (f"   {painted_bar(scr, share, 10, '36')} {share:>3.0f}%" if total else f"   {'':10} {'—':>4}"))
     if not notes:
         return rows
     recent = sorted(weeks)[-4:]
@@ -4961,7 +4968,8 @@ def top_frame(scr, now, days, codex_live, scan, events, scanning, width=100, agy
             lines = _top_frame(scr, now, days, codex_live, scan, events, scanning, width, agy_live, True, weeks)
         offload = next((i for i, x in enumerate(lines) if ANSI.sub("", x).startswith("OFFLOAD")), None)
         if len(lines) > height and offload is not None and height >= len(lines) - offload:
-            lines = lines[:height - (len(lines) - offload)] + lines[offload:]  # the lines just above go
+            keep = offload - 1 if offload and lines[offload - 1] == "" and height > len(lines) - offload else offload
+            lines = lines[:height - (len(lines) - keep)] + lines[keep:]  # the lines just above go, not the gap
     return lines
 
 

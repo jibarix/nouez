@@ -2386,6 +2386,8 @@ class UsageLogTest(HandlerTest):
         self.assertEqual(server.fit(line, 4), "\x1b[31mabcd\x1b[0m")
         self.assertEqual(server.ANSI.sub("", server.fit(line, 100)), "abcdefghi")
         self.assertEqual(server.bar(50, 4), "██░░")
+        self.assertNotIn("\x1b[32m", server.painted_bar(scr, 0, 4, "32"))  # 0.16.0: an empty bar isn't coloured
+        self.assertTrue(server.painted_bar(scr, 50, 4, "32").startswith("\x1b[32m██\x1b[0m"))
         now = time.time()
         live = {"rateLimits": {"planType": "pro", "primary": {"usedPercent": 30, "windowDurationMins": 10080,
                                                                "resetsAt": now + 3.5 * 86400}}}
