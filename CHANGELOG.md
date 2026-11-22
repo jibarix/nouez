@@ -6,6 +6,18 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-11-22
+
+`server.py top` shows Antigravity's quota, and the status line addition keeps Claude Code's numbers steady when several sessions are open. Tested with Claude Code 2.1.330, Codex CLI 0.170.0 with app-server daemon 0.171.0, Antigravity CLI 1.5.14, Python 3.11.9 on Windows 11. After updating, reconnect `consultants` with `/mcp` in each open Claude Code session; open sessions keep running the old server until then.
+
+### Added
+
+- `server.py top` shows each Antigravity quota group (Gemini models; Claude and GPT models; Argon) with its weekly and 5-hour windows, read once a minute with `agy -p /usage`, a read-only command that runs no model turn. Nothing shows when `agy` isn't installed.
+
+### Fixed
+
+- Every open Claude Code session's status line saves `claude-usage.json`, so a session holding older numbers could overwrite newer ones, and `top` and `ConsultantBudget` jumped between them (21% one moment, 19% the next). The README's status line addition now keeps, for each window, the later window and, within the same window, the higher percentage. Update your status line script from the README.
+
 ## [0.14.0] - 2026-11-22
 
 A local usage log and `python server.py top`, a status screen for Codex and Claude Code usage and how much work goes to consultants. Tested with Claude Code 2.1.330, Codex CLI 0.170.0 with app-server daemon 0.171.0, Python 3.11.9 on Windows 11. After updating, reconnect `consultants` with `/mcp` in each open Claude Code session; open sessions keep running the old server until then.
@@ -318,7 +330,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/jibarix/nouez/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/jibarix/nouez/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/jibarix/nouez/compare/v0.12.4...v0.13.0
 [0.12.4]: https://github.com/jibarix/nouez/compare/v0.12.3...v0.12.4

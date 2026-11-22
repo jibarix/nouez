@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.14.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.14.1\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -1361,6 +1361,15 @@ needed'' and the like are \code{changes}; then ``no-go'', ``blocked'', ``reject'
 with ANSI colours and the terminal's alternate screen. It redraws every 5 seconds, reads Codex's
 usage from the daemon every 60 and reads the transcripts again every 300, each in a background
 thread.
+
+When the Antigravity CLI is installed (\code{agy} on \code{PATH}, or on Windows
+\code{\%LOCALAPPDATA\%\textbackslash agy\textbackslash bin\textbackslash agy.exe}), the screen also
+runs \code{agy -p /usage -{}-output-format json} once a minute, with \code{-{}-settings} denying
+file writes, edits, commands, MCP tools and scheduling. \code{/usage} is a read-only command: it
+answers with \code{num\_turns} 0 and no tokens. nouez reads \code{command.data.groups}, each a
+\code{name} and \code{buckets} with \code{window} (\code{weekly} or \code{5h}),
+\code{remaining\_fraction} and \code{reset\_time}, and shows the percentage used,
+$100 \times (1 - \textit{remaining\_fraction})$, like the other windows.
 
 Token counts per week (weeks start on Monday, local time):
 

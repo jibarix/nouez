@@ -45,7 +45,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.14.0"
+SERVER_VERSION = "0.14.1"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -3377,9 +3377,9 @@ def window_row(scr, owner, label, used, resets_at, length, now):
             f"(in {span_text(resets_at - now)})  {scr.dim(outlook)}")
 
 
-def subscription_rows(scr, now, codex_live, codex_saved, claude_path=None):
+def subscription_rows(scr, now, codex_live, codex_saved, claude_path=None, agy_live=None):
     """The subscriptions section: Codex from the daemon (or its last session file), Claude Code
-    from its status line file."""
+    from its status line file, Antigravity from `agy`."""
     rows = []
     limits = codex_live.get("rateLimits") if isinstance(codex_live, dict) else None
     if isinstance(limits, dict):
@@ -3434,7 +3434,81 @@ def subscription_rows(scr, now, codex_live, codex_saved, claude_path=None):
         rows.append(f"  {'Claude Code':<16}" + scr.dim(
             "usage not known: it reaches nouez through the status line (README, Choosing a consultant)"
             if saved is None else "no current window saved yet"))
-    return rows
+    return rows + agy_rows(scr, now, agy_live)
+
+
+AGY_GROUPS = {"Gemini Models": "AG Gemini", "Claude and GPT models": "AG Claude+GPT", "Gemini 4 Argon": "AG Argon"}
+AGY_WINDOWS = {"weekly": 7 * 86400, "5h": 5 * 3600}
+
+
+def agy_rows(scr, now, agy_live):
+    """Antigravity's quota groups, from `agy -p /usage`. Nothing at all when agy isn't installed."""
+    if agy_live is None:
+        return []
+    if not isinstance(agy_live.get("groups"), list):
+        return [f"  {'Antigravity':<16}" + scr.dim(f"usage not known: {agy_live.get('error') or 'agy gave no quota'}")]
+    rows = []
+    for group in agy_live["groups"]:
+        if not isinstance(group, dict) or not isinstance(group.get("buckets"), list):
+            continue
+        name = group.get("name") if isinstance(group.get("name"), str) else "?"
+        owner = AGY_GROUPS.get(name, f"AG {name}"[:15])
+        for b in group["buckets"]:
+            left = number(b.get("remaining_fraction")) if isinstance(b, dict) else None
+            if left is None:
+                continue
+            length = AGY_WINDOWS.get(b.get("window"))
+            row = window_row(scr, owner, window_label(length) if length else "usage", (1 - left) * 100,
+                             iso_seconds(b.get("reset_time")), length, now)
+            if row:
+                rows.append(row)
+                owner = ""
+    if rows:
+        rows.append(scr.dim(f"  {'':<16}(Antigravity; AG Claude+GPT runs Claude and GPT models on Google's quota, "
+                            "not Claude Code's)"))
+    return rows or [f"  {'Antigravity':<16}" + scr.dim("no current quota window reported")]
+
+
+AGY_READ_ONLY = {"permissions": {"deny": ["write_file(*)", "edit_file(*)", "command(*)", "mcp(*)", "schedule(*)"]}}
+
+
+def agy_command(env=None):
+    """The Antigravity CLI: `agy` on PATH, else where its installer puts it on Windows; None if neither."""
+    env = os.environ if env is None else env
+    found = shutil.which("agy", path=env.get("PATH"))
+    if found:
+        return found
+    if os.name == "nt" and env.get("LOCALAPPDATA"):
+        default = os.path.join(env["LOCALAPPDATA"], "agy", "bin", "agy.exe")
+        if os.path.isfile(default):
+            return default
+    return None
+
+
+def read_agy_usage():
+    """Antigravity's quota from `agy -p /usage` (a read-only command that runs no model turn), as
+    {"groups": [...]}; {"error": ...} if agy didn't answer; None if agy isn't installed."""
+    agy = agy_command()
+    if not agy:
+        return None
+    try:
+        done = subprocess.run([agy, "-p", "/usage", "--output-format", "json", "--settings", json.dumps(AGY_READ_ONLY)],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              stdin=subprocess.DEVNULL, timeout=30, cwd=tempfile.gettempdir(),
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"error": f"agy didn't answer ({type(e).__name__})"}
+    for line in reversed(done.stdout.splitlines()):
+        try:
+            reply = json.loads(line)
+        except ValueError:
+            continue
+        data = (reply.get("command") or {}).get("data") if isinstance(reply, dict) else None
+        if isinstance(data, dict) and isinstance(data.get("groups"), list):
+            return {"groups": data["groups"]}
+        break
+    last = (done.stderr.strip().splitlines() or ["no quota in its answer"])[-1]
+    return {"error": f"agy: {last[:120]}"}
 
 
 def columns(blocks, width=26):
@@ -3517,14 +3591,14 @@ def offload_rows(scr, weeks, per_week, scanning):
     return rows
 
 
-def top_frame(scr, now, days, codex_live, scan, events, scanning, width=100):
+def top_frame(scr, now, days, codex_live, scan, events, scanning, width=100, agy_live=None):
     """All of the status screen as lines."""
     since = now - days * 86400 if days else None
     summary = log_summary(events, since)
     keys = "  ".join(f"[{k}] {'all' if v is None else f'{v}d'}" for k, v in TOP_PERIODS.items())
     lines = [scr.bold(f"nouez {SERVER_VERSION} · usage") + scr.dim(f"   {time.strftime('%a %b %d %H:%M:%S', time.localtime(now))}"
                                                             f"   {keys}  [r] refresh  [q] quit"), ""]
-    lines += [scr.bold("SUBSCRIPTIONS")] + subscription_rows(scr, now, codex_live, scan.get("codex_limits"))
+    lines += [scr.bold("SUBSCRIPTIONS")] + subscription_rows(scr, now, codex_live, scan.get("codex_limits"), agy_live=agy_live)
     lines += ["", scr.bold("CONSULTATIONS")] + consultation_rows(scr, summary, days)
     lines += ["", scr.bold("OFFLOAD") + scr.dim("  (work done by consultants and Codex instead of Claude Code)")]
     lines += offload_rows(scr, weekly_tokens(scan), log_summary(events)["per_week"], scanning)
@@ -3589,7 +3663,7 @@ def run_top(argv):
             return 2
     state_path = os.path.join(nouez_cache_dir(), SCAN_STATE_FILE)
     state = read_scan_state(state_path)
-    shared = {"scan": json.loads(json.dumps(state)), "scanning": True, "codex": None}
+    shared = {"scan": json.loads(json.dumps(state)), "scanning": True, "codex": None, "agy": None}
     guard = threading.Lock()
 
     def scan_once():
@@ -3602,13 +3676,13 @@ def run_top(argv):
             shared["scan"], shared["scanning"] = json.loads(json.dumps(state)), False
 
     if once:
-        shared["codex"] = read_codex_usage()
+        shared["codex"], shared["agy"] = read_codex_usage(), read_agy_usage()
         scan_once()
         tty_out = sys.stdout.isatty()
         scr = Screen(tty_out and enable_ansi())
         width = shutil.get_terminal_size().columns if tty_out else 1000  # a file or pipe gets whole lines
         print("\n".join(top_frame(scr, time.time(), days, shared["codex"], shared["scan"],
-                                  read_usage_log(), False, width)))
+                                  read_usage_log(), False, width, shared["agy"])))
         return 0
 
     stop = threading.Event()
@@ -3617,9 +3691,9 @@ def run_top(argv):
         last_scan = last_codex = 0.0
         while not stop.is_set():
             if time.monotonic() - last_codex >= TOP_CODEX_SECONDS:
-                codex = read_codex_usage()
+                codex, agy = read_codex_usage(), read_agy_usage()
                 with guard:
-                    shared["codex"] = codex
+                    shared["codex"], shared["agy"] = codex, agy
                 last_codex = time.monotonic()
             if time.monotonic() - last_scan >= TOP_SCAN_SECONDS:
                 try:
@@ -3644,8 +3718,8 @@ def run_top(argv):
         while True:
             size = shutil.get_terminal_size((120, 40))
             with guard:
-                codex, scan, scanning = shared["codex"], shared["scan"], shared["scanning"]
-            lines = top_frame(scr, time.time(), days, codex, scan, read_usage_log(), scanning, size.columns)
+                codex, scan, scanning, agy = shared["codex"], shared["scan"], shared["scanning"], shared["agy"]
+            lines = top_frame(scr, time.time(), days, codex, scan, read_usage_log(), scanning, size.columns, agy)
             sys.stdout.write("\x1b[H" + "".join(f"{line}\x1b[K\n" for line in lines[:size.lines - 1]) + "\x1b[J")
             sys.stdout.flush()
             key = read_key(TOP_REFRESH)
@@ -3654,8 +3728,9 @@ def run_top(argv):
             if key in TOP_PERIODS:
                 days = TOP_PERIODS[key]
             elif key in ("r", "R"):
+                codex, agy = read_codex_usage(), read_agy_usage()
                 with guard:
-                    shared["codex"] = read_codex_usage()
+                    shared["codex"], shared["agy"] = codex, agy
     except KeyboardInterrupt:
         return 0
     finally:

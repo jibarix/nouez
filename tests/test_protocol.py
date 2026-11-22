@@ -2333,6 +2333,7 @@ class UsageLogTest(HandlerTest):
         self.assertIn("No Claude Code or Codex sessions", frame)
         # the command itself, on empty folders
         with mock.patch.object(server, "read_codex_usage", return_value=None), \
+                mock.patch.object(server, "read_agy_usage", return_value=None), \
                 mock.patch.object(server, "claude_config_dir", return_value=os.path.join(self.dir, "none")), \
                 mock.patch.object(server, "codex_home", return_value=os.path.join(self.dir, "none")), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
@@ -2340,6 +2341,67 @@ class UsageLogTest(HandlerTest):
             self.assertEqual(server.run_top(["--days", "x"]), 2)
         self.assertIn("No consultations logged (last 30 days)", out.getvalue())
         self.assertTrue(os.path.exists(os.path.join(self.dir, server.SCAN_STATE_FILE)))
+
+    def test_antigravity_rows(self):
+        now = time.time()
+        scr = server.Screen(False)
+        self.assertEqual(server.agy_rows(scr, now, None), [])  # agy not installed: no rows at all
+        self.assertIn("usage not known: agy: not signed in",
+                      server.agy_rows(scr, now, {"error": "agy: not signed in"})[0])
+
+        def reset(secs):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + secs))
+        live = {"groups": [
+            {"name": "Gemini Models", "buckets": [
+                {"window": "weekly", "remaining_fraction": 0.25, "reset_time": reset(86400)},
+                {"window": "5h", "remaining_fraction": 1, "reset_time": reset(3600)},
+                {"window": "5h", "reset_time": reset(3600)}]},  # no fraction: left out
+            {"name": "Claude and GPT models", "buckets": [
+                {"window": "weekly", "remaining_fraction": 0.9, "reset_time": reset(-60)}]},  # past reset: left out
+            {"name": "New group", "buckets": [
+                {"window": "daily", "remaining_fraction": 0.5, "reset_time": reset(600)}]}]}
+        text = "\n".join(server.agy_rows(scr, now, live))
+        self.assertRegex(text, r"AG Gemini +weekly .* 75%")
+        self.assertRegex(text, r"pace: ~8[78]% by the reset")  # 75% used in 6 of 7 days
+        self.assertRegex(text, r"\n +5-hour .*  0%")
+        self.assertNotRegex(text, r"AG Claude\+GPT +weekly")
+        self.assertRegex(text, r"AG New group +usage .* 50%")
+        self.assertIn("Google's quota", text)
+        frame = "\n".join(server.top_frame(scr, now, 7, None, {}, [], False, 200, live))
+        self.assertIn("AG Gemini", frame)
+
+    def test_read_agy_usage(self):
+        groups = [{"name": "Gemini Models", "buckets": []}]
+        answer = json.dumps({"status": "SUCCESS", "num_turns": 0,
+                             "command": {"name": "usage", "data": {"groups": groups}}})
+        with mock.patch.object(server, "agy_command", return_value=None), \
+                mock.patch.object(server.subprocess, "run") as run:
+            self.assertIsNone(server.read_agy_usage())
+            run.assert_not_called()
+        with mock.patch.object(server, "agy_command", return_value="agy"), \
+                mock.patch.object(server.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, "noise\n" + answer + "\n", "")
+            self.assertEqual(server.read_agy_usage(), {"groups": groups})
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[:5], ["agy", "-p", "/usage", "--output-format", "json"])
+            self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), server.AGY_READ_ONLY)
+            self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            run.return_value = subprocess.CompletedProcess([], 1, "", "Error: You are not logged into Antigravity.\n")
+            self.assertEqual(server.read_agy_usage(), {"error": "agy: Error: You are not logged into Antigravity."})
+            run.side_effect = subprocess.TimeoutExpired("agy", 30)
+            self.assertEqual(server.read_agy_usage(), {"error": "agy didn't answer (TimeoutExpired)"})
+
+    def test_agy_command(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with mock.patch.object(server.shutil, "which", return_value="/bin/agy"):
+            self.assertEqual(server.agy_command({"PATH": "x"}), "/bin/agy")
+        with mock.patch.object(server.shutil, "which", return_value=None):
+            self.assertIsNone(server.agy_command({"PATH": "x", "LOCALAPPDATA": d}))
+            os.makedirs(os.path.join(d, "agy", "bin"))
+            open(os.path.join(d, "agy", "bin", "agy.exe"), "w").close()
+            want = os.path.join(d, "agy", "bin", "agy.exe") if os.name == "nt" else None
+            self.assertEqual(server.agy_command({"PATH": "x", "LOCALAPPDATA": d}), want)
 
 if __name__ == "__main__":
     unittest.main()

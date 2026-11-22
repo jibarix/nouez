@@ -25,10 +25,11 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.14.0 |
+| nouez | 0.14.1 |
 | Claude Code | 2.1.330 |
 | Codex CLI | 0.170.0 |
 | Codex app-server daemon | 0.171.0 |
+| Antigravity CLI (optional, for `top`) | 1.5.14 |
 | Python | 3.11.9 |
 | OS | Windows 11 |
 
@@ -172,17 +173,36 @@ On Windows, nouez also reads the key from your saved user environment variables,
 
 nouez then asks `artificialanalysis.ai/api/v2/language/models/free` (two or so pages) about once a week, with the key and `nouez/<version>` as the client name and nothing from your projects. The list is kept in `nouez/aa-models.json` in your cache folder. A failed attempt waits 6 hours before the next and the old list stays in use. `refresh: true` fetches again if the list is over an hour old; Claude passes it only when you ask for fresh scores.
 
-**Claude Code's usage needs one addition to your status line.** Claude Code passes `rate_limits` to the status line command as JSON (on Pro and Max plans, after a session's first reply). Have your status line script save it, with the time, to `nouez/claude-usage.json` in your cache folder: `{"saved": <unix seconds>, "rate_limits": <as received>}`. Write it to a temporary file and rename it, so nouez never reads half a file, and never let a failure here break the status line. In PowerShell:
+**Claude Code's usage needs one addition to your status line.** Claude Code passes `rate_limits` to the status line command as JSON (on Pro and Max plans, after a session's first reply). Have your status line script save it, with the time, to `nouez/claude-usage.json` in your cache folder: `{"saved": <unix seconds>, "rate_limits": <as received>}`. Every open session's status line writes this file, and a session that hasn't heard from Claude Code lately holds older numbers, so keep the newer reading: for each window, the later window, and within the same window the higher percentage. Write it to a temporary file and rename it, so nouez never reads half a file, and never let a failure here break the status line. In PowerShell:
 
 ```powershell
 if ($null -ne $data.rate_limits -and $env:LOCALAPPDATA) {
     try {
         $dir = Join-Path $env:LOCALAPPDATA 'nouez'
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
-        $json = @{ saved = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); rate_limits = $data.rate_limits } | ConvertTo-Json -Depth 5 -Compress
+        $file = Join-Path $dir 'claude-usage.json'
+        # Every open session writes this file, some with older numbers. Per window, keep the later
+        # window, and within the same window (resets within 10 min) the higher percentage.
+        $limits = @{}
+        foreach ($p in $data.rate_limits.PSObject.Properties) { $limits[$p.Name] = $p.Value }
+        $saved = $null
+        try { $saved = [IO.File]::ReadAllText($file) | ConvertFrom-Json } catch {}
+        if ($null -ne $saved -and $null -ne $saved.rate_limits) {
+            foreach ($k in @('five_hour', 'seven_day')) {
+                $old = $saved.rate_limits.$k; $new = $limits[$k]
+                if ($null -eq $old -or $null -eq $old.resets_at -or $null -eq $old.used_percentage) { continue }
+                if ([double]$old.resets_at -le [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) { continue }
+                if ($null -eq $new -or $null -eq $new.resets_at -or $null -eq $new.used_percentage) { $limits[$k] = $old; continue }
+                $gap = [double]$old.resets_at - [double]$new.resets_at
+                if ($gap -gt 600 -or ([math]::Abs($gap) -le 600 -and [double]$old.used_percentage -gt [double]$new.used_percentage)) {
+                    $limits[$k] = $old
+                }
+            }
+        }
+        $json = @{ saved = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); rate_limits = $limits } | ConvertTo-Json -Depth 5 -Compress
         $tmp = Join-Path $dir "claude-usage.$PID.tmp"
         [IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding $false))
-        Move-Item -Force $tmp (Join-Path $dir 'claude-usage.json')
+        Move-Item -Force $tmp $file
     } catch { if ($tmp) { Remove-Item -Force -ErrorAction SilentlyContinue $tmp } }
 }
 ```
@@ -239,7 +259,7 @@ python /path/to/nouez/server.py top
 
 It shows:
 
-- **Usage:** each Codex and Claude Code window, with a bar, the reset, and where the pace lands at the reset (red when used up or running out first, yellow over 90%). Codex is read live from the daemon once a minute; without the daemon, from Codex's last session file. Claude Code's comes from the status line file (see [Choosing a consultant](#choosing-a-consultant)).
+- **Usage:** each Codex and Claude Code window, with a bar, the reset, and where the pace lands at the reset (red when used up or running out first, yellow over 90%). Codex is read live from the daemon once a minute; without the daemon, from Codex's last session file. Claude Code's comes from the status line file (see [Choosing a consultant](#choosing-a-consultant)). If the Antigravity CLI (`agy`) is installed, on your `PATH` or where its installer puts it on Windows, each of its quota groups too, read once a minute with `agy -p /usage`, which runs no model turn and uses no quota. The "AG Claude+GPT" group is Claude and GPT models run inside Antigravity on Google's quota, apart from Claude Code's.
 - **Consultations:** messages sent, steered and with a changed model or effort; counts by model, kind, project and verdict; the median and slowest reply times; and review loops that went past three CHANGES rounds in a row.
 - **Offload:** for each of the last 8 weeks, the output tokens of Claude Code (and its subagents) beside those of nouez consultants and of your own Codex sessions, and the share that wasn't Anthropic's; then Claude Code's output by model. These come from the Claude Code transcripts (`~/.claude/projects`) and Codex session files (`~/.codex/sessions`) on this computer. The first run reads the last 13 weeks of them, which can take a minute; the counts are kept in `nouez/usage-weeks.json` and later runs read only what was added.
 
@@ -384,7 +404,7 @@ python -m unittest discover tests
 - Telling the caller's own session apart is thorough only on Windows, where nouez walks the whole chain of parent processes. Elsewhere it knows only its immediate parent, so if a wrapper sits between Claude Code and nouez, `CloseClaudeSession` may not recognise the caller.
 - Nothing can start a session on the computer from your phone unless something there is already running and connected: an open Claude Code session with Remote Control, for instance.
 - The trust check reads git's files, not Claude Code's code. For a worktree whose git data was moved out with `--separate-git-dir`, it says it can't tell, except when that git folder is named `.git` and sits beside other files: then nouez, like `git worktree list`, takes that folder for the main checkout.
-- `ConsultantBudget` names models as Artificial Analysis does ("GPT-6.2 Sol (high)"), not by Codex model id; matching them is left to Claude. Artificial Analysis scores API access at set effort levels, which may differ from a subscription's. Google's usage windows (Antigravity) aren't shown.
+- `ConsultantBudget` names models as Artificial Analysis does ("GPT-6.2 Sol (high)"), not by Codex model id; matching them is left to Claude. Artificial Analysis scores API access at set effort levels, which may differ from a subscription's. Antigravity's quota is shown by `server.py top` only, not by `ConsultantBudget`.
 - `server.py top` counts tokens from Claude Code's transcripts and Codex's session files, which neither documents; an update to either could change them. Output tokens only: a reply's input and cached tokens aren't counted.
 - Only the 50 most recent saved sessions are checked for unloaded consultants. Older ones can still be reached by their full thread id.
 - Uses the experimental Codex app-server protocol (`thread/start`, `thread/resume`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/name/set`, `thread/turns/list`, `thread/archive`, `turn/start`, `turn/steer`, `account/rateLimits/read`, `model/list`), which may change between Codex releases. See [Tested with](#tested-with).
