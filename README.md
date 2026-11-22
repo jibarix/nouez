@@ -18,7 +18,7 @@ The same server also helps when you drive Claude Code from your phone with Remot
 - Python 3.9+ (standard library only, nothing to install)
 - [Claude Code](https://docs.claude.com/en/docs/claude-code)
 - The [Codex CLI](https://github.com/openai/codex) on your `PATH`, logged in
-- Optional: Google's Antigravity CLI (`agy`), signed in, for consultants on Gemini models (see [Antigravity consultants](#antigravity-consultants))
+- Optional: Google's Antigravity CLI (`agy`), signed in, for consultants on Gemini or another model it lists (see [Antigravity consultants](#antigravity-consultants))
 
 ### Tested with
 
@@ -26,7 +26,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.15.0 |
+| nouez | 0.15.1 |
 | Claude Code | 2.1.330 |
 | Codex CLI | 0.170.0 |
 | Codex app-server daemon | 0.171.0 |
@@ -105,7 +105,7 @@ Claude calls `StartConsultant` to create a background Codex session in your proj
 
 **The consultant is always read-only.** It can read your files and run read-only commands for auditing, validation and research, but it can't change anything. It never stops to ask for approvals, because no terminal is attached to answer them. Claude does all the writing. There is no option to give a consultant write access.
 
-**3. Watch or join in (optional).** A background consultant is an ordinary Codex session. A consultant started by `StartConsultant` is shown automatically (pass `watch: false` to skip that); for a session you opened yourself, ask Claude to *"open the consultant in a terminal"* (`WatchConsultant`). Either way, `codex resume <id>` opens next to Claude Code: as a split pane in the same tab when Claude Code runs in Windows Terminal or tmux, otherwise in a new terminal window. You can read along there or type into the session yourself. Codex can't open a session before its first message, so the pane appears when Claude sends that message, and reappears on the next message if you close it. Without a split, Windows uses a new Windows Terminal window (falling back to a console window), macOS uses Terminal, and Linux uses `x-terminal-emulator`, `gnome-terminal` or `xterm`. In Windows Terminal the pane opens in the window running the Claude Code session that asked for it, even if you last used another window: nouez brings that window to the front while `wt` runs, then gives the focus back. If Claude Code's tab isn't the selected tab in its window, the consultant opens in a new tab there instead, and if the window can't be found or brought to the front (a locked screen, say), it opens in a new window of its own rather than in another session's. If a terminal already shows the session, no second one opens. The window runs the Codex daemon's own `codex` binary when it can find it, so it matches the daemon's version; otherwise it falls back to the `codex` on your `PATH` and warns if the versions differ.
+**3. Watch or join in (optional).** A background consultant is an ordinary Codex session. A consultant started by `StartConsultant` is shown automatically (pass `watch: false` to skip that); for a session you opened yourself, ask Claude to *"open the consultant in a terminal"* (`WatchConsultant`). Either way, `codex resume <id>` opens next to Claude Code: as a split pane in the same tab when Claude Code runs in Windows Terminal or tmux, otherwise in a new terminal window. You can read along there or type into the session yourself. Codex can't open a session before its first message, so the pane appears when Claude sends that message, and reappears on the next message if you close it. Without a split, Windows uses a new Windows Terminal window (falling back to a console window), macOS uses Terminal, and Linux uses `x-terminal-emulator`, `gnome-terminal` or `xterm`. In Windows Terminal the pane opens in the window running the Claude Code session that asked for it, even if you last used another window: nouez brings that window to the front while `wt` runs, then gives the focus back. If Claude Code's tab isn't the selected tab in its window, the consultant opens in a new tab there instead, and if the window can't be found or brought to the front (a locked screen, say), it opens in a new window of its own rather than in another session's. If a terminal already shows the session, no second one opens. The pane's `codex resume` trusts the session's folder for that run only, so Codex doesn't stop at "Trust this folder?" (nothing is saved to your Codex config; the folder's own `.codex` config and hooks load in the pane, as if you had answered yes), and it skips Codex's update check. The window runs the Codex daemon's own `codex` binary when it can find it, so it matches the daemon's version; otherwise it falls back to the `codex` on your `PATH` and warns if the versions differ.
 
 ### Reusing a consultant
 
@@ -244,17 +244,17 @@ A verdict line first makes the reply easy to act on, and "what you didn't check"
 
 ### Antigravity consultants
 
-A consultant can also run on Google's Antigravity CLI (`agy`) and its Gemini models, so a second opinion can come from a third family of models and from Google's quota instead of the Codex subscription. Claude starts one with `StartConsultant` and `provider: "antigravity"`, only when you ask or your own rules say when, and then uses it with the same tools as a Codex consultant. It starts on `gemini-4-neon` at level `high`; `model` and `effort` pick another (`ConsultantBudget` lists the models), and `SendConsultantMessage` changes them for later messages while the conversation keeps its context.
+A consultant can also run on Google's Antigravity CLI (`agy`) and its Gemini models, so a second opinion can come from a third family of models and from Google's quota instead of the Codex subscription. Claude starts one with `StartConsultant` and `provider: "antigravity"`, only when you ask or your own rules say when, and then uses it with the same tools as a Codex consultant. It starts on `gemini-4-neon` at level `high`; `model` and `effort` pick another (`ConsultantBudget` lists the models), and `SendConsultantMessage` changes them for later messages while the conversation keeps its context. Any model agy lists works, including the Claude and GPT models Antigravity runs on Google's quota; those use that quota, not your Claude Code or Codex usage.
 
 How it differs from a Codex consultant:
 
 - **Read-only by agy's own rules.** Every turn runs `agy -p` with deny rules for file writes and edits, commands, MCP tools and URL actions, and with slash commands off. Its browser tools aren't available in this mode. It can read files, search and read web pages.
-- **One message at a time.** Each message runs one agy turn in the background. A message sent while a turn runs is refused, with nothing sent, since agy can't steer a running turn. Wait for the reply, or stop the consultant.
+- **One message at a time.** Each message runs one agy turn in the background. A message sent while a turn runs is refused, with nothing sent, since agy can't steer a running turn; this holds across all your Claude Code sessions. Wait for the reply, or stop the consultant.
 - **No pane.** `WatchConsultant` gives the command to open its conversation in agy yourself (`agy --conversation <id>`) instead.
 - **A 30-minute limit per turn.** A turn still running then ends with what it has, reported as interrupted.
-- `StopConsultant` ends a running turn and forgets the consultant; its conversation stays in agy.
+- `StopConsultant` ends a running turn and forgets the consultant; its conversation stays in agy. It ends only the process nouez started (on Windows, checked by its start time and program). If it can't end it, nothing is stopped and it says so; send the stop again.
 
-nouez keeps each consultant, and each turn's input and output, in `nouez/agy/` in your cache folder. Replies are logged with their token counts, which `server.py top` shows as Gemini in the offload table.
+nouez keeps each consultant, and each turn's input and output, in `nouez/agy/` in your cache folder. Replies are logged with their token counts, which `server.py top` shows in the offload table's Antigravity column.
 
 ### Usage log and status screen
 
@@ -278,7 +278,7 @@ It shows:
 
 - **Usage:** each Codex and Claude Code window, with a bar, the reset, and where the pace lands at the reset (red when used up or running out first, yellow over 90%). Codex is read live from the daemon once a minute; without the daemon, from Codex's last session file. Claude Code's comes from the status line file (see [Choosing a consultant](#choosing-a-consultant)). If the Antigravity CLI (`agy`) is installed, on your `PATH` or where its installer puts it on Windows, each of its quota groups too, read once a minute with `agy -p /usage`, which runs no model turn and uses no quota. The "AG Claude+GPT" group is Claude and GPT models run inside Antigravity on Google's quota, apart from Claude Code's.
 - **Consultations:** messages sent, steered and with a changed model or effort; counts by model, kind, project and verdict; the median and slowest reply times; and review loops that went past three CHANGES rounds in a row.
-- **Offload:** for each of the last 8 weeks, the output tokens of Claude Code (and its subagents) beside those of nouez's Codex consultants, of your own Codex sessions and of Antigravity consultants (Gemini, from the usage log), and the share that wasn't Anthropic's; then Claude Code's output by model. These come from the Claude Code transcripts (`~/.claude/projects`) and Codex session files (`~/.codex/sessions`) on this computer. The first run reads the last 13 weeks of them, which can take a minute; the counts are kept in `nouez/usage-weeks.json` and later runs read only what was added.
+- **Offload:** for each of the last 8 weeks, the output tokens of Claude Code (and its subagents) beside those of nouez's Codex consultants, of your own Codex sessions and of Antigravity consultants (from the usage log), and the share done outside Claude Code; then Claude Code's output by model. These come from the Claude Code transcripts (`~/.claude/projects`) and Codex session files (`~/.codex/sessions`) on this computer. The first run reads the last 13 weeks of them, which can take a minute; the counts are kept in `nouez/usage-weeks.json` and later runs read only what was added.
 
 Keys: `1`, `7`, `3` or `a` to show 1, 7 or 30 days of consultations or all of them; `r` to refresh now; `q` or Esc to quit. `--days N` picks the period to start with, and `--once` prints one screen and exits. Nothing leaves your computer.
 
@@ -426,6 +426,8 @@ python -m unittest discover tests
 - `ConsultantBudget` names models as Artificial Analysis does ("GPT-6.2 Sol (high)"), not by Codex model id; matching them is left to Claude. Artificial Analysis scores API access at set effort levels, which may differ from a subscription's.
 - `server.py top` counts tokens from Claude Code's transcripts and Codex's session files, which neither documents; an update to either could change them. Output tokens only: a reply's input and cached tokens aren't counted.
 - An Antigravity consultant can't be kept from agy's `schedule` tool: agy has no deny rule or setting for it. Scheduling changes no files, but it can keep a turn waiting until the 30-minute limit. nouez tells the model not to schedule anything. agy's `-p` mode and its event stream aren't documented as stable; an agy update could change them.
+- Elsewhere than Windows, only the nouez server that started an Antigravity turn can tell its process is still agy, so after a reconnect, or from another session, `StopConsultant` won't end it; it ends at agy's 30-minute limit. There, too, that server keeps its turns' processes by process id alone, and a status check can reap an ended one just as a stop signals it; the time between is very short, and the stop signals only processes it started. nouez doesn't guard against a relative entry in `PATH` that finds `agy` inside the consultant's folder, or against links placed in its cache folder; both need someone who can already change your files.
+- If nouez can neither save a new Antigravity turn's process id nor end that process (a full disk, say), it says so and asks you to end agy in Task Manager. Until you do, that agy runs unseen: after 30 seconds the turn counts as failed, so another message can start a second turn beside it.
 - Only the 50 most recent saved sessions are checked for unloaded consultants. Older ones can still be reached by their full thread id.
 - Uses the experimental Codex app-server protocol (`thread/start`, `thread/resume`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/name/set`, `thread/turns/list`, `thread/archive`, `turn/start`, `turn/steer`, `account/rateLimits/read`, `model/list`), which may change between Codex releases. See [Tested with](#tested-with).
 

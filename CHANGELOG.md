@@ -6,6 +6,33 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-11-22
+
+Fixes from a review of 0.15.0's Antigravity consultants. Reconnect `consultants` with `/mcp` in each open Claude Code session.
+
+### Fixed
+
+- Two Antigravity consultants in the same folder could get the same name, so a message or a stop could reach the wrong one. A new consultant now gets more of its id in its name when needed, chosen under one lock for all Antigravity consultants, and a name two consultants share is refused, asking for the full id.
+- A turn could be reported as failed when agy wrote its result just before exiting. nouez now checks whether agy runs before reading its output.
+- A message over about 1 MB made its running turn invisible, so another message could start a second turn. The turn's record no longer holds a copy of the message.
+- Two Claude Code sessions could start turns on the same consultant at once, and a stop landing while a turn started could leave it running. A send and a stop now take one lock per consultant, shared by every nouez server on the computer, and a send reads the consultant again under it.
+- A turn whose agy process couldn't start was reported as "Stopped by StopConsultant"; it is now reported as failed, with the reason.
+- `StopConsultant` ends a turn only if its process is the one nouez started (on Windows, the same start time and program as at launch; elsewhere, a process this server started). A process nouez can't check counts as running until agy's 30-minute limit and is never ended. A stop that can't end a turn changes nothing and says so, so it can be sent again.
+- On Windows, a running agy process whose times Windows wouldn't give was taken for ended, so a stop could say it had ended a turn that ran on. Only an exit code nouez can read now counts as ended; otherwise the process counts as unknown.
+- `StopConsultant` marked a turn stopped before ending its process, so if the process didn't end, and the mark couldn't be taken back, the turn read as stopped while agy ran on, and another message could start beside it. The turn is now marked stopped only after nouez has seen agy end; until then it reads as still running.
+- A reply that came back while nouez couldn't save a new `model` or `effort` as the consultant's didn't say so, though a later message would use the old model. It now says so, as the "delivered" result already did.
+- A turn whose files couldn't be written is removed, and an agy process whose id couldn't be saved is ended with the processes it started before nouez says to send again.
+- A `model` or `effort` on `SendConsultantMessage` is resolved against the consultant as read under the lock; if the new model can't be saved, the reply still gives the turn's id.
+- The model is checked again just before each turn starts, so an edited consultant record can't pass an option to agy.
+- On a busy Windows computer, a Codex consultant could get a new pane on every message (one had six), and `StopConsultant` left its panes open while saying it had stopped. Both asked WMI through PowerShell, which could take minutes then, past nouez's 20-second limit. nouez now reads the process list and command lines straight from Windows, in milliseconds, ends a pane's processes without `taskkill`, and says if a pane still shows a stopped consultant.
+- A Codex consultant's pane could stop at Codex's "Trust this folder?" or update question, so it showed nothing. The pane's `codex resume` now trusts the session's folder and its git root for that run only (nothing is saved to Codex's config) and skips the update check.
+- The architecture document named agy's output file `.out`; it is `.jsonl`.
+
+### Changed
+
+- The README and the server's instructions no longer describe Antigravity consultants as Gemini only.
+- `server.py top`: the offload table's Gemini column is now Antigravity, since an Antigravity consultant can run any model agy lists, and the share is "not Claude Code" instead of "not Anthropic".
+
 ## [0.15.0] - 2026-11-22
 
 Consultants on Google's Antigravity CLI, for second opinions from Gemini models on Google's quota. Tested with Claude Code 2.1.330, Codex CLI 0.170.0 with app-server daemon 0.171.0, Antigravity CLI 1.5.14, Python 3.11.9 on Windows 11. After updating, reconnect `consultants` with `/mcp` in each open Claude Code session; open sessions keep running the old server until then.
@@ -351,7 +378,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/jibarix/nouez/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/jibarix/nouez/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/jibarix/nouez/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/jibarix/nouez/compare/v0.13.0...v0.14.0

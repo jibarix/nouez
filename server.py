@@ -46,7 +46,7 @@ import urllib.request
 import uuid
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.15.0"
+SERVER_VERSION = "0.15.1"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -1110,11 +1110,74 @@ def viewer_running(thread_id):
     if not re.fullmatch(r"[0-9A-Za-z-]+", thread_id):
         return False
     if os.name == "nt":
-        ps = ("@(Get-CimInstance Win32_Process -Filter \"Name='codex.exe'\" | Where-Object "
-              f"{{ $_.CommandLine -like '* resume {thread_id}*' }}).Count")
-        out = run_text(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps]).strip()
-        return out.isdigit() and int(out) > 0
+        return bool(codex_viewers(thread_id))
     return bool(run_text(["pgrep", "-f", f"codex[^ ]* resume {thread_id}"]).split())
+
+
+def process_command_line(pid):
+    """Windows: a process's command line, or None. Read straight from the system, in
+    milliseconds even when the computer is busy (a WMI query can take minutes then)."""
+    import ctypes
+    from ctypes import wintypes
+    handle = open_process(pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        ntdll = ctypes.windll.ntdll
+        ntdll.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                    wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+        size = wintypes.ULONG(0)
+        ntdll.NtQueryInformationProcess(handle, 60, None, 0, ctypes.byref(size))  # ProcessCommandLineInformation
+        if not 0 < size.value <= 1 << 20:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if ntdll.NtQueryInformationProcess(handle, 60, buf, size, ctypes.byref(size)) != 0:
+            return None
+
+        class UnicodeString(ctypes.Structure):
+            _fields_ = [("Length", ctypes.c_ushort), ("MaximumLength", ctypes.c_ushort),
+                        ("Buffer", ctypes.c_void_p)]
+        us = UnicodeString.from_buffer(buf)
+        return ctypes.wstring_at(us.Buffer, us.Length // 2) if us.Buffer and us.Length else ""
+    finally:
+        close_handle(handle)
+
+
+def codex_viewers(thread_id, table=None, command_line=None):
+    """Windows: the codex.exe processes showing `codex resume <id>`, as (codex pid, the pid of
+    the `cmd /k` open_terminal wrapped it in, or None)."""
+    table = process_table() if table is None else table
+    command_line = command_line or process_command_line
+    found = []
+    for pid, (parent, exe) in table.items():
+        if exe.lower() != "codex.exe":
+            continue
+        line = command_line(pid) or ""
+        if not re.search(rf"\sresume\s+\"?{re.escape(thread_id)}(\s|\"|$)", line):
+            continue
+        shell = None
+        if parent in table and table[parent][1].lower() == "cmd.exe":
+            if re.search(r"/k\s", command_line(parent) or "", re.IGNORECASE):
+                shell = parent
+        found.append((pid, shell))
+    return found
+
+
+def end_tree(pid, table, code=1):
+    """Windows: end a process and everything it started, deepest first, without taskkill."""
+    children = {}
+    for child, (parent, _) in table.items():
+        children.setdefault(parent, []).append(child)
+    order, todo, seen = [], [pid], set()
+    while todo:
+        p = todo.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        order.append(p)
+        todo.extend(children.get(p, []))
+    for p in reversed(order):
+        end_process(p, code)
 
 
 _console_lock = threading.Lock()  # AttachConsole is per process, so one lookup at a time
@@ -1197,6 +1260,8 @@ def _kernel32():
     kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, ctypes.c_uint]
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                    ctypes.POINTER(wintypes.DWORD)]
     return ctypes, wintypes, kernel32
 
 
@@ -1219,6 +1284,15 @@ def handle_start(handle):
     if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != 259:  # STILL_ACTIVE
         return None
     return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+
+
+def handle_exited(handle):
+    """Windows: True if the process has ended, False if it runs, None if that can't be read."""
+    ctypes, wintypes, kernel32 = _kernel32()
+    code = wintypes.DWORD()
+    if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+        return None
+    return code.value != 259  # STILL_ACTIVE
 
 
 def close_handle(handle):
@@ -1358,13 +1432,44 @@ def run_in_host_window(wt, cwd, command):
     return how
 
 
+CMD_SPECIAL = set('&|<>^%!"\'\r\n')  # a folder with one of these isn't put on a cmd /k line
+
+
+def viewer_options(cwd):
+    """Options for the viewer's `codex resume`, so the pane shows the consultant rather than a
+    question: no update check, and the folder (and its git root) trusted for this run only.
+    Without that, Codex asks "Trust this folder?" in every folder the user hasn't trusted, and
+    the pane waits there. Nothing is saved to config.toml. A trusted folder's .codex config and
+    hooks load in the viewer, as they would after the user answered the question themselves."""
+    options = ["-c", "check_for_update_on_startup=false"]
+    folders, here = [], os.path.abspath(cwd)
+    folders.append(here)
+    while True:
+        if os.path.exists(os.path.join(here, ".git")):
+            if here not in folders:
+                folders.append(here)
+            break
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+    keys = []
+    for folder in folders:
+        key = os.path.normcase(os.path.normpath(folder)) if os.name == "nt" else os.path.realpath(folder)
+        if CMD_SPECIAL & set(key):
+            return options  # Codex asks instead; such a path could break out of cmd's command line
+        keys.append(key)
+    table = ",".join(f"'{key}'={{trust_level='trusted'}}" for key in keys)
+    return [*options, "-c", f"projects={{{table}}}"]
+
+
 def open_terminal(cwd, thread_id, codex="codex"):
     """Open `codex resume <id>` beside Claude Code: a split pane when Claude Code runs in
     Windows Terminal or tmux, otherwise a new terminal window. Returns a description of what opened."""
     if not re.fullmatch(r"[0-9A-Za-z-]+", thread_id):
         raise BridgeError(f"Refusing to open a terminal for an unexpected thread id: {thread_id!r}")
     cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
-    resume = [codex, "resume", thread_id]
+    resume = [codex, "resume", thread_id, *viewer_options(cwd)]
     kwargs = {"cwd": cwd, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     tmux = shutil.which("tmux") if os.environ.get("TMUX") else None
     if tmux:
@@ -1421,21 +1526,13 @@ def close_terminals(thread_id):
         return 0
     if os.name == "nt":
         # Only the cmd windows open_terminal started, running codex by name or by full path.
-        # Each output line: the cmd pid, then its children.
-        ps = ("Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object "
-              f"{{ $_.CommandLine -like '*/k *codex* resume {thread_id}' }} | ForEach-Object {{ "
-              "$p = $_.ProcessId; "
-              "$k = @(Get-CimInstance Win32_Process -Filter \"ParentProcessId=$p\" | ForEach-Object { $_.ProcessId }); "
-              "\"$p $k\" }")
-        out = run_text(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
-        shells = [line.split() for line in out.splitlines() if line.strip()]
-        for pids in shells:
-            for child in pids[1:]:
-                run_text(["taskkill", "/PID", child, "/T", "/F"])
+        table = process_table()
+        viewers = [(pid, shell) for pid, shell in codex_viewers(thread_id, table) if shell]
+        for pid, shell in viewers:
+            end_tree(pid, table)
             # Windows Terminal closes a pane by itself only on a clean exit, so end cmd with code 0.
-            if pids[0].isdigit():
-                end_process(int(pids[0]), 0)
-        return len(shells)
+            end_process(shell, 0)
+        return len(viewers)
     pattern = f"codex[^ ]* resume {thread_id}"
     pids = run_text(["pgrep", "-f", pattern]).split()
     if pids:
@@ -2670,8 +2767,12 @@ def stop_consultant(args, cancel=None, progress=None):
     with _send_locks_guard:
         _unwatched.discard(thread["id"])
     closed = close_terminals(thread["id"])
+    deadline = time.monotonic() + 3  # an ended process can still be listed for a moment
+    while (left := viewer_running(thread["id"])) and time.monotonic() < deadline:
+        time.sleep(0.2)
     return (f"Stopped {name} (archived)."
             + (f" Closed {closed} terminal window(s) showing it." if closed else "")
+            + (" A terminal still shows it; close it yourself." if left else "")
             + f" To bring it back: codex unarchive {thread['id']}, "
             f"then codex resume {thread['id']}.")
 
@@ -3595,6 +3696,7 @@ AGY_MODEL_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{0,79}")
 AGY_MODELS_SECONDS = 60 * 60  # how long a list from `agy models` is trusted
 AGY_START_GRACE = 30          # a turn whose process can't be seen yet counts as running this long
 AGY_TURN_LIMIT = "30m"        # agy's --print-timeout: a turn still running then ends with what it has
+AGY_TURN_SECONDS = 30 * 60    # the same, in seconds: a process nouez can't check counts as running this long
 AGY_PREAMBLE = ("You are a read-only consultant, asked by another AI agent through the nouez bridge. "
                 "You can read files, search and read web pages; writing or editing files, running "
                 "commands and MCP tools are denied by the user's settings, so don't try them. Don't "
@@ -3637,7 +3739,54 @@ def agy_consultants(include_stopped=False):
 
 
 def agy_save(rec):
-    write_json_atomic(os.path.join(agy_folder(rec["id"]), "consultant.json"), rec)
+    if not write_json_atomic(os.path.join(agy_folder(rec["id"]), "consultant.json"), rec):
+        raise BridgeError(f"Could not save {rec.get('name')} in {agy_folder(rec['id'])}.")
+
+
+AGY_LOCK_SECONDS = 15  # how long a send or stop waits for another nouez server's to finish
+
+
+class agy_lock:
+    """One lock per consultant, shared by every nouez server on this computer (a locked byte in
+    its folder's `lock` file): a send and a stop take it, so two sessions can't start turns at
+    once and a stop can't land while a turn is starting. The system frees it if a server dies."""
+
+    def __init__(self, cid):
+        self.cid = cid  # None: the lock for all Antigravity consultants, taken while a name is chosen
+
+    def _lock(self, fd, on):
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK if on else msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, (fcntl.LOCK_EX | fcntl.LOCK_NB) if on else fcntl.LOCK_UN)
+
+    def __enter__(self):
+        folder = agy_folder(self.cid) if self.cid else agy_root()
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, "lock")
+        self.fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+        deadline = time.monotonic() + AGY_LOCK_SECONDS
+        while True:
+            try:
+                self._lock(self.fd, True)
+                return self
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    raise BridgeError(("Another Claude Code session is sending to or stopping this consultant"
+                                       if self.cid else "Another Claude Code session is starting an Antigravity "
+                                       "consultant") + "; nothing was done. Try again in a moment.") from None
+                time.sleep(0.1)
+
+    def __exit__(self, *exc):
+        try:
+            self._lock(self.fd, False)
+        except OSError:
+            pass
+        os.close(self.fd)
 
 
 def agy_resolve(to, exact_only=False):
@@ -3646,9 +3795,12 @@ def agy_resolve(to, exact_only=False):
     if not isinstance(to, str) or not to:
         return None
     recs = agy_consultants()
-    for rec in recs:
-        if to in (rec.get("name"), rec.get("id")):
-            return rec
+    exact = [r for r in recs if to in (r.get("name"), r.get("id"))]
+    if len(exact) > 1:
+        raise BridgeError(f"{to!r} names several Antigravity consultants: "
+                          + ", ".join(r["id"] for r in exact) + ". Use the full id.")
+    if exact:
+        return exact[0]
     if exact_only or len(to) < 6 or not re.fullmatch(r"[0-9a-f-]+", to):
         return None
     hits = [r for r in recs if r["id"].startswith(to) or r["id"].endswith(to)]
@@ -3716,20 +3868,86 @@ def agy_model_id(current, model=None, effort=None, known=None):
     return candidates[0]
 
 
-def pid_alive(pid, start=None):
-    """Whether the process is still running (and, on Windows, is the one started at `start`)."""
+def handle_image(handle):
+    """Windows: the full path of a process's program, or None."""
+    ctypes, wintypes, kernel32 = _kernel32()
+    buf, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
+    if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+        return None
+    return buf.value
+
+
+_agy_children = {}  # POSIX: pid -> Popen of the turns this server started, the only processes it signals
+_kernel32_err = []
+
+
+def open_process_why(pid, access):
+    """Windows: (a handle to the process or None, the error code when None)."""
+    import ctypes
+    from ctypes import wintypes
+    if not _kernel32_err:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        _kernel32_err.append(k)
+    handle = _kernel32_err[0].OpenProcess(access, False, pid)
+    return (handle or None), (0 if handle else ctypes.get_last_error())
+
+
+def agy_identity(meta, access=QUERY):
+    """Whether the turn's agy process runs and is the very process nouez started: ("ours", a handle
+    on Windows, which keeps its pid from passing to another process), ("gone", None) when it has
+    ended or its pid is now another process's, or ("unknown", None) when that can't be checked.
+    Windows compares the creation time and program recorded at launch; elsewhere only the server
+    that started the process can tell."""
+    pid = meta.get("pid")
     if not isinstance(pid, int) or pid <= 0:
-        return False
+        return "gone", None
     if os.name == "nt":
-        now = process_start(pid)
-        return now is not None and (start is None or now == start)
+        handle, err = open_process_why(pid, access)
+        if not handle:
+            return ("gone" if err == 87 else "unknown"), None  # ERROR_INVALID_PARAMETER: no such process
+        start, recorded = handle_start(handle), meta.get("pid_start")
+        image, program = meta.get("image"), None
+        if start is None:
+            # Ended, or its times couldn't be read; only an exit code nouez can read means ended.
+            state = "gone" if handle_exited(handle) else "unknown"
+        elif isinstance(recorded, int) and start == recorded:
+            program = handle_image(handle)
+            if isinstance(image, str) and image and program:
+                if program.lower() == image.lower():
+                    return "ours", handle
+                state = "gone"
+            else:
+                state = "unknown"  # no program recorded at launch, or it can't be read now
+        else:
+            state = "gone" if isinstance(recorded, int) else "unknown"
+        close_handle(handle)
+        return state, None
+    proc = _agy_children.get(pid)
+    if proc is not None:
+        if proc.poll() is None:  # also reaps it once it has ended
+            return "ours", None
+        _agy_children.pop(pid, None)
+        return "gone", None
     try:
         os.kill(pid, 0)
-        return True
     except PermissionError:
-        return True
+        return "gone", None  # another user's process: not one nouez started
     except OSError:
-        return False
+        return "gone", None
+    return "unknown", None
+
+
+def agy_alive(meta):
+    """Whether the turn's agy process is still running. A process nouez can't check counts as
+    running until agy's own turn limit has passed."""
+    state, handle = agy_identity(meta)
+    close_handle(handle)
+    if state == "unknown":
+        started = meta.get("started")
+        return isinstance(started, (int, float)) and time.time() - started < AGY_TURN_SECONDS + 120
+    return state == "ours"
 
 
 def agy_turn_ids(cid):
@@ -3776,13 +3994,20 @@ def agy_turn(cid, turn_id, now=None):
             sent = json.loads(f.readline())["message"]["content"]
     except (OSError, ValueError, KeyError, TypeError):
         sent = ""
+    sent = sent if isinstance(sent, str) else ""
+    skip = meta.get("shown_from")
+    shown = meta.get("shown") or (sent[skip:] if isinstance(skip, int) and 0 <= skip <= len(sent) else sent)
+    started = number(meta.get("started")) or 0
+    now = now or time.time()
+    # Whether agy runs, seen before its output is read: if it had already ended, the output read
+    # next is complete, so a missing result means a failure, not a result about to be written.
+    running = (not meta.get("stopped") and not meta.get("failed")
+               and (agy_alive(meta) or (not meta.get("pid") and now - started < AGY_START_GRACE)))
     events = agy_events(os.path.join(folder, turn_id + ".jsonl"))
     result = next((e.get("result") for e in reversed(events) if e["event"] == "result"), None)
     result = result if isinstance(result, dict) else None
-    started = number(meta.get("started")) or 0
-    now = now or time.time()
     turn = {"id": turn_id, "provider": "antigravity", "startedAt": int(started), "model": meta.get("model"),
-            "items": [{"type": "userMessage", "content": [{"type": "text", "text": meta.get("shown") or sent}]}]}
+            "items": [{"type": "userMessage", "content": [{"type": "text", "text": shown}]}]}
     conv = next((e.get("conversation_id") for e in events if isinstance(e.get("conversation_id"), str)), None)
     if conv:
         turn["conversation"] = conv
@@ -3790,7 +4015,7 @@ def agy_turn(cid, turn_id, now=None):
         text = result.get("response") if isinstance(result.get("response"), str) else ""
         turn["items"].append({"type": "agentMessage", "text": text, "phase": "final_answer"})
         ok = result.get("status") == "SUCCESS"
-        turn["status"] = "completed" if ok else ("interrupted" if meta.get("stopped") else "failed")
+        turn["status"] = "completed" if ok else ("interrupted" if meta.get("stopped") or meta.get("stopping") else "failed")
         if not ok:
             turn["error"] = {"message": f"Antigravity: {result.get('error') or result.get('status')}"}
         elif result.get("finished_reason") == "print_timeout":
@@ -3806,14 +4031,15 @@ def agy_turn(cid, turn_id, now=None):
                      for s in [e.get("step_update") or {}] if isinstance(s.get("text_delta"), str))
     if deltas:
         turn["items"].append({"type": "agentMessage", "text": deltas, "phase": "commentary"})
-    running = (not meta.get("stopped")
-               and (pid_alive(meta.get("pid"), meta.get("pid_start"))
-                    or (not meta.get("pid") and now - started < AGY_START_GRACE)))
     if running:
         turn["status"] = "inProgress"
         return turn
     turn["durationMs"] = None
-    if meta.get("stopped"):
+    if meta.get("failed"):
+        turn["status"] = "failed"
+        turn["error"] = {"message": f"Could not start agy: {str(meta['failed'])[:300]}"}
+        return turn
+    if meta.get("stopped") or meta.get("stopping"):
         turn["status"] = "interrupted"
         turn["error"] = {"message": "Stopped by StopConsultant."}
         return turn
@@ -3871,14 +4097,20 @@ def agy_start_turn(rec, text, model, conversation, shown):
     if not exe:
         raise BridgeError("The Antigravity CLI (agy) isn't installed or can't be found: it isn't on PATH"
                           + (" or in %LOCALAPPDATA%\\agy\\bin" if os.name == "nt" else "") + ".")
+    if not isinstance(model, str) or not AGY_MODEL_NAME.fullmatch(model):  # never read as an option
+        raise BridgeError(f"{rec.get('name')} has no valid model ({model!r}); pass `model` to set one.")
+    if not text.endswith(shown):
+        raise BridgeError("internal: the message shown must end the text sent")
     folder = os.path.join(agy_folder(rec["id"]), "turns")
     os.makedirs(folder, exist_ok=True)
     turn_id = str(uuid.uuid4())
     base = os.path.join(folder, turn_id)
     with open(base + ".in", "w", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps({"event": "user", "message": {"content": text}}, ensure_ascii=False) + "\n")
-    meta = {"id": turn_id, "started": round(time.time(), 3), "model": model, "shown": shown}
-    write_json_atomic(base + ".json", meta)
+    # The message isn't copied here: history reads it from .in, from shown_from on.
+    meta = {"id": turn_id, "started": round(time.time(), 3), "model": model, "shown_from": len(text) - len(shown)}
+    if not write_json_atomic(base + ".json", meta):
+        raise BridgeError(f"Could not write the turn's files in {folder}; nothing was sent.")
     argv = [exe, "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands",
             "--model", model, "--print-timeout", AGY_TURN_LIMIT,
             "--settings", json.dumps(AGY_READ_ONLY, separators=(",", ":"))]
@@ -3888,12 +4120,53 @@ def agy_start_turn(rec, text, model, conversation, shown):
     try:
         proc = agy_spawn(argv, rec["cwd"], base + ".in", base + ".jsonl", base + ".err")
     except OSError as e:
-        meta["stopped"] = True
-        write_json_atomic(base + ".json", meta)
+        meta["failed"] = str(e) or type(e).__name__
+        if not write_json_atomic(base + ".json", meta):
+            remove_file(base + ".json")  # leave no turn that looks as if it were starting
         raise BridgeError(f"Could not start agy: {e}") from None
-    meta.update(pid=proc.pid, pid_start=process_start(proc.pid) if os.name == "nt" else None)
-    write_json_atomic(base + ".json", meta)
+    meta["pid"] = proc.pid
+    if os.name == "nt":
+        handle = open_process(proc.pid)
+        if handle:
+            meta.update(pid_start=handle_start(handle), image=handle_image(handle))
+            close_handle(handle)
+    else:
+        _agy_children[proc.pid] = proc
+    if not write_json_atomic(base + ".json", meta):
+        # Its process id couldn't be saved, so nouez couldn't see or stop it: end it now.
+        if agy_end_unsaved(proc):
+            remove_file(base + ".json")
+            raise BridgeError(f"Could not save the turn's process id in {folder}; agy was ended and "
+                              "nothing was sent. Send the message again.")
+        raise BridgeError(f"Could not save the turn's process id in {folder}, and agy (pid {proc.pid}) didn't "
+                          "end. End it yourself in Task Manager before sending again.")
     return turn_id
+
+
+def remove_file(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def agy_end_unsaved(proc):
+    """End a turn's agy process, and those it started, through the Popen that started it (which
+    keeps its pid from passing to another process). True if it ended."""
+    _agy_children.pop(proc.pid, None)
+    try:
+        if os.name == "nt":
+            run_text(["taskkill", "/F", "/T", "/PID", str(proc.pid)], timeout=10)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def agy_wait(cid, turn_id, timeout, cancel, on_poll=None):
@@ -3914,9 +4187,15 @@ def agy_wait(cid, turn_id, timeout, cancel, on_poll=None):
         time.sleep(min(POLL_SECONDS, deadline - now))
 
 
-def agy_name(cwd, cid):
+def agy_name(cwd, cid, taken=()):
+    """agy-<folder>-<last 6 of the id>, with more of the id when another consultant has that name."""
     base = os.path.basename(cwd.rstrip("\\/")) or "agy"
-    return f"{AGY_PREFIX}{base}-{cid[-6:]}".lower()
+    hexes = cid.replace("-", "")
+    for n in (6, 8, 12, len(hexes)):
+        name = f"{AGY_PREFIX}{base}-{hexes[-n:]}".lower()
+        if name not in taken:
+            return name
+    return f"{AGY_PREFIX}{base}-{cid}".lower()
 
 
 def format_agy(recs):
@@ -3967,10 +4246,12 @@ def start_agy_consultant(args, cwd):
         raise BridgeError("`instructions` must be a string.")
     title = args.get("title") if isinstance(args.get("title"), str) else None
     cid = str(uuid.uuid4())
-    rec = {"id": cid, "name": agy_name(cwd, cid), "cwd": cwd, "model": model, "created": round(time.time(), 3),
-           "instructions": instructions or None, "title": title}
-    os.makedirs(agy_folder(cid), exist_ok=True)
-    agy_save(rec)
+    with agy_lock(None):  # two sessions starting consultants at once can't pick the same name
+        taken = {r.get("name") for r in agy_consultants(include_stopped=True)}
+        rec = {"id": cid, "name": agy_name(cwd, cid, taken), "cwd": cwd, "model": model,
+               "created": round(time.time(), 3), "instructions": instructions or None, "title": title}
+        os.makedirs(agy_folder(cid), exist_ok=True)
+        agy_save(rec)
     record_usage({"event": "start", "consultant": rec["name"], "thread": cid, "new": True, "provider": "antigravity",
                   "project": os.path.basename(os.path.normpath(cwd)) or None, "model": model})
     ignored = " (watch doesn't apply: an Antigravity consultant has no pane)" if args.get("watch") is True else ""
@@ -3986,13 +4267,19 @@ def start_agy_consultant(args, cwd):
 def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, reason, cancel, progress):
     """SendConsultantMessage for an Antigravity consultant."""
     cid, name = rec["id"], rec["name"]
-    model = rec.get("model") or f"{AGY_MODEL}-{AGY_EFFORT}"
-    if args.get("model") or args.get("effort"):
-        model = agy_model_id(model, args.get("model"), args.get("effort"), agy_models())
+    override = args.get("model") or args.get("effort")
+    known = agy_models() if override else None  # can take seconds, so read before taking the lock
     stamp = revision_line(rec.get("cwd")) if flag(args, "revision") else ""
     shown = f"[Message from {sender} via the consultants bridge]\n{stamp}\n{message}"
-    with send_lock(cid):
+    with send_lock(cid), agy_lock(cid):
         check_cancel(cancel)
+        # Read the consultant again under the lock: another session may have stopped it or changed its model.
+        rec = read_json_file(os.path.join(agy_folder(cid), "consultant.json"))
+        if not rec or rec.get("id") != cid or rec.get("stopped"):
+            raise BridgeError(f"{name} was stopped; nothing was sent. Start a consultant again with StartConsultant.")
+        model = rec.get("model") or f"{AGY_MODEL}-{AGY_EFFORT}"
+        if override:
+            model = agy_model_id(model, args.get("model"), args.get("effort"), known)
         current = agy_turns(cid, 1)
         if current and current[0]["status"] == "inProgress":
             raise BridgeError(
@@ -4006,12 +4293,16 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
                         if rec.get("instructions") else "")
             text = f"{AGY_PREAMBLE}\n\n{standing}{shown}"
         turn_id = agy_start_turn(rec, text, model, conversation, shown)
-        changed = model != rec.get("model")
+        changed, kept = model != rec.get("model"), True
         if changed:
             rec = {**rec, "model": model}
-            agy_save(rec)
-    mode = f"started a new turn on {model}" + (", which the consultant keeps for later messages until changed"
-                                                if changed else "")
+            try:
+                agy_save(rec)
+            except BridgeError:
+                kept = False  # the turn runs all the same: say so rather than hide its id
+    mode = f"started a new turn on {model}" + (
+        "" if not changed else ", which the consultant keeps for later messages until changed" if kept
+        else f", but nouez couldn't save it as {name}'s model, so later messages use the one it had")
     if not usage_log_off():
         event = {"event": "send", "consultant": name, "thread": cid, "turn": turn_id, "provider": "antigravity",
                  "project": os.path.basename(os.path.normpath(rec.get("cwd") or "")) or None, "mode": "new",
@@ -4031,7 +4322,10 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
     done, turn = agy_wait(cid, turn_id, timeout, cancel, progress_reporter(progress, name))
     if done:
         record_reply(cid, name, turn)
-        return format_turn(name, turn) + f"\n\n({name} runs on {model}.)"
+        return format_turn(name, turn) + (
+            f"\n\n({name} runs on {model}.)" if kept else
+            f"\n\n(This turn ran on {model}, but nouez couldn't save it as {name}'s model, so later "
+            "messages use the one it had.)")
     return still_working(name, turn_id, turn,
                          f"Delivered ({mode}), but no reply within {timeout:.0f}s. Don't send the message "
                          f"again. {read_later(cid, turn_id)}")
@@ -4095,28 +4389,70 @@ def agy_history(rec, limit):
             f"and the turn id.\n{rows}")
 
 
+def agy_end_process(meta):
+    """End a turn's agy process and the processes it started. True if it isn't running afterwards
+    (or never ran). On Windows only the process nouez started is ended: a handle opened after the
+    identity check keeps its pid from passing to another process meanwhile."""
+    pid = meta.get("pid")
+    state, handle = agy_identity(meta, QUERY | SYNCHRONIZE | TERMINATE)
+    if state == "gone":
+        return True  # never ran, already ended, or the pid is now another process's: leave it alone
+    if state == "unknown":
+        return False  # can't tell it is the process nouez started: never end it
+    if os.name == "nt":
+        try:
+            try:
+                run_text(["taskkill", "/F", "/T", "/PID", str(pid)], timeout=10)  # with agy's children
+            except (OSError, subprocess.SubprocessError):
+                pass
+            if not wait_handle(handle, 5):
+                _kernel32()[2].TerminateProcess(handle, 1)
+            return wait_handle(handle, 2)
+        finally:
+            close_handle(handle)
+    proc = _agy_children.get(pid)  # ours: not reaped yet, so neither its pid nor its group is reused
+    for sig, seconds in ((signal.SIGTERM, 5), (signal.SIGKILL, 2)):
+        try:
+            os.killpg(pid, sig)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=seconds)
+            _agy_children.pop(pid, None)
+            return True
+        except subprocess.TimeoutExpired:
+            continue
+    return False
+
+
 def stop_agy_consultant(rec):
     """Mark the consultant stopped and end a turn still running. Its files and agy's conversation stay."""
-    ended = 0
-    for tid in agy_turn_ids(rec["id"])[:5]:
-        path = os.path.join(agy_folder(rec["id"]), "turns", tid + ".json")
-        meta = read_json_file(path)
-        if not meta or meta.get("stopped"):
-            continue
-        turn = agy_turn(rec["id"], tid)
-        if turn and turn["status"] == "inProgress":
-            write_json_atomic(path, {**meta, "stopped": True})
-            if pid_alive(meta.get("pid"), meta.get("pid_start")):
-                if os.name == "nt":
-                    run_text(["taskkill", "/F", "/T", "/PID", str(meta["pid"])], timeout=10)
-                else:
-                    try:
-                        os.killpg(meta["pid"], signal.SIGTERM)
-                    except OSError:
-                        pass
+    ended, stuck = 0, []
+    with agy_lock(rec["id"]):
+        for tid in agy_turn_ids(rec["id"])[:5]:
+            path = os.path.join(agy_folder(rec["id"]), "turns", tid + ".json")
+            meta = read_json_file(path)
+            if not meta or meta.get("stopped") or meta.get("failed"):
+                continue
+            turn = agy_turn(rec["id"], tid)
+            if not turn or turn["status"] != "inProgress":
+                continue
+            # "stopping" names the turn interrupted once its process has gone, but doesn't hide a
+            # process that runs on; "stopped" is written only after nouez saw it end.
+            if write_json_atomic(path, {**meta, "stopping": True}) and agy_end_process(meta):
+                write_json_atomic(path, {**meta, "stopping": True, "stopped": True})
                 ended += 1
-    conv = agy_conversation(rec["id"])
-    agy_save({**rec, "stopped": round(time.time(), 3)})
+            else:
+                write_json_atomic(path, meta)  # still running: a later stop can try again
+                stuck.append(meta.get("pid"))
+        if stuck:
+            raise BridgeError(
+                f"Couldn't stop {rec['name']}: nouez couldn't end its agy process (pid "
+                f"{', '.join(map(str, stuck))}), or couldn't confirm it is the process nouez started. Nothing "
+                "was stopped. Try StopConsultant again; if it still runs, end it yourself (Task Manager), "
+                f"or let it end at agy's {AGY_TURN_LIMIT} limit.")
+        conv = agy_conversation(rec["id"])
+        agy_save({**rec, "stopped": round(time.time(), 3)})
     return (f"Stopped {rec['name']}." + (" Ended its running turn." if ended else "")
             + (f" Its conversation stays in Antigravity: to pick it up yourself, run "
                f"agy --conversation {conv} in {rec.get('cwd')}." if conv else ""))
@@ -4234,9 +4570,9 @@ def consultation_rows(scr, summary, days):
 
 
 def offload_rows(scr, weeks, per_week, scanning, gemini=None):
-    """Output tokens by week, and the share made by models that aren't Anthropic's: Codex
-    consultants and the user's own Codex sessions from their files, Antigravity consultants
-    (Gemini) from the usage log."""
+    """Output tokens by week, and the share made outside Claude Code: Codex consultants and the
+    user's own Codex sessions from their files, Antigravity consultants (on Google's quota, whatever
+    model they run) from the usage log."""
     gemini = gemini or {}
     empty = {"claude": 0, "subagents": 0, "consultants": 0, "codex": 0, "models": {}}
     weeks = {**{w: empty for w in gemini}, **weeks}
@@ -4244,7 +4580,7 @@ def offload_rows(scr, weeks, per_week, scanning, gemini=None):
         return [scr.dim("  Reading transcripts for the first time…" if scanning else
                         "  No Claude Code or Codex sessions in the last weeks.")]
     rows = [f"  {'week of':<11}{'Claude':>9}{'subagents':>11}{'consultants':>13}{'own Codex':>11}"
-            f"{'Gemini':>8}{'messages':>10}   not Anthropic"]
+            f"{'Antigravity':>13}{'messages':>10}   not Claude Code"]
     for week in sorted(weeks)[-TOP_WEEKS:]:
         w = weeks[week]
         g = gemini.get(week, 0)
@@ -4252,7 +4588,7 @@ def offload_rows(scr, weeks, per_week, scanning, gemini=None):
         other = w["consultants"] + w["codex"] + g
         share = 100 * other / total if total else 0
         rows.append(f"  {week:<11}{token_text(w['claude']):>9}{token_text(w['subagents']):>11}"
-                    f"{token_text(w['consultants']):>13}{token_text(w['codex']):>11}{token_text(g):>8}"
+                    f"{token_text(w['consultants']):>13}{token_text(w['codex']):>11}{token_text(g):>13}"
                     f"{per_week.get(week, 0):>10}"
                     f"   {scr.paint(bar(share, 12), '36')} {share:>3.0f}%")
     recent = sorted(weeks)[-4:]
@@ -4263,7 +4599,7 @@ def offload_rows(scr, weeks, per_week, scanning, gemini=None):
     if total:
         parts = [f"{m.replace('claude-', '')} {100 * n / total:.0f}%" for m, n in models.most_common(5) if n]
         rows += ["", f"  Claude output by model, last {len(recent)} weeks: " + " · ".join(parts)]
-    rows.append(scr.dim("  Output tokens, from the transcripts on this computer; Gemini from the usage log's "
+    rows.append(scr.dim("  Output tokens, from the transcripts on this computer; Antigravity from the usage log's "
                         "Antigravity replies. \"messages\" counts consultations logged that week."))
     return rows
 
@@ -4443,7 +4779,8 @@ INSTRUCTIONS = (
     "call for it. The change keeps the consultant's context and stays for later messages, so once the "
     "harder part is done, send the usual values again. ConsultantBudget shows the usage left on "
     "each subscription, with reset times, and model scores, for choosing a consultant's model and "
-    "effort by the user's own rules. A consultant on Google's Antigravity CLI (Gemini models) is "
+    "effort by the user's own rules. A consultant on Google's Antigravity CLI (Gemini by default, or "
+    "another model agy lists) is "
     "started with StartConsultant provider=\"antigravity\", only when the user asks for one or the "
     "user's own rules call for it; it is used with the same tools, read-only, one message at a time."
 )

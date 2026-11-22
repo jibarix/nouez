@@ -2459,7 +2459,7 @@ class AgyTest(unittest.TestCase):
         self.running = events is None
         return mock.Mock(pid=4242)
 
-    def alive(self, pid, start=None):
+    def alive(self, meta):
         return self.running
 
     def start(self, **args):
@@ -2532,7 +2532,7 @@ class AgyTest(unittest.TestCase):
 
         # The next turn continues the conversation, on a new level, without the preamble; it runs on.
         self.replies = [None]
-        with mock.patch.object(server, "pid_alive", self.alive):
+        with mock.patch.object(server, "agy_alive", self.alive):
             out = server.send_consultant_message({"to": name, "message": "And now?", "effort": "low", "wait": 0})
             self.assertIn("Delivered to", out)
             self.assertIn(f"server.py wait {server.agy_resolve(name)['id']} ", out)
@@ -2552,10 +2552,9 @@ class AgyTest(unittest.TestCase):
             self.assertRegex(history, r"\[completed, .*took 7s\] from Claude Code \(with the user's words\): "
                                       r"\"Which fruit\?\" -> \"pomme\"")
             self.assertEqual(server.agy_resolve(name)["model"], "gemini-4-neon-low")
-            with mock.patch.object(server, "run_text") as kill:
+            with mock.patch.object(server, "agy_end_process", return_value=True) as kill:
                 stopped = server.stop_consultant({"to": name})
-            if os.name == "nt":
-                self.assertEqual(kill.call_args.args[0][:4], ["taskkill", "/F", "/T", "/PID"])
+            self.assertEqual(kill.call_args.args[0]["pid"], 4242)
         self.assertIn("Ended its running turn", stopped)
         self.assertIn("agy --conversation conv-1234-abcd", stopped)
         self.assertIsNone(server.agy_resolve(name))
@@ -2586,7 +2585,7 @@ class AgyTest(unittest.TestCase):
         for events, status, error in cases:
             with self.subTest(status=status, error=error):
                 self.replies = [events]
-                with mock.patch.object(server, "pid_alive", lambda pid, start=None: False):
+                with mock.patch.object(server, "agy_alive", lambda meta: False):
                     server.send_consultant_message({"to": name, "message": "x", "wait": 0})
                     tid = server.agy_turn_ids(cid)[0]
                     with open(os.path.join(server.agy_folder(cid), "turns", tid + ".err"), "w") as f:
@@ -2622,7 +2621,7 @@ class AgyTest(unittest.TestCase):
                            ("a b c d e f g h", None), ("conv-1234-abcd", "conv-1234-abcd")):
             with self.subTest(conv=conv):
                 self.replies = [[agy_result("ok")]]
-                with mock.patch.object(server, "pid_alive", lambda pid, start=None: False):
+                with mock.patch.object(server, "agy_alive", lambda meta: False):
                     server.send_consultant_message({"to": name, "message": "x", "wait": 0})
                 # The newest turn's events name this conversation; older turns name only rejected ones.
                 with open(os.path.join(server.agy_folder(cid), "turns", server.agy_turn_ids(cid)[0] + ".jsonl"),
@@ -2639,6 +2638,168 @@ class AgyTest(unittest.TestCase):
         self.assertIsNone(server.agy_resolve(ra["id"][-6:], exact_only=True))
         self.assertIsNone(server.agy_resolve("codex-nouez-abcdef"))
         self.assertIsNone(server.agy_resolve(""))
+
+    def test_names_never_clash(self):
+        """0.15.1: a name another consultant has gets more of the id; a name two share is refused."""
+        cid = "01a20315-4fb3-73b3-bb66-75ebdee30b97"
+        self.assertEqual(server.agy_name(self.work, cid), f"agy-{os.path.basename(self.work).lower()}-e30b97")
+        taken = {server.agy_name(self.work, cid)}
+        self.assertTrue(server.agy_name(self.work, cid, taken).endswith("-75ebdee30b97"[-8:]))
+        _, a = self.start()
+        _, b = self.start(new=True)
+        rb = server.agy_resolve(b)
+        server.agy_save({**rb, "name": a})  # two consultants named alike, as by an older nouez
+        with self.assertRaisesRegex(server.BridgeError, "names several Antigravity consultants"):
+            server.agy_resolve(a)
+        self.assertEqual(server.agy_resolve(rb["id"])["id"], rb["id"])
+
+    def test_result_written_as_agy_exits_is_read(self):
+        """0.15.1: agy is seen ended before its output is read, so a result written just before
+        it exits is never taken for a failure."""
+        _, name = self.start()
+        cid = server.agy_resolve(name)["id"]
+        self.replies = [None]
+        server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+        tid = server.agy_turn_ids(cid)[0]
+        out = os.path.join(server.agy_folder(cid), "turns", tid + ".jsonl")
+
+        def finishes(meta):  # the result lands, then agy exits, between the check and the read
+            with open(out, "a", encoding="utf-8") as f:
+                f.write(agy_lines(agy_result("just in time")))
+            return False
+        with mock.patch.object(server, "agy_alive", finishes):
+            turn = server.agy_turn(cid, tid)
+        self.assertEqual(turn["status"], "completed")
+        meta = server.read_json_file(os.path.join(server.agy_folder(cid), "turns", tid + ".json"))
+        self.assertNotIn("shown", meta)  # the message is read from .in, so the record stays small
+        self.assertEqual(turn["items"][0]["content"][0]["text"],
+                         "[Message from Claude Code via the consultants bridge]\n\nx")
+
+    def test_launch_failure_and_bad_model(self):
+        _, name = self.start()
+        rec = server.agy_resolve(name)
+
+        def broken(*a):
+            raise FileNotFoundError("no such program")
+        with mock.patch.object(server, "agy_spawn", broken):
+            with self.assertRaisesRegex(server.BridgeError, "Could not start agy"):
+                server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+        turn = server.agy_turns(rec["id"], 1)[0]
+        self.assertEqual(turn["status"], "failed")
+        self.assertIn("Could not start agy: no such program", turn["error"]["message"])
+        self.assertNotIn("StopConsultant", turn["error"]["message"])
+        server.agy_save({**rec, "model": "--dangerously-skip-permissions"})  # an edited record
+        with self.assertRaisesRegex(server.BridgeError, "has no valid model"):
+            server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+        self.assertEqual(self.runs, [])
+
+    def test_lock_and_stopped_consultant(self):
+        """0.15.1: one lock per consultant across nouez servers; a send re-reads the consultant under it."""
+        _, name = self.start()
+        rec = server.agy_resolve(name)
+        with mock.patch.object(server, "AGY_LOCK_SECONDS", 0.3):
+            with server.agy_lock(rec["id"]):
+                with self.assertRaisesRegex(server.BridgeError, "Another Claude Code session"):
+                    with server.agy_lock(rec["id"]):
+                        pass
+                with self.assertRaisesRegex(server.BridgeError, "Another Claude Code session"):
+                    server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+        self.assertEqual(self.runs, [])
+        server.agy_save({**rec, "stopped": time.time()})  # stopped by another session after resolving
+        with self.assertRaisesRegex(server.BridgeError, "was stopped; nothing was sent"):
+            server.send_agy_message(rec, {}, "x", "Claude Code", None, 0, None, None, None, None)
+        self.assertEqual(self.runs, [])
+
+    def test_failed_stop_changes_nothing(self):
+        _, name = self.start()
+        cid = server.agy_resolve(name)["id"]
+        self.replies = [None]
+        with mock.patch.object(server, "agy_alive", self.alive):
+            server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+            with mock.patch.object(server, "agy_end_process", return_value=False):
+                with self.assertRaisesRegex(server.BridgeError, "Couldn't stop .*pid 4242.*Nothing was stopped"):
+                    server.stop_consultant({"to": name})
+            self.assertFalse(server.agy_resolve(name).get("stopped"))
+            self.assertEqual(server.agy_turns(cid, 1)[0]["status"], "inProgress")
+            path = os.path.join(server.agy_folder(cid), "turns", server.agy_turn_ids(cid)[0] + ".json")
+            self.assertNotIn("stopping", server.read_json_file(path))
+            seen = []
+
+            def ends(meta):  # while it is being ended: still running, so still in progress
+                seen.append((server.read_json_file(path), server.agy_turns(cid, 1)[0]["status"]))
+                self.running = False
+                return True
+            with mock.patch.object(server, "agy_end_process", ends):
+                self.assertIn("Ended its running turn", server.stop_consultant({"to": name}))
+        (during, status), = seen
+        self.assertTrue(during.get("stopping"))
+        self.assertNotIn("stopped", during)  # written only once agy has ended (round 3, point 2)
+        self.assertEqual(status, "inProgress")
+        self.assertTrue(server.read_json_file(path).get("stopped"))
+        self.assertEqual(server.agy_turns(cid, 1)[0]["status"], "interrupted")
+        self.assertIsNone(server.agy_resolve(name))
+
+    def test_unsaved_model_said_on_a_reply(self):
+        """0.15.1: a reply that came back on a model nouez couldn't save says so (round 3, point 3)."""
+        _, name = self.start()
+        self.replies = [[agy_result("ok")]]
+        with mock.patch.object(server, "agy_save", side_effect=server.BridgeError("disk full")):
+            out = server.send_consultant_message({"to": name, "message": "x", "effort": "low", "wait": 5})
+        self.assertIn("ok", out)
+        self.assertIn("couldn't save it as", out)
+        self.assertEqual(server.agy_resolve(name)["model"], "gemini-4-neon-high")
+
+    def test_unsaved_pid_ends_agy(self):
+        _, name = self.start()
+        cid = server.agy_resolve(name)["id"]
+        real = server.write_json_atomic
+        writes = []
+
+        def pid_write_fails(path, data):
+            if path.endswith(".json") and os.sep + "turns" + os.sep in path:
+                writes.append(path)
+                if len(writes) == 2:  # the write that records the pid
+                    return False
+            return real(path, data)
+        with mock.patch.object(server, "write_json_atomic", pid_write_fails), \
+                mock.patch.object(server, "agy_end_unsaved", return_value=True) as end:
+            with self.assertRaisesRegex(server.BridgeError, "agy was ended and nothing was sent"):
+                server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+        self.assertEqual(end.call_args.args[0].pid, 4242)
+        self.assertEqual(server.agy_turn_ids(cid), [])  # no turn left looking as if it were starting
+        with mock.patch.object(server, "AGY_LOCK_SECONDS", 0.2), server.agy_lock(None):
+            with self.assertRaisesRegex(server.BridgeError, "starting an Antigravity consultant"):
+                self.start(new=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows process handles")
+    def test_stop_ends_only_the_process_nouez_started(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        handle = server.open_process(proc.pid)
+        meta = {"pid": proc.pid, "pid_start": server.handle_start(handle), "image": server.handle_image(handle),
+                "started": time.time()}
+        server.close_handle(handle)
+        self.assertTrue(server.agy_alive(meta))
+        # (changed fields, counts as running, agy_end_process's answer); never ended in any of these
+        for wrong, alive, ended in (({"pid_start": meta["pid_start"] + 1}, False, True),  # pid now another's
+                                    ({"image": "C:\\other\\agy.exe"}, False, True),   # another program
+                                    ({"pid_start": None}, True, False),                 # can't be checked
+                                    ({"image": None}, True, False),
+                                    ({"image": None, "started": time.time() - 3 * 3600}, False, False)):
+            with self.subTest(wrong=wrong):
+                self.assertEqual(server.agy_alive({**meta, **wrong}), alive)
+                self.assertEqual(server.agy_end_process({**meta, **wrong}), ended)
+                self.assertIsNone(proc.poll())
+        # Its times can't be read but it runs: unknown, never taken for ended (round 3, point 1)
+        with mock.patch.object(server, "handle_start", return_value=None):
+            self.assertTrue(server.agy_alive(meta))
+            self.assertFalse(server.agy_end_process(meta))
+            self.assertEqual(server.agy_identity(meta)[0], "unknown")
+        self.assertIsNone(proc.poll())
+        self.assertTrue(server.agy_end_process(meta))
+        self.assertIsNotNone(proc.wait(timeout=5))
+        self.assertFalse(server.agy_alive(meta))
 
     def test_budget_and_offload(self):
         now = time.time()
@@ -2666,10 +2827,65 @@ class AgyTest(unittest.TestCase):
         scr = server.Screen(False)
         weeks = {week: {"claude": 9000, "subagents": 0, "consultants": 0, "codex": 0, "models": {}}}
         rows = "\n".join(server.offload_rows(scr, weeks, {}, False, summary["gemini_week"]))
-        self.assertIn("Gemini", rows)
+        self.assertIn("Antigravity", rows)
+        self.assertIn("not Claude Code", rows)
         self.assertRegex(rows, week + r" .* 3k .* 25%")
         only = "\n".join(server.offload_rows(scr, {}, {}, False, {week: 1000}))
         self.assertRegex(only, week + r" .*100%")
+
+
+
+class PaneTest(unittest.TestCase):
+    """0.15.1: panes are found and closed from Windows' own process list, not WMI."""
+    TID = "01a2ffff-0000-7000-8000-00000000abcd"
+
+    def test_codex_viewers(self):
+        table = {10: (1, "cmd.exe"), 11: (10, "codex.exe"), 12: (1, "codex.exe"), 13: (1, "codex.exe"),
+                 14: (1, "cmd.exe"), 15: (14, "codex.exe"), 16: (1, "python.exe")}
+        lines = {10: f"cmd /k codex resume {self.TID}", 11: f"C:\\x\\codex.exe resume {self.TID}",
+                 12: f"codex resume {self.TID}", 13: f"codex resume {self.TID}0",  # another id
+                 14: "cmd /c something", 15: f'"codex.exe" resume "{self.TID}"', 16: f"x resume {self.TID}"}
+        found = server.codex_viewers(self.TID, table, lines.get)
+        self.assertEqual(sorted(found), [(11, 10), (12, None), (15, None)])
+
+    def test_viewer_trusts_its_folder_for_one_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, "Repo Name")
+            sub = os.path.join(repo, "sub")
+            os.makedirs(os.path.join(repo, ".git"))
+            os.makedirs(sub)
+            key = (lambda p: os.path.normcase(os.path.normpath(p)) if os.name == "nt" else os.path.realpath(p))
+            options = server.viewer_options(sub)
+            self.assertEqual(options[:2], ["-c", "check_for_update_on_startup=false"])
+            self.assertEqual(options[2:], ["-c", f"projects={{'{key(sub)}'={{trust_level='trusted'}},"
+                                                 f"'{key(repo)}'={{trust_level='trusted'}}}}"])
+            self.assertEqual(server.viewer_options(repo)[3], f"projects={{'{key(repo)}'={{trust_level='trusted'}}}}")
+            odd = os.path.join(tmp, "a&b")
+            os.makedirs(odd)
+            self.assertEqual(server.viewer_options(odd), ["-c", "check_for_update_on_startup=false"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows process list")
+    def test_command_line_and_end_tree(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import subprocess, sys, time; "
+                                 "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); time.sleep(60)",
+                                 "resume", self.TID])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        line = server.process_command_line(proc.pid)
+        self.assertTrue(line.endswith(f"resume {self.TID}"), line)
+        self.assertIsNone(server.process_command_line(0))
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            table = server.process_table()
+            kids = [p for p, (parent, _) in table.items() if parent == proc.pid]
+            if kids:
+                break
+            time.sleep(0.1)
+        self.assertTrue(kids)
+        server.end_tree(proc.pid, table)
+        self.assertIsNotNone(proc.wait(timeout=5))
+        time.sleep(0.5)
+        self.assertNotIn(kids[0], server.process_table())
 
 
 if __name__ == "__main__":

@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.15.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.15.1\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -1398,11 +1398,13 @@ Antigravity CLI instead of the Codex daemon. There is no daemon: each message ru
 \code{agy -p} process in the background, and nouez keeps the state in files under
 \code{agy/} in its cache folder. \code{agy/}\textit{id}\code{/consultant.json} holds the name,
 folder, model, title and standing instructions. \code{turns/}\textit{turn}\code{.json} holds a
-turn's process id and start time, its model and the message as shown in history, beside its
-\code{.in}, \code{.out} and \code{.err} files. The id is a UUID nouez makes; agy's own
-conversation id comes from the first turn's events. Names are
-\code{agy-}\textit{folder}\code{-}\textit{last 6 of the id}; the other tools try these names
-first and fall back to Codex.
+turn's process id, start time and program, its model, and where in \code{.in} the message as
+shown in history starts, beside its \code{.in}, \code{.jsonl} and \code{.err} files. The id is a
+UUID nouez makes; agy's own conversation id comes from the first turn's events. Names are
+\code{agy-}\textit{folder}\code{-}\textit{last 6 of the id}, with more of the id when another
+consultant has that name, chosen under a lock for all Antigravity consultants; a name two
+consultants share is refused. The other tools try these
+names first and fall back to Codex.
 
 \begin{figure}[H]
 \centering
@@ -1411,8 +1413,8 @@ first and fall back to Codex.
   \msg{1.2}{0}{5}{tools/call SendConsultantMessage}
   \msg{2.1}{5}{15.5}{write turn .json and .in}
   \msg{3.0}{5}{10.5}{start, detached; stdin from .in}
-  \ret{3.9}{10.5}{15.5}{events to .out}
-  \msg{4.8}{5}{15.5}{poll .out and the process}
+  \ret{3.9}{10.5}{15.5}{events to .jsonl}
+  \msg{4.8}{5}{15.5}{poll the process, then .jsonl}
   \ret{5.8}{5}{0}{reply, or turn id and waiter}
 \end{tikzpicture}
 \caption{One message to an Antigravity consultant. The process outlives nouez, so a reconnect or
@@ -1452,18 +1454,31 @@ A turn is
 \code{completed} on a \code{SUCCESS} result, \code{interrupted} when \code{finished\_reason} is
 \code{print\_timeout} or nouez stopped it, and \code{failed} on another status or when the process
 ended without a result (with the last lines of \code{.err}). Without a result, it is
-\code{inProgress} while its process runs, checked by process id and start time, or for 30\,s after
-the turn started while the process can't be seen yet.
+\code{inProgress} while its process runs, checked by process id, start time and program, or for
+30\,s after the turn started while the process can't be seen yet. nouez checks the process before
+reading \code{.jsonl}: had agy already ended, the output read is complete, so a result written just
+before agy exits is never taken for a failure. A turn whose process couldn't start is
+\code{failed}, with the reason.
 
-A message sent while a turn runs is refused, since agy can't steer one. The first message carries
+A message sent while a turn runs is refused, since agy can't steer one. A send and a stop take
+one lock per consultant, a locked byte in its folder's \code{lock} file, shared by every nouez
+server on the computer and freed by the system if a server dies; a send reads the consultant again
+under it, so a stop or a model change from another session is seen. The first message carries
 a read-only preamble and the standing instructions; later ones pass \code{-{}-conversation}. A
 \code{model} or \code{effort} on \code{SendConsultantMessage} picks the id from
 \code{agy models} (cached an hour): the family with the level appended, such as
-\code{gemini-4-neon-low}. \code{StopConsultant} ends a running turn with
-\code{taskkill /F /T} and marks the turn and the consultant stopped; the files stay, and agy keeps the
-conversation. Replies are logged with \code{provider: "antigravity"} and \code{tokens}, and each
+\code{gemini-4-neon-low}; the id is checked again just before each turn starts.
+\code{StopConsultant} opens a handle to the turn's process only if its start time and program
+match those recorded at launch, ends it and its children with \code{taskkill /F /T}, waits for it to
+exit, and only then marks the turn and the consultant stopped; meanwhile the turn is marked
+\code{stopping}, which reads as \code{interrupted} once the process has gone but never hides one
+that runs on. The files stay, and agy keeps the conversation. A process whose start time can't be
+read counts as ended only if its exit code says so. Elsewhere than Windows, only the server that started a process signals it. A process
+that can't be checked counts as running until agy's limit and is never ended, and a stop that can't
+end a turn changes nothing and says so. A turn whose record can't be written is removed; a process
+whose id can't be saved is ended with its children before nouez says to send again. Replies are logged with \code{provider: "antigravity"} and \code{tokens}, and each
 send with Antigravity's quota groups under \code{usage.antigravity}. \code{top} adds their
-\code{output\_tokens} per week as Gemini.
+\code{output\_tokens} per week in its Antigravity column, whatever model the consultant runs.
 
 \subsection{Claude Code sessions}
 \label{sec:claude-tools}
@@ -1587,6 +1602,21 @@ Linux & x-terminal-emulator -e | gnome-terminal -- | xterm -e  <codex> resume <i
 \end{tabularx}
 \end{center}
 
+In every row, \code{<codex> resume <id>} is followed by two options, so the pane shows the
+consultant rather than a question that waits for an answer:
+
+\begin{plain}[The viewer's options, for one run; nothing is saved to config.toml]
+-c check_for_update_on_startup=false
+-c projects={'c:\users\me\projects\repo'={trust_level='trusted'}}
+\end{plain}
+
+The second option trusts the session's folder and its git root. Without it, Codex asks
+``Trust this folder?'' in every folder the user hasn't trusted, and up to 0.15.0 a pane waited
+on that question with nothing shown. A trusted folder's own \code{.codex} config and hooks load in
+the viewer, as they would after the user answered the question. A folder whose path holds one of
+\code{\& | < > \^{} \% ! " '} gets no such option, since the path goes on \code{cmd}'s command
+line; Codex asks there.
+
 \subsubsection*{Finding Claude Code's window (Windows Terminal)}
 \label{sec:wt-host}
 
@@ -1619,28 +1649,30 @@ title look alike.
 Thread ids are checked against \code{[0-9A-Za-z-]+} before they appear in any command: opening a
 pane refuses a malformed id with an error, and the checks and closing skip it.
 
-\begin{plain}[Is a viewer already running? (Windows)]
-powershell -NoProfile -NonInteractive -Command
-  @(Get-CimInstance Win32_Process -Filter "Name='codex.exe'" |
-    Where-Object { $_.CommandLine -like '* resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17*' }).Count
--> 1
+On Windows nouez runs no command for this: it lists processes with the Win32 call
+\code{CreateToolhelp32Snapshot} and reads each \code{codex.exe}'s command line with
+\code{NtQueryInformationProcess} (\code{ProcessCommandLineInformation}), which takes milliseconds
+even on a busy computer. Up to 0.15.0 it asked WMI through PowerShell, which could take minutes
+then; the check timed out, found no viewer, and opened another pane.
+
+\begin{plain}[Is a viewer already running? (Windows), as nouez checks it]
+codex.exe 72832, parent cmd.exe 34288
+  command line: codex.exe resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17
+-> running; 34288 is a pane nouez opened (cmd /k ...)
 \end{plain}
 \begin{plain}[Is a viewer already running? (macOS, Linux)]
 pgrep -f "codex[^ ]* resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17"
 \end{plain}
-\begin{plain}[Closing on StopConsultant (Windows), abridged: find the cmd windows nouez opened, with their children]
-powershell ... Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
-  Where-Object { $_.CommandLine -like '*/k *codex* resume 01a1f3c2-...' } | ForEach-Object { "$p $k" }
--> 18244 20112
-taskkill /PID 20112 /T /F            (codex inside the pane)
+\begin{plain}[Closing on StopConsultant (Windows): the viewers found as above, inside a cmd /k]
+TerminateProcess(20112 and its children, deepest first)  (codex inside the pane)
 TerminateProcess(18244, exit code 0) (cmd; a clean exit lets Windows Terminal close the pane)
 \end{plain}
 \begin{plain}[Closing on StopConsultant (macOS, Linux)]
 pkill -f "codex[^ ]* resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17"
 \end{plain}
 
-The last two lines are what nouez does, not commands it runs: \code{taskkill} is run per child,
-and the cmd process is ended through the Win32 \code{TerminateProcess} call.
+These are Win32 calls, not commands. \code{StopConsultant} then checks again and says so if
+a terminal still shows the consultant.
 
 Each check and close command has a timeout (20~s; 10~s for \code{codex -{}-version}). When it
 fires, nouez stops reading the command's pipes, because on Windows a grandchild process can keep
@@ -1783,6 +1815,7 @@ Default \code{wait} & 5 s / 0 s & SendConsultantMessage / GetConsultantReply \\
 \code{AGY\_START\_GRACE} & 30 s & a turn with no process seen yet counts as running \\
 \code{AGY\_MODELS\_SECONDS} & 1 h & how long the list from \code{agy models} is used \\
 \code{AGY\_USAGE\_SECONDS} & 60 s & wait for \code{agy -p /usage} \\
+\code{AGY\_LOCK\_SECONDS} & 15 s & wait for another server's send or stop \\
 \bottomrule
 \end{tabular}
 \end{center}
