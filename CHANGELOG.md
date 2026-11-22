@@ -6,6 +6,24 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-11-22
+
+The status screen follows updates, plus fixes from a review of 0.15.1's Codex panes and Antigravity stops. Close a status screen started before this version and run `server.py top` again once; from then on it follows updates by itself. Reconnect `consultants` with `/mcp` in each open Claude Code session.
+
+### Changed
+
+- `server.py top` kept running the version it started with after nouez was updated, so its numbers and header could be out of date. It now watches `server.py` and, once the file has stayed the same for a redraw, compiles and still has the status screen and its entry point, starts again on it with the same period. That doesn't prove the file whole: one cut short after those lines passes, and then the window waits as below. `top` runs the screen as a child process and restarts it, on every system. It notes the version before the screen's Python reads the file, so a change made while the screen starts counts too, and a fix written while a failed screen was starting is picked up at once. Once the screen has restarted, only quitting it (`q`, Esc or Ctrl+C) closes the window: a restarted screen that fails, or ends without being asked to (a file cut short that does nothing), leaves it waiting for the next update. Ctrl+C at any moment closes the window, and elsewhere than Windows, ending `top` (or closing its terminal) ends the screen too, which puts the terminal back as it was, even when it comes while the screen is starting. `--days` takes 0 to 65,535 (179 years); anything else is refused.
+
+### Fixed
+
+- On Windows, `StopConsultant` took any `codex.exe` whose command line held the words `resume <id>` for a pane, so a `codex exec` prompt with those words could be ended, as could a `cmd /k` window you had opened yourself. It also missed a pane whose `codex` ran through npm's `node`, or had already exited. A pane now carries a token, `-c nouez_pane=<token>` (Codex ignores the unknown key), made from the thread id and a random key kept in nouez's cache folder (`pane-key`), and is found by its own `cmd` window's command: `codex resume <id>` with that token, and nothing else for `cmd` to run. A terminal you open yourself is left alone, whatever you type in it. Panes opened before 0.15.2 carry no token and are left open: close them yourself. On macOS and Linux, a stop also ends only a process whose program is `codex`, run as `codex resume <id>` with the token, checked again just before it is signalled: not one you started, and not the terminal emulator that runs it, which could hold other windows. A pane's processes count only if they started after their parent and still have that parent once all of them are held open, and each is checked and ended through a handle opened before the check, so a process id passed on to another program is never touched.
+- `StopConsultant` said it had closed a pane as soon as it had found one. It now counts a pane closed only once its window's process has ended, and says when one is still open.
+- A pane didn't open when both the path of `codex` and the project folder had spaces: `cmd` dropped the program's opening quote. The pane's command now reaches `cmd /d /s /k` as one quoted argument, in Windows Terminal and in a console window.
+- A pane trusted the session's folder even when you had marked it untrusted in Codex. A folder marked untrusted in Codex's `config.toml` now stays so, and Codex asks as usual. If `config.toml` can't be read for sure (on Python before 3.11, an `untrusted` written other than as Codex writes it, or an escape outside a `'...'` string), no folder is trusted for the run, and an odd but valid `config.toml` no longer keeps the pane from opening.
+- A folder with letters outside ASCII in its path (`C:\École`) got the wrong trust key, so its pane still asked. The key now lowercases only ASCII letters, as Codex does.
+- On Windows, an agy process that exited with code 259 could be taken for one still running. nouez now asks Windows whether the process has ended, rather than reading its exit code.
+- A waiter that read an Antigravity turn just as `StopConsultant` ended it could report it failed rather than stopped. nouez reads the turn's stop marks again once agy has gone. A stop that couldn't end agy retries taking back its mark, so a later failure isn't named a stop.
+
 ## [0.15.1] - 2026-11-22
 
 Fixes from a review of 0.15.0's Antigravity consultants. Reconnect `consultants` with `/mcp` in each open Claude Code session.
@@ -378,7 +396,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.15.2...HEAD
+[0.15.2]: https://github.com/jibarix/nouez/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/jibarix/nouez/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/jibarix/nouez/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/jibarix/nouez/compare/v0.14.0...v0.14.1

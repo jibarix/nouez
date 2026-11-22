@@ -26,6 +26,8 @@ import base64
 import collections
 import datetime
 import glob
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -45,8 +47,14 @@ import urllib.parse
 import urllib.request
 import uuid
 
+try:  # this file as Python read it, as near that moment as can be: top restarts when it changes
+    _loaded = os.stat(os.path.abspath(__file__))
+    LOADED_STAMP = (_loaded.st_mtime_ns, _loaded.st_size)
+except OSError:
+    LOADED_STAMP = None
+
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.15.1"
+SERVER_VERSION = "0.15.2"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -1110,18 +1118,21 @@ def viewer_running(thread_id):
     if not re.fullmatch(r"[0-9A-Za-z-]+", thread_id):
         return False
     if os.name == "nt":
-        return bool(codex_viewers(thread_id))
+        return bool(codex_viewers(thread_id)[0])
     return bool(run_text(["pgrep", "-f", f"codex[^ ]* resume {thread_id}"]).split())
 
 
-def process_command_line(pid):
-    """Windows: a process's command line, or None. Read straight from the system, in
-    milliseconds even when the computer is busy (a WMI query can take minutes then)."""
+def process_command_line(pid=None, handle=None):
+    """Windows: a process's command line, or None, from its pid or from a handle already open on
+    it. Read straight from the system, in milliseconds even when the computer is busy (a WMI
+    query can take minutes then)."""
     import ctypes
     from ctypes import wintypes
-    handle = open_process(pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-    if not handle:
-        return None
+    opened = None
+    if handle is None:
+        handle = opened = open_process(pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
     try:
         ntdll = ctypes.windll.ntdll
         ntdll.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
@@ -1140,44 +1151,154 @@ def process_command_line(pid):
         us = UnicodeString.from_buffer(buf)
         return ctypes.wstring_at(us.Buffer, us.Length // 2) if us.Buffer and us.Length else ""
     finally:
-        close_handle(handle)
+        close_handle(opened)
+
+
+def split_windows_args(line):
+    """A Windows command line split into arguments as the C runtime does: 2n backslashes before a
+    quote give n backslashes and the quote starts or ends a quoted part; 2n+1 give a literal quote."""
+    args, cur, have, quoted, i, n = [], [], False, False, 0, len(line)
+    while i < n:
+        c = line[i]
+        if c == "\\":
+            j = i
+            while j < n and line[j] == "\\":
+                j += 1
+            if j < n and line[j] == '"':
+                cur.append("\\" * ((j - i) // 2))
+                if (j - i) % 2:
+                    cur.append('"')
+                    j += 1
+            else:
+                cur.append(line[i:j])
+            have, i = True, j
+        elif c == '"':
+            if quoted and line[i + 1:i + 2] == '"':
+                cur.append('"')
+                i += 2
+            else:
+                quoted, have, i = not quoted, True, i + 1
+        elif c in " \t" and not quoted:
+            if have:
+                args.append("".join(cur))
+                cur, have = [], False
+            i += 1
+        else:
+            cur.append(c)
+            have, i = True, i + 1
+    if have:
+        args.append("".join(cur))
+    return args
+
+
+def is_resume_of(argv, thread_id):
+    """Whether arguments are `codex resume <thread_id> ...`: the subcommand and the id themselves,
+    not the same words inside a prompt."""
+    return (len(argv) >= 3 and re.split(r"[\\/]", argv[0])[-1].lower() in ("codex", "codex.exe", "codex.cmd")
+            and argv[1] == "resume" and argv[2] == thread_id)
+
+
+def shell_command(line):
+    """The command a `cmd [/d] [/s] /k <command>` line runs, as cmd takes it, or None."""
+    m = re.match(r'\s*(?:"[^"]*"|\S+)((?:\s+/[a-jl-z])*)\s+/k\s+(.*)$', line, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+    run = m.group(2)
+    if "/s" in m.group(1).lower() and run.startswith('"') and run.count('"') >= 2:
+        last = run.rfind('"')
+        run = run[1:last] + run[last + 1:]  # /s: cmd drops the first and the last quote
+    return run
+
+
+def is_nouez_pane(line, thread_id):
+    """Whether a cmd.exe command line is a pane open_terminal started for this thread: `cmd /k`
+    running `codex resume <id>` with this thread's pane token right after it, and nothing else for
+    cmd to run. A shell the user opened can't carry the token, whatever they typed."""
+    run = shell_command(line)
+    if run is None or (CMD_SPECIAL - {'"', "'"}) & set(run):
+        return False
+    argv = split_windows_args(run)
+    return is_resume_of(argv, thread_id) and argv[3:5] == ["-c", f"nouez_pane={pane_token(thread_id)}"]
 
 
 def codex_viewers(thread_id, table=None, command_line=None):
-    """Windows: the codex.exe processes showing `codex resume <id>`, as (codex pid, the pid of
-    the `cmd /k` open_terminal wrapped it in, or None)."""
+    """Windows: (viewers, shells): the codex.exe processes running `codex resume <id>`, whoever
+    started them, and the `cmd /k` windows open_terminal started for it. A shell counts by the
+    command it was given, so a shell the user opened isn't one, and one whose codex has ended or
+    runs through npm's node still is."""
     table = process_table() if table is None else table
     command_line = command_line or process_command_line
-    found = []
-    for pid, (parent, exe) in table.items():
-        if exe.lower() != "codex.exe":
-            continue
-        line = command_line(pid) or ""
-        if not re.search(rf"\sresume\s+\"?{re.escape(thread_id)}(\s|\"|$)", line):
-            continue
-        shell = None
-        if parent in table and table[parent][1].lower() == "cmd.exe":
-            if re.search(r"/k\s", command_line(parent) or "", re.IGNORECASE):
-                shell = parent
-        found.append((pid, shell))
-    return found
+    viewers, shells = [], []
+    for pid, (_, exe) in table.items():
+        name = exe.lower()
+        if name == "codex.exe":
+            if is_resume_of(split_windows_args(command_line(pid) or ""), thread_id):
+                viewers.append(pid)
+        elif name == "cmd.exe" and is_nouez_pane(command_line(pid) or "", thread_id):
+            shells.append(pid)
+    return viewers, shells
 
 
-def end_tree(pid, table, code=1):
-    """Windows: end a process and everything it started, deepest first, without taskkill."""
+def end_tree(root, pid, table, code=1, snapshot=None):
+    """Windows: end every process that `root`, an open handle on process `pid`, started, deepest
+    first. A process counts as a child only if it started after its parent, so a parent pid that
+    has passed to an unrelated process doesn't pull that one in. Each is opened before it is
+    checked, and once all are open, a new snapshot must still name the same parent: a child that
+    ended between the first snapshot and its opening can't be stood in for by a new process with
+    its pid, since an open handle keeps a pid from being reused."""
+    kernel32 = _kernel32()[2]
     children = {}
     for child, (parent, _) in table.items():
         children.setdefault(parent, []).append(child)
-    order, todo, seen = [], [pid], set()
+    found, todo, seen = [], [(pid, handle_start(root))], {pid}
     while todo:
-        p = todo.pop()
-        if p in seen:
-            continue
-        seen.add(p)
-        order.append(p)
-        todo.extend(children.get(p, []))
-    for p in reversed(order):
-        end_process(p, code)
+        parent, parent_start = todo.pop()
+        for child in children.get(parent, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            handle = open_process(child, QUERY | SYNCHRONIZE | TERMINATE)
+            if not handle:
+                continue
+            start = handle_start(handle)
+            if start is None or parent_start is None or start < parent_start:
+                close_handle(handle)
+                continue
+            found.append((handle, child, parent))
+            todo.append((child, start))
+    fresh = (snapshot or process_table)() if found else {}
+    opened, kept = [], {pid}
+    for handle, child, parent in found:  # parents come before their children
+        if parent in kept and fresh.get(child, (None,))[0] == parent:
+            kept.add(child)
+            opened.append(handle)
+        else:
+            close_handle(handle)
+    try:
+        for handle in reversed(opened):
+            kernel32.TerminateProcess(handle, code)
+        for handle in opened:
+            wait_handle(handle, 2)
+    finally:
+        for handle in opened:
+            close_handle(handle)
+
+
+def end_shell(pid, thread_id, table):
+    """Windows: end a viewer's `cmd /k` window and everything in it; True once that cmd has
+    ended. The shell is checked again through the handle that ends it."""
+    shell, err = open_process_why(pid, QUERY | SYNCHRONIZE | TERMINATE)
+    if not shell:
+        return err == 87  # ERROR_INVALID_PARAMETER: it has ended already
+    try:
+        if not is_nouez_pane(process_command_line(handle=shell) or "", thread_id):
+            return False  # its pid has passed to another process: leave that alone
+        end_tree(shell, pid, table)
+        # Windows Terminal closes a pane by itself only on a clean exit, so end cmd with code 0.
+        _kernel32()[2].TerminateProcess(shell, 0)
+        return wait_handle(shell, 3)
+    finally:
+        close_handle(shell)
 
 
 _console_lock = threading.Lock()  # AttachConsole is per process, so one lookup at a time
@@ -1281,18 +1402,23 @@ def handle_start(handle):
     code = wintypes.DWORD()
     if not kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
         return None
-    if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != 259:  # STILL_ACTIVE
+    if handle_exited(handle):
         return None
     return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
 
 
 def handle_exited(handle):
-    """Windows: True if the process has ended, False if it runs, None if that can't be read."""
+    """Windows: True if the process has ended, False if it runs, None if that can't be read. A
+    handle with SYNCHRONIZE access is asked directly; without it, the exit code is read, and 259
+    (STILL_ACTIVE), which a process can also exit with, counts as unknown rather than running."""
     ctypes, wintypes, kernel32 = _kernel32()
+    state = kernel32.WaitForSingleObject(handle, 0)
+    if state in (0, 258):  # WAIT_OBJECT_0: signalled, it has ended; WAIT_TIMEOUT: it runs
+        return state == 0
     code = wintypes.DWORD()
-    if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+    if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259:
         return None
-    return code.value != 259  # STILL_ACTIVE
+    return True
 
 
 def close_handle(handle):
@@ -1435,12 +1561,136 @@ def run_in_host_window(wt, cwd, command):
 CMD_SPECIAL = set('&|<>^%!"\'\r\n')  # a folder with one of these isn't put on a cmd /k line
 
 
-def viewer_options(cwd):
+def codex_project_key(folder):
+    """The key Codex files a folder's trust under: on Windows the full path with only ASCII
+    letters lowercased (as Codex does, so `C:\\École` is `c:\\École`), elsewhere the real path."""
+    if os.name != "nt":
+        return os.path.realpath(folder)
+    return "".join(c.lower() if c.isascii() else c for c in os.path.normpath(os.path.abspath(folder)))
+
+
+def codex_trust_levels(home=None):
+    """{folder key: trust level} from Codex's config.toml, keys as codex_project_key gives them;
+    {} when there is no config.toml, None when it can't be read for sure."""
+    try:
+        with open(os.path.join(home or codex_home(), "config.toml"), encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    fold = (lambda k: "".join(c.lower() if c.isascii() else c for c in k)) if os.name == "nt" else (lambda k: k)
+    try:
+        import tomllib  # Python 3.11+
+    except ImportError:
+        tomllib = None
+    if tomllib:
+        try:
+            projects = tomllib.loads(text).get("projects", {})
+        except ValueError:
+            return None
+        if not isinstance(projects, dict):
+            return None
+        return {fold(k): v.get("trust_level") for k, v in projects.items() if isinstance(v, dict)}
+    # Older Python: only the [projects.'<path>'] tables Codex writes. An escape outside a literal
+    # ('...') string could spell any key or value, so a file with one can't be read for sure.
+    if any("\\" in re.sub(r"'[^']*'", "", line) for line in text.splitlines()):
+        return None
+    levels, key = {}, None
+    for line in text.splitlines():
+        if line.lstrip().startswith("["):
+            m = re.fullmatch(r"\s*\[\s*projects\.(?:'([^']*)'|\"((?:[^\"\\]|\\.)*)\")\s*\]\s*(#.*)?", line)
+            key = None
+            if m:
+                key = m.group(1) if m.group(1) is not None else m.group(2)
+            continue
+        m = re.fullmatch(r"\s*trust_level\s*=\s*[\"']([a-z]+)[\"']\s*(#.*)?", line)
+        if key is not None and m:
+            levels[fold(key)] = m.group(1)
+    # Without escapes, "untrusted" can only be written out, so one this reader didn't take in
+    # (an inline table, say) shows up here and makes the whole file uncertain.
+    if text.count("untrusted") != sum(v == "untrusted" for v in levels.values()):
+        return None
+    return levels
+
+
+_pane_key = None
+_pane_key_lock = threading.Lock()
+
+
+def pane_key():
+    """A random secret made once in nouez's cache folder, shared by every nouez server of this
+    user; the pane tokens come from it. If it can't be read or made, a secret of this server's
+    own: its panes are then found by it alone."""
+    global _pane_key
+    with _pane_key_lock:
+        if _pane_key is None:
+            path, key = os.path.join(nouez_cache_dir(), "pane-key"), b""
+
+            def read():
+                try:
+                    with open(path, "rb") as f:
+                        return f.read(64)
+                except FileNotFoundError:
+                    return b""
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                key = read()
+                if len(key) < 32:
+                    # Made under a lock all servers take, and read again under it, so they all end
+                    # on the same key; written in full under a name of its own, then moved into
+                    # place in one step, so a reader never sees half of one. A short file can only
+                    # be a damaged one, and is replaced.
+                    lock = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+                    locked = False
+                    try:
+                        for _ in range(50):
+                            try:
+                                agy_lock(None)._lock(lock, True)
+                                locked = True
+                                break
+                            except OSError:
+                                time.sleep(0.1)
+                        key = read()
+                        if locked and len(key) < 32:
+                            tmp = f"{path}.{os.getpid()}.tmp"
+                            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
+                            try:
+                                with os.fdopen(fd, "wb") as f:
+                                    f.write(os.urandom(32))
+                                os.replace(tmp, path)
+                            finally:
+                                if os.path.exists(tmp):
+                                    os.remove(tmp)
+                            key = read()
+                    finally:
+                        if locked:
+                            agy_lock(None)._lock(lock, False)
+                        os.close(lock)
+            except OSError as e:
+                log(f"pane key: {e}")
+            _pane_key = key if len(key) >= 32 else os.urandom(32)
+        return _pane_key
+
+
+def pane_token(thread_id):
+    """The token a pane for this thread carries as `-c nouez_pane=<token>` (Codex ignores the
+    unknown key), so a stop closes the panes nouez opened and never a terminal the user opened."""
+    return "p" + hmac.new(pane_key(), thread_id.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def pane_resume(codex, thread_id, cwd):
+    """The `codex resume` command a pane runs: the pane token first, then viewer_options."""
+    return [codex, "resume", thread_id, "-c", f"nouez_pane={pane_token(thread_id)}", *viewer_options(cwd)]
+
+
+def viewer_options(cwd, home=None):
     """Options for the viewer's `codex resume`, so the pane shows the consultant rather than a
     question: no update check, and the folder (and its git root) trusted for this run only.
-    Without that, Codex asks "Trust this folder?" in every folder the user hasn't trusted, and
-    the pane waits there. Nothing is saved to config.toml. A trusted folder's .codex config and
-    hooks load in the viewer, as they would after the user answered the question themselves."""
+    Without that, Codex asks "Trust this folder?" in every folder the user hasn't decided on, and
+    the pane waits there. Nothing is saved to config.toml, and a folder the user marked untrusted
+    stays so: Codex asks as usual. A trusted folder's .codex config and hooks load in the viewer,
+    as they would after the user answered the question themselves."""
     options = ["-c", "check_for_update_on_startup=false"]
     folders, here = [], os.path.abspath(cwd)
     folders.append(here)
@@ -1453,11 +1703,15 @@ def viewer_options(cwd):
         if parent == here:
             break
         here = parent
-    keys = []
+    keys, levels = [], codex_trust_levels(home)
+    if levels is None:
+        return options  # the user's answers can't be read for sure: Codex asks
     for folder in folders:
-        key = os.path.normcase(os.path.normpath(folder)) if os.name == "nt" else os.path.realpath(folder)
+        key = codex_project_key(folder)
         if CMD_SPECIAL & set(key):
             return options  # Codex asks instead; such a path could break out of cmd's command line
+        if levels.get(key) == "untrusted":
+            return options  # the user's own answer stands
         keys.append(key)
     table = ",".join(f"'{key}'={{trust_level='trusted'}}" for key in keys)
     return [*options, "-c", f"projects={{{table}}}"]
@@ -1469,21 +1723,29 @@ def open_terminal(cwd, thread_id, codex="codex"):
     if not re.fullmatch(r"[0-9A-Za-z-]+", thread_id):
         raise BridgeError(f"Refusing to open a terminal for an unexpected thread id: {thread_id!r}")
     cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
-    resume = [codex, "resume", thread_id, *viewer_options(cwd)]
+    resume = pane_resume(codex, thread_id, cwd)
     kwargs = {"cwd": cwd, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     tmux = shutil.which("tmux") if os.environ.get("TMUX") else None
     if tmux:
         argv, how = [tmux, "split-window", "-h", "-c", cwd, shlex.join(resume)], "a tmux split pane"
     elif os.name == "nt":
         # codex on PATH is usually an npm .cmd shim, so run it through cmd; /k keeps errors on screen.
+        # The whole command goes to cmd as one quoted argument with /s, which makes cmd drop just
+        # those outer quotes: without it, a quoted program path followed by another quoted
+        # argument loses its opening quote. Windows Terminal passes such an argument on as "...".
+        line = subprocess.list2cmdline(resume)
+        if set(line) & (CMD_SPECIAL - {'"', "'"}):  # quotes are for cmd to read, not operators
+            raise BridgeError(f"Can't open a terminal safely for this command; run it yourself: {line}")
+        shell = ["cmd", "/d", "/s", "/k", line]
         wt = shutil.which("wt")
         if wt and os.environ.get("WT_SESSION"):
-            return run_in_host_window(wt, cwd, ["-d", cwd, "--title", "Codex consultant", "cmd", "/k", *resume])
+            return run_in_host_window(wt, cwd, ["-d", cwd, "--title", "Codex consultant", *shell])
         elif wt:
-            argv = [wt, "-w", "new", *map(wt_escape, ["-d", cwd, "--title", "Codex consultant", "cmd", "/k", *resume])]
+            argv = [wt, "-w", "new", *map(wt_escape, ["-d", cwd, "--title", "Codex consultant", *shell])]
             how = "Windows Terminal"
         else:
-            argv, how = ["cmd", "/c", "start", "Codex consultant", "cmd", "/k", *resume], "a console window"
+            # A string, so start gets the quoting above as it is (a list would escape its quotes).
+            argv, how = f'cmd /c start "Codex consultant" cmd /d /s /k "{line}"', "a console window"
     elif sys.platform == "darwin":
         script = f"cd {shlex.quote(cwd)} && {shlex.join(resume)}"
         argv, how = ["osascript", "-e", f"tell application \"Terminal\" to do script {json.dumps(script)}",
@@ -1510,34 +1772,32 @@ def show_viewer(thread, info, quiet=False):
     return f"Opened {name} in {open_terminal(thread.get('cwd'), tid, codex)}.{warning}"
 
 
-def end_process(pid, code):
-    """Windows: terminate a process with a chosen exit code."""
-    import ctypes
-    kernel32 = ctypes.windll.kernel32
-    handle = kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
-    if handle:
-        kernel32.TerminateProcess(handle, code)
-        kernel32.CloseHandle(handle)
-
-
 def close_terminals(thread_id):
-    """Best effort: end `codex resume <id>` processes so their windows close. Returns how many."""
+    """Best effort: end the `codex resume <id>` windows open_terminal opened (they carry the
+    thread's pane token), so they close.
+    Returns (how many were seen to end, how many were found)."""
     if not re.fullmatch(r"[0-9A-Za-z-]+", thread_id):
-        return 0
+        return 0, 0
     if os.name == "nt":
-        # Only the cmd windows open_terminal started, running codex by name or by full path.
         table = process_table()
-        viewers = [(pid, shell) for pid, shell in codex_viewers(thread_id, table) if shell]
-        for pid, shell in viewers:
-            end_tree(pid, table)
-            # Windows Terminal closes a pane by itself only on a clean exit, so end cmd with code 0.
-            end_process(shell, 0)
-        return len(viewers)
-    pattern = f"codex[^ ]* resume {thread_id}"
-    pids = run_text(["pgrep", "-f", pattern]).split()
-    if pids:
-        run_text(["pkill", "-f", pattern])
-    return len(pids)
+        shells = codex_viewers(thread_id, table)[1]
+        return sum(end_shell(pid, thread_id, table) for pid in shells), len(shells)
+    # Only a process whose own program is codex: a terminal emulator started with
+    # `-e codex resume ...`, which may hold other windows, has the same words in its command line.
+    pattern = f"codex[^ ]* resume {thread_id} -c nouez_pane={pane_token(thread_id)}( |$)"
+    def still_pane(pid):  # checked again just before the signal, in case the pane ended meanwhile
+        ps = lambda field: run_text(["ps", "-o", f"{field}=", "-p", pid]).strip()
+        return os.path.basename(ps("comm")).startswith("codex") and re.search(pattern, ps("args"))
+    found = ended = 0
+    for pid in run_text(["pgrep", "-f", pattern]).split():
+        if pid.isdigit() and still_pane(pid):
+            found += 1
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+                ended += 1
+            except OSError:
+                pass
+    return ended, found
 
 
 # Variables Claude Code sets for the commands it runs, tying them to its session. A `claude` that
@@ -2766,13 +3026,13 @@ def stop_consultant(args, cancel=None, progress=None):
     set_watch(thread["id"], False)
     with _send_locks_guard:
         _unwatched.discard(thread["id"])
-    closed = close_terminals(thread["id"])
+    closed, found = close_terminals(thread["id"])
     deadline = time.monotonic() + 3  # an ended process can still be listed for a moment
     while (left := viewer_running(thread["id"])) and time.monotonic() < deadline:
         time.sleep(0.2)
     return (f"Stopped {name} (archived)."
             + (f" Closed {closed} terminal window(s) showing it." if closed else "")
-            + (" A terminal still shows it; close it yourself." if left else "")
+            + (" A terminal still shows it; close it yourself." if left or closed < found else "")
             + f" To bring it back: codex unarchive {thread['id']}, "
             f"then codex resume {thread['id']}.")
 
@@ -3894,7 +4154,7 @@ def open_process_why(pid, access):
     return (handle or None), (0 if handle else ctypes.get_last_error())
 
 
-def agy_identity(meta, access=QUERY):
+def agy_identity(meta, access=QUERY | SYNCHRONIZE):
     """Whether the turn's agy process runs and is the very process nouez started: ("ours", a handle
     on Windows, which keeps its pid from passing to another process), ("gone", None) when it has
     ended or its pid is now another process's, or ("unknown", None) when that can't be checked.
@@ -4003,6 +4263,10 @@ def agy_turn(cid, turn_id, now=None):
     # next is complete, so a missing result means a failure, not a result about to be written.
     running = (not meta.get("stopped") and not meta.get("failed")
                and (agy_alive(meta) or (not meta.get("pid") and now - started < AGY_START_GRACE)))
+    if not running:
+        # A stop marks the turn before it ends agy, so read the marks again now that agy has been
+        # seen gone: from the first read alone, a stop in between would look like a failure.
+        meta = read_json_file(os.path.join(folder, turn_id + ".json")) or meta
     events = agy_events(os.path.join(folder, turn_id + ".jsonl"))
     result = next((e.get("result") for e in reversed(events) if e["event"] == "result"), None)
     result = result if isinstance(result, dict) else None
@@ -4443,7 +4707,14 @@ def stop_agy_consultant(rec):
                 write_json_atomic(path, {**meta, "stopping": True, "stopped": True})
                 ended += 1
             else:
-                write_json_atomic(path, meta)  # still running: a later stop can try again
+                # Still running: take the mark back, so a later stop can try again and a failure
+                # after this isn't named a stop. A save can fail for a moment (a virus scanner).
+                for _ in range(5):
+                    if write_json_atomic(path, meta):
+                        break
+                    time.sleep(0.2)
+                else:
+                    log(f"agy stop: couldn't clear the stopping mark of turn {tid}")
                 stuck.append(meta.get("pid"))
         if stuck:
             raise BridgeError(
@@ -4664,17 +4935,168 @@ def read_key(timeout):
     return sys.stdin.read(1) if ready else None
 
 
+# The screen's exit codes to its supervisor, small enough for any system: the user quit; start
+# again with the period it was given; or start again with TOP_PERIODS' period at the index added.
+TOP_QUIT, TOP_RELOAD = 70, 71
+
+
+def source_stamp(path):
+    """(modification time, size) of a file, or None."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def top_reload_due(path, started, seen):
+    """Whether server.py has changed since the screen started, has stayed the same since the last
+    check, compiles, and still has the status screen and its entry point (a file cut short can
+    compile too). Returns (due, stamp now). A file still being written waits a round."""
+    now = source_stamp(path)
+    if now is None or now == started or now != seen:
+        return False, now
+    try:
+        with open(path, "rb") as f:
+            code = f.read()
+        compile(code, path, "exec")
+    except (OSError, SyntaxError, ValueError):
+        return False, now
+    if b"\ndef run_top(" not in code or b'\nif __name__ == "__main__":' not in code:
+        return False, now
+    return True, now
+
+
+def top_args(argv):
+    """The screen's own arguments from a `top` command line, without --screen and --since."""
+    args, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a == "--since":
+            skip = True
+        elif a != "--screen":
+            args.append(a)
+    return args
+
+
+class TopEnded(Exception):
+    """Raised in the supervisor by SIGTERM or SIGHUP (not on Windows)."""
+
+
+def end_child(child):
+    """Ask a child to end, force it after 2 seconds, and reap it."""
+    if child.poll() is None:
+        child.terminate()
+    try:
+        child.wait(2)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait()
+
+
+def supervise_top(argv):
+    """Run the status screen as a child and start it again, from the server.py now on disk, each
+    time it exits asking for that, so the screen always runs the installed version. Only the
+    user's quit ends it once the screen has restarted: any other end of a restarted screen (a
+    crash, or a file cut short that does nothing) leaves the window waiting for the next update."""
+    args = top_args(argv)
+    flags = ["-I"] if sys.flags.isolated else []
+    source = os.path.abspath(__file__)
+    state = {"signum": None, "raise": True}
+    if os.name != "nt":
+        def ended(signum, frame):  # the window closed or someone ended top: end the screen too
+            state["signum"] = signum
+            if state["raise"]:
+                raise TopEnded(signum)
+        for name in ("SIGTERM", "SIGHUP"):
+            signal.signal(getattr(signal, name), ended)
+    try:
+        return _supervise_top(args, flags, source, state)
+    except TopEnded as e:
+        child = getattr(e, "child", None)
+        if child is not None:
+            end_child(child)  # out of the interrupted wait, so it can reap the screen
+        return 128 + e.args[0]
+
+
+def _supervise_top(args, flags, source, state):
+    reloaded = False
+    while True:
+        # The screen takes this as the version it runs, so a change from here on restarts it.
+        stamp = source_stamp(source)
+        since = ["--since", f"{stamp[0]}:{stamp[1]}"] if stamp else []
+        state["raise"] = False  # a signal while the screen starts is acted on once it has
+        try:
+            child = subprocess.Popen([sys.executable, *flags, source, "top", "--screen", *since, *args])
+        except OSError as e:
+            state["raise"] = True
+            print(f"Could not start the status screen: {e}")
+            return 1 if state["signum"] is None else 128 + state["signum"]
+        interrupted = False
+        try:
+            state["raise"] = True
+            if state["signum"] is not None:
+                raise TopEnded(state["signum"])
+            while True:
+                try:
+                    code = child.wait()
+                    break
+                except KeyboardInterrupt:
+                    # The screen gets a Ctrl+C typed in the window too, and ends itself; one sent
+                    # to this process alone is passed on.
+                    interrupted = True
+                    try:
+                        code = child.wait(2)
+                        break
+                    except subprocess.TimeoutExpired:
+                        end_child(child)
+                    except KeyboardInterrupt:
+                        pass
+        except TopEnded as e:
+            e.child = child
+            raise
+        if code == TOP_QUIT or interrupted:
+            return 0
+        periods = list(TOP_PERIODS.values())
+        if TOP_RELOAD <= code <= TOP_RELOAD + len(periods):
+            if code > TOP_RELOAD:
+                args = ["--days", str(periods[code - TOP_RELOAD - 1] or 0)]
+            reloaded = True
+            continue
+        if not reloaded:
+            return code
+        print(f"\nThe status screen from the updated server.py ended with code {code}. It starts again "
+              "when server.py changes; Ctrl+C closes this window.")
+        seen = stamp  # what the failed screen ran: a fix written since then is due at once
+        try:
+            while True:
+                time.sleep(TOP_REFRESH)
+                due, seen = top_reload_due(source, stamp, seen)
+                if due:
+                    break
+        except KeyboardInterrupt:
+            return code
+
+
 def run_top(argv):
     """`server.py top [--once] [--days N]`: the usage status screen."""
-    once, days = "--once" in argv, 7
-    if "--days" in argv:
-        i = argv.index("--days")
-        try:
-            days = int(argv[i + 1])
-            days = days if days > 0 else None
-        except (IndexError, ValueError):
-            print("usage: server.py top [--once] [--days N]  (N = 0 for everything logged)")
-            return 2
+    if "--once" not in argv and "--screen" not in argv:
+        return supervise_top(argv)  # it notes the version before the screen's Python reads it
+    once, days, since, quit_code = "--once" in argv, 7, None, TOP_QUIT if "--screen" in argv else 0
+    try:
+        if "--days" in argv:
+            days = int(argv[argv.index("--days") + 1])
+            if not 0 <= days <= 0xFFFF:
+                raise ValueError
+            days = days or None
+        if "--since" in argv:
+            since = tuple(int(n) for n in argv[argv.index("--since") + 1].split(":"))
+            if len(since) != 2:
+                raise ValueError
+    except (IndexError, ValueError):
+        print("usage: server.py top [--once] [--days N]  (N from 0, everything logged, to 65535)")
+        return 2
     state_path = os.path.join(nouez_cache_dir(), SCAN_STATE_FILE)
     state = read_scan_state(state_path)
     shared = {"scan": json.loads(json.dumps(state)), "scanning": True, "codex": None, "agy": None}
@@ -4721,15 +5143,26 @@ def run_top(argv):
 
     scr = Screen(enable_ansi())
     threading.Thread(target=background, daemon=True).start()
-    posix_tty = None
-    if os.name != "nt" and sys.stdin.isatty():
-        import termios
-        import tty
-        posix_tty = termios.tcgetattr(sys.stdin)
-        tty.setcbreak(sys.stdin)
-    sys.stdout.write("\x1b[?1049h\x1b[?25l")  # own screen, no cursor
+    source = os.path.abspath(__file__)
+    if os.name != "nt" and "--screen" in argv:  # ended by its supervisor: restore the terminal first
+        def ended(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, ended)
+    # The version this screen runs: as the process that started it saw the file, or as Python
+    # loaded it. A change after that, even one made while starting, restarts it.
+    started = seen = since or LOADED_STAMP or source_stamp(source)
+    reload, posix_tty, given = False, None, days
     try:
+        if os.name != "nt" and sys.stdin.isatty():
+            import termios
+            import tty
+            posix_tty = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin)
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")  # own screen, no cursor
         while True:
+            reload, seen = top_reload_due(source, started, seen)
+            if reload:  # server.py was updated: start again on the new version
+                break
             size = shutil.get_terminal_size((120, 40))
             with guard:
                 codex, scan, scanning, agy = shared["codex"], shared["scan"], shared["scanning"], shared["agy"]
@@ -4738,7 +5171,7 @@ def run_top(argv):
             sys.stdout.flush()
             key = read_key(TOP_REFRESH)
             if key in ("q", "Q", "\x1b", "\x03"):
-                return 0
+                return quit_code
             if key in TOP_PERIODS:
                 days = TOP_PERIODS[key]
             elif key in ("r", "R"):
@@ -4746,7 +5179,7 @@ def run_top(argv):
                 with guard:
                     shared["codex"], shared["agy"] = codex, agy
     except KeyboardInterrupt:
-        return 0
+        return quit_code
     finally:
         stop.set()
         sys.stdout.write("\x1b[?25h\x1b[?1049l")
@@ -4754,6 +5187,9 @@ def run_top(argv):
         if posix_tty is not None:
             import termios
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, posix_tty)
+    if days == given:
+        return TOP_RELOAD  # supervise_top starts it again
+    return TOP_RELOAD + 1 + list(TOP_PERIODS.values()).index(days)
 
 
 # --- MCP stdio server --------------------------------------------------------

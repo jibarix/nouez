@@ -2739,6 +2739,43 @@ class AgyTest(unittest.TestCase):
         self.assertEqual(server.agy_turns(cid, 1)[0]["status"], "interrupted")
         self.assertIsNone(server.agy_resolve(name))
 
+    def test_stop_during_a_read_is_a_stop(self):
+        """A reader that loaded the turn just before a stop marked it names it stopped, not failed."""
+        _, name = self.start()
+        cid = server.agy_resolve(name)["id"]
+        self.replies = [None]
+        with mock.patch.object(server, "agy_alive", self.alive):
+            server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+        tid = server.agy_turn_ids(cid)[0]
+        path = os.path.join(server.agy_folder(cid), "turns", tid + ".json")
+
+        def stopped_meanwhile(meta):  # the stop marks the turn and ends agy between the reads
+            server.write_json_atomic(path, {**meta, "stopping": True, "stopped": True})
+            return False
+        with mock.patch.object(server, "agy_alive", stopped_meanwhile):
+            self.assertEqual(server.agy_turn(cid, tid)["status"], "interrupted")
+
+    def test_failed_stop_clears_its_mark_after_a_failed_save(self):
+        _, name = self.start()
+        cid = server.agy_resolve(name)["id"]
+        self.replies = [None]
+        real, fails = server.write_json_atomic, [1]
+
+        def flaky(path, data):  # the first save that takes the mark back fails
+            if path.endswith(".json") and "turns" in path and not data.get("stopping") and fails:
+                fails.pop()
+                return False
+            return real(path, data)
+        with mock.patch.object(server, "agy_alive", self.alive):
+            server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+            with mock.patch.object(server, "agy_end_process", return_value=False), \
+                 mock.patch.object(server, "write_json_atomic", flaky), mock.patch.object(server.time, "sleep"):
+                with self.assertRaises(server.BridgeError):
+                    server.stop_consultant({"to": name})
+        self.assertEqual(fails, [])
+        path = os.path.join(server.agy_folder(cid), "turns", server.agy_turn_ids(cid)[0] + ".json")
+        self.assertNotIn("stopping", server.read_json_file(path))
+
     def test_unsaved_model_said_on_a_reply(self):
         """0.15.1: a reply that came back on a model nouez couldn't save says so (round 3, point 3)."""
         _, name = self.start()
@@ -2839,14 +2876,120 @@ class PaneTest(unittest.TestCase):
     """0.15.1: panes are found and closed from Windows' own process list, not WMI."""
     TID = "01a2ffff-0000-7000-8000-00000000abcd"
 
+    def setUp(self):
+        key = mock.patch.object(server, "_pane_key", b"k" * 32)  # never the user's real key
+        key.start()
+        self.addCleanup(key.stop)
+
     def test_codex_viewers(self):
+        t = self.TID
         table = {10: (1, "cmd.exe"), 11: (10, "codex.exe"), 12: (1, "codex.exe"), 13: (1, "codex.exe"),
-                 14: (1, "cmd.exe"), 15: (14, "codex.exe"), 16: (1, "python.exe")}
-        lines = {10: f"cmd /k codex resume {self.TID}", 11: f"C:\\x\\codex.exe resume {self.TID}",
-                 12: f"codex resume {self.TID}", 13: f"codex resume {self.TID}0",  # another id
-                 14: "cmd /c something", 15: f'"codex.exe" resume "{self.TID}"', 16: f"x resume {self.TID}"}
-        found = server.codex_viewers(self.TID, table, lines.get)
-        self.assertEqual(sorted(found), [(11, 10), (12, None), (15, None)])
+                 14: (1, "cmd.exe"), 15: (14, "codex.exe"), 16: (1, "python.exe"), 17: (1, "codex.exe"),
+                 18: (1, "cmd.exe"), 19: (18, "node.exe"), 20: (19, "codex.exe"), 21: (1, "cmd.exe"),
+                 22: (1, "cmd.exe"), 23: (1, "cmd.exe"), 24: (1, "cmd.exe"), 25: (1, "cmd.exe"), 26: (1, "cmd.exe"),
+                 27: (1, "cmd.exe"), 28: (1, "cmd.exe")}
+        up = f"-c nouez_pane={server.pane_token(t)} -c check_for_update_on_startup=false"
+        old = "-c check_for_update_on_startup=false"  # the options alone, as a user could type them
+        lines = {10: f'cmd.exe /d /s /k "codex resume {t} {up}"', 11: f"C:\\x\\codex.exe resume {t}",
+                 12: f"codex resume {t}", 13: f"codex resume {t}0",  # another id
+                 14: "cmd /k", 15: f'"codex.exe" resume "{t}"', 16: f"x resume {t}",
+                 17: f'codex exec "then run codex resume {t} please"',  # words in a prompt
+                 # npm's shim: cmd -> node -> codex.exe, with quoted paths that have spaces
+                 18: f'cmd /d /s /k ""C:\\Program Files\\nodejs\\codex.cmd" resume {t} {up} -c "projects={{\'c:\\a b\'=1}}""',
+                 19: "node codex.js", 20: f"C:\\n\\codex.exe resume {t}",
+                 21: f'cmd /k echo codex resume {t}', 22: f"cmd /c codex resume {t}",
+                 # shells the user typed: no options, other options, or more commands after it
+                 23: f"cmd /k codex resume {t}", 24: f'cmd /d /s /k "codex resume {t} --yolo"',
+                 25: f'cmd /d /s /k "codex resume {t} {up} & del x"',
+                 26: f"cmd /k C:\c\codex.exe resume {t} {old}",  # typed, or a pane before the token
+                 27: f'cmd /d /s /k "codex resume {t} {old} -c projects={{}}"',
+                 28: f'cmd /d /s /k "codex resume {t} -c nouez_pane=p{"0" * 32} {old}"'}  # a wrong token
+        viewers, shells = server.codex_viewers(t, table, lines.get)
+        self.assertEqual(sorted(viewers), [11, 12, 15, 20])
+        self.assertEqual(sorted(shells), [10, 18])  # only the panes nouez opens
+        self.assertNotEqual(server.pane_token(t), server.pane_token(t[:-1] + "e"))
+
+    def test_pane_line_matches_open_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for folder in (tmp, os.path.join(tmp, "a b")):
+                os.makedirs(folder, exist_ok=True)
+                with mock.patch.object(server, "codex_trust_levels", return_value={}):
+                    resume = server.pane_resume("C:\\Program Files\\c\\codex.exe", self.TID, folder)
+                self.assertIn("-c", resume[5:])  # the trust option too
+                line = f'C:\\WINDOWS\\system32\\cmd.exe /d /s /k "{subprocess.list2cmdline(resume)}"'
+                self.assertTrue(server.is_nouez_pane(line, self.TID), line)
+                self.assertFalse(server.is_nouez_pane(line, self.TID[:-1] + "e"))
+
+    def test_pane_key_is_made_once(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(server, "nouez_cache_dir", return_value=tmp):
+            server._pane_key = None
+            first = server.pane_key()
+            with open(os.path.join(tmp, "pane-key"), "rb") as f:
+                self.assertEqual(f.read(), first)
+            server._pane_key = None
+            self.assertEqual(server.pane_key(), first)  # another server reads the same key
+            with open(os.path.join(tmp, "pane-key"), "wb") as f:
+                f.write(b"short")  # a key cut short: replaced, and every server reads the new one
+            server._pane_key = None
+            fixed = server.pane_key()
+            with open(os.path.join(tmp, "pane-key"), "rb") as f:
+                self.assertEqual(f.read(), fixed)
+            self.assertEqual(len(fixed), 32)
+            self.assertNotEqual(fixed, first)
+            self.assertEqual(sorted(os.listdir(tmp)), ["pane-key", "pane-key.lock"])  # no temporary file left
+            os.remove(os.path.join(tmp, "pane-key"))
+            server._pane_key = None
+            def first_wins(src, dst):
+                with open(dst, "wb") as f:
+                    f.write(b"z" * 32)
+            real_open = server.os.open
+
+            def first_wins_lock(path, *a):
+                if path.endswith(".lock"):  # another server makes its key while this one waits
+                    first_wins(None, os.path.join(tmp, "pane-key"))
+                return real_open(path, *a)
+            with mock.patch.object(server.os, "open", side_effect=first_wins_lock):
+                won = server.pane_key()  # read again under the lock: the other server's key is used
+            self.assertEqual(won, b"z" * 32)
+            server._pane_key = None
+            with mock.patch.object(server.os, "makedirs", side_effect=PermissionError("no")):
+                own = server.pane_key()  # unusable cache: this server's own
+            self.assertEqual(len(own), 32)
+
+    def test_posix_stop_kills_only_tokened_panes(self):
+        # 41: the terminal emulator running `-e codex resume ...`; 42: codex, from a path with a space.
+        # 43: codex, but another session's, on a number a pane that just ended had.
+        token = server.pane_token(self.TID)
+        pane = f"/opt/Codex Tools/bin/codex resume {self.TID} -c nouez_pane={token}"
+        programs = {"41": ("/usr/bin/x-terminal-emulator", "x-terminal-emulator -e " + pane),
+                    "42": ("/opt/Codex Tools/bin/codex", pane), "43": ("codex", "codex resume other")}
+        calls, killed = [], []
+
+        def run(argv):
+            calls.append(argv)
+            if argv[0] == "pgrep":
+                return "41\n42\n43\n"
+            return programs[argv[-1]][argv[2] == "args="] + "\n"
+        with mock.patch.object(server.os, "name", "posix"), mock.patch.object(server, "run_text", side_effect=run), \
+             mock.patch.object(server.os, "kill", side_effect=lambda pid, sig: killed.append(pid)), \
+             mock.patch.object(server.signal, "SIGTERM", 15):
+            self.assertEqual(server.close_terminals(self.TID), (1, 1))
+        self.assertEqual(killed, [42])
+        pattern = calls[0][-1]
+        self.assertEqual(pattern, f"codex[^ ]* resume {self.TID} -c nouez_pane={token}( |$)")
+        for line, hit in ((f"/opt/Codex Tools/bin/codex resume {self.TID} -c nouez_pane={token} -c x=1", True),
+                          (f"codex resume {self.TID} -c nouez_pane={token}", True),
+                          (f"codex resume {self.TID} -c nouez_pane={token}0", False)):
+            self.assertEqual(bool(re.search(pattern, line)), hit, line)
+
+    def test_windows_arguments(self):
+        split = server.split_windows_args
+        self.assertEqual(split(r'"C:\Program Files\c.exe" resume  id -c "a b\\" x\"y'),
+                         [r"C:\Program Files\c.exe", "resume", "id", "-c", "a b\\", 'x"y'])
+        self.assertEqual(split('a "" b'), ["a", "", "b"])
+        self.assertEqual(server.shell_command('cmd /d /s /k ""C:\\a b\\c.exe" r "x y""'), '"C:\\a b\\c.exe" r "x y"')
+        self.assertEqual(server.shell_command("C:\\WINDOWS\\system32\\cmd.exe /K codex resume x"), "codex resume x")
+        self.assertIsNone(server.shell_command("cmd /c codex resume x"))
 
     def test_viewer_trusts_its_folder_for_one_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2854,18 +2997,57 @@ class PaneTest(unittest.TestCase):
             sub = os.path.join(repo, "sub")
             os.makedirs(os.path.join(repo, ".git"))
             os.makedirs(sub)
-            key = (lambda p: os.path.normcase(os.path.normpath(p)) if os.name == "nt" else os.path.realpath(p))
-            options = server.viewer_options(sub)
+            key = server.codex_project_key
+            options = server.viewer_options(sub, home=tmp)
             self.assertEqual(options[:2], ["-c", "check_for_update_on_startup=false"])
             self.assertEqual(options[2:], ["-c", f"projects={{'{key(sub)}'={{trust_level='trusted'}},"
                                                  f"'{key(repo)}'={{trust_level='trusted'}}}}"])
-            self.assertEqual(server.viewer_options(repo)[3], f"projects={{'{key(repo)}'={{trust_level='trusted'}}}}")
+            self.assertEqual(server.viewer_options(repo, home=tmp)[3],
+                             f"projects={{'{key(repo)}'={{trust_level='trusted'}}}}")
             odd = os.path.join(tmp, "a&b")
             os.makedirs(odd)
-            self.assertEqual(server.viewer_options(odd), ["-c", "check_for_update_on_startup=false"])
+            self.assertEqual(server.viewer_options(odd, home=tmp), ["-c", "check_for_update_on_startup=false"])
+            # A folder the user marked untrusted stays so: Codex asks as usual.
+            with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as f:
+                f.write(f"model = \"x\"\n\n[projects.'{key(repo)}']\ntrust_level = \"untrusted\"\n")
+            self.assertEqual(server.viewer_options(sub, home=tmp), ["-c", "check_for_update_on_startup=false"])
+            with mock.patch.dict(sys.modules, {"tomllib": None}):  # Python before 3.11
+                self.assertEqual(server.codex_trust_levels(tmp), {key(repo): "untrusted"})
+                self.assertEqual(server.viewer_options(sub, home=tmp), ["-c", "check_for_update_on_startup=false"])
+            # Written another way, as valid TOML the line reader doesn't follow: uncertain, so Codex asks.
+            with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as f:
+                f.write(f"projects = {{ '{key(repo)}' = {{ trust_level = \"untrusted\" }} }}\n")
+            self.assertEqual(server.viewer_options(sub, home=tmp), ["-c", "check_for_update_on_startup=false"])
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                self.assertIsNone(server.codex_trust_levels(tmp))
+                self.assertEqual(server.viewer_options(sub, home=tmp), ["-c", "check_for_update_on_startup=false"])
+            with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as f:
+                f.write("not = [toml\n")
+            self.assertEqual(server.viewer_options(sub, home=tmp), ["-c", "check_for_update_on_startup=false"])
+            # Valid TOML the line reader can't follow, or an odd shape: no trust where unsure, no crash.
+            escaped = f"[projects.'{key(repo)}']\ntrust_level = \"\\u0075ntrusted\"\n"
+            # untrusted: which readers must give no trust ("all", or "old" for the line reader only)
+            for text, untrusted in ((escaped, "all"), ('[projects."c:\\U0001F600"]\ntrust_level = "trusted"\n', "old"),
+                                    ('projects = "x"\n', "")):  # the last: only that it doesn't raise
+                with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as f:
+                    f.write(text)
+                for modules in ({}, {"tomllib": None}):
+                    with mock.patch.dict(sys.modules, modules):
+                        got = server.viewer_options(sub, home=tmp)  # never raises
+                    if untrusted == "all" or (untrusted == "old" and modules):
+                        self.assertEqual(got, ["-c", "check_for_update_on_startup=false"], (text, modules))
+
+    @unittest.skipUnless(os.name == "nt", "Windows paths")
+    def test_trust_key_folds_only_ascii(self):
+        self.assertEqual(server.codex_project_key("C:\\École\\Repo"), "c:\\École\\repo")
 
     @unittest.skipUnless(os.name == "nt", "Windows process list")
     def test_command_line_and_end_tree(self):
+        sleep = [sys.executable, "-c", "import time; time.sleep(60)"]
+        older = subprocess.Popen(sleep)  # started before the root: never its child
+        self.addCleanup(older.wait)
+        self.addCleanup(older.kill)
+        time.sleep(0.05)
         proc = subprocess.Popen([sys.executable, "-c", "import subprocess, sys, time; "
                                  "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); time.sleep(60)",
                                  "resume", self.TID])
@@ -2882,10 +3064,259 @@ class PaneTest(unittest.TestCase):
                 break
             time.sleep(0.1)
         self.assertTrue(kids)
-        server.end_tree(proc.pid, table)
-        self.assertIsNotNone(proc.wait(timeout=5))
+        real_open = server.open_process
+        handle = server.open_process(proc.pid, server.QUERY | server.SYNCHRONIZE | server.TERMINATE)
+        self.addCleanup(server.close_handle, handle)
+        self.assertTrue(server.process_command_line(handle=handle).endswith(f"resume {self.TID}"))
+        # Only this test's own processes are in reach. One that started before the root isn't
+        # its child; one that started after it but has another parent (a pid reused since the
+        # snapshot) is caught by the second snapshot.
+        newer = subprocess.Popen(sleep)
+        self.addCleanup(newer.wait)
+        self.addCleanup(newer.kill)
+        table[older.pid] = table[newer.pid] = (proc.pid, "python.exe")
+        reach = {proc.pid, *kids, older.pid, newer.pid}
+        with mock.patch.object(server, "open_process",
+                               side_effect=lambda pid, *a: real_open(pid, *a) if pid in reach else None):
+            server.end_tree(handle, proc.pid, table)
         time.sleep(0.5)
         self.assertNotIn(kids[0], server.process_table())
+        self.assertIsNone(older.poll())
+        self.assertIsNone(newer.poll())
+        self.assertIsNone(proc.poll())  # end_tree leaves the root itself to its caller
+
+    @unittest.skipUnless(os.name == "nt", "Windows process handles")
+    def test_exit_code_259_is_an_end(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(259)"])
+        proc.wait(timeout=30)
+        handle = server.open_process(proc.pid, server.QUERY | server.SYNCHRONIZE)
+        self.addCleanup(server.close_handle, handle)
+        self.assertTrue(server.handle_exited(handle))
+        self.assertIsNone(server.handle_start(handle))
+        bare = server.open_process(proc.pid)  # no SYNCHRONIZE: 259 can't be told from running
+        self.addCleanup(server.close_handle, bare)
+        self.assertIsNone(server.handle_exited(bare))
+
+
+class TopReloadTest(unittest.TestCase):
+    """0.15.2: the status screen starts again on an updated server.py."""
+
+    def test_reload_waits_for_a_finished_file_that_compiles(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, "server.py")
+
+        def write(text, ns):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.utime(path, ns=(ns, ns))
+        write("x = 1\n", 10**18)
+        started = seen = server.source_stamp(path)
+        self.assertEqual(server.top_reload_due(path, started, seen), (False, started))  # unchanged
+        write("x = 22\n", 2 * 10**18)
+        due, seen = server.top_reload_due(path, started, seen)
+        self.assertFalse(due)  # changed: waits one round in case it is still being written
+        write("def broken(:\n", 3 * 10**18)
+        due, seen = server.top_reload_due(path, started, seen)
+        due, seen = server.top_reload_due(path, started, seen)
+        self.assertFalse(due)  # stable but doesn't compile: keep the screen running
+        for cut in ("", "x = 1\n\ndef run_top(argv):\n    return 0\n"):  # empty, or cut short: compiles
+            write(cut, 4 * 10**18 + len(cut))
+            due, seen = server.top_reload_due(path, started, seen)
+            due, seen = server.top_reload_due(path, started, seen)
+            self.assertFalse(due, repr(cut))
+        write('x = 1\n\ndef run_top(argv):\n    return 0\n\nif __name__ == "__main__":\n    pass\n', 5 * 10**18)
+        due, seen = server.top_reload_due(path, started, seen)
+        self.assertFalse(due)
+        self.assertTrue(server.top_reload_due(path, started, seen)[0])
+        os.remove(path)
+        self.assertFalse(server.top_reload_due(path, started, seen)[0])
+
+    def test_period_is_kept_whole(self):
+        # The longest period is the most a restart can carry; a longer one is refused, not cut.
+        seen = []
+        with mock.patch.object(server, "read_scan_state", return_value={}), \
+             mock.patch.object(server, "scan_usage"), mock.patch.object(server, "write_json_atomic"), \
+             mock.patch.object(server, "read_codex_usage"), mock.patch.object(server, "read_agy_usage"), \
+             mock.patch.object(server, "read_usage_log", return_value=[]), \
+             mock.patch.object(server, "top_frame", side_effect=lambda scr, now, days, *a: seen.append(days) or []), \
+             mock.patch("builtins.print"):
+            for asked in ("65535", "30"):
+                self.assertEqual(server.run_top(["--once", "--days", asked]), 0)
+            for bad in (["--days", "70000"], ["--days", "-1"], ["--since", "1"], ["--since", "a:b"]):
+                self.assertEqual(server.run_top(["--once", *bad]), 2, bad)
+        self.assertEqual(seen, [0xFFFF, 30])
+
+    def test_screen_tells_its_supervisor(self):
+        # q ends the window; an update restarts it, with the period the screen had then.
+        def screen(keys, due, argv=("--screen", "--days", "7")):
+            keys, due = iter(keys), iter(due)
+            with mock.patch.object(server, "read_scan_state", return_value={}), \
+                 mock.patch.object(server, "scan_usage"), mock.patch.object(server, "write_json_atomic"), \
+                 mock.patch.object(server, "read_codex_usage"), mock.patch.object(server, "read_agy_usage"), \
+                 mock.patch.object(server, "read_usage_log", return_value=[]), \
+                 mock.patch.object(server, "top_frame", return_value=[]), \
+                 mock.patch.object(server, "enable_ansi", return_value=False), \
+                 mock.patch.object(server, "read_key", side_effect=lambda t: next(keys)), \
+                 mock.patch.object(server, "top_reload_due", side_effect=lambda *a: (next(due), (1, 1))), \
+                 mock.patch.object(server.sys.stdin, "isatty", return_value=False), \
+                 mock.patch.object(server.sys, "stdout", io.StringIO()):
+                return server.run_top(list(argv))
+        self.assertEqual(screen(["q"], [False]), server.TOP_QUIT)
+        self.assertEqual(screen([None], [False, True]), server.TOP_RELOAD)  # period unchanged
+        periods = list(server.TOP_PERIODS.values())
+        self.assertEqual(screen(["a"], [False, True]), server.TOP_RELOAD + 1 + periods.index(None))
+        self.assertEqual(screen(["3"], [False, True]), server.TOP_RELOAD + 1 + periods.index(30))
+        self.assertLess(server.TOP_RELOAD + len(periods), 256)  # an exit code any system keeps
+        with mock.patch.object(server, "supervise_top", return_value=0) as sup:
+            self.assertEqual(server.run_top(["--days", "7"]), 0)  # on every system
+        sup.assert_called_once_with(["--days", "7"])
+
+    def test_failed_update_keeps_the_window(self):
+        for failed in (1, 0):  # a crash, or a file cut short that does nothing and exits cleanly
+            self.window_waits(failed)
+
+    def window_waits(self, failed):
+        codes = [server.TOP_RELOAD, failed, server.TOP_QUIT]  # reloaded, the new file fails, the next one runs
+
+        class Child:
+            def __init__(self, argv):
+                pass
+
+            def wait(self):
+                return codes.pop(0)
+        due = iter([(False, (1, 1)), (True, (2, 2))])
+        with mock.patch.object(server.subprocess, "Popen", Child), \
+             mock.patch.object(server.time, "sleep"), \
+             mock.patch.object(server, "top_reload_due", side_effect=lambda *a: next(due)), \
+             mock.patch("builtins.print") as said:
+            self.assertEqual(server.supervise_top([]), 0)
+        self.assertIn(f"ended with code {failed}", said.call_args[0][0])
+        self.assertEqual(codes, [])
+
+    def test_ctrl_c_closes_the_window(self):
+        # Ctrl+C reaching the supervisor means quit, whatever code the screen then ends with
+        # (it may not have reached its own quit handler yet).
+        class Child:
+            def __init__(self, argv):
+                self.calls = 0
+
+            def wait(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise KeyboardInterrupt
+                return 1
+        with mock.patch.object(server.subprocess, "Popen", Child):
+            self.assertEqual(server.supervise_top([]), 0)
+
+        class Deaf(Child):  # an interrupt sent to the supervisor alone: the screen is ended for it
+            ended = []
+
+            def wait(self, timeout=None):
+                if timeout is None:
+                    if not self.ended:
+                        raise KeyboardInterrupt
+                    return -15
+                if not self.ended:
+                    raise server.subprocess.TimeoutExpired("screen", timeout)
+                return -15
+
+            def poll(self):
+                return None if not self.ended else -15
+
+            def terminate(self):
+                self.ended.append("terminate")
+        with mock.patch.object(server.subprocess, "Popen", Deaf):
+            self.assertEqual(server.supervise_top([]), 0)
+        self.assertEqual(Deaf.ended, ["terminate"])
+
+    def test_ending_top_ends_the_screen(self):
+        # Elsewhere than Windows, SIGTERM or SIGHUP to the supervisor ends the screen first.
+        handlers, ended = {}, []
+
+        class Child:
+            def __init__(self, argv):
+                pass
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                ended.append("terminate")
+
+            def wait(self, timeout=None):
+                if timeout is None:
+                    handlers[server.signal.SIGTERM](server.signal.SIGTERM, None)
+                ended.append("reaped")
+                return 0
+        with mock.patch.object(server.os, "name", "posix"), \
+             mock.patch.object(server.signal, "SIGHUP", 1, create=True), \
+             mock.patch.object(server.signal, "signal", side_effect=lambda n, h: handlers.__setitem__(n, h)), \
+             mock.patch.object(server.subprocess, "Popen", Child):
+            self.assertEqual(server.supervise_top([]), 128 + server.signal.SIGTERM)
+        self.assertEqual(ended, ["terminate", "reaped"])  # reaped outside the interrupted wait
+        self.assertEqual(set(handlers), {server.signal.SIGTERM, 1})
+
+        class Starting(Child):  # the signal comes while the screen is being started
+            def __init__(self, argv):
+                handlers[1](1, None)
+
+            def wait(self, timeout=None):
+                ended.append("reaped")
+                return 0
+        ended.clear()
+        with mock.patch.object(server.os, "name", "posix"), \
+             mock.patch.object(server.signal, "SIGHUP", 1, create=True), \
+             mock.patch.object(server.signal, "signal", side_effect=lambda n, h: handlers.__setitem__(n, h)), \
+             mock.patch.object(server.subprocess, "Popen", Starting):
+            self.assertEqual(server.supervise_top([]), 128 + 1)
+        self.assertEqual(ended, ["terminate", "reaped"])
+
+    def test_failed_update_watches_from_what_it_ran(self):
+        # A fix written between the failed screen's start and its failure is due at once: the
+        # window compares with the version the screen was started on, not the file at failure.
+        codes, argvs, calls = [server.TOP_RELOAD, 1, server.TOP_QUIT], [], []
+
+        class Child:
+            def __init__(self, argv):
+                argvs.append(argv)
+
+            def wait(self):
+                return codes.pop(0)
+        stamps = iter([(1, 1), (2, 2), (3, 3)])
+        with mock.patch.object(server.subprocess, "Popen", Child), \
+             mock.patch.object(server.time, "sleep"), \
+             mock.patch.object(server, "source_stamp", side_effect=lambda p: next(stamps)), \
+             mock.patch.object(server, "top_reload_due", side_effect=lambda *a: calls.append(a) or (True, (4, 4))), \
+             mock.patch("builtins.print"):
+            self.assertEqual(server.supervise_top([]), 0)
+        self.assertEqual([a[a.index("--since") + 1] for a in argvs], ["1:1", "2:2", "3:3"])
+        self.assertEqual(calls[0][1:], ((2, 2), (2, 2)))
+
+    def test_supervisor_restarts_with_the_period(self):
+        periods = list(server.TOP_PERIODS.values())
+        codes = [server.TOP_RELOAD + 1 + periods.index(30), server.TOP_RELOAD + 1 + periods.index(None),
+                 server.TOP_RELOAD, server.TOP_QUIT]
+        argvs = []
+
+        class Child:
+            def __init__(self, argv):
+                argvs.append(argv)
+
+            def wait(self):
+                return codes.pop(0)
+        with mock.patch.object(server.subprocess, "Popen", Child):
+            self.assertEqual(server.supervise_top(["--days", "7"]), 0)
+        self.assertEqual([server.top_args(a[a.index("top") + 1:]) for a in argvs],
+                         [["--days", "7"], ["--days", "30"], ["--days", "0"], ["--days", "0"]])
+        self.assertTrue(all("--screen" in a and "--since" in a for a in argvs))
+        self.assertTrue(all(a[0] == sys.executable for a in argvs))
+        codes[:] = [3]
+        with mock.patch.object(server.subprocess, "Popen", Child):
+            self.assertEqual(server.supervise_top([]), 3)  # a crash ends it with the screen's code
+        codes[:] = [2]
+        with mock.patch.object(server.subprocess, "Popen", Child):
+            self.assertEqual(server.supervise_top(["--days", "x"]), 2)  # so does a usage error
 
 
 if __name__ == "__main__":

@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.15.1\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.15.2\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -1362,6 +1362,29 @@ with ANSI colours and the terminal's alternate screen. It redraws every 5 second
 usage from the daemon every 60 and reads the transcripts again every 300, each in a background
 thread.
 
+The screen keeps to the \code{server.py} on disk. Before each redraw it compares the file's
+modification time and size with those of the version it runs; once they have changed and stayed
+the same for one redraw, and the new file compiles and still holds \code{def run\_top(} and the
+\code{\_\_main\_\_} entry point (an empty file, or one cut short after a whole function, compiles too),
+the screen starts again on it with the same period. The version it runs is passed to it as
+\code{-{}-since <mtime>:<size>}, as the process starting it saw the file just before; only the first
+screen started by hand takes it as Python loaded the file. A change after that, even while the
+screen starts, restarts it. On every system \code{server.py top} runs the screen
+as a child (\code{top -{}-screen}), noting the version just before, and reads its exit code: 70
+when the user quit, 71 to start again with the period it was given, 72 to 75 to start again with
+the period of \code{TOP\_PERIODS} (1, 7 or 30 days, or all). Once the screen has restarted, any
+other code, 0 included (a file cut short after the entry point can do nothing and exit cleanly),
+leaves the window waiting; it starts the screen again once \code{server.py} differs from the
+version that failed, and Ctrl+C closes it. Ctrl+C reaches the screen and the supervisor
+together; the supervisor waits for the screen to end and then exits, whatever code it ended with,
+and ends a screen that hasn't within 2 seconds. Elsewhere than Windows, a \code{SIGTERM} or
+\code{SIGHUP} to the supervisor ends the screen first: the signal only raises an exception, so the
+screen is ended and reaped outside the interrupted wait, and one that comes while the screen is
+starting is acted on once it has started. The screen takes \code{SIGTERM} as Ctrl+C, so it puts the
+terminal back before it ends. The compile-and-markers check doesn't prove a file whole: one cut short after the entry
+point passes, and its screen ends at once, which leaves the window waiting. The terminal goes into cbreak
+mode inside the block that restores it, so an interrupt at any point leaves it as it was.
+
 When the Antigravity CLI is installed (\code{agy} on \code{PATH}, or on Windows
 \code{\%LOCALAPPDATA\%\textbackslash agy\textbackslash bin\textbackslash agy.exe}), the screen also
 runs \code{agy -p /usage -{}-output-format json} once a minute, with the deny rules of
@@ -1472,8 +1495,12 @@ a read-only preamble and the standing instructions; later ones pass \code{-{}-co
 match those recorded at launch, ends it and its children with \code{taskkill /F /T}, waits for it to
 exit, and only then marks the turn and the consultant stopped; meanwhile the turn is marked
 \code{stopping}, which reads as \code{interrupted} once the process has gone but never hides one
-that runs on. The files stay, and agy keeps the conversation. A process whose start time can't be
-read counts as ended only if its exit code says so. Elsewhere than Windows, only the server that started a process signals it. A process
+that runs on. A reader that finds agy gone reads the turn's marks again before naming it failed,
+so a stop that lands between its reads still reads as a stop; a stop that can't end agy retries
+taking its mark back. The files stay, and agy keeps the conversation. Whether the process has
+ended is asked of Windows (\code{WaitForSingleObject} with no wait, on a handle with
+\code{SYNCHRONIZE}), not read from its exit code, which a process can set to 259, the value of
+\code{STILL\_ACTIVE}. Elsewhere than Windows, only the server that started a process signals it. A process
 that can't be checked counts as running until agy's limit and is never ended, and a stop that can't
 end a turn changes nothing and says so. A turn whose record can't be written is removed; a process
 whose id can't be saved is ended with its children before nouez says to send again. Replies are logged with \code{provider: "antigravity"} and \code{tokens}, and each
@@ -1593,19 +1620,20 @@ nouez reads the daemon's version from \code{userAgent} and looks under
 \textbf{Where Claude Code runs} & \textrm{\textbf{Command nouez starts}} \\
 \midrule
 tmux (\code{\$TMUX} set) & tmux split-window -h -c <cwd> '<codex> resume <id>' \\
-Windows Terminal (\code{\$WT\_SESSION}) & wt -w 0 split-pane -V -d <cwd> --title "Codex consultant" cmd /k <codex> resume <id>, with Claude Code's window brought to the front first (below); new-tab instead of split-pane when Claude Code's tab isn't selected; -w new when the window can't be found or brought to the front. In every argument after -w, \code{;} is passed as \code{\textbackslash;} (wt splits commands at a bare one) \\
-Windows, \code{wt} installed & wt -w new -d <cwd> --title "Codex consultant" cmd /k <codex> resume <id> \\
-Windows, no \code{wt} & cmd /c start "Codex consultant" cmd /k <codex> resume <id> \\
+Windows Terminal (\code{\$WT\_SESSION}) & wt -w 0 split-pane -V -d <cwd> --title "Codex consultant" cmd /d /s /k "<codex> resume <id>", with Claude Code's window brought to the front first (below); new-tab instead of split-pane when Claude Code's tab isn't selected; -w new when the window can't be found or brought to the front. In every argument after -w, \code{;} is passed as \code{\textbackslash;} (wt splits commands at a bare one) \\
+Windows, \code{wt} installed & wt -w new -d <cwd> --title "Codex consultant" cmd /d /s /k "<codex> resume <id>" \\
+Windows, no \code{wt} & cmd /c start "Codex consultant" cmd /d /s /k "<codex> resume <id>" \\
 macOS & osascript -e 'tell application "Terminal" to do script "cd <cwd> \&\& <codex> resume <id>"' -e '... activate' \\
 Linux & x-terminal-emulator -e | gnome-terminal -- | xterm -e  <codex> resume <id> \\
 \bottomrule
 \end{tabularx}
 \end{center}
 
-In every row, \code{<codex> resume <id>} is followed by two options, so the pane shows the
-consultant rather than a question that waits for an answer:
+In every row, \code{<codex> resume <id>} is followed by the pane's token, then two options, so
+the pane shows the consultant rather than a question that waits for an answer:
 
 \begin{plain}[The viewer's options, for one run; nothing is saved to config.toml]
+-c nouez_pane=p3f9c...                       (the pane token; Codex ignores the unknown key)
 -c check_for_update_on_startup=false
 -c projects={'c:\users\me\projects\repo'={trust_level='trusted'}}
 \end{plain}
@@ -1613,9 +1641,22 @@ consultant rather than a question that waits for an answer:
 The second option trusts the session's folder and its git root. Without it, Codex asks
 ``Trust this folder?'' in every folder the user hasn't trusted, and up to 0.15.0 a pane waited
 on that question with nothing shown. A trusted folder's own \code{.codex} config and hooks load in
-the viewer, as they would after the user answered the question. A folder whose path holds one of
-\code{\& | < > \^{} \% ! " '} gets no such option, since the path goes on \code{cmd}'s command
-line; Codex asks there.
+the viewer, as they would after the user answered the question. A folder the user marked
+\code{untrusted} in Codex's \code{config.toml} gets no such option. Before Python 3.11 nouez reads
+only the \code{[projects.'<path>']} tables Codex writes; if the file has an escape outside a
+\code{'...'} string (which could spell any word), names \code{untrusted} anywhere else, or can't
+be read, no folder gets the option. Nor does a folder whose path holds one of
+\code{\& | < > \^{} \% ! " '}, since the path goes on \code{cmd}'s command line; Codex asks there.
+The key is the folder's full path with only ASCII letters lowercased, as Codex makes it
+(\code{C:\textbackslash{}École} is \code{c:\textbackslash{}École}).
+
+On Windows the whole command reaches \code{cmd} as one argument. Arguments with spaces in it are
+quoted for Codex's C runtime (\code{subprocess.list2cmdline}), and the argument as a whole is
+quoted once more, which Windows Terminal does by itself and \code{start} gets written out;
+\code{/s} makes \code{cmd} drop only that outer pair. Without it, a quoted program path followed
+by another quoted argument (a path and a folder that both hold spaces) lost its opening quote, and
+\code{cmd} tried to run \code{C:\textbackslash{}Program}. \code{/d} skips \code{cmd}'s AutoRun
+commands. A command holding one of \code{\& | < > \^{} \%} or \code{!} isn't run at all.
 
 \subsubsection*{Finding Claude Code's window (Windows Terminal)}
 \label{sec:wt-host}
@@ -1649,26 +1690,52 @@ title look alike.
 Thread ids are checked against \code{[0-9A-Za-z-]+} before they appear in any command: opening a
 pane refuses a malformed id with an error, and the checks and closing skip it.
 
-On Windows nouez runs no command for this: it lists processes with the Win32 call
-\code{CreateToolhelp32Snapshot} and reads each \code{codex.exe}'s command line with
-\code{NtQueryInformationProcess} (\code{ProcessCommandLineInformation}), which takes milliseconds
-even on a busy computer. Up to 0.15.0 it asked WMI through PowerShell, which could take minutes
-then; the check timed out, found no viewer, and opened another pane.
+On Windows nouez runs no command for this. It lists processes with the Win32 call
+\code{CreateToolhelp32Snapshot}, and reads the command line of each \code{codex.exe} and
+\code{cmd.exe} with \code{NtQueryInformationProcess}, information class
+\code{ProcessCommandLineInformation}. That takes milliseconds even on a busy computer. Up to 0.15.0 it asked WMI through PowerShell, which
+could take minutes then; the check timed out, found no viewer, and opened another pane. A command
+line is split into arguments as the C runtime does, and only \code{codex resume <id>} as separate
+arguments counts, so the same words inside a \code{codex exec} prompt don't. A viewer is any such
+\code{codex.exe}, whoever started it. A pane nouez opened is a \code{cmd.exe} whose own
+\code{/k} command is \code{codex resume <id>} followed at once by \code{-c nouez\_pane=<token>},
+with nothing for \code{cmd} to run after it. The token is \code{p} and 32 hex digits of
+HMAC-SHA256 over the thread id, keyed with 32 random bytes made once in nouez's cache folder
+(\code{pane-key}, shared by the user's nouez servers; made under a lock file all servers take and
+read again under it, so all end on one key, and written in full under a name of its own before it
+is moved into place; if it can't be read or made, a server uses a key of its own, and only it finds
+its panes). A shell the user opened can't hold the token,
+whatever they type; a pane whose \code{codex} runs through npm's \code{node}, or has already
+exited, still counts. Panes from before 0.15.2 carry no token and are left open.
 
-\begin{plain}[Is a viewer already running? (Windows), as nouez checks it]
-codex.exe 72832, parent cmd.exe 34288
-  command line: codex.exe resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17
--> running; 34288 is a pane nouez opened (cmd /k ...)
+\begin{plain}[Is a viewer already running? Which panes did nouez open? (Windows)]
+codex.exe 72832: C:\...\codex.exe resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17 -c ...
+  -> a viewer is running
+cmd.exe 34288: cmd /d /s /k ""C:\...\codex.exe" resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17 -c ..."
+  -> a pane nouez opened
 \end{plain}
 \begin{plain}[Is a viewer already running? (macOS, Linux)]
 pgrep -f "codex[^ ]* resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17"
 \end{plain}
-\begin{plain}[Closing on StopConsultant (Windows): the viewers found as above, inside a cmd /k]
-TerminateProcess(20112 and its children, deepest first)  (codex inside the pane)
-TerminateProcess(18244, exit code 0) (cmd; a clean exit lets Windows Terminal close the pane)
+\begin{plain}[Closing on StopConsultant (Windows): each pane found as above]
+OpenProcess(34288), its /k command checked again through that handle
+OpenProcess(each child, grandchild ...), kept only if it started after its parent
+CreateToolhelp32Snapshot again: kept only if each still has the same parent
+TerminateProcess(those, deepest first)       (codex, or node and codex, inside the pane)
+TerminateProcess(34288, exit code 0)         (a clean exit lets Windows Terminal close the pane)
+WaitForSingleObject(34288, 3 s)              (closed only once cmd has ended)
 \end{plain}
+
+Every process is checked and ended through a handle opened before the check, so a process id
+that passes to another program meanwhile is never touched. A child whose parent id was reused
+isn't taken for the pane's: it started before its parent. Nor is a process that took a child's id
+after the first snapshot: an open handle keeps an id from being reused, so the second snapshot,
+taken with all of them open, names each one's real parent.
 \begin{plain}[Closing on StopConsultant (macOS, Linux)]
-pkill -f "codex[^ ]* resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17"
+pgrep -f "codex[^ ]* resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17 -c nouez_pane=p3f9c...( |$)"
+ps -o comm= -p <pid>; ps -o args= -p <pid>   (for each, just before the signal: the program is
+                                             codex and the command still has the token)
+kill -TERM <pid>
 \end{plain}
 
 These are Win32 calls, not commands. \code{StopConsultant} then checks again and says so if
