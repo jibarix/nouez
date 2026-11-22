@@ -7,6 +7,7 @@ import contextlib
 import glob
 import io
 import json
+import ntpath
 import os
 import queue
 import re
@@ -22,6 +23,14 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import server  # noqa: E402
+
+
+def setUpModule():
+    # Whether this machine has Codex mustn't change the results: tests take it as installed unless
+    # they say otherwise.
+    patcher = mock.patch.object(server, "codex_installed", lambda: True)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
 
 # Tests never write to the user's usage log; the log's own tests turn it back on for a temp file.
 os.environ["NOUEZ_NO_USAGE_LOG"] = "1"
@@ -251,12 +260,141 @@ class ReplyTest(unittest.TestCase):
         text = "a" * (server.MAX_REPLY_CHARS + 123)
         turn = {"id": "turn-test-truncate", "status": "completed",
                 "items": [{"type": "agentMessage", "phase": "final_answer", "text": text}]}
-        out = server.format_turn("codex-x", turn)
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with mock.patch.object(server, "nouez_cache_dir", lambda: root):
+            out = server.format_turn("codex-x", turn)
         self.assertIn("[Truncated: 123 more characters.", out)
-        path = os.path.join(server.tempfile.gettempdir(), "nouez", "turn-test-truncate.md")
-        self.addCleanup(os.remove, path)
+        path = os.path.join(root, "replies", "reply-turn-test-truncate.md")  # 0.18.0: not in the shared temp folder
+        self.assertIn(path, out)
         with open(path, encoding="utf-8") as f:
             self.assertEqual(f.read(), text)
+        if os.name != "nt":
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_old_reply_files_are_pruned(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        folder = os.path.join(root, "replies")
+        os.makedirs(folder)
+        old, new = os.path.join(folder, "reply-old.md"), os.path.join(folder, "reply-new.md")
+        # 0.18.0: names nouez doesn't give (an ordinary notes.md too) are kept, however old
+        mine, notes = os.path.join(folder, "notes.txt"), os.path.join(folder, "notes.md")
+        for f in (old, new, mine, notes):
+            open(f, "w").close()
+        for f in (old, mine, notes):
+            os.utime(f, (time.time() - 30 * 86400,) * 2)
+        with mock.patch.object(server, "nouez_cache_dir", lambda: root):
+            server.cap_reply("turn-x", "a" * 50, 10)
+        self.assertEqual(sorted(os.listdir(folder)), ["notes.md", "notes.txt", "reply-new.md", "reply-turn-x.md"])
+
+    def test_reply_folder_junction_is_not_followed(self):
+        """0.18.0: a junction or other reparse point (which islink doesn't see on Windows) counts as a link."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        os.makedirs(os.path.join(root, "replies"))
+        real_lstat = os.lstat
+        def lstat(p, *a, **k):
+            st = real_lstat(p, *a, **k)
+            if os.path.basename(p) != "replies":
+                return st
+            return mock.Mock(st_mode=st.st_mode, st_file_attributes=0x400)
+        with mock.patch.object(server, "nouez_cache_dir", lambda: root), mock.patch.object(server.os, "lstat", lstat):
+            self.assertFalse(server.plain_folder(os.path.join(root, "replies")))
+            out = server.cap_reply("turn-j", "a" * 50, 10)
+        self.assertIn("could not be saved", out)
+        self.assertEqual(os.listdir(os.path.join(root, "replies")), [])
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_reply_folder_link_is_not_followed(self):
+        """0.18.0: a replies folder that is a link is neither written nor pruned."""
+        root, elsewhere = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        self.addCleanup(shutil.rmtree, elsewhere, True)
+        victim = os.path.join(elsewhere, "reply-old.md")
+        open(victim, "w").close()
+        os.utime(victim, (time.time() - 30 * 86400,) * 2)
+        os.symlink(elsewhere, os.path.join(root, "replies"))
+        with mock.patch.object(server, "nouez_cache_dir", lambda: root):
+            out = server.cap_reply("turn-y", "a" * 50, 10)
+        self.assertIn("could not be saved", out)
+        self.assertEqual(os.listdir(elsewhere), ["reply-old.md"])
+
+    def test_cache_dir_is_absolute_and_private(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        var = "LOCALAPPDATA" if os.name == "nt" else "XDG_CACHE_HOME"
+        with mock.patch.dict(os.environ, {var: "relative/cache", "HOME": home, "USERPROFILE": home}):
+            root = server.nouez_cache_dir()
+        self.assertTrue(os.path.isabs(root), root)
+        self.assertNotIn("relative", root)
+        if os.name != "nt":
+            self.assertEqual(os.stat(root).st_mode & 0o777, 0o700)
+
+    @unittest.skipIf(os.name == "nt", "POSIX ownership")
+    def test_cache_dir_of_another_user_is_not_used(self):
+        """0.18.0: a nouez folder someone else owns is never written to; a private one replaces it."""
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        real_open, real_fstat, theirs = os.open, os.fstat, set()
+        def fake_open(path, *a, **k):
+            fd = real_open(path, *a, **k)
+            if os.path.basename(path) == "nouez":
+                theirs.add(fd)
+            return fd
+        def fstat(fd):
+            st = real_fstat(fd)
+            if fd not in theirs:
+                return st
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, os.getuid() + 1, *st[5:]))
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": home}), mock.patch.object(server, "_private_roots", {}), \
+                mock.patch.object(server.os, "open", fake_open), mock.patch.object(server.os, "fstat", fstat), \
+                mock.patch.object(server.tempfile, "gettempdir", lambda: tmp), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            root = server.nouez_cache_dir()
+        # One fallback for every process of this user, so the status line, top and waiters agree.
+        self.assertEqual(root, os.path.join(tmp, f"nouez-{os.getuid()}"))
+        self.assertEqual(os.stat(root).st_mode & 0o777, 0o700)
+        self.assertIn("isn't a folder of yours", err.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_cache_dir_that_is_a_link_is_not_used(self):
+        """0.18.0: a link of the user's own to a folder of theirs is refused too, and its target left as it was."""
+        home, target, tmp = tempfile.mkdtemp(), tempfile.mkdtemp(), tempfile.mkdtemp()
+        for d in (home, target, tmp):
+            self.addCleanup(shutil.rmtree, d, True)
+        os.chmod(target, 0o755)
+        os.symlink(target, os.path.join(home, "nouez"))
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": home}), mock.patch.object(server, "_private_roots", {}), \
+                mock.patch.object(server.tempfile, "gettempdir", lambda: tmp), contextlib.redirect_stderr(io.StringIO()) as err:
+            root = server.nouez_cache_dir()
+        self.assertEqual(root, os.path.join(tmp, f"nouez-{os.getuid()}"))
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o755)
+        self.assertIn("isn't a folder of yours", err.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    def test_cache_dir_in_a_folder_others_can_change_is_not_used(self):
+        """0.18.0: another user could swap the folder later, so it isn't used."""
+        home, tmp = tempfile.mkdtemp(), tempfile.mkdtemp()
+        for d in (home, tmp):
+            self.addCleanup(shutil.rmtree, d, True)
+        os.chmod(home, 0o777)
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": home}), mock.patch.object(server, "_private_roots", {}), \
+                mock.patch.object(server.tempfile, "gettempdir", lambda: tmp), contextlib.redirect_stderr(io.StringIO()) as err:
+            root = server.nouez_cache_dir()
+        self.assertEqual(root, os.path.join(tmp, f"nouez-{os.getuid()}"))
+        self.assertIn("other users can change", err.getvalue())
+
+    def test_drive_less_paths_are_not_absolute(self):
+        """0.18.0: on Windows `\\tools` is on the current drive, so it isn't taken as absolute."""
+        with mock.patch.object(server.os, "name", "nt"), mock.patch.object(server.os, "path", ntpath):
+            self.assertFalse(server.rooted("\\tools"))
+            self.assertFalse(server.rooted("tools"))
+            self.assertTrue(server.rooted("C:\\tools"))
+            self.assertTrue(server.rooted("\\\\server\\share\\tools"))
+            self.assertIsNone(server.find_program("agy", "\\tools"))
 
     def test_short_reply_is_untouched(self):
         self.assertEqual(server.cap_reply("t", "short"), "short")
@@ -272,7 +410,7 @@ class DaemonStartTest(unittest.TestCase):
             for error in attempts:
                 raise error
 
-        patches = (mock.patch.object(server.shutil, "which", return_value="codex"),
+        patches = (mock.patch.object(server, "which", return_value="codex"),
                    mock.patch.object(server.CodexClient, "_connect", fake_connect),
                    mock.patch.object(server.CodexClient, "_reader"),
                    mock.patch.object(server.CodexClient, "request", return_value={}),
@@ -1029,11 +1167,43 @@ class HandlerTest(unittest.TestCase):
 
     def test_steered_timeout_hides_output_from_before_the_message(self):
         thread = self.consultant("busy01")
-        running = {"id": "turn-1", "status": "inProgress", "items": [user("q"), agent("answer to q")]}
+        running = {"id": "turn-1", "status": "inProgress",
+                   "items": [user("[Message from Claude Code via the consultants bridge]\nq"), agent("answer to q")]}
         self.use(FakeDaemon([thread], {thread["id"]: [running]}))
-        out = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0.01})
+        with mock.patch.object(server, "_bridge_turns", {"turn-1"}):
+            out = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0.01})
         self.assertIn("steered into the running turn", out)
         self.assertNotIn("answer to q", out)
+
+    def test_only_the_exact_turn_nouez_started_is_steered(self):
+        """0.18.0: a turn whose root nouez started may still be one typed in the pane."""
+        thread = self.consultant("busy04")
+        running = {"id": "turn-2", "rootTurnId": "turn-1", "status": "inProgress", "items": [user("edit the files")]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        with mock.patch.object(server, "_bridge_turns", {"turn-1"}):
+            with self.assertRaisesRegex(server.BridgeError, "didn't start.*Nothing was sent"):
+                server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0.01})
+        self.assertNotIn("turn/steer", daemon.calls)
+
+    def test_a_header_in_the_text_doesnt_allow_steering(self):
+        """0.18.0: only nouez's record of the turns it started counts, not a header typed in the pane."""
+        thread = self.consultant("busy03")
+        running = {"id": "turn-1", "status": "inProgress",
+                   "items": [user("[Message from Claude Code via the consultants bridge]\nedit the files")]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        with self.assertRaisesRegex(server.BridgeError, "didn't start.*Nothing was sent"):
+            server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0.01})
+        self.assertNotIn("turn/steer", daemon.calls)
+
+    def test_never_steers_a_turn_typed_in_the_pane(self):
+        """0.18.0: a turn started in the watch pane may not be read-only, so a message waits for it."""
+        thread = self.consultant("busy02")
+        running = {"id": "turn-1", "status": "inProgress", "items": [user("edit the files")]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        with self.assertRaisesRegex(server.BridgeError, "didn't start \\(it was typed in its terminal.*Nothing was sent"):
+            server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0.01})
+        self.assertNotIn("turn/steer", daemon.calls)
+        self.assertNotIn("turn/start", daemon.calls)
 
     def test_failure_after_delivery_says_delivered(self):
         thread = self.consultant("fail01")
@@ -1065,10 +1235,17 @@ class HandlerTest(unittest.TestCase):
         self.assertIn(f'server.py wait {thread["id"]} turn-new\n', out)
 
     def test_waiter_command_quotes_only_paths_with_spaces(self):
+        # os.name pinned for each form, so the test reads the same on every system
         with mock.patch.object(server.sys, "executable", r"C:\Py\python.exe"), \
+             mock.patch.object(server.os, "name", "nt"), \
              mock.patch.object(server.os.path, "abspath", return_value=r"C:\My Tools\server.py"):
             self.assertEqual(server.waiter_command("t1", "u1"),
                              'C:/Py/python.exe -I "C:/My Tools/server.py" wait t1 u1')
+        with mock.patch.object(server.sys, "executable", "/usr/bin/python3"), \
+             mock.patch.object(server.os, "name", "posix"), \
+             mock.patch.object(server.os.path, "abspath", return_value="/home/me/My Tools/server.py"):
+            self.assertEqual(server.waiter_command("t1", "u1"),
+                             '/usr/bin/python3 -I "/home/me/My Tools/server.py" wait t1 u1')
 
     def run_waiter(self, *args):
         buf = io.StringIO()
@@ -1081,7 +1258,44 @@ class HandlerTest(unittest.TestCase):
         for rule in server.allow_rules():
             prefix = rule[rule.index("(") + 1:-len(" *)")]
             self.assertTrue(cmd.startswith(prefix + " "), (rule, cmd))
-        self.assertEqual([r.split("(")[0] for r in server.allow_rules()], ["Bash", "PowerShell"])
+        self.assertEqual([r.split("(")[0] for r in server.allow_rules()],
+                         ["Bash", "PowerShell"] if os.name == "nt" else ["Bash"])
+
+    def test_doctor_per_setup(self):
+        """0.18.0: doctor reports each consultant CLI apart, and neither one is required."""
+        def doctor(codex, agy, usage=None, login=(0, "Logged in using ChatGPT")):
+            # the fake paths are POSIX ones; on Windows a path needs a drive to be rooted
+            patcher = mock.patch.object(server, "rooted", lambda path: path.startswith("/"))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+            found = {"codex": codex, "claude": "/bin/claude", "wt": "wt", "tmux": "/bin/tmux"}
+            with mock.patch.object(server, "which", lambda name, env=None: found.get(name)),                  mock.patch.object(server, "agy_command", lambda env=None: agy),                  mock.patch.object(server, "codex_version", lambda exe: "0.170.0"),                  mock.patch.object(server, "run_status", lambda argv, timeout=20: login),                  mock.patch.object(server, "run_text", lambda argv, timeout=20: "1.5.14"),                  mock.patch.object(server, "read_agy_usage", lambda: usage),                  mock.patch.object(server, "CodexClient", FakeDaemon([])),                  mock.patch.object(server, "claude_config_dir", lambda: tempfile.gettempdir() + "/no-such-dir"),                  contextlib.redirect_stdout(io.StringIO()) as out:
+                return server.run_doctor(), out.getvalue()
+        code, out = doctor(None, None)
+        self.assertEqual(code, 0, out)
+        self.assertIn("consultations are off", out)
+        self.assertIn("there is no", out)
+        code, out = doctor(None, "/bin/agy", {"groups": []})
+        self.assertEqual(code, 0, out)
+        self.assertIn("Codex isn't installed", out)
+        self.assertIn("1 of 1 installed consultant CLI(s) work; StartConsultant uses Antigravity", out)
+        code, out = doctor(None, "/bin/agy", {"error": "agy: not signed in"})
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, "run `[^`]*/bin/agy[^`]*` once in a terminal to sign in, then `[^`]*/bin/agy[^`]* models`")
+        code, out = doctor("/bin/codex", None, login=(1, "Not logged in"))
+        self.assertEqual(code, 1, out)
+        self.assertIn("Codex isn't signed in (Not logged in): run `codex login`.", out)
+        code, out = doctor("/bin/codex", None)
+        self.assertEqual(code, 0, out)
+        self.assertIn("Antigravity isn't installed", out)
+        code, out = doctor("/bin/codex", "/bin/agy", {"groups": []}, login=(1, "Not logged in"))
+        self.assertEqual(code, 0, out)  # one working CLI is enough
+        self.assertIn("[problem] Codex isn't signed in", out)
+        self.assertIn("1 of 2 installed consultant CLI(s) work: the problem above only matters for that CLI", out)
+        code, out = doctor(None, "/bin/agy", {"error": "agy didn't answer (TimeoutExpired)"})
+        self.assertEqual(code, 1, out)
+        self.assertIn("didn't answer within 60 seconds, so its sign-in is unknown", out)
+        self.assertNotIn("to sign in, then", out)
 
     def test_waiter_hands_over_before_the_background_timeout(self):
         thread = self.consultant("wait07")
@@ -1118,6 +1332,11 @@ class HandlerTest(unittest.TestCase):
         code, out = self.run_waiter(thread["id"], "turn-nope")
         self.assertEqual(code, 1)
         self.assertIn("has no turn turn-nope", out)
+
+    def test_waiter_reports_an_unreadable_consultants_file(self):  # 0.18.0: a message, not a traceback
+        with mock.patch.object(server, "agy_resolve", side_effect=server.BridgeError("can't read it")):
+            code, out = self.run_waiter("t-x", "u-x")
+        self.assertEqual((code, out.strip()), (1, "can't read it"))
 
     def test_waiter_gives_up_after_repeated_connection_failures(self):
         def down():
@@ -1451,6 +1670,196 @@ class HandlerTest(unittest.TestCase):
         self.assertIn("is working on turn turn-new", notes[0])
 
 
+class ShellWordTest(unittest.TestCase):
+    def test_shell_word_reads_back_in_each_shell(self):
+        """0.18.0: a path with spaces, $, a backtick or a quote is one literal word in bash and PowerShell."""
+        import base64
+        paths = ["/opt/py/python3", "/My Tools/server.py", "/a$HOME/b`x`/s.py", "/O'Neil/s.py",
+                 "/it's $HOME/q’s/s.py", "/x(y);z&w/s.py", "/José/s.py", '/say "hi"/s.py']
+        folder = tempfile.mkdtemp()
+        echo = os.path.join(folder, "echo it.py")  # a space, so its own path is quoted too
+        with open(echo, "w", encoding="utf-8") as f:
+            f.write("import sys\nsys.stdout.buffer.write(sys.argv[1].encode('utf-8'))\n")
+
+        def line(shell, path):  # the waiter's shape: interpreter, script, argument
+            words = [server.shell_word(x, shell) for x in (sys.executable, echo, path)]
+            return ("& " if shell == "powershell" else "") + " ".join(words)
+        shells = []
+        bash = shutil.which("bash")
+        if os.name == "nt":  # Git Bash, the shell Claude Code runs; System32's bash.exe is WSL's
+            git, tops = shutil.which("git"), []
+            while git and os.path.dirname(git) != git and len(tops) < 3:  # Git\cmd\git.exe, Git\mingw64\bin\git.exe
+                git = os.path.dirname(git)
+                tops.append(os.path.join(git, "bin", "bash.exe"))
+            bash = next((b for b in tops[1:] if os.path.isfile(b)), None)
+        if bash:
+            shells.append(("bash", lambda cmd: [bash, "-c", cmd]))
+        ps = shutil.which("powershell") or shutil.which("pwsh")
+        if ps:
+            shells.append(("powershell", lambda cmd: [ps, "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                                                      base64.b64encode(cmd.encode("utf-16-le")).decode()]))
+        if not shells:
+            self.skipTest("neither bash nor PowerShell is installed")
+        for shell, argv in shells:
+            for path in paths:
+                if shell == "powershell" and '"' in path and os.name == "nt":
+                    continue  # Windows paths can't hold a double quote, and PowerShell 5.1 drops it on the way to a program
+                cmd = line(shell, path)
+                env = dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*")  # Git Bash: leave /paths alone
+                got = subprocess.run(argv(cmd), capture_output=True, timeout=60, env=env).stdout.decode("utf-8")
+                self.assertEqual(got, path, (shell, cmd))
+        self.assertIsNone(server.shell_word("/a\nb", "bash"))
+
+    def test_waiter_command_per_shell(self):
+        with mock.patch.object(server.sys, "executable", "/opt/py/python3"),              mock.patch.object(server.os.path, "abspath", return_value="/home/o'neil $x/nouez/server.py"):
+            cmd = server.waiter_command("t1", "u1")
+            self.assertIn("(In PowerShell: & /opt/py/python3 -I '/home/o''neil", cmd)
+            with mock.patch.object(server.os, "name", "nt"):
+                rules = server.allow_rules()
+            self.assertEqual(len(rules), 2)
+            self.assertIn("o'" + chr(92) + "''neil", rules[0])  # bash's escape of a single quote
+            self.assertIn("o''neil", rules[1])  # PowerShell's
+
+
+class LaunchTest(unittest.TestCase):
+    """0.18.0: a pane or window whose launcher fails says so, rather than claiming it opened."""
+
+    def test_launch_reports_failure(self):
+        quick_fail = [sys.executable, "-c", "import sys; sys.stderr.write('no display: :0'); sys.exit(3)"]
+        with self.assertRaises(server.BridgeError) as e:
+            server.launch(quick_fail, "xterm", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.assertIn("xterm didn't open (exit code 3: no display: :0)", str(e.exception))
+        self.assertEqual(server.launch([sys.executable, "-c", "pass"], "Terminal"), "Terminal")
+        slow = [sys.executable, "-c", "import time; time.sleep(5)"]
+        import warnings
+        with mock.patch.object(server, "LAUNCH_GRACE", 0.3), warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)  # the window process is left running, as a real one is
+            started = time.monotonic()
+            self.assertEqual(server.launch(slow, "kitty"), "kitty")  # still running: taken as open
+            self.assertLess(time.monotonic() - started, 3)
+
+    def test_applescript_gets_text_as_an_argument(self):
+        script = '''cd '/tmp/a "b"' && codex resume x" & do shell script "touch /tmp/pwned'''
+        argv = server.apple_terminal(script)
+        self.assertEqual(argv[-1], script)
+        source = " ".join(argv[1:-1])
+        self.assertNotIn("pwned", source)
+        self.assertIn("do script (item 1 of argv)", source)
+        self.assertNotIn("activate", " ".join(server.apple_terminal("x", activate=False)))
+
+    def test_linux_terminals_and_display(self):
+        found = {"kitty": "/usr/bin/kitty", "xterm": "/usr/bin/xterm"}
+        with mock.patch.object(server, "which", lambda name, env=None: found.get(name)):
+            self.assertEqual(server.terminal_emulator(), ("/usr/bin/kitty", []))
+        with mock.patch.object(server, "which", lambda name, env=None: None):
+            self.assertEqual(server.terminal_emulator(), (None, None))
+        with mock.patch.object(server.sys, "platform", "linux"), mock.patch.object(server.os, "name", "posix"):
+            with mock.patch.dict(server.os.environ, {"DISPLAY": "", "WAYLAND_DISPLAY": ""}):
+                self.assertIn("no display", server.no_display())
+            with mock.patch.dict(server.os.environ, {"WAYLAND_DISPLAY": "wayland-0"}):
+                self.assertEqual(server.no_display(), "")
+
+    def test_open_terminal_on_linux(self):
+        calls = []
+
+        def fake_launch(argv, how, **kw):
+            calls.append(argv)
+            if "fail" in how:
+                raise server.BridgeError(f"{how} didn't open (exit code 1)")
+            return how
+        cwd = tempfile.gettempdir()
+        with mock.patch.object(server.sys, "platform", "linux"), mock.patch.object(server.os, "name", "posix"),              mock.patch.object(server, "launch", fake_launch), mock.patch.dict(server.os.environ, {"TMUX": "", "DISPLAY": ":0"}),              mock.patch.object(server, "pane_resume", lambda codex, tid, cwd: ["codex", "resume", tid]):
+            with mock.patch.object(server, "which", lambda name, env=None: {"wezterm": "/usr/bin/wezterm"}.get(name)):
+                self.assertEqual(server.open_terminal(cwd, "t-1"), "wezterm")
+                self.assertEqual(calls[-1], ["/usr/bin/wezterm", "start", "--", "codex", "resume", "t-1"])
+            with mock.patch.object(server, "which", lambda name, env=None: {"xterm": "/usr/bin/fail"}.get(name)):
+                with self.assertRaises(server.BridgeError) as e:
+                    server.open_terminal(cwd, "t-1")
+                self.assertIn("Pass watch=false", str(e.exception))
+                self.assertIn("codex resume t-1", str(e.exception))
+            with mock.patch.object(server, "which", lambda name, env=None: None):
+                with self.assertRaises(server.BridgeError) as e:
+                    server.open_terminal(cwd, "t-1")
+                self.assertIn("No terminal emulator found (x-terminal-emulator, gnome-terminal, konsole", str(e.exception))
+            with mock.patch.object(server, "which", lambda name, env=None: {"xterm": "/usr/bin/xterm"}.get(name)),                  mock.patch.dict(server.os.environ, {"DISPLAY": ""}):
+                with self.assertRaises(server.BridgeError) as e:
+                    server.open_terminal(cwd, "t-1")
+                self.assertIn("there is no display", str(e.exception))
+
+
+class PosixCloseTest(unittest.TestCase):
+    """0.18.0: on macOS and Linux CloseClaudeSession signals only a confirmed Claude Code session."""
+
+    def fake_ps(self, procs):
+        def run_text(argv, timeout=20):
+            if argv[0] != "ps":
+                return ""
+            field, pid = argv[2].rstrip("="), int(argv[-1])
+            return str(procs.get(pid, {}).get(field, ""))
+        return run_text
+
+    def target(self, pid=500, registered=None):
+        return {"pid": pid, "name": "work", "registered": registered if registered is not None else (time.time() - 60) * 1000}
+
+    def setUp(self):
+        self.real_match = server.registry_entry_matches
+        patcher = mock.patch.object(server, "registry_entry_matches", lambda target: True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_identity_checks(self):
+        claude = {"ppid": 1, "etime": "02:00", "comm": "claude", "args": "claude --resume x"}
+        node = {"ppid": 1, "etime": "1-00:00:00", "comm": "node", "args": "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"}
+        native = {"ppid": 1, "etime": "02:00", "comm": "2.1.325", "args": "/home/u/.local/share/claude/versions/2.1.325"}
+        other = {"ppid": 1, "etime": "02:00", "comm": "vim", "args": "vim notes"}
+        young = {"ppid": 1, "etime": "00:10", "comm": "claude", "args": "claude"}
+        helper = {"ppid": 1, "etime": "02:00", "comm": "claude-helper", "args": "claude-helper"}
+        mention = {"ppid": 1, "etime": "02:00", "comm": "node", "args": "node build.js --out claude-code"}
+        # 0.18.0: under claude/versions only a version the native installer names, not any program
+        planted = {"ppid": 1, "etime": "02:00", "comm": "tool", "args": "/tmp/claude/versions/x/tool"}
+        for proc, want in ((claude, ""), (node, ""), (native, ""), (other, "not Claude Code"), (young, "can't show that the process started before"),
+                           (helper, "not Claude Code"), (mention, "not Claude Code"), (planted, "not Claude Code"),
+                           (None, "has ended")):
+            procs = {500: proc, 900: {"ppid": 1}} if proc else {900: {"ppid": 1}}
+            with mock.patch.object(server, "run_text", self.fake_ps(procs)), mock.patch.object(server.os, "getppid", lambda: 900):
+                got = server.posix_session_problem(self.target())
+            self.assertIn(want, got) if want else self.assertEqual(got, "")
+        with mock.patch.object(server, "run_text", self.fake_ps({500: claude})):
+            self.assertIn("doesn't say when", server.posix_session_problem({"pid": 500, "name": "w", "registered": None}))
+        # 0.18.0: an ancestor ps can't show means the caller can't be ruled out, so nothing is signalled.
+        with mock.patch.object(server, "run_text", self.fake_ps({500: claude})), mock.patch.object(server.os, "getppid", lambda: 900):
+            self.assertIn("can't rule out", server.posix_session_problem(self.target()))
+
+    def test_a_replaced_registry_entry_is_refused(self):
+        """0.18.0: a new Claude Code process with the pid writes its own entry; the old session is then gone."""
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        os.makedirs(os.path.join(folder, "sessions"))
+        target = {"pid": 500, "name": "work", "registered": 1000, "session_id": "s-1"}
+        with mock.patch.object(server, "claude_config_dir", lambda: folder):
+            self.assertFalse(self.real_match(target))
+            for entry, want in (({"startedAt": 1000, "sessionId": "s-1"}, True),
+                                ({"startedAt": 2000, "sessionId": "s-2"}, False)):
+                with open(os.path.join(folder, "sessions", "500.json"), "w") as f:
+                    json.dump({"pid": 500, **entry}, f)
+                self.assertEqual(self.real_match(target), want)
+
+    def test_an_ancestor_is_refused(self):
+        procs = {700: {"ppid": 500, "etime": "02:00", "comm": "node", "args": "node nouez"},
+                 500: {"ppid": 1, "etime": "05:00", "comm": "claude", "args": "claude"}}
+        with mock.patch.object(server, "run_text", self.fake_ps(procs)), mock.patch.object(server.os, "getppid", lambda: 700):
+            self.assertEqual(server.posix_ancestors(), [700, 500])
+            self.assertIn("runs under", server.posix_session_problem(self.target()))
+
+    def test_end_session_signals_only_when_confirmed(self):
+        killed = []
+        with mock.patch.object(server.os, "name", "posix"), mock.patch.object(server, "posix_session_problem", lambda t: "it has ended"),              mock.patch.object(server.os, "kill", lambda pid, sig: killed.append(pid), create=True):
+            with self.assertRaises(server.BridgeError) as e:
+                server.end_session(self.target())
+        self.assertIn("Nothing was signalled", str(e.exception))
+        self.assertEqual(killed, [])
+
+
 class ReleaseTest(unittest.TestCase):
     """A change to server.py ships as a version: these fail until the version step is done."""
 
@@ -1494,17 +1903,60 @@ class HostWindowTests(unittest.TestCase):
         self.assertFalse(server._same_title("◐ Fix the build", "◐ Other session"))
 
     def test_unknown_window_gets_a_window_of_its_own(self):
+        user32 = mock.Mock(GetForegroundWindow=mock.Mock(return_value=0))  # no real Win32 calls on any system
         with mock.patch.object(server, "wt_host_window", return_value=None), \
+                mock.patch.object(server, "_wt_user32", return_value=(mock.Mock(), user32, mock.Mock())), \
                 mock.patch.object(server.subprocess, "Popen") as popen:
+            popen.return_value.wait.return_value = 0
             how = server.run_in_host_window("wt", ".", ["cmd", "a;b"])
         self.assertEqual(popen.call_args[0][0], ["wt", "-w", "new", "cmd", "a\\;b"])
         self.assertIn("new Windows Terminal window", how)
 
-    def test_semicolons_are_escaped_for_wt(self):
-        self.assertEqual(server.wt_escape("demo;calc.exe;"), "demo\\;calc.exe\\;")
-        with mock.patch.object(server.shutil, "which", return_value="wt"), \
+    def test_failed_wt_is_reported(self):  # 0.18.0: a wt.exe that fails isn't taken for an open pane
+        with mock.patch.object(server, "which", return_value="wt"), \
                 mock.patch.object(server.os, "name", "nt"), \
                 mock.patch.object(server.subprocess, "Popen") as popen:
+            popen.return_value.wait.return_value = 1
+            with self.assertRaisesRegex(server.BridgeError, "didn't open \\(exit code 1"):
+                server.open_window("C:/a", ["claude"], "Claude: x")
+
+    def test_console_without_wt_is_checked(self):
+        """0.18.0: without wt, the console's own process is watched for a quick failure."""
+        for wait, want in ((mock.Mock(return_value=2), "closed at once \\(exit code 2"),
+                           (mock.Mock(side_effect=subprocess.TimeoutExpired("x", 1)), None)):
+            with mock.patch.object(server, "which", return_value=None), mock.patch.object(server.os, "name", "nt"), \
+                    mock.patch.object(server.subprocess, "CREATE_NEW_CONSOLE", 16, create=True), \
+                    mock.patch.object(server.subprocess, "Popen") as popen:
+                popen.return_value.wait = wait
+                if want:
+                    with self.assertRaisesRegex(server.BridgeError, want):
+                        server.open_window("C:/a", ["claude"], "Claude: x")
+                else:
+                    self.assertEqual(server.open_window("C:/a", ["claude"], "Claude: x"), "a new console window")
+            self.assertEqual(popen.call_args.kwargs["creationflags"], 16)
+
+    def test_powershell_command_only_for_a_native_codex(self):
+        """0.18.0: a .cmd would go through cmd again, so no PowerShell command is given for one;
+        an argument keeps its backslashes."""
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cwd, True)
+        for program, given in (("C:/x%y/codex.cmd", False), ("C:/x%y/codex.exe", True)):
+            resume = [program, "resume", "t-1", "-c", "a=C:\\p q"]
+            with mock.patch.object(server.os, "name", "nt"), mock.patch.object(server, "pane_resume", return_value=resume), \
+                    mock.patch.dict(os.environ, {"TMUX": ""}):
+                with self.assertRaises(server.BridgeError) as e:
+                    server.open_terminal(cwd, "t-1", program)
+            self.assertIn("characters cmd reads as operators", str(e.exception))
+            self.assertEqual("In PowerShell" in str(e.exception), given, str(e.exception))
+            if given:
+                self.assertIn("'a=C:\\p q'", str(e.exception))
+
+    def test_semicolons_are_escaped_for_wt(self):
+        self.assertEqual(server.wt_escape("demo;calc.exe;"), "demo\\;calc.exe\\;")
+        with mock.patch.object(server, "which", return_value="wt"), \
+                mock.patch.object(server.os, "name", "nt"), \
+                mock.patch.object(server.subprocess, "Popen") as popen:
+            popen.return_value.wait.return_value = 0
             server.open_window("C:/a;b", ["claude"], "Claude: x;calc")
         self.assertEqual(popen.call_args[0][0],
                          ["wt", "-w", "new", "-d", "C:/a\\;b", "--title", "Claude: x\\;calc", "claude"])
@@ -1535,7 +1987,7 @@ class OpenClaudeSessionTests(unittest.TestCase):
                 os.chdir(cwd)
         self.assertEqual(os.path.dirname(found), bin_dir)
 
-    def run_helper(self, prompt, returncode=0, closed=False, extra=None):
+    def run_helper(self, prompt, returncode=0, closed=False, extra=None, exe="claude"):
         fd, spec = tempfile.mkstemp(prefix="nouez-claude-", suffix=".json")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(dict({"cwd": ROOT, "name": "n", "prompt": prompt}, **(extra or {})), f)
@@ -1544,7 +1996,7 @@ class OpenClaudeSessionTests(unittest.TestCase):
         marker = server.close_marker(999999)
         if closed:
             open(marker, "w").close()
-        with mock.patch.object(server, "find_program", return_value="claude"), \
+        with mock.patch.object(server, "find_program", return_value=exe), \
                 mock.patch.object(server.subprocess, "Popen", return_value=child) as popen:
             code = server.run_claude(spec)
         self.assertFalse(os.path.exists(spec))
@@ -1557,6 +2009,14 @@ class OpenClaudeSessionTests(unittest.TestCase):
         self.assertEqual(argv, ["claude", "--remote-control", "n", "--name", "n", "--", "--dangerously-skip-permissions"])
         argv, _ = self.run_helper("")
         self.assertEqual(argv, ["claude", "--remote-control", "n", "--name", "n"])
+
+    def test_batch_claude_gets_no_prompt(self):
+        """0.18.0: cmd would read a prompt's quotes, % and & as its own syntax, so it is shown instead."""
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            argv, _ = self.run_helper('x" & calc & "', exe="C:/npm/claude.CMD")
+        self.assertEqual(argv, ["C:/npm/claude.CMD", "--remote-control", "n", "--name", "n"])
+        self.assertIn("Paste it into the session yourself", out.getvalue())
+        self.assertIn('x" & calc & "', out.getvalue())
 
     def test_model_and_effort_are_passed_on(self):
         with mock.patch.dict(server.os.environ, {"CLAUDE_CODE_EFFORT_LEVEL": "high"}):
@@ -1808,6 +2268,14 @@ class OpenClaudeSessionTests(unittest.TestCase):
         self.assertIn("pid 61) and its window", out)
         self.assertIn("claude --resume s61", out)
         end.assert_called_once_with(running[1])
+        with mock.patch.object(server, "claude_sessions", return_value=running), \
+                mock.patch.object(server, "own_claude_pids", return_value=set()), \
+                mock.patch.object(server, "end_session"):
+            out = server.close_claude_session({"name": "x", "pid": 41})
+        if os.name == "nt":
+            self.assertIn("pid 41) (its terminal stays open at the shell prompt)", out)
+        else:  # 0.18.0: off Windows nouez can't tell whether the window closes
+            self.assertIn("its window closes if the terminal closes when its command ends", out)
 
     @unittest.skipUnless(os.name == "nt", "Windows process handles")
     def test_end_session_checks_identity_and_result(self):
@@ -1845,8 +2313,10 @@ class AdditionsTest(HandlerTest):
         self.assertNotIn("inside Codex", server.format_turn("codex-x", dict(turn, status="interrupted")))
 
     def test_truncated_reply_points_to_offset_paging(self):
-        out = server.cap_reply("turn-test-offset", "a" * 50, 10)
-        self.addCleanup(os.remove, os.path.join(server.tempfile.gettempdir(), "nouez", "turn-test-offset.md"))
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with mock.patch.object(server, "nouez_cache_dir", lambda: root):
+            out = server.cap_reply("turn-test-offset", "a" * 50, 10)
         self.assertIn("GetConsultantReply (turn_id turn-test-offset, offset 10)", out)
 
     def test_reply_reads_from_an_offset(self):
@@ -2145,6 +2615,117 @@ class BudgetTest(unittest.TestCase):
         self.assertIn("Antigravity (Google): y", out)
         self.assertIn("Claude Code: x", out)
         self.assertIn("Model scores: no key.", out)
+
+    def test_statusline_merge(self):
+        """0.18.0: `server.py statusline` keeps each window's better reading with its own time."""
+        now = 1_000_000.0
+        five = {"used_percentage": 40, "resets_at": now + 3000}
+        week = {"used_percentage": 20, "resets_at": now + 90000}
+        # first save: both windows, seen now
+        got = server.merge_claude_usage(None, {"five_hour": five, "seven_day": week}, now)
+        self.assertEqual(got["saved"], now)
+        self.assertEqual(got["rate_limits"]["five_hour"]["observed"], now)
+        # an older session reports a lower percentage of the same window: the higher one stays, with its time
+        older = {"five_hour": {"used_percentage": 30, "resets_at": now + 3005}, "seven_day": {**week, "used_percentage": 25}}
+        got2 = server.merge_claude_usage(got, older, now + 60)
+        self.assertEqual(got2["rate_limits"]["five_hour"]["used_percentage"], 40)
+        self.assertEqual(got2["rate_limits"]["five_hour"]["observed"], now)
+        self.assertEqual(got2["rate_limits"]["seven_day"]["used_percentage"], 25)
+        self.assertEqual(got2["rate_limits"]["seven_day"]["observed"], now + 60)
+        self.assertEqual(got2["saved"], now)  # the oldest reading shown, so an old number never looks fresh
+        # a later window replaces a reading of the earlier one; a reset window is dropped
+        later = {"five_hour": {"used_percentage": 2, "resets_at": now + 3000 + 18000}}
+        got3 = server.merge_claude_usage(got2, later, now + 3100)
+        self.assertEqual(got3["rate_limits"]["five_hour"]["used_percentage"], 2)
+        self.assertEqual(got3["rate_limits"]["seven_day"]["used_percentage"], 25)  # kept: not reset, not reported
+        # a window missing from the old file after it reset isn't brought back
+        got4 = server.merge_claude_usage(got3, {"five_hour": later["five_hour"]}, now + 200000)
+        self.assertNotIn("seven_day", got4["rate_limits"])
+        # broken input
+        self.assertEqual(server.merge_claude_usage("junk", {"five_hour": "x"}, now)["rate_limits"], {})
+        # a window reported after its reset isn't saved as current, and huge numbers are no numbers
+        past = {"five_hour": {"used_percentage": 99, "resets_at": now - 1}, "seven_day": {"used_percentage": 10 ** 400,
+                                                                                        "resets_at": now + 9000}}
+        self.assertEqual(server.merge_claude_usage(None, past, now)["rate_limits"], {})
+        self.assertIsNone(server.number(10 ** 400))
+
+    def test_each_window_keeps_its_own_time(self):
+        """0.18.0: a kept old reading gives no pace, though the other window is fresh."""
+        folder = tempfile.mkdtemp()
+        path = os.path.join(folder, "claude-usage.json")
+        now = time.time()
+        saved = {"saved": now - 7200, "rate_limits": {
+            "five_hour": {"used_percentage": 30, "resets_at": now + 3000, "observed": now - 60},
+            "seven_day": {"used_percentage": 50, "resets_at": now + 90000, "observed": now - 7200}}}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(saved, f)
+        lines = server.claude_budget(now, path)
+        five = next(l for l in lines if "5-hour" in l or "5h" in l)
+        week = next(l for l in lines if "week" in l.lower() and l is not five)
+        self.assertNotIn("pace not known", five)
+        self.assertIn("pace not known: an old reading", week)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[" * 100000)  # nested past Python's recursion limit
+        self.assertEqual(server.claude_budget(now, path), ["Claude Code: the saved usage file can't be read."])
+
+    def test_statusline_command(self):
+        """0.18.0: the command saves under a lock, prints a short line, and never fails."""
+        folder = tempfile.mkdtemp()
+        path = os.path.join(folder, "claude-usage.json")
+        now = time.time()
+        data = {"model": {"display_name": "Fable"}, "rate_limits": {"five_hour": {"used_percentage": 12.4, "resets_at": now + 600},
+                                                                   "seven_day": {"used_percentage": 50, "resets_at": now + 9000}}}
+        self.assertTrue(server.save_claude_usage(data, now, path))
+        self.assertTrue(any("12.4% used" in line for line in server.claude_budget(now, path)))
+        self.assertEqual(server.statusline_text(data), "Fable · 5h 12% · week 50%")
+        self.assertEqual(server.statusline_text(None), "")
+        # 0.18.0: a window that has reset isn't shown
+        self.assertEqual(server.statusline_text(data, now + 1000), "Fable · week 50%")
+        self.assertFalse(server.save_claude_usage({"model": {}}, now, path))
+        # a busy file skips the save rather than waiting
+        with mock.patch.object(server, "STATUSLINE_LOCK_SECONDS", 0.1):
+            with server.FileLock(path + ".lock", 1, "busy"):
+                if os.name == "nt":  # msvcrt locks are per handle, so a second lock in this process is refused
+                    self.assertFalse(server.save_claude_usage(data, now, path))
+        # end to end, with broken and good input
+        for stdin, want in ((b"not json", ""), (json.dumps(data).encode(), "Fable")):
+            env = dict(os.environ, LOCALAPPDATA=folder, XDG_CACHE_HOME=folder, PYTHONIOENCODING="utf-8")
+            out = subprocess.run([sys.executable, "-I", server.__file__, "statusline"], input=stdin,
+                                 capture_output=True, env=env, timeout=30)
+            self.assertEqual(out.returncode, 0)
+            self.assertIn(want, out.stdout.decode("utf-8"))
+        self.assertTrue(os.path.exists(os.path.join(folder, "nouez", "claude-usage.json")))
+        quiet = subprocess.run([sys.executable, "-I", server.__file__, "statusline", "--quiet"], input=json.dumps(data).encode(),
+                               capture_output=True, env=env, timeout=30)
+        self.assertEqual((quiet.returncode, quiet.stdout), (0, b""))
+
+    def test_iso_seconds_on_every_python(self):
+        """0.18.0: times parse the same on Python 3.9 and 3.10, whose fromisoformat is stricter."""
+        base = 1795324643.0  # 2026-11-22T05:17:23Z
+        for text, want in (("2026-11-22T05:17:23Z", base), ("2026-11-22T05:17:23.2Z", base + 0.2),
+                           ("2026-11-22T05:17:23.207Z", base + 0.207), ("2026-11-22T05:17:23.207123Z", base + 0.207123),
+                           ("2026-11-22T05:17:23.207123456Z", base + 0.207123), ("2026-11-22T05:17:23+00:00", base),
+                           ("2026-11-22T00:17:23.5-05:00", base + 0.5), ("2026-11-22T06:17:23+0100", base),
+                           ("2026-11-22 05:17:23z", base)):
+            self.assertAlmostEqual(server.iso_seconds(text), want, places=5, msg=text)
+        for bad in ("", "soon", "2026-11-22T25:00:00Z", None, 5):
+            self.assertIsNone(server.iso_seconds(bad), bad)
+
+    def test_budget_without_codex(self):
+        with mock.patch.object(server, "codex_installed", lambda: False), \
+             mock.patch.object(server, "CodexClient", side_effect=AssertionError("not called")), \
+             mock.patch.object(server, "claude_budget", return_value=["Claude Code: x"]), \
+             mock.patch.object(server, "aa_scores", return_value=({}, "no key")), \
+             mock.patch.object(server, "agy_budget", return_value=None):
+            out = server.consultant_budget({})
+            self.assertIn("Codex: not installed.", out)
+            self.assertNotIn("Codex", [g["title"] for g in server.subscription_groups(0, None, None, os.devnull)])
+            saved = {"ts": 100, "plan": "plus", "primary": {"used_percent": 10, "window_minutes": 300,
+                                                            "resets_at": 1000}}
+            kept = server.subscription_groups(200, None, saved, os.devnull)[0]
+            self.assertEqual(kept["title"], "Codex plus")
+            self.assertIn("Codex isn't on PATH", kept["note"])
+        self.assertIn("Codex", [g["title"] for g in server.subscription_groups(0, None, None, os.devnull)])
 
 
 
@@ -2550,9 +3131,9 @@ class UsageLogTest(HandlerTest):
     def test_agy_command(self):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
-        with mock.patch.object(server.shutil, "which", return_value="/bin/agy"):
+        with mock.patch.object(server, "which", return_value="/bin/agy"):
             self.assertEqual(server.agy_command({"PATH": "x"}), "/bin/agy")
-        with mock.patch.object(server.shutil, "which", return_value=None):
+        with mock.patch.object(server, "which", return_value=None):
             self.assertIsNone(server.agy_command({"PATH": "x", "LOCALAPPDATA": d}))
             os.makedirs(os.path.join(d, "agy", "bin"))
             open(os.path.join(d, "agy", "bin", "agy.exe"), "w").close()
@@ -2658,6 +3239,46 @@ class AgyTest(unittest.TestCase):
         with mock.patch.object(server, "agy_command", lambda env=None: None):
             with self.assertRaisesRegex(server.BridgeError, "Antigravity CLI .* can't be found"):
                 server.start_consultant({"cwd": tempfile.gettempdir(), "provider": "antigravity", "new": True})
+            with self.assertRaisesRegex(server.BridgeError, "Antigravity CLI .* can't be found"):
+                server.start_consultant({"cwd": self.work, "provider": "antigravity"})  # not "Using ..."
+
+    def test_without_codex(self):
+        """0.18.0: with only agy installed, the tools work without naming a provider."""
+        no_codex = mock.patch.object(server, "codex_installed", lambda: False)
+        no_codex.start()
+        self.addCleanup(no_codex.stop)
+        listed = server.list_consultants({"cwd": self.work})
+        self.assertIn("No consultants in", listed)
+        self.assertIn("Codex isn't installed", listed)
+        self.assertIn("Start an Antigravity consultant", listed)
+        with self.assertRaisesRegex(server.BridgeError, "No consultant named 'nobody'.*none is running"):
+            server.send_consultant_message({"to": "nobody", "message": "hi"})
+        with mock.patch.object(server, "agy_command", lambda env=None: None):
+            with self.assertRaisesRegex(server.BridgeError, "No consultant named 'nobody'. Neither Codex nor Antigravity"):
+                server.send_consultant_message({"to": "nobody", "message": "hi"})
+        out = server.start_consultant({"cwd": self.work, "model": "gpt-6.2-astra"})
+        self.assertIn("Codex isn't installed, so this is an Antigravity consultant (model 'gpt-6.2-astra'", out)
+        self.assertIn("model: gemini-4-neon-high (Antigravity)", out)
+        name = out.split("Started ")[1].split()[0]
+        again = server.start_consultant({"cwd": self.work})
+        self.assertIn("Codex isn't installed, so this is an Antigravity consultant.", again)
+        self.assertIn(f"Using {name}", again)
+        with mock.patch.object(server, "agy_models", lambda env=None, now=None: None):  # agy models timed out
+            unsure = server.start_consultant({"cwd": self.work, "model": "gpt-6.2-astra"})
+        self.assertIn("'gpt-6.2-astra' can't be checked: `agy models` didn't answer, so its default is used", unsure)
+        self.assertIn(f"Using {name}", unsure)
+        self.assertIn(name, server.list_consultants({"cwd": self.work}))
+        for tool in (server.send_consultant_message, server.get_consultant_history, server.stop_consultant):
+            with self.assertRaisesRegex(server.BridgeError, f"No consultant named 'nobody'.*exist: {name}"):
+                tool({"to": "nobody", "message": "hi"})
+        with self.assertRaisesRegex(server.BridgeError, "Codex isn't installed: .*pass provider antigravity"):
+            server.start_consultant({"cwd": self.work, "provider": "codex"})
+        with mock.patch.object(server, "agy_command", lambda env=None: None):
+            with self.assertRaisesRegex(server.BridgeError, "neither Codex .* nor Antigravity .*session tools still work"):
+                server.start_consultant({"cwd": self.work})
+            elsewhere = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, elsewhere, True)
+            self.assertIn("consultations are off", server.list_consultants({"cwd": elsewhere}))
 
     def test_send_reply_history_stop(self):
         _, name = self.start(instructions="Answer in French.")
@@ -2999,8 +3620,14 @@ class AgyTest(unittest.TestCase):
         self.assertIn("Antigravity (Google;", text)
         self.assertRegex(text, r"Gemini Models: weekly window: 25(\.0)?% used")
         self.assertIn("gemini-4-neon (low, high, xhigh)", text)
-        self.assertEqual(server.agy_budget(now, {"error": "agy: not signed in"}),
-                         ["Antigravity: usage not known (agy: not signed in)."])
+        failed = server.agy_budget(now, {"error": "agy: not signed in"})
+        self.assertEqual(failed[0], "Antigravity: usage not known (agy: not signed in).")
+        self.assertIn("gemini-4-neon (low, high, xhigh)", failed[1])  # models even when the quota call fails
+        installed = os.path.join(self.dir, "agy.exe")
+        with mock.patch.object(server, "agy_command", lambda env=None: installed),              mock.patch.object(server, "which", lambda name, env=None: None):
+            self.assertEqual(server.agy_shown(), ("& " if os.name == "nt" else "") + f"'{installed}'")
+        with mock.patch.object(server, "agy_command", lambda env=None: installed),              mock.patch.object(server, "which", lambda name, env=None: installed):
+            self.assertEqual(server.agy_shown(), "agy")
         with mock.patch.object(server, "read_agy_usage", lambda: None):
             self.assertEqual(server.agy_budget(now), [])
         self.assertEqual(server.agy_snapshot(live["groups"]), {"AG Gemini": {"weekly": 25.0}})
@@ -3187,6 +3814,18 @@ class PaneTest(unittest.TestCase):
             with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as f:
                 f.write("not = [toml\n")
             self.assertEqual(server.viewer_options(sub, home=tmp), ["-c", "check_for_update_on_startup=false"])
+            with mock.patch.dict(sys.modules, {"tomllib": None}):  # 0.18.0: malformed is unsure, not empty
+                self.assertIsNone(server.codex_trust_levels(tmp))
+            # 0.18.0: brackets matched by kind, and only TOML's own bare values
+            for text, readable in (("not = [}\n", False), ("not = bareword\n", False), ("a = [1, {b = }]\n", False),
+                                   ('a = [1, "x", { b = true }]\n', False), ("a = [1,,2]\n", False), ("a = {1}\n", False),
+                                   ("a = 1\na = 2\n", False), ("[t]\na = 1\n[t]\nb = 2\n", False),
+                                   ("c = 1979-05-27T07:32:00Z\n[t]\na = 1\n[u]\na = 'x'\n", True),
+                                   ("a = 1_000\nb = -3.5e2\nc = false\n", True)):
+                with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as f:
+                    f.write(text)
+                with mock.patch.dict(sys.modules, {"tomllib": None}):
+                    self.assertEqual(server.codex_trust_levels(tmp) is not None, readable, text)
             # Valid TOML the line reader can't follow, or an odd shape: no trust where unsure, no crash.
             escaped = f"[projects.'{key(repo)}']\ntrust_level = \"\\u0075ntrusted\"\n"
             # untrusted: which readers must give no trust ("all", or "old" for the line reader only)
@@ -3480,6 +4119,28 @@ class TopReloadTest(unittest.TestCase):
         codes[:] = [2]
         with mock.patch.object(server.subprocess, "Popen", Child):
             self.assertEqual(server.supervise_top(["--days", "x"]), 2)  # so does a usage error
+
+
+class RoundTwoFixesTest(unittest.TestCase):
+    def test_viewer_needs_a_codex_it_can_find(self):
+        """0.18.0: no bare `codex`, which could run one in the project folder."""
+        with mock.patch.object(server, "which", return_value=None):
+            with self.assertRaisesRegex(server.BridgeError, "isn't on PATH"):
+                server.viewer_codex({})
+            self.assertIsNone(server.codex_version("codex"))
+
+    def test_usage_log_skips_a_window_that_has_reset(self):
+        """0.18.0: the log records only windows that haven't reset, as the budget shows them."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        now = time.time()
+        with open(os.path.join(root, server.CLAUDE_USAGE_FILE), "w", encoding="utf-8") as f:
+            json.dump({"rate_limits": {"five_hour": {"used_percentage": 100, "resets_at": now - 60},
+                                       "seven_day": {"used_percentage": 40, "resets_at": now + 9000}}}, f)
+        client = mock.Mock(request=mock.Mock(side_effect=server.BridgeError("down")))
+        with mock.patch.object(server, "nouez_cache_dir", lambda: root):
+            snap = server.usage_snapshot(client)
+        self.assertEqual(snap.get("claude"), {server.window_label(7 * 86400): 40})
 
 
 if __name__ == "__main__":

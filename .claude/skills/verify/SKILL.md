@@ -35,6 +35,17 @@ Never weaken a check, skip a test or add a retry to make a step pass.
    by id, checks the id is kept, and closes it again. Tell the user before running it, since a window
    opens on their screen.
 
+   When the change touches what a newcomer's setup meets (providers, how Codex or `agy` is found,
+   `doctor`, setup steps, the MCP server instructions, ListConsultants or StartConsultant without a
+   provider, nouez's cache folder), add `--setups` (REVIEW.md item 11). It runs nouez four more
+   times, as a clone with Codex only, Antigravity only, both and neither would: each with an empty
+   cache, the left-out CLI hidden from PATH and its install folder, and checks doctor, `top --once`,
+   tools/list, ListConsultants, ConsultantBudget, ListClaudeSessions and StartConsultant with and
+   without a provider. The Antigravity-only run sends one short message. A setup whose CLI isn't
+   installed on this machine is skipped and says so. CI (`.github/workflows/tests.yml`) runs the
+   static checks and unit tests on Windows, macOS and Linux with Python 3.9 and 3.12, never the
+   live checks.
+
 5. **Report** each step as passed, failed or skipped, with the reason for a skip. In the commit
    message, say how the change was verified (for example "Verified: static, checklist, unit tests,
    live --sessions"), or "Verified: none" and why.

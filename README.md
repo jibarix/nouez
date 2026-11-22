@@ -1,24 +1,34 @@
 # nouez
 
-An MCP server that lets Claude Code consult live Codex sessions, and open, list and close Claude Code sessions on your computer, so you can start a new one from your phone.
+An MCP server that lets Claude Code consult a second model, on the Codex CLI, Google's Antigravity CLI or both, and open, list and close Claude Code sessions on your computer, so you can start a new one from your phone. Claude Code is the only agent it needs: each consultant CLI is optional.
 
 ## Why
 
 Two coding agents look at a problem differently. This bridge gives each one a fixed role:
 
 - **Claude Code is the main developer.** It plans, writes the code or text, and owns the work.
-- **Codex is the consultant.** Claude asks it for second opinions: reviewing a plan, checking a diff, finding a bug, validating a claim, or gathering context for research. The consultant only reads; it never edits your files.
+- **A consultant gives second opinions.** It runs on the Codex CLI or Google's Antigravity CLI (Gemini and other models), whichever you have. Claude asks it for second opinions: reviewing a plan, checking a diff, finding a bug, validating a claim, or gathering context for research. The consultant only reads; it never edits your files.
 
-Without the bridge, you run two terminals and copy text between them. With it, Claude starts a Codex consultant in the background, sends it questions, reads the answers and keeps working, all from your single Claude Code terminal. If you prefer to watch Codex work, you can still open it yourself and Claude will talk to that session instead.
+Without the bridge, you run two terminals and copy text between them. With it, Claude starts a consultant in the background, sends it questions, reads the answers and keeps working, all from your single Claude Code terminal. If you prefer to watch Codex work, you can still open it yourself and Claude will talk to that session instead.
 
 The same server also helps when you drive Claude Code from your phone with Remote Control: a session can open a new Claude Code session in another project on the computer, list the ones running, and close a stuck one (see [A new Claude Code session from your phone](#a-new-claude-code-session-from-your-phone)).
 
 ## Requirements
 
-- Python 3.9+ (standard library only, nothing to install)
-- [Claude Code](https://docs.claude.com/en/docs/claude-code)
-- The [Codex CLI](https://github.com/openai/codex) on your `PATH`, logged in
-- Optional: Google's Antigravity CLI (`agy`), signed in, for consultants on Gemini or another model it lists (see [Antigravity consultants](#antigravity-consultants))
+- [Claude Code](https://code.claude.com/docs/en/quickstart), the main tool.
+- Python 3.9 or later (standard library only, nothing to install).
+- For consultants, at least one of these, installed and signed in. Each is optional:
+  - the [Codex CLI](https://developers.openai.com/codex/cli/) (`codex`), with a ChatGPT plan or an API key;
+  - Google's [Antigravity CLI](https://antigravity.google/docs/cli-getting-started) (`agy`), for consultants on Gemini or another model it lists (see [Antigravity consultants](#antigravity-consultants)).
+
+What works with each setup:
+
+| Installed besides Claude Code | Consultants | `StartConsultant` without `provider` | Claude Code session tools, `ConsultantBudget`, `top` |
+|---|---|---|---|
+| Codex and Antigravity | both | Codex; Antigravity when you ask for it | yes |
+| Codex only | Codex | Codex | yes |
+| Antigravity only | Antigravity | Antigravity, and the result says so | yes |
+| neither | none: the consultant tools say so | an error naming both CLIs | yes |
 
 ### Tested with
 
@@ -26,7 +36,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.17.0 |
+| nouez | 0.18.0 |
 | Claude Code | 2.1.330 |
 | Codex CLI | 0.170.0 |
 | Codex app-server daemon | 0.171.0 |
@@ -34,9 +44,11 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 | Python | 3.11.9 |
 | OS | Windows 11 |
 
-Run `claude --version` and `codex --version` to see your versions. Codex updates its daemon by itself, so the daemon can be newer than the CLI; the folder under `~/.codex/packages/app-server-daemon/releases/` shows its version.
+Run `claude --version`, `codex --version` and `agy --version` to see your versions, or `server.py doctor`, which also shows the version of the Codex daemon that is running. Codex updates its daemon by itself, so the daemon can be newer than the CLI.
 
 ## Setup
+
+Run each command in a terminal. Where a path appears, use the absolute path to your copy of nouez, in quotes if it contains a space. On macOS and Linux, use `python3` wherever this says `python` if `python` isn't on your `PATH`. First check that `python --version` prints 3.9 or later. On Windows, if it opens the Microsoft Store or prints nothing, install Python from python.org (or use `py -3` wherever this says `python`). Run the commands outside any virtual environment, unless you mean nouez to run on that environment's Python.
 
 **1. Get the code.**
 
@@ -44,25 +56,32 @@ Run `claude --version` and `codex --version` to see your versions. Codex updates
 git clone https://github.com/jibarix/nouez.git
 ```
 
-**2. Register the server with Claude Code.** Use the absolute path to `server.py`:
+**2. Install and sign in to a consultant CLI** (skip it to use only the Claude Code session tools). Either one is enough; with both, Codex is the default.
+
+- **Codex:** install the [Codex CLI](https://developers.openai.com/codex/cli/), run `codex login` (with an API key instead, `codex login --with-api-key` reads it from standard input: `printenv OPENAI_API_KEY | codex login --with-api-key` in Bash or zsh, `$env:OPENAI_API_KEY | codex login --with-api-key` in PowerShell), then check with `codex login status`, which should say you are logged in. Usage windows in `ConsultantBudget` and `top` are those of a ChatGPT plan; with an API key there are none to show.
+- **Antigravity:** install the [Antigravity CLI](https://antigravity.google/docs/cli-getting-started), run `agy` once in a terminal and sign in with your Google account, then check with `agy models`, which should list models. On Windows the installer puts `agy` in `%LOCALAPPDATA%\agy\bin`; nouez finds it there even when that folder isn't on your `PATH`. If `agy` isn't found in your terminal, run it by its full path instead, in PowerShell `& "$env:LOCALAPPDATA\agy\bin\agy.exe" models`.
+
+If installing changed your `PATH`, quit and restart Claude Code (and the terminal it runs in), so the server it starts can find the new program.
+
+**3. Register the server with Claude Code.**
 
 ```sh
 # available in every project
-claude mcp add --scope user consultants -- python /absolute/path/to/nouez/server.py
+claude mcp add --scope user consultants -- python "/absolute/path/to/nouez/server.py"
 
-# or only in the current project
-claude mcp add consultants -- python /absolute/path/to/nouez/server.py
+# or only in one project: run this from that project's folder
+claude mcp add consultants -- python "/absolute/path/to/nouez/server.py"
 ```
 
-On macOS/Linux, use `python3` if `python` isn't on your `PATH`. On Windows, use a path like `C:/Users/you/nouez/server.py`.
+On Windows, use a path like `"C:/Users/you/nouez/server.py"`. To get [model scores](#choosing-a-consultant), add `-e ARTIFICIAL_ANALYSIS_API_KEY=<your key>` before `--` now; to add it later, see there.
 
-**3. Let Claude run the waiter.** Codex replies often take minutes, so Claude doesn't wait for them: it starts a small waiter command in the background, and the waiter wakes Claude with the reply when Codex finishes (see [Long tasks](#tips)). Claude Code asks before running a command it has no rule for, and in auto mode it may block one. To allow the waiter in every project, print its permission rules with the same `python` and path you registered:
+**4. Let Claude run the waiter** (skip it if you installed no consultant CLI). Replies often take minutes, so Claude doesn't wait for them: it starts a small waiter command in the background, and the waiter wakes Claude with the reply when the consultant finishes (see [Long tasks](#tips)). Claude Code asks before running a command it has no rule for, and in auto mode it may block one. To allow the waiter in every project, print its permission rules with the same `python` and path you registered:
 
 ```sh
-python /absolute/path/to/nouez/server.py allow-rule
+python "/absolute/path/to/nouez/server.py" allow-rule
 ```
 
-On Windows, quote a path that contains spaces: `python "C:/Users/you/My Projects/nouez/server.py" allow-rule`. It prints two rules, one for the Bash tool and one for the PowerShell tool. Add them to `permissions.allow` in `~/.claude/settings.json` (on Windows, `C:\Users\<you>\.claude\settings.json`), keeping anything already in the file. With no other permissions, the file looks like this:
+It prints the rules and the file to put them in: one rule for the Bash tool, and on Windows a second for the PowerShell tool. Add them to `permissions.allow` in that file (`~/.claude/settings.json`, or `settings.json` in `CLAUDE_CONFIG_DIR` if you set it; on Windows, `C:\Users\<you>\.claude\settings.json`), keeping anything already in it. If the file doesn't exist yet, create it. With no other permissions, on Windows it looks like this:
 
 ```json
 {
@@ -75,13 +94,19 @@ On Windows, quote a path that contains spaces: `python "C:/Users/you/My Projects
 }
 ```
 
-Instead of editing the file, you can approve the waiter the first time Claude Code asks and choose not to be asked again. The rules allow only this script's `wait` command with this interpreter, so auto mode keeps them. If you move nouez or change Python, run `allow-rule` again and replace them. Without them everything still works, but Claude Code asks each time, and if the waiter can't run Claude reads the reply only when you ask for it.
+Instead of editing the file, you can approve the waiter the first time Claude Code asks and choose not to be asked again. The rules allow only this script's `wait` command with this interpreter, so auto mode keeps them. If you move nouez or change Python, run `allow-rule` again and replace them. Without them everything still works, but Claude Code asks each time, and if the waiter can't run Claude reads the reply only when you ask for it. Claude Code reads `settings.json` when a session starts, so start a new session after editing it; `/mcp` reconnects only the server. `/permissions` in Claude Code shows the rules in effect.
 
-**4. Check it.** Run `claude mcp list`, or `/mcp` inside Claude Code. You should see `consultants` connected. Sessions that were already open keep the old server until you reconnect it there: `/mcp`, then reconnect `consultants`. Do the same after updating nouez (see [nouez updates](#nouez-updates)). A change to `settings.json` applies to sessions started after it.
+**5. Check it.** Run:
+
+```sh
+python "/absolute/path/to/nouez/server.py" doctor
+```
+
+It reports Claude Code's side (Python, `claude`, the waiter's rules, panes) and then each consultant CLI: whether it is installed, signed in and answering. A CLI you didn't install is a note, not a problem; doctor exits with 1 only when something installed doesn't work. Then run `claude mcp list`, or `/mcp` inside Claude Code: you should see `consultants` connected. Sessions that were already open keep the old server until you reconnect it there: `/mcp`, then reconnect `consultants`. Do the same after updating nouez (see [nouez updates](#nouez-updates)).
 
 ## Usage
 
-**1. Nothing to start.** If the Codex daemon isn't running (it stops when the computer restarts), the first tool call starts it, which adds a few seconds. To start it yourself, run:
+**1. Nothing to start.** With Codex, if its daemon isn't running (it stops when the computer restarts), the first tool call starts it, which adds a few seconds. To start it yourself, run:
 
 ```sh
 codex app-server daemon start
@@ -93,6 +118,8 @@ codex app-server daemon start
 
 > Start a Codex consultant I can watch.
 
+> Ask Gemini whether this plan holds up.
+
 > Ask the consultant to review the plan you just wrote. Push back on anything you disagree with before changing it.
 
 > Before you commit, send the diff to the consultant and ask it to look for bugs.
@@ -101,11 +128,11 @@ codex app-server daemon start
 
 > We're done. Stop the consultant.
 
-Claude calls `StartConsultant` to create a background Codex session in your project (or reuses one already working there, see [Reusing a consultant](#reusing-a-consultant)), `SendConsultantMessage` to ask questions, and `StopConsultant` when you're finished. Each message reaches Codex prefixed with `[Message from Claude Code via the consultants bridge]`, and Claude gets the answer back as a tool result.
+Claude calls `StartConsultant` to create a background consultant in your project (Codex if it is installed, otherwise Antigravity) (or reuses one already working there, see [Reusing a consultant](#reusing-a-consultant)), `SendConsultantMessage` to ask questions, and `StopConsultant` when you're finished. Each message reaches the consultant prefixed with `[Message from Claude Code via the consultants bridge]`, and Claude gets the answer back as a tool result.
 
-**The consultant is always read-only.** It can read your files and run read-only commands for auditing, validation and research, but it can't change anything. It never stops to ask for approvals, because no terminal is attached to answer them. Claude does all the writing. There is no option to give a consultant write access.
+**A consultant Claude starts is always read-only.** A Codex one can read your files and run read-only commands for auditing, validation and research; an Antigravity one can read files but runs no commands, so Claude puts the diff or test output it needs in the message. Neither can change anything. (A Codex session you opened yourself keeps its own permissions; see [below](#using-a-codex-session-you-opened-yourself).) It never stops to ask for approvals, because no terminal is attached to answer them. Claude does all the writing. There is no option to give a consultant write access.
 
-**3. Watch or join in (optional).** A background consultant is an ordinary Codex session. A consultant started by `StartConsultant` is shown automatically (pass `watch: false` to skip that); for a session you opened yourself, ask Claude to *"open the consultant in a terminal"* (`WatchConsultant`). Either way, `codex resume <id>` opens next to Claude Code: as a split pane in the same tab when Claude Code runs in Windows Terminal or tmux, otherwise in a new terminal window. You can read along there or type into the session yourself. Codex can't open a session before its first message, so the pane appears when Claude sends that message, and reappears on the next message if you close it. Without a split, Windows uses a new Windows Terminal window (falling back to a console window), macOS uses Terminal, and Linux uses `x-terminal-emulator`, `gnome-terminal` or `xterm`. In Windows Terminal the pane opens in the window running the Claude Code session that asked for it, even if you last used another window: nouez brings that window to the front while `wt` runs, then gives the focus back. If Claude Code's tab isn't the selected tab in its window, the consultant opens in a new tab there instead, and if the window can't be found or brought to the front (a locked screen, say), it opens in a new window of its own rather than in another session's. If a terminal already shows the session, no second one opens. The pane's `codex resume` trusts the session's folder for that run only, so Codex doesn't stop at "Trust this folder?" (nothing is saved to your Codex config; the folder's own `.codex` config and hooks load in the pane, as if you had answered yes), and it skips Codex's update check. A folder you marked untrusted in Codex stays so, and Codex asks as usual; so does every folder when nouez can't read Codex's config for sure. The window runs the Codex daemon's own `codex` binary when it can find it, so it matches the daemon's version; otherwise it falls back to the `codex` on your `PATH` and warns if the versions differ.
+**3. Watch or join in (optional, Codex).** A background Codex consultant is an ordinary Codex session. A consultant started by `StartConsultant` is shown automatically (pass `watch: false` to skip that); for a session you opened yourself, ask Claude to *"open the consultant in a terminal"* (`WatchConsultant`). Either way, `codex resume <id>` opens next to Claude Code: as a split pane in the same tab when Claude Code runs in Windows Terminal or tmux, otherwise in a new terminal window. You can read along there or type into the session yourself. Codex can't open a session before its first message, so the pane appears when Claude sends that message, and reappears on the next message if you close it. Without a split, Windows uses a new Windows Terminal window (falling back to a console window), macOS uses Terminal, and Linux uses the first terminal emulator it finds of `x-terminal-emulator`, `gnome-terminal`, `konsole`, `xfce4-terminal`, `kitty`, `alacritty`, `wezterm`, `foot` and `xterm`. If the pane can't open (no terminal emulator, no display as over SSH, or a launcher that fails), the result says why and gives the `codex resume` command to run yourself; the consultant works as usual. Without a display, pass `watch: false`, or run Claude Code inside tmux to get panes beside it. In Windows Terminal the pane opens in the window running the Claude Code session that asked for it, even if you last used another window: nouez brings that window to the front while `wt` runs, then gives the focus back. If Claude Code's tab isn't the selected tab in its window, the consultant opens in a new tab there instead, and if the window can't be found or brought to the front (a locked screen, say), it opens in a new window of its own rather than in another session's. If a terminal already shows the session, no second one opens. The pane's `codex resume` trusts the session's folder for that run only, so Codex doesn't stop at "Trust this folder?" (nothing is saved to your Codex config; the folder's own `.codex` config and hooks load in the pane, as if you had answered yes), and it skips Codex's update check. A folder you marked untrusted in Codex stays so, and Codex asks as usual; so does every folder when nouez can't read Codex's config for sure. The window runs the Codex daemon's own `codex` binary when it can find it, so it matches the daemon's version; otherwise it falls back to the `codex` on your `PATH` and warns if the versions differ.
 
 ### Reusing a consultant
 
@@ -123,7 +150,7 @@ This works from a new Claude Code session too: consultants that went idle still 
 
 > Start a second consultant in ~/projects/other-repo and ask it to …
 
-With more than one consultant running, name the one you mean. Once stopped, a consultant is archived and Claude can't reach it. To bring it back, run `codex unarchive <id>` (the id is in the stop message).
+With more than one consultant running, name the one you mean. Once stopped, a consultant is out of Claude's reach. A Codex one is archived: to bring it back, run `codex unarchive <id>` (the id is in the stop message). An Antigravity one is forgotten by nouez, but its conversation stays in agy (`agy --conversation <id>`).
 
 ### Using a Codex session you opened yourself
 
@@ -131,15 +158,15 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 
 ### A new Claude Code session from your phone
 
-Driving Claude Code from the Claude app with Remote Control, you can ask the session for another one: *"open a new Claude session for C:/Users/me/Projects/other"*. Claude calls `OpenClaudeSession`, which opens a new terminal window on the computer and starts `claude --remote-control <name>` in that folder. The new session shows up in the app's session list a few seconds later. It is an ordinary session that saves its transcript and can be resumed. A `claude` you start from Claude Code's own shell doesn't save its transcript, because it inherits `CLAUDE_CODE_CHILD_SESSION` and the other variables that mark it as a child session. `OpenClaudeSession` starts it without them, keeping any variable you set yourself in your Windows environment. The folder can be a new one: *"open a new Claude session in a new folder C:/Users/me/Projects/economic-recession"* makes Claude pass `create: true`, and nouez creates it (its parent must exist). To pick up an earlier conversation, ask *"resume the latest hours-tracker session"*: Claude passes `resume: "latest"` (or a session id), and the window runs `claude --resume <id>` with Remote Control, so the conversation carries on where it stopped. "latest" is the newest conversation in that folder that no running session has open; a conversation already open in a running session is never opened twice. Claude Code's experimental Code Mode doesn't run with Remote Control, and a conversation held in Code Mode resumes only in a terminal with Code Mode on, so `resume` can't bring one back as a remote session.
+Driving Claude Code from the Claude app with Remote Control, you can ask the session for another one: *"open a new Claude session for C:/Users/me/Projects/other"*. Claude calls `OpenClaudeSession`, which opens a new terminal window on the computer and starts `claude --remote-control <name>` in that folder. The new session shows up in the app's session list a few seconds later. It is an ordinary session that saves its transcript and can be resumed. A `claude` you start from Claude Code's own shell doesn't save its transcript, because it inherits `CLAUDE_CODE_CHILD_SESSION` and the other variables that mark it as a child session. `OpenClaudeSession` starts it without them, keeping any variable you set yourself in your environment. On Linux it needs a graphical desktop (an X or Wayland display): over SSH, or in tmux without one, no window can open. The folder can be a new one: *"open a new Claude session in a new folder C:/Users/me/Projects/economic-recession"* makes Claude pass `create: true`, and nouez creates it (its parent must exist). To pick up an earlier conversation, ask *"resume the latest hours-tracker session"*: Claude passes `resume: "latest"` (or a session id), and the window runs `claude --resume <id>` with Remote Control, so the conversation carries on where it stopped. "latest" is the newest conversation in that folder that no running session has open; a conversation already open in a running session is never opened twice. Claude Code's experimental Code Mode doesn't run with Remote Control, and a conversation held in Code Mode resumes only in a terminal with Code Mode on, so `resume` can't bring one back as a remote session.
 
 Claude Code asks whether you trust a folder the first time it runs there, and a session waiting at that question can't connect to the app. So before opening a window, nouez checks Claude Code's settings (`~/.claude.json`). If the folder isn't trusted, nothing opens and Claude asks you whether you trust it. If you say yes, Claude calls it again with `trust: true`, and nouez records your answer in `~/.claude.json` the way Claude Code's trust dialog does, then opens the window, so this works from your phone. Before each change nouez saves a dated copy of the file (the newest 20 are kept, in `%LOCALAPPDATA%\nouez\claude-json-backups`, or `$XDG_STATE_HOME/nouez/claude-json-backups` elsewhere, by default `~/.local/state/nouez/claude-json-backups`) and the result names it. Only that one setting changes. If you're at the computer, Claude can instead open the window untrusted (`open_untrusted: true`) so you answer Claude Code's own question there. Trust works like Claude Code's: outside a git repository, trusting a folder covers the folders inside it, but a git repository is trusted on its own (for a worktree, its main checkout), so trusting `C:/Users/me/Projects` doesn't cover a repository in it. Even in a trusted folder Claude Code can still ask on the computer: a project's own `.claude/settings.json` allow rules need that folder itself trusted, not just a folder above it, and a project's `.mcp.json` servers have their own approval. The result mentions these when the files are there, and says when nouez can't tell whether a folder is trusted (Claude Code's settings can't be read, or the git layout is unusual).
 
-To see what's running, ask any session *"which Claude sessions are open?"*. `ListClaudeSessions` lists the interactive Claude Code sessions registered in your Claude Code config folder, whoever started them, each with its name, folder, status and whether Remote Control is on. To close one, such as a stuck one, say which: *"close hours-tracker"*. `CloseClaudeSession` ends its `claude` process. A session `OpenClaudeSession` opened also gets its window closed; one you started yourself leaves its terminal at the shell prompt. The transcript stays, so `claude --resume` in that folder picks it up again. Claude shows you the list and closes only the sessions you pick, one call each, and never the one you're talking to. The list comes from `~/.claude/sessions`, which Claude Code keeps but doesn't document, so a future Claude Code version could change it.
+To see what's running, ask any session *"which Claude sessions are open?"*. `ListClaudeSessions` lists the interactive Claude Code sessions registered in your Claude Code config folder, whoever started them, each with its name, folder, status and whether Remote Control is on. To close one, such as a stuck one, say which: *"close hours-tracker"*. `CloseClaudeSession` ends its `claude` process. On Windows, a session `OpenClaudeSession` opened also gets its window closed. Elsewhere nouez ends only the `claude` process: a window `OpenClaudeSession` opened then closes if the terminal closes when its command ends, as most Linux terminals do, and stays at a prompt otherwise (macOS Terminal). A session you started yourself leaves its terminal at the shell prompt. On macOS and Linux nouez first checks with `ps` that the process is still Claude Code, started no later than the session was registered, and isn't one nouez itself runs under; if it can't confirm that, it signals nothing and says why. The transcript stays, so `claude --resume` in that folder picks it up again. Claude shows you the list and closes only the sessions you pick, one call each, and never the one you're talking to. The list comes from `~/.claude/sessions`, which Claude Code keeps but doesn't document, so a future Claude Code version could change it.
 
 ### Choosing model and effort
 
-A consultant uses the model and reasoning effort from your Codex config (`model` and `model_reasoning_effort` in `~/.codex/config.toml`). Claude can change either one for a hard question without starting over: `SendConsultantMessage` takes `model` and `effort`, the consultant keeps its context, and the setting stays for later messages until Claude sends the usual values again. nouez tells Claude to do this only when you ask, or when your own instructions say when. Which model suits which work is your call, so nouez doesn't decide it for you.
+A Codex consultant uses the model and reasoning effort from your Codex config (`model` and `model_reasoning_effort` in `~/.codex/config.toml`); an Antigravity one starts on `gemini-4-neon` at level `high` (`ConsultantBudget` lists agy's models and their levels). Claude can change either one for a hard question without starting over: `SendConsultantMessage` takes `model` and `effort`, the consultant keeps its context, and the setting stays for later messages until Claude sends the usual values again. nouez tells Claude to do this only when you ask, or when your own instructions say when. Which model suits which work is your call, so nouez doesn't decide it for you.
 
 To have Claude route work this way without being asked, write your rules in `~/.claude/CLAUDE.md`. Claude Code reads that file in every project, so the rules apply wherever you use a consultant. A project's own `CLAUDE.md` covers only that project. A starting point to adapt (the model ids are examples; `/model` in Codex lists the ones your account offers):
 
@@ -159,10 +186,24 @@ To have Claude route work this way without being asked, write your rules in `~/.
 `ConsultantBudget` gathers what a choice of model and effort depends on, in one call that changes nothing:
 
 - **Codex usage.** Each usage window on your Codex subscription (5-hour, weekly) with the percentage used, when it resets, and where the current pace lands at the reset, or when it runs out first. Also any free full resets your plan has; only you decide to use one. And the models your account offers, with their effort levels.
+- **Antigravity's quota,** when `agy` is installed: each quota group's windows the same way, and the models agy lists with their levels.
 - **Claude Code's own usage.** Claude Code tells only its status line how much of its 5-hour and weekly windows is used, so nouez reads a file the status line saves (below). Without it this part says "not known".
 - **Model scores.** The [Artificial Analysis](https://artificialanalysis.ai) Intelligence Index for the top OpenAI, Google and Anthropic models, with API price and speed. Higher is smarter. Data from Artificial Analysis; credit it when you share it.
 
-nouez reports; it doesn't choose. Your rules decide, in `~/.claude/CLAUDE.md` (see [Choosing model and effort](#choosing-model-and-effort)) or a skill. A `consult` skill to start from would sort consultations by kind (quick check, review, bug hunt, plan critique, research), give each a starting model and effort, then move up or down by what `ConsultantBudget` shows: for instance, one effort level down when Codex is on pace for over 90% of its week, and no consulting on a window that runs out before its reset.
+nouez reports; it doesn't choose. Your rules decide, in `~/.claude/CLAUDE.md` (see [Choosing model and effort](#choosing-model-and-effort)) or a skill. nouez ships one to start from, `skills/consult/SKILL.md`: it sorts consultations by kind (quick check, review, bug hunt, plan critique, research), works with Codex, Antigravity, both or neither, gives each kind a starting model and effort, then moves up or down by what `ConsultantBudget` shows, for instance one effort level down when a subscription is on pace for over 90% of its week, and no consulting on a window that runs out before its reset. Edit its table to your own models. To use it in every project, copy it to your Claude Code skills folder (if you already have a `consult` skill there, compare them first rather than overwrite it):
+
+```sh
+# macOS and Linux
+mkdir -p ~/.claude/skills/consult && cp "/absolute/path/to/nouez/skills/consult/SKILL.md" ~/.claude/skills/consult/
+```
+
+```powershell
+# Windows (PowerShell)
+New-Item -ItemType Directory -Force "$HOME\.claude\skills\consult" | Out-Null
+Copy-Item "C:/Users/you/nouez/skills/consult/SKILL.md" "$HOME\.claude\skills\consult\"
+```
+
+To use it in one project only, copy it to that project's `.claude/skills/consult/` instead. In a new Claude Code session, `/consult` should then be listed, and asking for a second opinion uses it.
 
 **Model scores need a free Artificial Analysis key.** Create an account at [artificialanalysis.ai](https://artificialanalysis.ai) and an API key (free tier, 100 requests a day). Set it as `ARTIFICIAL_ANALYSIS_API_KEY` in the environment Claude Code starts nouez from, for example as a user environment variable on Windows, or in the server's `env` when you register it:
 
@@ -170,45 +211,44 @@ nouez reports; it doesn't choose. Your rules decide, in `~/.claude/CLAUDE.md` (s
 claude mcp add consultants --scope user -e ARTIFICIAL_ANALYSIS_API_KEY=<your key> -- python /path/to/nouez/server.py
 ```
 
-On Windows, nouez also reads the key from your saved user environment variables, so a key saved while Claude Code is running works once you reconnect `consultants` in `/mcp`; no restart needed.
+Use the same scope and path you registered nouez with (Setup step 3). If `consultants` is already registered, `claude mcp add` won't change it: remove it and add it again in the same scope, with the key (`claude mcp get consultants` shows the scope and command it has now):
+
+```sh
+claude mcp remove consultants --scope user
+claude mcp add consultants --scope user -e ARTIFICIAL_ANALYSIS_API_KEY=<your key> -- python /path/to/nouez/server.py
+```
+
+Or set the variable where Claude Code starts: in your shell profile on macOS and Linux (`export ARTIFICIAL_ANALYSIS_API_KEY=...` in `~/.zshrc` or `~/.bashrc`, then start Claude Code from a new terminal), or as a user environment variable on Windows (`[Environment]::SetEnvironmentVariable('ARTIFICIAL_ANALYSIS_API_KEY', '<your key>', 'User')` in PowerShell). On Windows, nouez also reads the key from your saved user environment variables, so a key saved while Claude Code is running works once you reconnect `consultants` in `/mcp`; no restart needed. A key given with `-e` is stored in plain text in Claude Code's config (`~/.claude.json`, or `.mcp.json` for project scope, which you shouldn't commit with a key in it). Then `ConsultantBudget` should show "Model scores: Artificial Analysis Intelligence Index" with a list, not the "no Artificial Analysis key" note.
 
 nouez then asks `artificialanalysis.ai/api/v2/language/models/free` (two or so pages) about once a week, with the key and `nouez/<version>` as the client name and nothing from your projects. The list is kept in `nouez/aa-models.json` in your cache folder. A failed attempt waits 6 hours before the next and the old list stays in use. `refresh: true` fetches again if the list is over an hour old; Claude passes it only when you ask for fresh scores.
 
-**Claude Code's usage needs one addition to your status line.** Claude Code passes `rate_limits` to the status line command as JSON (on Pro and Max plans, after a session's first reply). Have your status line script save it, with the time, to `nouez/claude-usage.json` in your cache folder: `{"saved": <unix seconds>, "rate_limits": <as received>}`. Every open session's status line writes this file, and a session that hasn't heard from Claude Code lately holds older numbers, so keep the newer reading: for each window, the later window, and within the same window the higher percentage. Write it to a temporary file and rename it, so nouez never reads half a file, and never let a failure here break the status line. In PowerShell:
+**Claude Code's usage needs your status line to pass it on.** Claude Code passes `rate_limits` only to the status line command, as JSON on its stdin (on Pro and Max plans, after a session's first reply). `server.py statusline` reads that JSON, saves the usage to `nouez/claude-usage.json` in your cache folder and prints a short status line (the model and both windows). Every open session's status line runs it, some with older numbers, so it keeps the better reading of each window (the later window, and within the same window the higher percentage), each with the time it was seen, under a lock and through a temporary file. It never fails: a broken input or a busy file only skips the save.
 
-```powershell
-if ($null -ne $data.rate_limits -and $env:LOCALAPPDATA) {
-    try {
-        $dir = Join-Path $env:LOCALAPPDATA 'nouez'
-        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
-        $file = Join-Path $dir 'claude-usage.json'
-        # Every open session writes this file, some with older numbers. Per window, keep the later
-        # window, and within the same window (resets within 10 min) the higher percentage.
-        $limits = @{}
-        foreach ($p in $data.rate_limits.PSObject.Properties) { $limits[$p.Name] = $p.Value }
-        $saved = $null
-        try { $saved = [IO.File]::ReadAllText($file) | ConvertFrom-Json } catch {}
-        if ($null -ne $saved -and $null -ne $saved.rate_limits) {
-            foreach ($k in @('five_hour', 'seven_day')) {
-                $old = $saved.rate_limits.$k; $new = $limits[$k]
-                if ($null -eq $old -or $null -eq $old.resets_at -or $null -eq $old.used_percentage) { continue }
-                if ([double]$old.resets_at -le [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) { continue }
-                if ($null -eq $new -or $null -eq $new.resets_at -or $null -eq $new.used_percentage) { $limits[$k] = $old; continue }
-                $gap = [double]$old.resets_at - [double]$new.resets_at
-                if ($gap -gt 600 -or ([math]::Abs($gap) -le 600 -and [double]$old.used_percentage -gt [double]$new.used_percentage)) {
-                    $limits[$k] = $old
-                }
-            }
-        }
-        $json = @{ saved = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); rate_limits = $limits } | ConvertTo-Json -Depth 5 -Compress
-        $tmp = Join-Path $dir "claude-usage.$PID.tmp"
-        [IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding $false))
-        Move-Item -Force $tmp $file
-    } catch { if ($tmp) { Remove-Item -Force -ErrorAction SilentlyContinue $tmp } }
+If you have no status line yet, add this to `~/.claude/settings.json` (`%USERPROFILE%\.claude\settings.json` on Windows), inside its outer `{ }` beside any other settings, with your own paths and the `python` you registered nouez with. A new file holds just this:
+
+```json
+{
+  "statusLine": { "type": "command", "command": "python3 \"/absolute/path/to/nouez/server.py\" statusline" }
 }
 ```
 
-Here `$data` is the status line's input (`$data = [Console]::In.ReadToEnd() | ConvertFrom-Json`). The status line runs only while a Claude Code session is open, so the numbers are as of the last update; nouez shows how old they are and flags them after 30 minutes.
+On Windows: `"command": "python \"C:/Users/you/nouez/server.py\" statusline"`. Start a new session to see it. If you already have a status line script, keep it and pass its input on, with `--quiet` so only your script prints. In bash, read the input once at the top, give it to nouez, and have the rest of the script read `"$input"` instead of stdin:
+
+```sh
+input=$(cat)
+printf '%s' "$input" | python3 "/absolute/path/to/nouez/server.py" statusline --quiet
+# the rest of your script reads "$input", e.g. echo "$input" | jq ...
+```
+
+In PowerShell, the same with `$raw`:
+
+```powershell
+$raw = [Console]::In.ReadToEnd()
+$raw | & python "C:/Users/you/nouez/server.py" statusline --quiet
+$data = $raw | ConvertFrom-Json
+```
+
+The status line runs only while a Claude Code session is open, so the numbers are as of the last update; nouez shows how old they are and flags them after 30 minutes.
 
 ### A brief and a verdict
 
@@ -232,25 +272,25 @@ A verdict line first makes the reply easy to act on, and "what you didn't check"
 
 ### Tips
 
-- **Give Codex context.** Codex can read the files in its own working directory, so start it in the same repo. Tell Claude to include the specific file, diff or question in the message.
-- **Give Claude standing instructions.** A line in your project's `CLAUDE.md` makes the workflow automatic, for example: *"Before committing non-trivial changes, ask the Codex consultant to review the diff and address its findings. Reuse the existing consultant for this repo if there is one; otherwise start one."*
+- **Give the consultant context.** A consultant can read the files in its own working directory, so start it in the same repo. Tell Claude to include the specific file, diff or question in the message; an Antigravity consultant can't run commands, so it needs the diff or output itself.
+- **Give Claude standing instructions.** A line in your project's `CLAUDE.md` makes the workflow automatic, for example: *"Before committing non-trivial changes, ask the consultant to review the diff and address its findings. Reuse the existing consultant for this repo if there is one; otherwise start one."* (Say "the Codex consultant" only if you have Codex: it makes Claude ask for Codex by name.)
 - **Give the consultant a brief and ask for a verdict.** `StartConsultant` takes standing `instructions`, and each message can carry its own brief. A brief that says what is being decided gets a more useful answer than a role. See [A brief and a verdict](#a-brief-and-a-verdict).
 - **Pass on the user's words.** When Claude is acting on something you asked for, it can send your words with `owner_words`, kept apart from its own reading of them, so the consultant checks the work against what you said rather than against Claude's summary.
 - **Tie a review to a revision.** `revision: true` starts the message with the repo's commit, branch and number of uncommitted paths, and asks the consultant to name that revision in its answer, so a verdict can't be mistaken for one about a later state of the code.
 - **Run several consultants.** Start several, for example in different repos or with different models. `ListConsultants` shows each one's name and working directory so Claude can pick the right one.
-- **Long tasks.** By default Claude waits 5 seconds after sending, enough to confirm delivery and catch a quick answer, then starts a small waiter in the background, tells you the consultation is under way, and is free again, and so are you. When Codex finishes, the waiter exits with the reply and Claude Code wakes Claude with it, so Claude acts on the answer or reports it without you asking. Claude needs permission to run the waiter; see [Setup](#setup), step 3.
-- **Idle consultants.** After about a minute without activity, the Codex daemon unloads a consultant. It still appears in `ListConsultants`, and the next message reloads it with the same sandbox and history.
-- **Clean up.** Ask Claude to stop consultants when you're done, so they don't pile up in your Codex session list. Stopping archives a session rather than deleting it, and closes its watch window. On Windows, only windows the bridge opened are closed. On macOS and Linux, any `codex resume <id>` process for that session is ended, and a macOS Terminal window stays open at a shell prompt.
+- **Long tasks.** By default Claude waits 5 seconds after sending, enough to confirm delivery and catch a quick answer, then starts a small waiter in the background, tells you the consultation is under way, and is free again, and so are you. When the consultant finishes, the waiter exits with the reply and Claude Code wakes Claude with it, so Claude acts on the answer or reports it without you asking. Claude needs permission to run the waiter; see [Setup](#setup), step 4.
+- **Idle consultants.** After about a minute without activity, the Codex daemon unloads a Codex consultant. It still appears in `ListConsultants`, and the next message reloads it with the same sandbox and history.
+- **Clean up.** Ask Claude to stop consultants when you're done, so they don't pile up in your Codex session list or in `ListConsultants`. Stopping archives a Codex session rather than deleting it, and closes its watch window. Only panes and windows nouez opened are closed, on every system: each carries a token nouez gave it, so a `codex resume` you started yourself stays open. On macOS and Linux nouez ends the pane's `codex resume` process (checking its program and command line first), so a tmux pane or a Linux terminal window closes with it, while a macOS Terminal window stays open at a shell prompt.
 
 ### Antigravity consultants
 
-A consultant can also run on Google's Antigravity CLI (`agy`) and its Gemini models, so a second opinion can come from a third family of models and from Google's quota instead of the Codex subscription. Claude starts one with `StartConsultant` and `provider: "antigravity"`, only when you ask or your own rules say when, and then uses it with the same tools as a Codex consultant. It starts on `gemini-4-neon` at level `high`; `model` and `effort` pick another (`ConsultantBudget` lists the models), and `SendConsultantMessage` changes them for later messages while the conversation keeps its context. Any model agy lists works, including the Claude and GPT models Antigravity runs on Google's quota; those use that quota, not your Claude Code or Codex usage.
+A consultant can also run on Google's Antigravity CLI (`agy`) and its Gemini models, so a second opinion can come from a third family of models and from Google's quota instead of the Codex subscription. When Codex isn't installed, `StartConsultant` uses Antigravity without being asked, and says so. With both installed, Claude starts one with `provider: "antigravity"` only when you ask or your own rules say when. Either way it is used with the same tools as a Codex consultant. It starts on `gemini-4-neon` at level `high`; `model` and `effort` pick another (`ConsultantBudget` lists the models), and `SendConsultantMessage` changes them for later messages while the conversation keeps its context. Any model agy lists works, including the Claude and GPT models Antigravity runs on Google's quota; those use that quota, not your Claude Code or Codex usage.
 
 How it differs from a Codex consultant:
 
-- **Read-only by agy's own rules.** Every turn runs `agy -p` with deny rules for file writes and edits, commands, MCP tools and URL actions, and with slash commands off. Its browser tools aren't available in this mode. It can read files, search and read web pages.
+- **Read-only by agy's own rules.** Every turn runs `agy -p` with deny rules for file writes and edits, commands, MCP tools and URL actions, and with slash commands off. Its browser tools aren't available in this mode. It can read files, search and read web pages, but can't run `git diff` or the tests: Claude puts the diff or output it should judge in the message.
 - **One message at a time.** Each message runs one agy turn in the background. A message sent while a turn runs is refused, with nothing sent, since agy can't steer a running turn; this holds across all your Claude Code sessions. Wait for the reply, or stop the consultant.
-- **No pane.** `WatchConsultant` gives the command to open its conversation in agy yourself (`agy --conversation <id>`) instead.
+- **No pane.** `WatchConsultant` gives the command to open its conversation in agy yourself (`agy --conversation <id>`, with agy's full path when it isn't on your `PATH`) instead.
 - **A 30-minute limit per turn.** A turn still running then ends with what it has, reported as interrupted.
 - `StopConsultant` ends a running turn and forgets the consultant; its conversation stays in agy. It ends only the process nouez started (on Windows, checked by its start time and program). If it can't end it, nothing is stopped and it says so; send the stop again.
 
@@ -266,7 +306,7 @@ nouez notes each consultation in `nouez/usage-log.jsonl` in your cache folder (`
 
 Events of Antigravity consultants carry `provider: "antigravity"`, and their sends also record Antigravity's quota at that moment.
 
-It never holds the text of a message or reply. Past 20 MB it is renamed with the date and a new one starts. Set `NOUEZ_NO_USAGE_LOG=1` in nouez's environment to turn it off.
+It never holds the text of a message or reply. Past 20 MB it is renamed with the date and a new one starts. Set `NOUEZ_NO_USAGE_LOG=1` in nouez's environment to turn it off; that stops only this log, and an Antigravity consultant still keeps its turns in `nouez/agy/` (see [Files nouez keeps](#files-nouez-keeps)).
 
 To see it, with the usage of each subscription, run in a terminal:
 
@@ -277,39 +317,39 @@ python /path/to/nouez/server.py top
 It shows, in boxed panels:
 
 - **A top bar:** the version, and each subscription's most pressing window: a dot in its colour and its use, named when it isn't the weekly window (`● Claude 95% 5-hour`, `● AG Claude+GPT 82%`).
-- **Usage:** each Codex and Claude Code window, with a bar, the reset, and where the pace lands at the reset (red when used up or running out first, amber over 90%). A dotted mark (`┊`) in the bar shows how much of the window's time has gone: a bar filled past it is being used faster than evenly. Codex is read live from the daemon once a minute; without the daemon, from Codex's last session file. Claude Code's comes from the status line file (see [Choosing a consultant](#choosing-a-consultant)). If the Antigravity CLI (`agy`) is installed, on your `PATH` or where its installer puts it on Windows, each of its quota groups too, read once a minute with `agy -p /usage`, which runs no model turn and uses no quota. They are listed under an Antigravity line; its "Claude+GPT" group is Claude and GPT models run inside Antigravity on Google's quota, apart from Claude Code's.
+- **Usage:** each Codex and Claude Code window, with a bar, the reset, and where the pace lands at the reset (red when used up or running out first, amber over 90%). A dotted mark (`┊`) in the bar shows how much of the window's time has gone: a bar filled past it is being used faster than evenly. Codex is read live from the daemon once a minute; without the daemon, from Codex's last session file. Without Codex installed (and no Codex usage ever logged), its card and badge are left out. Claude Code's comes from the status line file (see [Choosing a consultant](#choosing-a-consultant)). If the Antigravity CLI (`agy`) is installed, on your `PATH` or where its installer puts it on Windows, each of its quota groups too, read once a minute with `agy -p /usage`, which runs no model turn and uses no quota. They are listed under an Antigravity line; its "Claude+GPT" group is Claude and GPT models run inside Antigravity on Google's quota, apart from Claude Code's.
 - **Consultations:** messages sent, and how many of their replies were read (with any that failed or were interrupted), steered and with a changed model or effort; counts by model, kind, project and verdict, which kind went to which model, and the latest reasons given; the median and slowest reply times; and consultants with three or more CHANGES rounds in a row. Verdicts and reply times are those of the period's own messages; other replies read, to earlier messages, are counted apart.
 - **Offload:** for each of the last 8 weeks, the output tokens of Claude Code (and its subagents) beside those of nouez's Codex consultants, of your own Codex sessions and of Antigravity consultants (from the usage log, in the week each message was sent), the messages logged ("sends"), and the share made outside Claude Code, your own Codex sessions included; then Claude Code's output by model. A dash means nothing was recorded: weeks before the usage log began, or Antigravity turns that reported no tokens; a `+` after a number, that some of that week's did. The share is of the output known. These come from the Claude Code transcripts (`~/.claude/projects`) and Codex session files (`~/.codex/sessions`) on this computer. The first run reads the last 13 weeks of them, which can take a minute; the counts are kept in `nouez/usage-weeks.json` and later runs read only what was added.
 
-With the 7- or 30-day period, a line of small bars shows the messages sent each day. The screen fits a terminal 100 columns wide, with the panels one above the other; from 149 columns, each subscription gets a card in a column on the left, beside the consultations and the offload table. On a short screen the optional lists go first, then older weeks (down to three), then the consultations' tables and last lines, then the remaining weeks and whole panels, so every box closes and the latest week stays. Keys, shown in the bar at the bottom: `1`, `7`, `3` or `a` to show 1, 7 or 30 days of consultations or all of them; `r` to read usage again now (in the background); `?` for a help page that says what the marks and columns mean (`?` or Esc goes back); `q` or Esc to quit. `--days N` picks the period to start with (0 for everything, up to 65535), and `--once` prints one screen, with those notes at the end, and exits; to a file or pipe it prints one column 104 wide. In a Windows console other than Windows Terminal (or another terminal that names itself), boxes have square corners and the mark is `|`, for fonts without the rounded ones. When `server.py` is updated, the screen starts again on the new version by itself, with the same period, so its header always shows the version installed. It waits until the new file has stopped changing, compiles and still holds the status screen; if the new screen fails all the same, the window waits for the next update instead of closing. Nothing leaves your computer.
+With the 7- or 30-day period, a line of small bars shows the messages sent each day. The screen fits a terminal 100 columns wide, with the panels one above the other; from 149 columns, each subscription gets a card in a column on the left, beside the consultations and the offload table. On a short screen the optional lists go first, then older weeks (down to three), then the consultations' tables and last lines, then the remaining weeks and whole panels, so every box closes and the latest week stays. Keys, shown in the bar at the bottom: `1`, `7`, `3` or `a` to show 1, 7 or 30 days of consultations or all of them; `r` to read usage again now (in the background); `?` for a help page that says what the marks and columns mean (`?` or Esc goes back); `q` or Esc to quit. `--days N` picks the period to start with (0 for everything, up to 65535), and `--once` prints one screen, with those notes at the end, and exits; to a file or pipe it prints one column 104 wide. In a Windows console other than Windows Terminal (or another terminal that names itself), boxes have square corners and the mark is `|`, for fonts without the rounded ones. When `server.py` is updated, the screen starts again on the new version by itself, with the same period, so its header always shows the version installed. It waits until the new file has stopped changing, compiles and still holds the status screen; if the new screen fails all the same, the window waits for the next update instead of closing. The screen reads local files, asks the Codex daemon for its usage (which the daemon gets from OpenAI) and agy for Antigravity's quota (`agy -p /usage`, no model turn, which agy gets from Google); nothing else leaves your computer.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `StartConsultant` | Starts a background Codex session in a project directory (always read-only; never asks for approvals). If a consultant it started already works in that project, returns it and starts nothing unless `new: true`. Never reuses a session you opened yourself. Says so if a newer nouez is out (see [nouez updates](#nouez-updates)), or if the Codex CLI or daemon is out of date (see [Codex updates](#codex-updates)). |
-| `ListConsultants` | Lists Codex sessions loaded on the local daemon, plus recent `StartConsultant` sessions it has unloaded, with each one's name, working directory, model, status and who started it. With `cwd`, only the sessions in that repo. |
-| `SendConsultantMessage` | Sends a message into a session, waits 5 seconds by default, and returns the reply if it is ready by then, or the turn id and a waiter command if not. If the session is idle the message starts a new turn; if it's busy it steers the running turn. Unloaded sessions are reloaded first. Refuses a session you opened yourself unless `allow_user_session: true`. |
+| `StartConsultant` | Starts a background consultant in a project directory: Codex when it is installed, otherwise Antigravity (always read-only; never asks for approvals). With neither installed, says so. If a consultant it started already works in that project, returns it and starts nothing unless `new: true`. Never reuses a session you opened yourself. Says so if a newer nouez is out (see [nouez updates](#nouez-updates)), or if the Codex CLI or daemon is out of date (see [Codex updates](#codex-updates)). |
+| `ListConsultants` | Lists Antigravity consultants and Codex sessions (those loaded on the local daemon, plus recent `StartConsultant` sessions it has unloaded), with each one's name, working directory, model, status and who started it. With `cwd`, only the sessions in that repo. |
+| `SendConsultantMessage` | Sends a message into a session, waits 5 seconds by default, and returns the reply if it is ready by then, or the turn id and a waiter command if not. If the session is idle the message starts a new turn; if a Codex session is busy it steers the running turn, but only one this server started: a turn typed in the pane, or one from before the server restarted, is refused with nothing sent (as is any message to a busy Antigravity consultant). Unloaded Codex sessions are reloaded first. Refuses a session you opened yourself unless `allow_user_session: true`. |
 | `GetConsultantReply` | Reads a reply without sending anything: the latest turn, or a specific turn id. Use it after sending with `wait: 0` or after a timeout. While the turn runs, it shows the output so far. With `offset`, reads a long reply from that character on. |
 | `GetConsultantHistory` | Lists a consultant's recent turns, newest first, one line each: turn id, status, when, how long, who sent it, and the first line of the message and of the reply. Reads only. |
-| `WatchConsultant` | Opens a session in a split pane beside Claude Code, or a new terminal window, so you can watch it or type into it. Does nothing if a terminal already shows it. |
+| `WatchConsultant` | Opens a Codex session in a split pane beside Claude Code, or a new terminal window, so you can watch it or type into it. Does nothing if a terminal already shows it. For an Antigravity consultant, gives the `agy --conversation` command to open it yourself. |
 | `OpenClaudeSession` | Opens a new terminal window running an interactive Claude Code session with Remote Control in `cwd` (required), named `name` (default: the folder's name), optionally with a first `prompt`, or picking up an earlier conversation held in that folder with `resume` (a session id, or `latest`). It starts on Opus (`model`, default `opus`, the latest Opus) at medium effort (`effort`: `low`, `medium`, `high`, `xhigh` or `max`); Claude passes others only when you ask. The session saves its transcript like one you started yourself. `create: true` makes the folder if it doesn't exist. In a folder Claude Code hasn't been trusted in, it opens nothing unless `trust: true` is given (you said you trust the folder: nouez records that, after a backup) or `open_untrusted: true` (it opens a session that waits at the trust question). In a trusted folder it then checks for up to 30 seconds that the new session is running and connected to Remote Control, and says if another session was already running in that folder. |
 | `ListClaudeSessions` | Lists the interactive Claude Code sessions registered in your Claude Code config folder: name, process id, folder, status, Remote Control, and which one is the caller. |
-| `CloseClaudeSession` | Closes one of them by `name` (or `pid` when names repeat), keeping its transcript. Never the caller. |
+| `CloseClaudeSession` | Closes one of them by `name` (or `pid` when names repeat), keeping its transcript. Never the caller, and on macOS and Linux only a process it confirms is that session. |
 | `ConsultantBudget` | Shows the usage left on your Codex subscription and Claude Code's own and, with `agy` installed, Antigravity's quota groups, with reset times and pace; the Codex and Antigravity models and their levels; and Artificial Analysis model scores. Reads only; see [Choosing a consultant](#choosing-a-consultant). |
-| `StopConsultant` | Archives a session that `StartConsultant` started and closes the terminal panes nouez opened for it (a terminal you opened yourself stays open). Needs the exact name or full thread id. Refuses sessions you opened yourself. |
+| `StopConsultant` | Archives a Codex session that `StartConsultant` started and closes the terminal panes nouez opened for it (a terminal you opened yourself stays open); ends an Antigravity consultant's running turn and forgets it. Needs the exact name or full thread id. Refuses sessions you opened yourself. |
 
 `StartConsultant` arguments (all optional):
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `cwd` | Claude Code's first workspace folder | Absolute path of the project Codex works in |
-| `model` | your Codex config | Codex model (new sessions only) |
-| `title` | | Session title shown in Codex (new sessions only) |
+| `cwd` | Claude Code's first workspace folder | Absolute path of the project the consultant works in |
+| `model` | your Codex config; Antigravity: `gemini-4-neon` | Model (new sessions only). Without `provider` and without Codex installed, a Codex model name is ignored, and the result says so |
+| `title` | | Session title, shown in Codex and in `ListConsultants` (new sessions only) |
 | `instructions` | | Standing instructions for the consultant's role (new sessions only) |
-| `watch` | `true` | Show the session in a pane beside Claude Code once it has its first message, and again on later messages if the pane was closed |
+| `watch` | `true` | Codex only: show the session in a pane beside Claude Code once it has its first message, and again on later messages if the pane was closed |
 | `new` | `false` | Start a new session even though a consultant already works in this project |
-| `provider` | `codex` | `antigravity` for a consultant on the Antigravity CLI (see [Antigravity consultants](#antigravity-consultants)) |
+| `provider` | `codex` if installed, else `antigravity` | `codex`, or `antigravity` for a consultant on the Antigravity CLI (see [Antigravity consultants](#antigravity-consultants)). An explicit choice is kept: `codex` without Codex installed is an error |
 | `effort` | `high` | Antigravity only: the model level of a new consultant |
 
 `SendConsultantMessage` arguments:
@@ -318,11 +358,11 @@ With the 7- or 30-day period, a line of small bars shows the messages sent each 
 |---|---|---|---|
 | `to` | yes | | Session name from `ListConsultants` (e.g. `codex-myproject-a1b2c3`), full thread id, or unique id prefix/suffix. `name` is accepted as an alias. |
 | `message` | yes | | The text to send |
-| `from` | no | `Claude Code` | Sender label shown to Codex |
+| `from` | no | `Claude Code` | Sender label shown to the consultant |
 | `owner_words` | no | | The user's own words, as they typed them. Sent first and marked off, with the rest of the message labelled as the sender's. Claude passes it only when it has the user's words to quote |
 | `revision` | no | `false` | Start the message with the git commit, branch and number of uncommitted paths in the consultant's folder, and ask the consultant to name that revision in its answer |
-| `model` | no | unchanged | Codex model id, e.g. `gpt-6-astra`, for this message and later ones. The consultant keeps its context. Refused, with nothing sent, while nouez sees the consultant mid-turn |
-| `effort` | no | unchanged | Codex reasoning effort (such as `low`, `medium`, `high` or `xhigh`; the levels depend on the model) for this message and later ones; send the usual value again to go back. Refused, with nothing sent, while nouez sees the consultant mid-turn |
+| `model` | no | unchanged | Model id, e.g. `gpt-6-astra` (Codex) or `gemini-4-neon` (Antigravity), for this message and later ones. The consultant keeps its context. Refused, with nothing sent, while nouez sees the consultant mid-turn |
+| `effort` | no | unchanged | Reasoning effort (Codex) or model level (Antigravity), such as `low`, `medium`, `high` or `xhigh`; the levels depend on the model, for this message and later ones; send the usual value again to go back. Refused, with nothing sent, while nouez sees the consultant mid-turn |
 | `wait` | no | `5` | How long to wait for the reply: seconds (`0` returns once the message is delivered), or `"done"` to wait until the turn ends. Capped at 4 hours |
 | `allow_user_session` | no | `false` | Allow sending to a session you opened yourself. Claude sets it only when you ask |
 | `kind` | no | | What the consultation is for: `quick-check`, `re-check`, `review`, `bug-hunt`, `plan-critique`, `research`, `fact-check` or `other`. Kept only in the [usage log](#usage-log-and-status-screen); anything else is refused, with nothing sent |
@@ -332,13 +372,13 @@ With the 7- or 30-day period, a line of small bars shows the messages sent each 
 
 `GetConsultantHistory` takes `to` and an optional `limit` (default 20, up to 100). The sender is the `from` label of a message sent through nouez, or "someone in the Codex pane" for one typed there. A turn with no message isn't anyone's: when a Codex daemon restart (an automatic update, say) cuts a turn off, the restarted daemon carries it on in a new turn with no message, listed as "Codex carrying on the work of turn …, with no new message".
 
-Most replies take longer than the default 5 seconds. Claude is told not to wait for them. Instead the result gives a waiter command, `python server.py wait <thread_id> <turn_id>` with full paths, which Claude runs as a background command (the Bash or PowerShell tool with `run_in_background`). A path is quoted only if it contains a space, so the command runs as is in either shell and the permission rules from `allow-rule` match it. The waiter checks the turn every 1.5 seconds; when the turn ends it prints the reply (cut at 20,000 characters, with the rest saved to a file) and exits, and Claude Code wakes Claude with that output. Claude Code stops a background command after 30 minutes by default, so after 25 minutes the waiter exits on its own with the output so far and the same command to run again, and Claude starts a new one. It rides out up to three failed connections in a row, such as a daemon restart. A restart interrupts the running turn and Codex carries it on in a new one; the waiter, `GetConsultantReply` and a waiting send follow it there, and the waiter says so with the reply, naming the daemon's old and new version if it changed. In a client that can't run background commands, Claude reads the reply later by calling `GetConsultantReply` with the returned `turn_id`, which returns at once. If you would rather have Claude wait, ask it to; it then passes `wait: "done"`, and the call returns when the turn ends (checked every 1.5 seconds), on an error, or after 4 hours. Claude Code keeps such a call in the foreground for about two minutes before moving it to the background. A "still working" result is never a reply. It shows the turn's output so far (the latest 4,000 characters written since the last message reached it), labelled as a snapshot that may change.
+Most replies take longer than the default 5 seconds. Claude is told not to wait for them. Instead the result gives a waiter command, `python server.py wait <thread_id> <turn_id>` with full paths, which Claude runs as a background command (the Bash or PowerShell tool with `run_in_background`). A path is quoted only when it needs it: in double quotes if it has spaces, in single quotes if it has a character a shell would expand (`$`, a backtick). Such a command runs as is in Bash and in PowerShell after `& `. A path with a single quote needs each shell's own escape, so the result then gives a PowerShell form too, and `allow-rule` prints a rule for each. The waiter checks the turn every 1.5 seconds; when the turn ends it prints the reply (cut at 20,000 characters, with the rest saved to a file) and exits, and Claude Code wakes Claude with that output. Claude Code stops a background command after 30 minutes by default, so after 25 minutes the waiter exits on its own with the output so far and the same command to run again, and Claude starts a new one. It rides out up to three failed connections in a row, such as a daemon restart. A restart interrupts the running turn and Codex carries it on in a new one; the waiter, `GetConsultantReply` and a waiting send follow it there, and the waiter says so with the reply, naming the daemon's old and new version if it changed. In a client that can't run background commands, Claude reads the reply later by calling `GetConsultantReply` with the returned `turn_id`, which returns at once. If you would rather have Claude wait, ask it to; it then passes `wait: "done"`, and the call returns when the turn ends (checked every 1.5 seconds), on an error, or after 4 hours. Claude Code keeps such a call in the foreground for about two minutes before moving it to the background. A "still working" result is never a reply. It shows the turn's output so far (the latest 4,000 characters written since the last message reached it), labelled as a snapshot that may change.
 
 While a call waits, nouez sends MCP progress notifications (`notifications/progress`, at most one every 10 seconds) naming the turn, the time so far and the latest line of output, when the client asked for them with a progress token. Claude Code 2.1.295 asks but doesn't display them.
 
 If waiting fails after a message was delivered, the error starts with `Delivered to`, so Claude knows not to send it again.
 
-Replies longer than 60,000 characters are cut there. The full text is saved to `nouez/<turn id>.md` in the system temp folder, and the cut reply ends with that path and the `GetConsultantReply` offset to read the rest.
+Replies longer than 60,000 characters are cut there. The full text is saved to `nouez/replies/reply-<turn id>.md` in your cache folder (deleted after 14 days: nouez checks when it starts and each time it saves another), and the cut reply ends with that path and the `GetConsultantReply` offset to read the rest.
 
 When `StartConsultant` reuses a consultant, its result says when the consultant started, how many turns it has had, and what its last turn was, so Claude can tell whether it is still the right one or a fresh one is wanted. `SendConsultantMessage` says which model and effort the consultant runs on. A turn that failed inside Codex (a dropped connection, for example) is reported as such: sending the message again is safe, since the consultant keeps its context.
 
@@ -350,7 +390,7 @@ Boolean arguments take `true`/`false` (or the strings `"true"`/`"false"`); any o
 
 ### nouez updates
 
-When a newer nouez is released on GitHub, `StartConsultant` adds a notice to its result with a link to the release notes. Claude tells you about it and goes on with the consultation. Ask Claude to update and it runs `git -C '<your nouez folder>' pull --ff-only` in that same session. If git fails (local changes, a conflict, or your copy has commits GitHub doesn't), Claude stops there, shows you what git said and doesn't discard anything. Only after the pull succeeds does it ask you to run `/mcp` and reconnect `consultants` to load the new version. (If the folder's name has a `'` in it, Claude asks you to run the pull yourself.) Your consultants keep their Codex sessions. Other open Claude Code sessions keep the old version until you reconnect there too.
+When a newer nouez is released on GitHub, `StartConsultant` adds a notice to its result with a link to the release notes. Claude tells you about it and goes on with the consultation. Ask Claude to update and it runs `git -C '<your nouez folder>' pull --ff-only` in that same session. If git fails (local changes, a conflict, or your copy has commits GitHub doesn't), Claude stops there, shows you what git said and doesn't discard anything. Only after the pull succeeds does it ask you to run `/mcp` and reconnect `consultants` to load the new version. (If the folder's name has a `'` in it, Claude asks you to run the pull yourself.) Your consultants keep their conversations. Other open Claude Code sessions keep the old version until you reconnect there too.
 
 To find out, nouez asks GitHub for the latest release (`api.github.com/repos/jibarix/nouez/releases/latest`). It sends no sign-in and nothing from your projects or sessions: GitHub sees an HTTPS request from your IP address with `nouez/<version>` as the client name, at the time the server starts, through your proxy if you have one set. An answer is reused for 24 hours and a failed attempt waits an hour before the next, kept in `nouez/latest-release.json` in your cache folder (`%LOCALAPPDATA%` on Windows, `$XDG_CACHE_HOME` or `~/.cache` elsewhere); servers that start at the same moment may each ask. The request runs in the background when the server starts, and each network step gives up after 3 seconds, so no tool waits for it; if you're offline there is simply no notice. The notice is given once per server process. To turn the check off, set the environment variable `NOUEZ_NO_UPDATE_CHECK=1`.
 
@@ -364,23 +404,29 @@ On Windows, if `codex app-server daemon update` fails with `Cannot connect to C:
 
 ## Troubleshooting
 
-To check the setup, run `python /absolute/path/to/nouez/server.py doctor`. It prints one line per check (Python, the Codex CLI and daemon, the waiter's allow rules, Windows Terminal, `claude`) and says what to fix. It changes nothing, though checking the daemon starts it if it isn't running.
+To check the setup, run `python "/absolute/path/to/nouez/server.py" doctor`. It prints one line per check, first Claude Code's side (Python, `claude`, the waiter's allow rules, panes), then each consultant CLI (Codex: found, signed in, daemon; Antigravity: found, version, signed in), and says what to fix. It changes nothing, though checking the daemon starts it if it isn't running, and the Antigravity check asks agy for its quota (no model turn; up to 60 seconds). One working consultant CLI is enough: a problem with the other one is shown but does not fail the check.
 
 | Message | Fix |
 |---|---|
-| `` `codex` CLI not found on PATH `` | Install the Codex CLI, or make sure the shell that launches Claude Code can find it. |
+| `` `codex` CLI not found on PATH `` | Install the Codex CLI, or make sure the shell that launches Claude Code can find it, then restart Claude Code. |
+| ``Codex isn't installed: `codex` isn't on PATH`` | `StartConsultant` was asked for `provider: "codex"`. Leave `provider` out to use Antigravity, or install Codex. |
+| `No consultant CLI is installed` | Install and sign in to Codex or Antigravity ([Setup](#setup), step 2), restart Claude Code, and check with `doctor`. The Claude Code session tools work meanwhile. |
+| `No consultant named 'x'. Codex isn't installed` | Only Antigravity consultants exist; the message lists them. Use one of those names, or start one. If it says neither CLI is installed, see [Setup](#setup), step 2. |
+| `The Antigravity CLI (agy) isn't installed or can't be found` | Install agy, or put it on the `PATH` Claude Code starts with, then restart Claude Code. |
+| `agy didn't report its quota` (doctor), or `Antigravity: usage not known` | Run `agy` in a terminal and sign in, then check `agy models` (on Windows, by its full path if `agy` isn't found: doctor prints it). |
+| `Antigravity has no model 'x'` | Your account doesn't offer that model. Pass one of the listed models as `model`. |
 | `Codex app-server daemon is not reachable, and starting it did not help` | Run `codex app-server daemon start` in a terminal to see why it fails, or open a Codex session. |
-| `No Codex sessions` | Ask Claude to start a consultant, or open Codex in a terminal. |
+| `No consultants` | Ask Claude to start a consultant. Without Codex, the message also says whether Antigravity is installed. |
 | `'x' is ambiguous` | Use the full name or thread id from `ListConsultants`. |
 | `'x' names more than one session` | Two sessions share a name (names keep only the last six characters of the id). Use the full thread id. |
 | `No Codex session named 'x'. Use its exact name or full thread id.` | `StopConsultant` matches exactly. Pass the name or full id from `ListConsultants`. |
 | `` `x` must be true or false `` | A boolean argument got some other value. Pass `true` or `false`. |
 | `` `wait` must be a number of seconds `` | Pass seconds (`0` or more) or `"done"`. |
-| `no reply within 5s` | Codex is still working; any output shown is not the reply. This is normal for the default 5-second wait. Claude starts a waiter that brings the reply back when it is ready. |
-| Claude Code asks before running `server.py wait`, or auto mode blocks it | The waiter has no permission rule. Add the rules that `python server.py allow-rule` prints (see [Setup](#setup), step 3), then start a new session. Meanwhile, ask Claude for the reply with `GetConsultantReply`. |
+| `no reply within 5s` | The consultant is still working; any output shown is not the reply. This is normal for the default 5-second wait. Claude starts a waiter that brings the reply back when it is ready. |
+| Claude Code asks before running `server.py wait`, or auto mode blocks it | The waiter has no permission rule. Add the rules that `python server.py allow-rule` prints (see [Setup](#setup), step 4), then start a new session. Meanwhile, ask Claude for the reply with `GetConsultantReply`. |
 | `is a Codex session the user opened` | `SendConsultantMessage` refuses your own sessions by default. Ask Claude to message it if you mean to; it then passes `allow_user_session: true`. |
 | `` `until_done` was replaced by `wait` `` | The caller used a pre-0.4 argument. Reconnect the server (`/mcp`) so Claude sees the new tool definitions. |
-| `Delivered to ..., but waiting for the reply failed` | The message reached Codex; only the wait failed. Don't resend it. Read the reply with `GetConsultantReply`. |
+| `Delivered to ..., but waiting for the reply failed` | The message reached the consultant; only the wait failed. Don't resend it. Read the reply with `GetConsultantReply`. |
 | `was not started by StartConsultant` | That's a session you opened yourself. Close it from its own terminal. |
 | The terminal window opens but shows an error | Make sure `codex` is on the `PATH` of new terminals, and that the session has had its first message. |
 | The terminal window asks to restart the daemon ("incompatible feature set") | The window's `codex` is a different version from the daemon. Choose **Cancel**: restarting interrupts running consultants, and running without the daemon shows a separate copy of the session. The bridge normally avoids this by using the daemon's own binary; if it warned that it couldn't find it, update the Codex CLI to the daemon's version. |
@@ -395,7 +441,27 @@ To check the setup, run `python /absolute/path/to/nouez/server.py doctor`. It pr
 
 `codex app-server proxy` relays stdio to the daemon's control socket, which speaks JSON-RPC over WebSocket. The server does the WebSocket handshake and framing itself, opens one short-lived connection per tool call, and polls the turn until it finishes. Sessions the bridge starts are tagged with `threadSource: "nouez"`, so it can find them again after the daemon unloads them and so `StopConsultant` knows which ones it may archive.
 
-For the Claude Code session tools, nouez doesn't talk to Claude Code at all. `OpenClaudeSession` opens a terminal window that runs `server.py claude`, which clears the variables Claude Code sets to tie its commands to its session and starts `claude --remote-control`. It runs the `claude` on your `PATH`, never one in the project folder. `ListClaudeSessions` reads the registry Claude Code keeps in `~/.claude/sessions`. On Windows it checks that each process is still the one that wrote its entry; elsewhere only that the process exists. `CloseClaudeSession` ends the chosen process. [docs/architecture.pdf](docs/architecture.pdf) has the details.
+For the Claude Code session tools, nouez doesn't talk to Claude Code at all. `OpenClaudeSession` opens a terminal window that runs `server.py claude`, which clears the variables Claude Code sets to tie its commands to its session and starts `claude --remote-control`. It runs the `claude` on your `PATH`, never one in the project folder. `ListClaudeSessions` reads the registry Claude Code keeps in `~/.claude/sessions`. On Windows it checks that each process is still the one that wrote its entry; elsewhere it lists those whose process exists, and `CloseClaudeSession` checks the program and start time before it signals one. `CloseClaudeSession` ends the chosen process. [docs/architecture.pdf](docs/architecture.pdf) has the details.
+
+### Files nouez keeps
+
+Everything is on your computer, under your user account. The cache folder is `%LOCALAPPDATA%\nouez` on Windows and `$XDG_CACHE_HOME/nouez` or `~/.cache/nouez` elsewhere (a relative `XDG_CACHE_HOME` is ignored). On macOS and Linux nouez makes that folder readable by you only (0700). If it can't (the folder is another user's or a link), nouez uses `nouez-<uid>` in the temp folder instead, made private the same way, and says so.
+
+| File | What | Kept |
+|---|---|---|
+| `usage-log.jsonl` | One line per consultation event: model, effort, kind, reason, tokens; never message text. Off with `NOUEZ_NO_USAGE_LOG=1`. | Renamed with the date past 20 MB |
+| `agy/<id>/` | Each Antigravity consultant: its record, and each turn's message and output (`turns/`) | Until you delete it; a stopped consultant's folder stays |
+| `replies/reply-<turn id>.md` | The full text of a reply longer than 60,000 characters | 14 days |
+| `claude-usage.json` | Claude Code's usage windows, written by `server.py statusline` | Replaced on each update |
+| `usage-weeks.json` | The weekly token counts `server.py top` read from Claude Code's and Codex's own files, so later runs read only what was added | Replaced on each run of `top` |
+| `aa-models.json` | Model scores from Artificial Analysis, with a key set | Replaced about weekly |
+| `latest-release.json` | The latest nouez release seen on GitHub | Replaced about daily |
+| `pane-key` | The local key that makes the token in each pane nouez opens | Kept |
+| `claude-json-backups/` | Dated copies of `~/.claude.json` from before `OpenClaudeSession` recorded trust (`$XDG_STATE_HOME/nouez` or `~/.local/state/nouez` on macOS and Linux) | The newest 20 |
+
+`OpenClaudeSession` also passes a first prompt through a private temporary file (0600) that the new window deletes once read. Codex keeps its own sessions in `~/.codex`, Antigravity its conversations in its own folder, and Claude Code its transcripts in `~/.claude`; nouez doesn't move or copy them.
+
+Over the network, nouez talks only to: the local Codex daemon (which talks to OpenAI with your messages, as Codex always does); `agy`, which sends your messages to Google, and whose `/usage` call asks Google for your quota without a model turn; GitHub, for the latest release; and Artificial Analysis, only with a key set. Neither of the last two gets anything from your projects or sessions.
 
 ## Tests
 
@@ -412,16 +478,17 @@ python -m unittest discover tests
 - `CloseClaudeSession` can end **any** Claude Code session running under your account on the computer, including ones you started yourself; only its caller is refused. Claude is told to close only sessions you pick from the list. The transcript is kept, but work in progress in that session (a running command, an unsent message) is lost.
 - `OpenClaudeSession` starts Claude Code with your normal settings and permissions in the folder you name. Its first prompt, if any, is passed through a temporary file that the new window deletes once it has read it, so it stays off Windows Terminal's command line (it still becomes an argument of the `claude` process).
 - Trusting a folder lets its Claude Code settings, hooks and MCP servers run. `OpenClaudeSession` records trust only with `trust: true`, which Claude is told to pass only when you've said you trust that folder; it never approves MCP servers. It changes nothing else in `~/.claude.json`, but Claude Code sessions rewrite that file all the time, and nothing outside Claude Code can lock it: nouez checks the file hasn't changed just before replacing it and reads the change back after, but a session saving in that same instant could still lose a setting. That's what the dated backups are for.
-- `ConsultantBudget` sends your Artificial Analysis key, if you set one, to `artificialanalysis.ai` over HTTPS about once a week. It reads `nouez/claude-usage.json` from your cache folder but never writes it.
+- `ConsultantBudget` sends your Artificial Analysis key, if you set one, to `artificialanalysis.ai` over HTTPS about once a week. It reads `nouez/claude-usage.json` from your cache folder; only `server.py statusline`, run by your status line, writes it.
 - The `nouez` tag is a guard against mistakes, not a security boundary. Any local program that can reach the Codex daemon can set the same tag, and can archive sessions directly anyway.
 
 ## Limitations
 
-- Local only: it talks to the Codex daemon on the same machine, and opens and closes Claude Code sessions on the same machine.
+- Local only: it talks to the Codex daemon and runs `agy` on the same machine, and opens and closes Claude Code sessions on the same machine.
 - `ListClaudeSessions` reads `~/.claude/sessions` (under `CLAUDE_CONFIG_DIR` if you set it), which Claude Code keeps but doesn't document. A Claude Code update could change it. On Windows a session is listed only if its entry records when its process started, so an entry can't point at an unrelated process that reused the pid.
 - In Windows Terminal, the moment between bringing Claude Code's window to the front and `wt` opening the pane is short but not locked: if you click another window in that instant, the pane can land there. Two tabs with the same title in one window can't be told apart, so the pane may split the other one.
-- Finding Claude Code's own Windows Terminal window, and closing a session's window, are Windows-only. Elsewhere the pane opens as before, and a closed session's terminal stays open.
-- Telling the caller's own session apart is thorough only on Windows, where nouez walks the whole chain of parent processes. Elsewhere it knows only its immediate parent, so if a wrapper sits between Claude Code and nouez, `CloseClaudeSession` may not recognise the caller.
+- Finding Claude Code's own Windows Terminal window, and closing a session's window, are Windows-only. Elsewhere the pane opens as before, and closing a session ends its `claude` process; its window closes only if the terminal closes when its command ends.
+- On macOS, the first Codex pane or `OpenClaudeSession` window makes macOS ask whether the app Claude Code runs in may control Terminal. Allow it, or nothing opens (System Settings → Privacy & Security → Automation changes it later).
+- Telling the caller's own session apart is thorough only on Windows, where nouez walks the whole chain of parent processes. Elsewhere it walks the chain with `ps`, and refuses any session it runs under; if `ps` can't be run, it knows only its immediate parent.
 - Nothing can start a session on the computer from your phone unless something there is already running and connected: an open Claude Code session with Remote Control, for instance.
 - The trust check reads git's files, not Claude Code's code. For a worktree whose git data was moved out with `--separate-git-dir`, it says it can't tell, except when that git folder is named `.git` and sits beside other files: then nouez, like `git worktree list`, takes that folder for the main checkout.
 - `ConsultantBudget` names models as Artificial Analysis does ("GPT-6.2 Sol (high)"), not by Codex model id; matching them is left to Claude. Artificial Analysis scores API access at set effort levels, which may differ from a subscription's.

@@ -1,0 +1,53 @@
+# Unit tests on every system nouez supports, at the oldest and a current Python.
+# No live checks here: those need Codex, Antigravity and Claude Code signed in (verify.py live).
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        python: ["3.9", "3.12"]
+        exclude:
+          - os: ubuntu-latest  # its newest image has no Python 3.9 build
+            python: "3.9"
+        include:
+          - os: ubuntu-24.04
+            python: "3.9"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # the history and tags, for the static checks' range and version tag
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Static checks
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # The commits this push or pull request brings; a new branch (no before), or a before
+          # this checkout doesn't have (a force push), is checked against main. A range git still
+          # can't read fails the step.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+              || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            BASE=$(git merge-base origin/main HEAD 2>/dev/null || git rev-list --max-parents=0 HEAD | tail -n 1)
+          fi
+          # On main itself that base is HEAD, an empty range: check at least the last commit.
+          if [ "$(git rev-parse "$BASE")" = "$(git rev-parse HEAD)" ]; then
+            BASE=$(git rev-parse HEAD^ 2>/dev/null) || { echo "No commit to compare HEAD with"; exit 1; }
+          fi
+          python -I .claude/skills/verify/verify.py static --range "$BASE..HEAD"
+      - name: Unit tests
+        run: python -m unittest tests.test_protocol

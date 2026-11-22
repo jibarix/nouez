@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.17.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.18.0\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -361,8 +361,8 @@ ConsultantBudget & true & & \code{openWorldHint: true} \\
 \end{tabular}
 \end{center}
 
-{\small $^*$Its only write is nouez's own copy of an over-long reply in the temp folder
-(Section~\ref{sec:send}).}
+{\small $^*$Its only write is nouez's own copy of an over-long reply in \code{replies/} in its
+cache folder, deleted after 14 days (Section~\ref{sec:send}).}
 
 \code{ping} is answered with an empty result: \code{\{"jsonrpc": "2.0", "id": 9, "result": \{\}\}}.
 
@@ -1135,11 +1135,17 @@ returns before the reply, and a \code{GetConsultantReply} that finds the turn st
 it with full paths (\code{sys.executable -I} and the absolute path of \code{server.py}) and tell
 Claude to run it as a background command. In Claude Code that is the Bash or PowerShell tool with
 \code{run\_in\_background}: Claude is free at once, and when the command exits Claude Code wakes it
-with the command's output, so the reply arrives without the user asking for it. A path is quoted
-only if it contains a space (the command then adds that PowerShell needs \code{\&} before it), so
-the command runs as is in either shell and a permission rule can match it by prefix.
+with the command's output, so the reply arrives without the user asking for it. A path made only
+of letters, digits and \code{./:+-} is left bare, so the command runs as is in either shell and a
+permission rule can match it by prefix (backslashes are written as \code{/} on Windows). Any other
+path is quoted for each shell: in double quotes when it holds none of \code{\$`"!} or curly
+quotes, otherwise in single quotes, with a \code{'} written \code{'\textbackslash'{}'} for Bash and
+doubled for PowerShell. When the two forms differ, the result gives both, the PowerShell one after
+\code{\&}. A path with a control character gets no command: Claude is told to use
+\code{GetConsultantReply} instead.
 
-\code{server.py allow-rule} prints those rules for the interpreter that runs it, one per shell tool:
+\code{server.py allow-rule} prints those rules for the interpreter that runs it, one per shell tool
+(the PowerShell one only on Windows):
 \begin{plain}
 Add these to permissions.allow in ~/.claude/settings.json:
 "Bash(C:/Python313/python.exe -I C:/Users/you/nouez/server.py wait *)",
@@ -1300,8 +1306,12 @@ once 5\% of the window has gone.
 
 Claude Code tells only its status line command how much of its usage windows is used
 (\code{rate\_limits.five\_hour} and \code{seven\_day}, each \code{used\_percentage} and
-\code{resets\_at}). The README shows a status line addition that saves them to
-\code{claude-usage.json} with the time; nouez reads that file and never writes it.
+\code{resets\_at}). \code{server.py statusline}, set as (or called from) the status line command,
+reads that JSON on stdin and saves the windows to \code{claude-usage.json}, each with the time it
+was seen. Under a lock on \code{claude-usage.json.lock} it merges them with the saved ones: a later
+window replaces an earlier one, the same window keeps the higher percentage, and a window that has
+reset is dropped. It writes atomically, prints a short status line (nothing with \code{-{}-quiet}),
+and exits 0 whatever happens, so it can't break the status line. The server only reads the file.
 
 Model scores come from \code{https://artificialanalysis.ai/api/v2/language/models/free}, with the key
 from \code{ARTIFICIAL\_ANALYSIS\_API\_KEY} in an \code{x-api-key} header, page by page while
@@ -1440,7 +1450,10 @@ that's gone drops out.
 \label{sec:agy}
 
 With \code{provider: "antigravity"}, \code{StartConsultant} makes a consultant on Google's
-Antigravity CLI instead of the Codex daemon. There is no daemon: each message runs one
+Antigravity CLI instead of the Codex daemon. Without \code{provider} it uses Codex when the codex
+CLI is installed and Antigravity otherwise, and says so in its result; with neither it fails with
+a message naming both CLIs and \code{server.py doctor}. \code{agy} is looked up on PATH, then, on
+Windows, in its installer's folder \code{\%LOCALAPPDATA\%\textbackslash agy\textbackslash bin}. There is no daemon: each message runs one
 \code{agy -p} process in the background, and nouez keeps the state in files under
 \code{agy/} in its cache folder. \code{agy/}\textit{id}\code{/consultant.json} holds the name,
 folder, model, title and standing instructions. \code{turns/}\textit{turn}\code{.json} holds a
@@ -1643,11 +1656,11 @@ nouez reads the daemon's version from \code{userAgent} and looks under
 \textbf{Where Claude Code runs} & \textrm{\textbf{Command nouez starts}} \\
 \midrule
 tmux (\code{\$TMUX} set) & tmux split-window -h -c <cwd> '<codex> resume <id>' \\
-Windows Terminal (\code{\$WT\_SESSION}) & wt -w 0 split-pane -V -d <cwd> --title "Codex consultant" cmd /d /s /k "<codex> resume <id>", with Claude Code's window brought to the front first (below); new-tab instead of split-pane when Claude Code's tab isn't selected; -w new when the window can't be found or brought to the front. In every argument after -w, \code{;} is passed as \code{\textbackslash;} (wt splits commands at a bare one) \\
-Windows, \code{wt} installed & wt -w new -d <cwd> --title "Codex consultant" cmd /d /s /k "<codex> resume <id>" \\
+Windows Terminal (\code{\$WT\_SESSION}) & wt -w 0 split-pane -V -d <cwd> -{}-title "Codex consultant" cmd /d /s /k "<codex> resume <id>", with Claude Code's window brought to the front first (below); new-tab instead of split-pane when Claude Code's tab isn't selected; -w new when the window can't be found or brought to the front. In every argument after -w, \code{;} is passed as \code{\textbackslash;} (wt splits commands at a bare one) \\
+Windows, \code{wt} installed & wt -w new -d <cwd> -{}-title "Codex consultant" cmd /d /s /k "<codex> resume <id>" \\
 Windows, no \code{wt} & cmd /c start "Codex consultant" cmd /d /s /k "<codex> resume <id>" \\
-macOS & osascript -e 'tell application "Terminal" to do script "cd <cwd> \&\& <codex> resume <id>"' -e '... activate' \\
-Linux & x-terminal-emulator -e | gnome-terminal -- | xterm -e  <codex> resume <id> \\
+macOS & osascript -e 'on run argv' -e 'tell application "Terminal" to do script (item 1 of argv)' -e '... activate' -e 'end run' 'cd <cwd> \&\& <codex> resume <id>' (the command is an argument, never part of the script) \\
+Linux & the first of x-terminal-emulator -e, gnome-terminal -{}-, konsole -e, xfce4-terminal -x, kitty, alacritty -e, wezterm start -{}-, foot, xterm -e, then <codex> resume <id>; an error when there is no display (\code{DISPLAY}, \code{WAYLAND\_DISPLAY}) \\
 \bottomrule
 \end{tabularx}
 \end{center}
@@ -1776,8 +1789,10 @@ the window and bringing it to the front (Section~\ref{sec:wt-host}), so that cal
 \label{sec:claude-os}
 
 \code{OpenClaudeSession} opens a new window: in Windows Terminal with the command below,
-otherwise in a new console (Windows), Terminal (macOS) or the first of
-\code{x-terminal-emulator}, \code{gnome-terminal} and \code{xterm} (Linux).
+otherwise in a new console (Windows), Terminal (macOS) or the first terminal emulator of the
+panes' list (Linux, Section~\ref{sec:os}). On macOS and Linux a launcher that exits with an
+error within 1.5 seconds (a tmux split, an emulator without a display) is reported with what it
+said, and with the command to run yourself.
 
 \begin{plain}[The window's command]
 wt -w new -d <cwd> --title "Claude: <name>"
@@ -1827,9 +1842,13 @@ wait up to 3 s for the helper to exit, else TerminateProcess(helper, exit code 0
 kill -TERM 20964             (then wait up to 5 s for it to end; an error if it doesn't)
 \end{plain}
 
-On Windows, nouez refuses to close any of its own ancestor processes, which include the Claude
-Code session it serves. Elsewhere it knows only its parent process (\code{os.getppid}), so a
-wrapper between Claude Code and nouez would hide the caller from that check.
+nouez refuses to close any of its own ancestor processes, which include the Claude Code session
+it serves (on macOS and Linux it walks them with \code{ps -o ppid=}). On macOS and Linux, just
+before the signal, it also checks with \code{ps} that the pid is still Claude Code (its program is
+\code{claude}, a version under \code{claude/versions/}, or Node running \code{claude-code}) and
+that the process started no later than 5 seconds after the session's \code{startedAt} in the
+registry, so a pid the system has given to another program is never signalled. When it can't tell,
+it signals nothing and says so.
 
 \subsubsection*{Trust}
 \label{sec:trust}

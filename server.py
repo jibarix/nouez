@@ -1,12 +1,16 @@
-"""nouez: MCP server that lets Claude Code talk to Codex sessions.
+"""nouez: MCP server that lets Claude Code consult a second model, on the Codex CLI, Google's
+Antigravity CLI (agy) or both, each optional, and open, list and close Claude Code sessions.
 
 Tools
-  StartConsultant        reuse the repo's consultant, or start a read-only one, shown in a pane
-  ListConsultants        Codex sessions on the local app-server daemon
+  StartConsultant        reuse the repo's consultant, or start a read-only one (Codex if installed,
+                         else Antigravity); a Codex one is shown in a pane
+  ListConsultants        Antigravity consultants and Codex sessions on the local app-server daemon
   SendConsultantMessage  send a message into one of them and return its reply
   GetConsultantReply     read (or wait for) a reply sent with wait=0
-  WatchConsultant        open a session in a terminal window
-  StopConsultant         archive a session that StartConsultant started
+  GetConsultantHistory   a consultant's recent turns
+  WatchConsultant        open a Codex session in a terminal window
+  StopConsultant         stop a consultant that StartConsultant started
+  ConsultantBudget       usage left on each subscription, models and their scores
   OpenClaudeSession      open a new terminal running a fresh Claude Code session with Remote Control
   ListClaudeSessions     the Claude Code sessions running on this computer
   CloseClaudeSession     close one of them (never the caller)
@@ -17,9 +21,13 @@ Command line
   server.py claude <spec.json>           start that Claude Code session (run by OpenClaudeSession)
   server.py allow-rule                   print the Claude Code permission rules that let the
                                          waiter run without asking
+  server.py doctor                       check Claude Code's side and each consultant CLI
+  server.py statusline [--quiet]         Claude Code's status line: saves its usage for nouez
+  server.py top                          the status screen: usage and consultations
 
 Transport to Codex: `codex app-server proxy` relays stdio to the daemon's control
-socket, which speaks JSON-RPC over WebSocket. Standard library only.
+socket, which speaks JSON-RPC over WebSocket. To Antigravity: one `agy -p` process per
+message, with deny rules that keep it read-only. Standard library only.
 """
 
 import base64
@@ -37,6 +45,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -56,7 +65,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.17.0"
+SERVER_VERSION = "0.18.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -88,6 +97,7 @@ _stdout_lock = threading.Lock()
 _send_locks = {}  # thread id -> lock, so concurrent sends can't both start a turn
 _send_locks_guard = threading.Lock()
 _watch_pending = set()  # consultants to open in a terminal once their first turn starts
+_bridge_turns = set()  # turns this server started (read-only), which a later message may steer
 _unwatched = set()  # StartConsultant sessions started with watch=false: no automatic pane
 _update_noted = set()  # latest Codex versions StartConsultant has already told about
 _nouez_latest = None  # the latest nouez release found this process, e.g. "0.9.0"
@@ -245,7 +255,7 @@ class CodexClient:
     """One short-lived connection to the Codex app-server daemon."""
 
     def __init__(self, timeout=15):
-        exe = shutil.which("codex")
+        exe = which("codex")
         if not exe:
             raise BridgeError("`codex` CLI not found on PATH.")
         self.timeout = timeout
@@ -565,6 +575,16 @@ def user_texts(turn):
             for c in (i.get("content") or [])]
 
 
+def bridge_started(client, thread_id, turn):
+    """Whether nouez started this turn, or the turn it carries on: then it runs read-only and a
+    message may steer it. A turn typed in the watch pane may run with whatever permissions the
+    user set there, so it is never steered."""
+    # Only nouez's own record of the exact turn counts: a turn's text proves nothing, since a
+    # message typed in the pane can start with the same header, and a root only shows shared
+    # ancestry. After a restart the record is empty, so nothing is steered until a new turn starts.
+    return turn.get("id") in _bridge_turns
+
+
 def continued_from(turn):
     """The first turn of the chain of work this turn belongs to (its rootTurnId), or None if it
     starts its own chain. A restarted daemon that carries on a turn the restart cut off names that
@@ -674,16 +694,73 @@ def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None, on_poll=None
         time.sleep(min(POLL_SECONDS, deadline - now))
 
 
+REPLY_FILE_DAYS = 14  # a saved long reply is deleted after this many days
+
+
+REPLY_FILE = re.compile(r"reply-[0-9A-Za-z_-]+\.md|\.reply-[0-9A-Za-z_]+\.tmp")  # nouez's names only
+
+
+def plain_folder(path):
+    """Whether path is a folder itself: not a link, nor on Windows a junction or another reparse
+    point, which islink doesn't see."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    reparse = getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode) and not reparse
+
+
+def replies_folder(create=False):
+    """nouez's folder of saved long replies. Raises OSError if it or nouez's folder is a link or a
+    junction, or not a folder, so nothing is written or deleted wherever a link points."""
+    root = nouez_cache_dir()
+    folder = os.path.join(root, "replies")
+    if create:
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+    for p in (root, folder):
+        if os.path.lexists(p) and not plain_folder(p):
+            raise OSError(f"{p} isn't a plain folder")
+    return folder
+
+
+def prune_replies(days=REPLY_FILE_DAYS):
+    """Delete the saved replies not changed for `days` days: files with nouez's own names only,
+    never links. Best effort; run when the server starts and before each save."""
+    cutoff = time.time() - days * 86400
+    try:
+        with os.scandir(replies_folder()) as entries:
+            for entry in entries:
+                try:
+                    if (REPLY_FILE.fullmatch(entry.name) and entry.is_file(follow_symlinks=False)
+                            and entry.stat(follow_symlinks=False).st_mtime < cutoff):
+                        os.remove(entry.path)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
 def cap_reply(turn_id, reply, limit=MAX_REPLY_CHARS):
     """The reply, or its first `limit` characters with the rest saved to a file the caller can read."""
     if len(reply) <= limit:
         return reply
-    folder = os.path.join(tempfile.gettempdir(), "nouez")
-    path = os.path.join(folder, re.sub(r"[^0-9A-Za-z-]", "_", turn_id) + ".md")
     try:
-        os.makedirs(folder, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(reply)
+        folder = replies_folder(create=True)
+        path = os.path.join(folder, "reply-" + re.sub(r"[^0-9A-Za-z-]", "_", turn_id) + ".md")
+        prune_replies()
+        # Written beside it and renamed over it: a link at that name is replaced, not followed.
+        fd, tmp = tempfile.mkstemp(dir=folder, prefix=".reply-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(reply)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
         where = f"The full reply is saved in {path}."
     except OSError as e:
         where = f"The full reply could not be saved ({e}); read it in the consultant's pane."
@@ -714,25 +791,72 @@ def still_working(name, turn_id, turn, advice):
     return out
 
 
-def waiter_prefix():
-    """The start of every waiter command: this interpreter and this file, with absolute paths.
-    A path is quoted only if it has a space, so the command runs as is in bash and PowerShell
-    alike and a permission rule can match it by prefix."""
-    def q(path):
+def shell_word(path, shell):
+    """path as one word for `shell` ("bash" or "powershell"): as is when it has only letters,
+    digits and `_ . / : + -`; in double quotes when it has spaces but nothing either shell expands
+    there (so commands and permission rules for such a path stay as they were); otherwise in
+    single quotes, read literally by both, with a single quote escaped each shell's way. None if
+    it holds a control character. On Windows backslashes become forward slashes, which both read."""
+    if os.name == "nt":
         path = path.replace("\\", "/")
-        return f'"{path}"' if " " in path else path
-    return f"{q(sys.executable)} -I {q(os.path.abspath(__file__))} wait"
+    if any(ord(c) < 32 or ord(c) == 127 for c in path):
+        return None
+    if re.fullmatch(r"[\w./:+-]+", path):
+        return path
+    if not any(c in '$`"\u201c\u201d\u201e!\\' for c in path):
+        return f'"{path}"'
+    literal = shell_literal(path)
+    if literal:
+        return literal
+    if shell == "powershell":
+        return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", path) + "'"
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def powershell_arg(arg):
+    """arg as one PowerShell word, exactly as it is (no slashes turned), or None with a control
+    character."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in arg):
+        return None
+    if re.fullmatch(r"[\w./:=+-]+", arg) and not arg.startswith("-"):
+        return arg
+    return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", arg) + "'"
+
+
+def waiter_prefix(shell="bash"):
+    """The start of every waiter command in `shell`: this interpreter and this file, with absolute
+    paths, quoted as shell_word does so a permission rule can match it by prefix. None if a path
+    can't be written as a command."""
+    exe, script = shell_word(sys.executable, shell), shell_word(os.path.abspath(__file__), shell)
+    return f"{exe} -I {script} wait" if exe and script else None
 
 
 def waiter_command(thread_id, turn_id):
-    """The shell command that waits for a turn and prints its reply."""
-    cmd = f"{waiter_prefix()} {thread_id} {turn_id}"
-    return cmd + ("\n(In PowerShell, put & and a space before it.)" if cmd.startswith('"') else "")
+    """The shell command that waits for a turn and prints its reply, with PowerShell's form when
+    it differs."""
+    bash, ps = waiter_prefix("bash"), waiter_prefix("powershell")
+    if not bash or not ps:
+        return (f"(no waiter command: the path to Python or nouez has a control character; read the "
+                f"reply with GetConsultantReply, turn_id {turn_id})")
+    cmd = f"{bash} {thread_id} {turn_id}"
+    if ps != bash:
+        return cmd + f"\n(In PowerShell: & {ps} {thread_id} {turn_id})"
+    return cmd + ("\n(In PowerShell, put & and a space before it.)" if cmd[0] in "\"'" else "")
+
+
+NO_ALLOW_RULE = ("The path to Python or nouez has a `*` or a control character, which a permission rule "
+                 "can't hold literally, so there is no allow rule for the waiter and Claude Code asks "
+                 "before each wait. Moving nouez to a folder without them fixes it.")
 
 
 def allow_rules():
-    """Claude Code permission rules matching every waiter command of this install, one per shell tool."""
-    return [f"{tool}({waiter_prefix()} *)" for tool in ("Bash", "PowerShell")]
+    """Claude Code permission rules matching every waiter command of this install, one per shell
+    tool: Bash everywhere, PowerShell on Windows, each with that shell's quoting."""
+    rules = [("Bash", waiter_prefix("bash"))]
+    if os.name == "nt":
+        rules.append(("PowerShell", waiter_prefix("powershell")))
+    # A `*` in the prefix would be a wildcard in the rule, matching other paths too: no rule then.
+    return [f"{tool}({prefix} *)" for tool, prefix in rules if prefix and "*" not in prefix]
 
 
 def read_later(thread_id, turn_id):
@@ -871,7 +995,8 @@ def version_of(text):
 
 
 def codex_version(exe):
-    return version_of(run_text([shutil.which(exe) or exe, "--version"], timeout=10))
+    found = exe if rooted(exe) else which(exe)  # never a bare name, which could run a project's own
+    return version_of(run_text([found, "--version"], timeout=10)) if found else None
 
 
 def viewer_codex(info):
@@ -889,12 +1014,15 @@ def viewer_codex(info):
         for path in sorted(glob.glob(pattern)):
             if codex_version(path) == version:
                 return path, ""
-    on_path = codex_version("codex")
+    codex = which("codex")  # the absolute path checked here, so the pane runs that one
+    if not codex:  # a bare name would run whatever codex the project folder holds
+        raise BridgeError("the codex CLI isn't on PATH, so no pane can open (the consultant itself runs on)")
+    on_path = codex_version(codex)
     if version and on_path and on_path != version:
-        return "codex", (f" Warning: the codex CLI on PATH is {on_path} but the daemon is {version}, so the "
-                         "window may ask to restart the daemon. Choose Cancel (restarting interrupts running "
-                         f"consultants) and update the codex CLI to {version}.")
-    return "codex", ""
+        return codex, (f" Warning: the codex CLI on PATH is {on_path} but the daemon is {version}, so the "
+                       "window may ask to restart the daemon. Choose Cancel (restarting interrupts running "
+                       f"consultants) and update the codex CLI to {version}.")
+    return codex, ""
 
 
 def version_key(version):
@@ -950,13 +1078,69 @@ def update_check_off(env=None):
     return value not in ("", "0", "false", "no")
 
 
+_private_roots = {}  # nouez folder -> the folder used for it in this process, once checked private
+
+
 def nouez_cache_dir():
-    """nouez's folder in the user's own cache folder."""
+    """nouez's folder in the user's own cache folder: %LOCALAPPDATA%\\nouez on Windows, else
+    $XDG_CACHE_HOME/nouez or ~/.cache/nouez. A relative variable is ignored, since it would put
+    nouez's files in whatever folder the server was started from. On macOS and Linux the folder is
+    made 0700 (once per process), so other users can't read anything in it."""
     if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(os.path.join("~", "AppData", "Local"))
+        base, fallback = os.environ.get("LOCALAPPDATA"), os.path.join("~", "AppData", "Local")
     else:
-        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser(os.path.join("~", ".cache"))
-    return os.path.join(base, "nouez")
+        base, fallback = os.environ.get("XDG_CACHE_HOME"), os.path.join("~", ".cache")
+    if not base or not rooted(base):
+        base = os.path.expanduser(fallback)
+    root = os.path.join(base, "nouez")
+    if os.name == "nt" or root in _private_roots:
+        return _private_roots.get(root, root) if os.name != "nt" else root
+    problem = private_folder_problem(root)
+    if problem:
+        # Never write prompts or replies where another user could read or plant files. The
+        # fallback is the same for all of this user's processes (the server, the status line,
+        # top, a waiter), so they still share their files; only if it isn't usable either does
+        # this process get a folder of its own, and it says what that loses.
+        shared = os.path.join(tempfile.gettempdir(), f"nouez-{os.getuid()}")
+        if not private_folder_problem(shared):
+            print(f"nouez: {root} {problem}, so nouez keeps its files in {shared}.", file=sys.stderr)
+            _private_roots[root] = shared
+            return shared
+        fallback = tempfile.mkdtemp(prefix="nouez-")
+        print(f"nouez: {root} {problem}, and {shared} isn't usable either, so this process keeps its files "
+              f"in {fallback}. Other nouez processes (the status line, top, a waiter) won't see them.",
+              file=sys.stderr)
+        _private_roots[root] = fallback
+        return fallback
+    _private_roots[root] = root
+    return root
+
+
+def private_folder_problem(path):
+    """macOS and Linux: "" once `path` is a folder of this user's, not a link, readable by them
+    only (made so), in a folder no other user can change; otherwise why it isn't. The folder is
+    checked and changed through one open handle, so it can't be swapped in between, and a parent
+    another user could write to (without the sticky bit /tmp has) would let them swap it later."""
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        parent = os.stat(os.path.dirname(path) or ".")
+        if parent.st_uid not in (os.getuid(), 0) or (parent.st_mode & 0o022 and not parent.st_mode & stat.S_ISVTX):
+            return "is in a folder other users can change"
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as e:
+        return "isn't a folder of yours" if os.path.islink(path) else f"couldn't be checked ({e})"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            return "isn't a folder of yours"
+        os.fchmod(fd, 0o700)
+        if os.fstat(fd).st_mode & 0o077:
+            return "couldn't be made readable by you only"
+    except OSError as e:
+        return f"couldn't be checked ({e})"
+    finally:
+        os.close(fd)
+    return ""
 
 
 def release_cache_file():
@@ -1089,7 +1273,7 @@ def nouez_update_notice():
     shown = folder.replace("\\", "/") if os.name == "nt" else folder
     quoted = shell_literal(shown)
     reconnect = ("ask the user to run /mcp and reconnect consultants, which loads the new "
-                 "version; the Codex consultants keep their sessions.")
+                 "version; consultants keep their conversations.")
     if os.path.exists(os.path.join(folder, ".git")) and quoted:
         how = (f"run `git -C {quoted} pull --ff-only` in a shell. If git fails (local changes, a conflict, "
                "no branch checked out), stop there: tell the user what git said, don't ask them "
@@ -1539,18 +1723,23 @@ def run_in_host_window(wt, cwd, command):
     previous = user32.GetForegroundWindow()
     if not host or not _activate_window(ctypes, user32, kernel32, host[0]):
         # Opening it in another session's window is worse than a window of its own.
-        subprocess.Popen([wt, "-w", "new", *command], cwd=cwd, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         why = "couldn't be brought to the front" if host else "couldn't be found"
-        return f"a new Windows Terminal window (Claude Code's window {why})"
+        return launch([wt, "-w", "new", *command], f"a new Windows Terminal window (Claude Code's window {why})",
+                      cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     hwnd, console_title = host
     # split-pane splits the window's selected tab; if that isn't Claude Code's, open a tab instead.
     in_view = _same_title(_window_text(ctypes, user32, hwnd), console_title)
     action, how = (["split-pane", "-V"], "a Windows Terminal split pane") if in_view else \
                   (["new-tab"], "a new tab in Claude Code's Windows Terminal window")
     try:
-        subprocess.Popen([wt, "-w", "0", *action, *command], cwd=cwd, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait(timeout=10)
+        with tempfile.TemporaryFile() as err:
+            proc = subprocess.Popen([wt, "-w", "0", *action, *command], cwd=cwd, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=err)
+            code = proc.wait(timeout=10)
+            if code:
+                err.seek(0)
+                said = " ".join(err.read(4000).decode("utf-8", "replace").split())[:300]
+                raise BridgeError(f"{how} didn't open (exit code {code}{': ' + said if said else ''})")
         time.sleep(0.5)  # wt.exe hands the request to the running terminal; let it land first
     except subprocess.TimeoutExpired:
         pass
@@ -1569,6 +1758,32 @@ def codex_project_key(folder):
     if os.name != "nt":
         return os.path.realpath(folder)
     return "".join(c.lower() if c.isascii() else c for c in os.path.normpath(os.path.abspath(folder)))
+
+
+TOML_STRING = r"\"(?:[^\"\\]|\\.)*\"|'[^']*'"
+TOML_KEY = rf"(?:[A-Za-z0-9_-]+|{TOML_STRING})(?:\s*\.\s*(?:[A-Za-z0-9_-]+|{TOML_STRING}))*"
+TOML_SCALAR = (r'""|true|false|[+-]?(?:inf|nan|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?)|0x[0-9A-Fa-f_]+|'
+               r'0o[0-7_]+|0b[01_]+|\d{4}-\d\d-\d\d(?:[T ]\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?:Z|[+-]\d\d:\d\d)?)?|'
+               r'\d\d:\d\d(?::\d\d(?:\.\d+)?)?')  # a string (already "") or a TOML number, boolean or date
+
+
+def plain_toml_line(line):
+    """Whether a line of TOML is complete on its own: blank, a comment, a [table] or [[table]]
+    header, or key = value with a one-line value (string, number, date, boolean, or an inline
+    array or table whose brackets close on the line). Python before 3.11 has no TOML reader, so
+    a file with any other line can't be read for sure."""
+    if re.fullmatch(rf"\s*(#.*)?|\s*\[\[?\s*{TOML_KEY}\s*\]\]?\s*(#.*)?", line):
+        return True
+    m = re.fullmatch(rf"\s*{TOML_KEY}\s*=\s*(.+)", line)
+    if not m:
+        return False
+    rest = re.sub(TOML_STRING, '""', m.group(1))  # strings can hold brackets, quotes and #
+    if '"""' in m.group(1) or "'''" in m.group(1) or re.search(r"[\"']", rest.replace('""', "")):
+        return False  # a multi-line or unclosed string
+    value = rest.split("#", 1)[0].strip()
+    if value[:1] not in "[{":
+        return bool(re.fullmatch(TOML_SCALAR, value))
+    return False  # an array or inline table: this reader doesn't check them, so the file is unsure
 
 
 def codex_trust_levels(home=None):
@@ -1598,6 +1813,23 @@ def codex_trust_levels(home=None):
     # ('...') string could spell any key or value, so a file with one can't be read for sure.
     if any("\\" in re.sub(r"'[^']*'", "", line) for line in text.splitlines()):
         return None
+    if not all(plain_toml_line(line) for line in text.splitlines()):
+        return None  # malformed, or a shape (an array, a value over several lines) this reader can't follow
+    seen, table = set(), ""
+    for line in text.splitlines():  # a key or table given twice is invalid TOML
+        if re.fullmatch(r"\s*(#.*)?", line):
+            continue
+        header = re.fullmatch(r"\s*(\[\[?)\s*(.*?)\s*\]\]?\s*(#.*)?", line)
+        if header:
+            table = header.group(2)
+            if header.group(1) == "[" and ("[]", table) in seen:
+                return None
+            seen.add(("[]", table))
+            continue
+        key = (table, line.split("=", 1)[0].strip())
+        if key in seen:
+            return None
+        seen.add(key)
     levels, key = {}, None
     for line in text.splitlines():
         if line.lstrip().startswith("["):
@@ -1719,6 +1951,73 @@ def viewer_options(cwd, home=None):
     return [*options, "-c", f"projects={{{table}}}"]
 
 
+# Linux terminal emulators nouez can open a window in, in the order tried, with the arguments
+# that come before the command to run in it.
+TERMINALS = (("x-terminal-emulator", ["-e"]), ("gnome-terminal", ["--"]), ("konsole", ["-e"]),
+             ("xfce4-terminal", ["-x"]), ("kitty", []), ("alacritty", ["-e"]), ("wezterm", ["start", "--"]),
+             ("foot", []), ("xterm", ["-e"]))
+LAUNCH_GRACE = 1.5  # seconds a launcher has to fail before nouez takes it as started
+
+
+def terminal_emulator():
+    """(path, arguments before the command) of the first terminal emulator found, or (None, None)."""
+    for name, lead in TERMINALS:
+        exe = which(name)
+        if exe:
+            return exe, lead
+    return None, None
+
+
+def no_display():
+    """Why a Linux window can't open (no X or Wayland display), or ""."""
+    if sys.platform == "darwin" or os.name == "nt":
+        return ""
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return ""
+    return "there is no display (DISPLAY and WAYLAND_DISPLAY aren't set, as over SSH)"
+
+
+def apple_terminal(script, activate=True):
+    """osascript arguments that run `script` in a new Terminal window. The script goes to the
+    AppleScript as an argument, never into its source, so no text in it can change what runs."""
+    lines = ["on run argv", 'tell application "Terminal" to do script (item 1 of argv)']
+    if activate:
+        lines.append('tell application "Terminal" to activate')
+    lines.append("end run")
+    return ["osascript", *[x for line in lines for x in ("-e", line)], script]
+
+
+def launch(argv, how, **kwargs):
+    """Start a launcher (tmux, osascript, a terminal emulator) and make sure it didn't fail: one
+    that exits within LAUNCH_GRACE seconds with an error raises BridgeError with what it said.
+    One still running then (an emulator showing the window) is left to run."""
+    kwargs.pop("stderr", None)
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(argv, stderr=err, **kwargs)
+        try:
+            code = proc.wait(LAUNCH_GRACE)
+        except subprocess.TimeoutExpired:
+            return how
+        if code == 0:
+            return how
+        err.seek(0)
+        said = " ".join(err.read(4000).decode("utf-8", "replace").split())[:300]
+    raise BridgeError(f"{how} didn't open (exit code {code}{': ' + said if said else ''})")
+
+
+def launch_console(argv, how, cwd):
+    """Windows without Windows Terminal: run argv in a console of its own, its output shown there,
+    and raise BridgeError if it ends with an error within LAUNCH_GRACE seconds."""
+    proc = subprocess.Popen(argv, cwd=cwd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+    try:
+        code = proc.wait(LAUNCH_GRACE)
+    except subprocess.TimeoutExpired:
+        return how
+    if code == 0:
+        return how
+    raise BridgeError(f"{how} closed at once (exit code {code})")
+
+
 def open_terminal(cwd, thread_id, codex="codex"):
     """Open `codex resume <id>` beside Claude Code: a split pane when Claude Code runs in
     Windows Terminal or tmux, otherwise a new terminal window. Returns a description of what opened."""
@@ -1727,9 +2026,13 @@ def open_terminal(cwd, thread_id, codex="codex"):
     cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
     resume = pane_resume(codex, thread_id, cwd)
     kwargs = {"cwd": cwd, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-    tmux = shutil.which("tmux") if os.environ.get("TMUX") else None
+    tmux = which("tmux") if os.environ.get("TMUX") else None
+    yourself = f" Pass watch=false to start without a pane, or run this yourself: {shlex.join(resume)}"
     if tmux:
-        argv, how = [tmux, "split-window", "-h", "-c", cwd, shlex.join(resume)], "a tmux split pane"
+        try:
+            return launch([tmux, "split-window", "-h", "-c", cwd, shlex.join(resume)], "a tmux split pane", **kwargs)
+        except BridgeError as e:
+            raise BridgeError(f"{e}.{yourself}") from None
     elif os.name == "nt":
         # codex on PATH is usually an npm .cmd shim, so run it through cmd; /k keeps errors on screen.
         # The whole command goes to cmd as one quoted argument with /s, which makes cmd drop just
@@ -1737,31 +2040,42 @@ def open_terminal(cwd, thread_id, codex="codex"):
         # argument loses its opening quote. Windows Terminal passes such an argument on as "...".
         line = subprocess.list2cmdline(resume)
         if set(line) & (CMD_SPECIAL - {'"', "'"}):  # quotes are for cmd to read, not operators
-            raise BridgeError(f"Can't open a terminal safely for this command; run it yourself: {line}")
+            # Only for a program PowerShell runs itself: a .cmd goes through cmd again, and
+            # Windows PowerShell 5.1 drops the double quotes inside an argument.
+            native = os.path.splitext(resume[0])[1].lower() in (".exe", ".com")
+            words = [shell_word(resume[0], "powershell")] + [powershell_arg(a) for a in resume[1:]]
+            yours = (f" In PowerShell, in {cwd}: & {' '.join(words)}"
+                     if native and all(words) and not any('"' in a for a in resume[1:]) else "")
+            raise BridgeError("Can't open a terminal safely for this command: its path has characters cmd "
+                              f"reads as operators.{yours}")
         shell = ["cmd", "/d", "/s", "/k", line]
-        wt = shutil.which("wt")
+        wt = which("wt")
         if wt and os.environ.get("WT_SESSION"):
             return run_in_host_window(wt, cwd, ["-d", cwd, "--title", "Codex consultant", *shell])
         elif wt:
             argv = [wt, "-w", "new", *map(wt_escape, ["-d", cwd, "--title", "Codex consultant", *shell])]
             how = "Windows Terminal"
         else:
-            # A string, so start gets the quoting above as it is (a list would escape its quotes).
-            argv, how = f'cmd /c start "Codex consultant" cmd /d /s /k "{line}"', "a console window"
-    elif sys.platform == "darwin":
-        script = f"cd {shlex.quote(cwd)} && {shlex.join(resume)}"
-        argv, how = ["osascript", "-e", f"tell application \"Terminal\" to do script {json.dumps(script)}",
-                     "-e", "tell application \"Terminal\" to activate"], "Terminal"
-        kwargs["start_new_session"] = True
+            # cmd itself in a new console, so codex's errors show there (/k keeps it open); a
+            # string, so cmd gets the quoting above as it is (a list would escape its quotes).
+            # Only the console is checked, not codex in it.
+            return launch_console(f'cmd /d /s /k "{line}"', "a console window (any error from codex shows in it)", cwd)
     else:
-        term = shutil.which("x-terminal-emulator") or shutil.which("gnome-terminal") or shutil.which("xterm")
-        if not term:
-            raise BridgeError(f"No terminal emulator found. Run this yourself: codex resume {thread_id}")
-        flag = "--" if term.endswith("gnome-terminal") else "-e"
-        argv, how = [term, flag, *resume], os.path.basename(term)
-        kwargs["start_new_session"] = True
-    subprocess.Popen(argv, **kwargs)
-    return how
+        if sys.platform == "darwin":
+            argv, how = apple_terminal(f"cd {shlex.quote(cwd)} && {shlex.join(resume)}"), "Terminal"
+        else:
+            term, lead = terminal_emulator()
+            if not term:
+                raise BridgeError("No terminal emulator found (" + ", ".join(n for n, _ in TERMINALS)
+                                  + ")." + yourself)
+            if no_display():
+                raise BridgeError(f"Can't open a terminal window: {no_display()}.{yourself}")
+            argv, how = [term, *lead, *resume], os.path.basename(term)
+        try:
+            return launch(argv, how, start_new_session=True, **kwargs)
+        except BridgeError as e:
+            raise BridgeError(f"{e}.{yourself}") from None
+    return launch(argv, how, **kwargs)
 
 
 def show_viewer(thread, info, quiet=False):
@@ -1841,13 +2155,27 @@ def find_program(name, path):
         exts = [e for e in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(";") if e]
     for folder in (path or "").split(os.pathsep):
         folder = folder.strip().strip('"')
-        if not folder or not os.path.isabs(folder):
+        if not folder or not rooted(folder):
             continue
         for ext in exts:
             candidate = os.path.join(folder, name + ext)
             if os.path.isfile(candidate) and (os.name == "nt" or os.access(candidate, os.X_OK)):
                 return candidate
     return None
+
+
+def rooted(path):
+    """Whether `path` is absolute by itself. On Windows that needs a drive or a share as well:
+    `\\tools` is on whatever drive is current, which here is the project's."""
+    return (isinstance(path, str) and os.path.isabs(path)
+            and (os.name != "nt" or bool(os.path.splitdrive(path)[0])))
+
+
+def which(name, env=None):
+    """A program on PATH, found the way `find_program` does: never in the current folder (the
+    project, which could hold its own `codex.exe`) or a relative PATH entry."""
+    env = os.environ if env is None else env
+    return find_program(name, env.get("PATH", ""))
 
 
 def close_marker(pid):
@@ -1890,8 +2218,15 @@ def run_claude(spec_path):
             input("Press Enter to close.")
             return 1
         argv += ["--resume", spec["resume"]]
-    if spec.get("prompt"):
-        argv += ["--", spec["prompt"]]  # so a prompt starting with "-" can't pass for an option
+    prompt = spec.get("prompt")
+    if prompt and exe.lower().endswith((".cmd", ".bat")):
+        # A batch script gets its arguments through cmd, which reads quotes, % and & in them as its
+        # own syntax, so the prompt could run as commands. It is shown to paste instead.
+        print("This claude is a batch script (" + os.path.basename(exe) + "), so the first message can't be "
+              "passed to it safely. Paste it into the session yourself:\n\n" + prompt + "\n")
+        prompt = None
+    if prompt:
+        argv += ["--", prompt]  # so a prompt starting with "-" can't pass for an option
     child = subprocess.Popen(argv, cwd=spec["cwd"], env=env)
     code = child.wait()
     marker = close_marker(child.pid)
@@ -1909,22 +2244,20 @@ def open_window(cwd, argv, title):
     """Run `argv` in a new terminal window. Returns a description of what opened."""
     kwargs = {"cwd": cwd, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     if os.name == "nt":
-        wt = shutil.which("wt")
+        wt = which("wt")
         if wt:
-            subprocess.Popen([wt, "-w", "new", *map(wt_escape, ["-d", cwd, "--title", title, *argv])], **kwargs)
-            return "a new Windows Terminal window"
-        subprocess.Popen(argv, cwd=cwd, creationflags=subprocess.CREATE_NEW_CONSOLE)
-        return "a new console window"
+            return launch([wt, "-w", "new", *map(wt_escape, ["-d", cwd, "--title", title, *argv])],
+                          "a new Windows Terminal window", **kwargs)
+        return launch_console(argv, "a new console window", cwd)
     if sys.platform == "darwin":
-        script = f"cd {shlex.quote(cwd)} && {shlex.join(argv)}"
-        subprocess.Popen(["osascript", "-e", f"tell application \"Terminal\" to do script {json.dumps(script)}"],
-                         start_new_session=True, **kwargs)
-        return "a new Terminal window"
-    term = shutil.which("x-terminal-emulator") or shutil.which("gnome-terminal") or shutil.which("xterm")
+        return launch(apple_terminal(f"cd {shlex.quote(cwd)} && {shlex.join(argv)}", activate=False),
+                      "a new Terminal window", start_new_session=True, **kwargs)
+    term, lead = terminal_emulator()
     if not term:
-        raise BridgeError("No terminal emulator found.")
-    subprocess.Popen([term, "--" if term.endswith("gnome-terminal") else "-e", *argv], start_new_session=True, **kwargs)
-    return os.path.basename(term)
+        raise BridgeError("No terminal emulator found (" + ", ".join(n for n, _ in TERMINALS) + ").")
+    if no_display():
+        raise BridgeError(f"Can't open a terminal window: {no_display()}.")
+    return launch([term, *lead, *argv], os.path.basename(term), start_new_session=True, **kwargs)
 
 
 def trust_key(path):
@@ -2112,7 +2445,7 @@ def trust_backup_dir():
         base, fallback = os.environ.get("LOCALAPPDATA"), os.path.join("~", "AppData", "Local")
     else:
         base, fallback = os.environ.get("XDG_STATE_HOME"), os.path.join("~", ".local", "state")
-    if not base or not os.path.isabs(base):  # a relative one would put the copies in the project
+    if not base or not rooted(base):  # a relative one would put the copies in the project
         base = os.path.expanduser(fallback)
     return os.path.join(base, "nouez", "claude-json-backups")
 
@@ -2281,7 +2614,7 @@ def connection_note(before, cwd, cancel=None):
 
 def open_claude_session(args, cancel=None, progress=None):
     cwd = args.get("cwd")
-    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+    if not isinstance(cwd, str) or not rooted(cwd):
         raise BridgeError("cwd must be an absolute path.")
     cwd = os.path.abspath(cwd)
     given = args.get("name")
@@ -2428,10 +2761,97 @@ def claude_sessions():
             except PermissionError:
                 pass
         sessions.append({"pid": pid, "name": str(info.get("name") or "?"), "cwd": info.get("cwd") or "?",
+                         "registered": info.get("startedAt"),
                          "status": info.get("status") or "?", "session_id": info.get("sessionId"),
                          "remote": bool(info.get("bridgeSessionId")), "helper": helper,
                          "start": started, "helper_start": helper_start})
     return sorted(sessions, key=lambda s: s["name"].lower())
+
+
+def posix_process(pid):
+    """macOS and Linux: {"ppid", "start", "comm", "args"} of a running process, from ps, or None
+    if it isn't running or ps can't tell. "start" is the latest time (epoch seconds) it can have
+    started: ps counts whole seconds since then, and the time is taken after asking."""
+    def ps(field):
+        return run_text(["ps", "-o", f"{field}=", "-p", str(int(pid))], timeout=10).strip()
+    elapsed = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", ps("etime"))
+    ppid, comm, args = ps("ppid"), ps("comm"), ps("args")
+    if not elapsed or not ppid.isdigit() or not comm:
+        return None
+    days, hours, minutes, seconds = (int(x or 0) for x in elapsed.groups())
+    return {"ppid": int(ppid), "start": time.time() - (((days * 24 + hours) * 60 + minutes) * 60 + seconds),
+            "comm": comm, "args": args}
+
+
+def is_claude_program(proc):
+    """Whether a process (posix_process) is Claude Code: its program is `claude` exactly (or a
+    version the native installer keeps under claude/versions), or Node whose script is the
+    claude-code package's cli.js. Not claude-helper or another program that merely starts so."""
+    comm, args = proc["comm"], proc["args"]
+    words = args.split() if args else []
+    first = words[0] if words else ""
+    if os.path.basename(comm) == "claude" or os.path.basename(first) == "claude":
+        return True
+    if any(re.search(r"/claude/versions/\d+\.\d+\.\d+[^/ ]*$", p) for p in (comm, first)):
+        return True
+    script = next((w for w in words[1:] if not w.startswith("-")), "")
+    return (os.path.basename(comm) in ("node", "nodejs", "bun")
+            and script.endswith("/@anthropic-ai/claude-code/cli.js"))
+
+
+def registry_entry_matches(target):
+    """Whether Claude Code's registry still holds this session's entry for its pid (read again)."""
+    try:
+        with open(os.path.join(claude_config_dir(), "sessions", f"{int(target['pid'])}.json"), encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return (isinstance(info, dict) and info.get("startedAt") == target.get("registered")
+            and info.get("sessionId") == target.get("session_id"))
+
+
+def posix_ancestors():
+    """macOS and Linux: pids of this server's ancestors, nearest first (from ps), or None when ps
+    couldn't show the whole chain up to init, so a caller can't rule out one of them."""
+    found, pid = [], os.getppid()
+    while pid > 1:
+        if pid in found or len(found) >= 64:
+            return None
+        found.append(pid)
+        parent = run_text(["ps", "-o", "ppid=", "-p", str(pid)], timeout=10).strip()
+        if not parent.isdigit():
+            return None
+        pid = int(parent)
+    return found
+
+
+def posix_session_problem(target):
+    """Why a session's process can't be confirmed as that Claude Code session ("" if it can):
+    it has ended, its program isn't Claude Code, it started after the session was registered (its
+    pid went to another process), or it is above this server."""
+    registered = number(target.get("registered"))
+    if registered is None:
+        return "Claude Code's registry doesn't say when the session started, so the process can't be matched to it"
+    ancestors = posix_ancestors()  # the slow walk first, so the checks below are the last before the signal
+    if ancestors is None:
+        return "ps couldn't show every process this server runs under, so it can't rule out this one"
+    if target["pid"] in ancestors:
+        return "it is a process this server runs under"
+    proc = posix_process(target["pid"])
+    if not proc:
+        return "it has ended, or ps can't show it"
+    if not is_claude_program(proc):
+        return f"pid {target['pid']} is now {os.path.basename(proc['comm'])}, not Claude Code"
+    # A session registers after its process starts. ps gives the time since the start in whole
+    # seconds, so "start" is the latest the process can have started; unless that is before the
+    # registration, it could be another process that got the pid since.
+    if proc["start"] > registered / 1000:
+        return ("ps can't show that the process started before the session was registered, so it may be "
+                "another process that got its pid")
+    # A new Claude Code process with this pid writes its own entry over the old one.
+    if not registry_entry_matches(target):
+        return "Claude Code's registry no longer shows this session for that pid"
+    return ""
 
 
 def end_session(target):
@@ -2439,6 +2859,11 @@ def end_session(target):
     OpenClaudeSession opened it. Raises BridgeError if the process is still running afterwards."""
     pid = target["pid"]
     if os.name != "nt":
+        # Checked just before the signal, as panes are: the registry can outlive its process.
+        problem = posix_session_problem(target)
+        if problem:
+            raise BridgeError(f"Didn't close {target['name']} (pid {pid}): {problem}. Nothing was signalled; "
+                              "close it yourself if it is still open.")
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -2500,7 +2925,7 @@ def _is_nouez_helper(pid):
 
 def own_claude_pids():
     """Pids of the processes above this server, among them the Claude Code session it serves."""
-    return set(_ancestor_pids()) if os.name == "nt" else {os.getppid()}
+    return set(_ancestor_pids()) if os.name == "nt" else {os.getppid(), *(posix_ancestors() or [])}
 
 
 def describe_sessions(sessions, own):
@@ -2540,7 +2965,13 @@ def close_claude_session(args, cancel=None, progress=None):
     if target["pid"] in own:
         raise BridgeError("That is the session you are running in; it can't close itself.")
     end_session(target)
-    where = "and its window" if target["helper"] else "(its terminal stays open at the shell prompt)"
+    if target["helper"]:
+        where = "and its window"
+    elif os.name == "nt":
+        where = "(its terminal stays open at the shell prompt)"
+    else:
+        where = ("(its window closes if the terminal closes when its command ends, as most Linux terminals "
+                 "do; otherwise it stays at a shell prompt)")
     resume = f"claude --resume {target['session_id']}" if target["session_id"] else "claude --resume"
     return (f"Closed {target['name']} (pid {target['pid']}) {where}. Its transcript is kept: "
             f"`{resume}` in {target['cwd']} picks it up again.")
@@ -2617,22 +3048,32 @@ def list_consultants(args, cancel=None, progress=None):
     else:
         root, agy = None, agy_consultants()
     codex_note = ""
-    try:
-        client = CodexClient()
-        try:
-            if args.get("cwd"):
-                root, threads = repo_consultants(client, args["cwd"])
-            else:
-                threads = load_consultants(client, include_all)
-        finally:
-            client.close()
-    except BridgeError as e:
+    if not codex_installed():
+        threads = []
+        codex_note = "Codex isn't installed, so there are no Codex sessions."
         if not agy:
-            raise
-        threads, codex_note = [], f"Codex sessions unavailable: {e}"
+            where = f" in {root}" if root else ""
+            return (f"No consultants{where}. {codex_note} "
+                    + ("Start an Antigravity consultant with StartConsultant." if agy_command() else
+                       "Antigravity (agy) isn't installed either, so consultations are off; the Claude Code "
+                       "session tools still work. `server.py doctor` shows what to install."))
+    else:
+        try:
+            client = CodexClient()
+            try:
+                if args.get("cwd"):
+                    root, threads = repo_consultants(client, args["cwd"])
+                else:
+                    threads = load_consultants(client, include_all)
+            finally:
+                client.close()
+        except BridgeError as e:
+            if not agy:
+                raise
+            threads, codex_note = [], f"Codex sessions unavailable: {e}"
     where = f" in {root}" if root else ""
     if not threads and not agy:
-        return f"No Codex sessions{where}. Start one with StartConsultant, or open Codex in a terminal."
+        return f"No consultants{where}. Start one with StartConsultant, or open Codex in a terminal."
     parts = []
     if threads:
         parts.append(f"{len(threads)} Codex session(s){where}:\n" + format_threads(threads))
@@ -2650,11 +3091,33 @@ def start_consultant(args, cancel=None, progress=None):
     cwd = os.path.abspath(args.get("cwd") or default_cwd())
     if not os.path.isdir(cwd):
         raise BridgeError(f"cwd is not a directory: {cwd}")
-    provider = args.get("provider") or "codex"
-    if provider not in PROVIDERS:
+    provider = args.get("provider")
+    if provider is not None and provider not in PROVIDERS:
         raise BridgeError(f"`provider` must be one of {', '.join(PROVIDERS)}, not {provider!r}.")
+    if provider is None and not codex_installed():
+        if not agy_command():
+            raise BridgeError("No consultant CLI is installed: neither Codex (`codex`) nor Antigravity (`agy`) "
+                              "was found, so consultations are off. The Claude Code session tools still work. "
+                              "Install and sign in to either one, then reconnect nouez (/mcp); "
+                              "`server.py doctor` checks the setup.")
+        args = dict(args)
+        known = agy_models()
+        # The model was asked for with Codex in mind; without agy's list it can't be checked, so
+        # the Antigravity default is used rather than a name agy may not have.
+        dropped = args.get("model") if args.get("model") and not any(
+            k == args["model"] or agy_base(k) == args["model"] for k in known or ()) else None
+        if dropped:
+            args.pop("model")
+        why = "isn't one of Antigravity's" if known else "can't be checked: `agy models` didn't answer"
+        return ("Codex isn't installed, so this is an Antigravity consultant"
+                + (f" (model {dropped!r} {why}, so its default is used)" if dropped else "")
+                + ".\n" + start_agy_consultant(args, cwd))
     if provider == "antigravity":
         return start_agy_consultant(args, cwd)
+    if not codex_installed():
+        raise BridgeError("Codex isn't installed: `codex` isn't on PATH."
+                          + (" Antigravity is: pass provider antigravity, or leave provider out."
+                             if agy_command() else " `server.py doctor` checks the setup."))
     # Consultants audit, validate and research; they never edit. No terminal is attached to
     # answer approval prompts, so never ask; the read-only sandbox is the limit.
     params = {"cwd": cwd, "sandbox": SANDBOX, "approvalPolicy": "never", "threadSource": BRIDGE_SOURCE}
@@ -2827,6 +3290,14 @@ def send_consultant_message(args, cancel=None, progress=None):
                     f"its {' or '.join(overrides)}. Nothing was sent. Read that turn's reply with "
                     f"GetConsultantReply first, then send again; or send now without "
                     f"{' and '.join(overrides)} to add the message to the running turn.")
+            if current and current.get("status") == "inProgress" and is_bridge(thread) \
+                    and not bridge_started(client, tid, current):
+                raise BridgeError(
+                    f"{name} is working on turn {current['id']}, which this nouez server didn't start "
+                    "(it was typed in its terminal, or started before the server restarted), so it may not be "
+                    "read-only. Nothing was sent. Wait for that turn to end "
+                    f"(GetConsultantReply with turn_id {current['id']}), then send again: a new turn runs "
+                    "read-only.")
             if current and current.get("status") == "inProgress":
                 # Session is mid-turn: steer the running turn instead of queueing a new one.
                 client.request("turn/steer", {"threadId": tid, "expectedTurnId": current["id"], "input": [{"type": "text", "text": text}]})
@@ -2839,6 +3310,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                 started = client.request("turn/start", {"threadId": tid, "input": [{"type": "text", "text": text}],
                                                         **overrides, **policy})
                 turn_id, mode = started["turn"]["id"], "started a new turn"
+                _bridge_turns.add(turn_id)
                 if overrides:
                     mode += f" on {settings}, which the consultant keeps for later messages until changed"
                 else:
@@ -2987,7 +3459,7 @@ def watch_consultant(args, cancel=None, progress=None):
         conv = agy_conversation(agy["id"])
         return (f"{agy['name']} is an Antigravity consultant: it has no live pane, since each message runs "
                 "one agy turn in the background. GetConsultantHistory lists its turns."
-                + (f" To open its conversation in agy yourself, run agy --conversation {conv} "
+                + (f" To open its conversation in agy yourself, run {agy_shown()} --conversation {conv} "
                    f"in {agy.get('cwd')}." if conv else ""))
     client = CodexClient()
     try:
@@ -3058,9 +3530,12 @@ CLAUDE_WINDOWS = (("five_hour", 5 * 60 * 60), ("seven_day", 7 * 24 * 60 * 60))
 
 def number(value):
     """value if it's a real finite number (not a bool), else None."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return value
+    try:
+        return value if math.isfinite(value) else None
+    except OverflowError:  # an int too big for a float
+        return None
 
 
 def span_text(seconds):
@@ -3096,20 +3571,24 @@ def window_pace(used, resets_at, length, now):
     return ("at reset", used / gone)
 
 
-def window_text(label, used, resets_at, length, now):
+def window_text(label, used, resets_at, length, now, sampled=None):
     """One usage window: how much is used, when it resets, and the pace: where the current rate
-    of use lands at the reset, or when it runs out first. None if used or resets_at is unusable."""
+    of use lands at the reset, or when it runs out first. A reading taken at `sampled` gives its
+    pace as of then, and an old one none. None if used or resets_at is unusable."""
     used, resets_at, length = number(used), number(resets_at), number(length)
     if used is None or resets_at is None or resets_at <= now:
         return None
     left = resets_at - now
     text = (f"{label} window: {used:g}% used, resets "
             f"{time.strftime('%a %b %d %H:%M', time.localtime(resets_at))} (in {span_text(left)})")
-    pace = window_pace(used, resets_at, length, now)
+    at = min(number(sampled) or now, now)
+    if now - at > CLAUDE_USAGE_STALE:
+        return text + ("; used up at the last reading" if used >= 100 else "; pace not known: an old reading")
+    pace = window_pace(used, resets_at, length, at)
     if pace and pace[0] == "used up":
         text += "; used up"
     elif pace and pace[0] == "runs out":
-        text += f"; at this rate it runs out in about {span_text(pace[1])}, before the reset"
+        text += f"; at this rate it runs out in about {span_text(at + pace[1] - now)}, before the reset"
     elif pace:
         text += f"; at this rate about {pace[1]:.0f}% by the reset"
     return text
@@ -3170,6 +3649,93 @@ def codex_budget(client, now):
     return lines
 
 
+STATUSLINE_LOCK_SECONDS = 2  # a status line mustn't hang: skip the save if another holds the file longer
+
+
+def valid_window(w):
+    return isinstance(w, dict) and number(w.get("used_percentage")) is not None and number(w.get("resets_at")) is not None
+
+
+def merge_claude_usage(old, limits, now):
+    """The usage file to save: the windows in `limits` (just received), each marked with when it
+    was seen, except where `old` (the file as it was) holds a better reading of a window that
+    hasn't reset: a later window, or within the same one (resets within 10 minutes) a higher
+    percentage. A kept reading keeps its own time, and `saved` is the oldest reading's time, so
+    an old number never looks fresh."""
+    old_limits = old.get("rate_limits") if isinstance(old, dict) and isinstance(old.get("rate_limits"), dict) else {}
+    old_saved = number(old.get("saved")) if isinstance(old, dict) else None
+    merged = {k: v for k, v in limits.items() if k not in dict(CLAUDE_WINDOWS)}
+    for key, _ in CLAUDE_WINDOWS:
+        new, prev = limits.get(key), old_limits.get(key)
+        if valid_window(new) and number(new["resets_at"]) > now:
+            new = {**new, "observed": now}
+        else:
+            new = None
+        if valid_window(prev) and number(prev["resets_at"]) > now:
+            prev = {**prev, "observed": number(prev.get("observed")) or old_saved or now}
+            gap = number(prev["resets_at"]) - number(new["resets_at"]) if new else None
+            if new is None or gap > 600 or (abs(gap) <= 600 and number(prev["used_percentage"]) > number(new["used_percentage"])):
+                new = prev
+        if new:
+            merged[key] = new
+    seen = [w["observed"] for k, w in merged.items() if k in dict(CLAUDE_WINDOWS)]
+    return {"saved": round(min(seen) if seen else now, 3), "rate_limits": merged}
+
+
+def save_claude_usage(data, now=None, path=None):
+    """Merge the status line's `rate_limits` into nouez's usage file, under a lock, atomically.
+    False if there was nothing to save or the file was busy."""
+    limits = data.get("rate_limits") if isinstance(data, dict) else None
+    if not isinstance(limits, dict) or not limits:
+        return False
+    now = time.time() if now is None else now
+    path = path or os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE)
+    try:
+        with FileLock(path + ".lock", STATUSLINE_LOCK_SECONDS, "busy"):
+            old = read_json_file(path)
+            return write_json_atomic(path, merge_claude_usage(old, limits, now))
+    except (BridgeError, OSError):
+        return False
+
+
+def statusline_text(data, now=None):
+    """A one-line status: the model and Claude Code's usage windows, or "" with nothing to show."""
+    if not isinstance(data, dict):
+        return ""
+    model = data.get("model")
+    name = model.get("display_name") if isinstance(model, dict) else None
+    parts = [name] if isinstance(name, str) and name else []
+    limits = data.get("rate_limits") if isinstance(data.get("rate_limits"), dict) else {}
+    now = time.time() if now is None else now
+    for key, label in (("five_hour", "5h"), ("seven_day", "week")):
+        used = number(limits.get(key, {}).get("used_percentage")) if isinstance(limits.get(key), dict) else None
+        resets = number(limits[key].get("resets_at")) if used is not None else None
+        if used is not None and (resets is None or resets > now):  # one that has reset says nothing now
+            parts.append(f"{label} {used:.0f}%")
+    return " · ".join(parts)
+
+
+def run_statusline(argv):
+    """`server.py statusline [--quiet]`: Claude Code's status line command. Reads the status JSON
+    on stdin, saves the usage for nouez, and prints a short status line (nothing with --quiet,
+    for a script that prints its own). Never fails: a status line that errors shows nothing."""
+    try:
+        raw = sys.stdin.buffer.read(1 << 20)
+        data = json.loads(raw.decode("utf-8-sig", "replace"))
+    except (OSError, ValueError, AttributeError, RecursionError):
+        data = None
+    try:
+        save_claude_usage(data)
+    except Exception:  # a status line must never break
+        pass
+    if "--quiet" not in argv:
+        try:
+            print(statusline_text(data))
+        except Exception:  # a status line must never break
+            pass
+    return 0
+
+
 def claude_budget(now, path=None):
     """Lines on Claude Code's own usage windows, from the file the user's status line saves."""
     path = path or os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE)
@@ -3179,7 +3745,7 @@ def claude_budget(now, path=None):
     except FileNotFoundError:
         return ["Claude Code: not known. Its usage reaches nouez only through the status line; "
                 "see Choosing a consultant in nouez's README."]
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return ["Claude Code: the saved usage file can't be read."]
     limits = saved.get("rate_limits") if isinstance(saved, dict) else None
     at = number(saved.get("saved")) if isinstance(saved, dict) else None
@@ -3188,7 +3754,8 @@ def claude_budget(now, path=None):
         for key, length in CLAUDE_WINDOWS:
             w = limits.get(key)
             if isinstance(w, dict):
-                text = window_text(window_label(length), w.get("used_percentage"), w.get("resets_at"), length, now)
+                text = window_text(window_label(length), w.get("used_percentage"), w.get("resets_at"), length,
+                                   now, number(w.get("observed")) or at)
                 if text:
                     lines.append(f"  - {text}")
     if not lines:
@@ -3337,14 +3904,17 @@ def aa_lines(cache, note, now):
 def consultant_budget(args, cancel=None, progress=None):
     now = time.time()
     out = [f"Consultation budget, {time.strftime('%a %b %d %H:%M', time.localtime(now))}:", ""]
-    try:
-        client = CodexClient()
+    if not codex_installed():
+        out.append("Codex: not installed.")
+    else:
         try:
-            out += codex_budget(client, now)
-        finally:
-            client.close()
-    except BridgeError as e:
-        out.append(f"Codex: usage unavailable ({e}).")
+            client = CodexClient()
+            try:
+                out += codex_budget(client, now)
+            finally:
+                client.close()
+        except BridgeError as e:
+            out.append(f"Codex: usage unavailable ({e}).")
     out.append("")
     out += claude_budget(now)
     out.append("")
@@ -3433,7 +4003,8 @@ def usage_snapshot(client):
         with open(os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE), encoding="utf-8-sig") as f:
             limits = json.loads(f.read(65536)).get("rate_limits")
         claude = {window_label(length): limits[key]["used_percentage"] for key, length in CLAUDE_WINDOWS
-                  if isinstance(limits.get(key), dict) and number(limits[key].get("used_percentage")) is not None}
+                  if isinstance(limits.get(key), dict) and number(limits[key].get("used_percentage")) is not None
+                  and (number(limits[key].get("resets_at")) or 0) > time.time()}  # not one that has reset
         if claude:
             snap["claude"] = claude
     except Exception:
@@ -3490,11 +4061,21 @@ TOP_PERIODS = {"1": 1, "7": 7, "3": 30, "a": None}  # key: days the consultation
 
 
 def iso_seconds(text):
-    """An ISO 8601 time ("2026-11-22T05:17:23.207Z") as epoch seconds, or None."""
+    """An ISO 8601 time ("2026-11-22T05:17:23.207Z") as epoch seconds, or None. Before Python 3.11,
+    fromisoformat takes only 3 or 6 digits of fraction and an offset with a colon, so the text is
+    brought to that form first (a fraction cut or padded to 6 digits, "Z" and "+0000" to "+00:00")."""
     if not isinstance(text, str):
         return None
+    m = re.fullmatch(r"(\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?)(?:[.,](\d+))?\s*(Z|z|[+-]\d\d:?\d\d)?", text.strip())
+    if not m:
+        return None
+    when, fraction, zone = m.groups()
+    if fraction:
+        when += "." + (fraction + "000000")[:6]
+    if zone:
+        when += "+00:00" if zone in ("Z", "z") else zone[:3] + ":" + zone[-2:]
     try:
-        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        return datetime.datetime.fromisoformat(when).timestamp()
     except ValueError:
         return None
 
@@ -3964,17 +4545,20 @@ def subscription_groups(now, codex_live, codex_saved, claude_path=None, agy_live
                                      codex_saved.get("ts"))
                 if state:
                     entries.append(("", window_label(mins * 60) if mins else "usage", state))
+        installed = codex_installed()
         if entries:
             ago = span_text(now - codex_saved["ts"])
-            note = f"(from Codex's last session file, {ago} ago; the daemon didn't answer)"
+            why = "the daemon didn't answer" if installed else "Codex isn't on PATH"
+            note = f"(from Codex's last session file, {ago} ago; {why})"
             short = f"from the last session file, {ago} ago"
-    groups.append({"title": title if entries else "Codex", "entries": entries, "note": note, "short": short,
-                   "empty": "usage not known: the daemon didn't answer and no recent session reports it"})
+    if entries or codex_installed():  # left out when Codex isn't installed and never reported usage
+        groups.append({"title": title if entries else "Codex", "entries": entries, "note": note, "short": short,
+                       "empty": "usage not known: the daemon didn't answer and no recent session reports it"})
     path = claude_path or os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE)
     try:
         with open(path, encoding="utf-8-sig") as f:
             saved = json.loads(f.read(65536))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         saved = None
     limits = saved.get("rate_limits") if isinstance(saved, dict) else None
     at = number(saved.get("saved")) if isinstance(saved, dict) else None
@@ -3982,7 +4566,8 @@ def subscription_groups(now, codex_live, codex_saved, claude_path=None, agy_live
     for key, length in CLAUDE_WINDOWS:
         w = limits.get(key) if isinstance(limits, dict) else None
         if isinstance(w, dict):
-            state = window_state(w.get("used_percentage"), w.get("resets_at"), length, now, at)
+            state = window_state(w.get("used_percentage"), w.get("resets_at"), length, now,
+                                 number(w.get("observed")) or at)
             if state:
                 entries.append(("", window_label(length), state))
     if entries and at:
@@ -4097,10 +4682,10 @@ AGY_USAGE_SECONDS = 60  # agy -p /usage can take over 20 s on a busy computer
 def agy_command(env=None):
     """The Antigravity CLI: `agy` on PATH, else where its installer puts it on Windows; None if neither."""
     env = os.environ if env is None else env
-    found = shutil.which("agy", path=env.get("PATH"))
+    found = which("agy", env)
     if found:
         return found
-    if os.name == "nt" and env.get("LOCALAPPDATA"):
+    if os.name == "nt" and rooted(env.get("LOCALAPPDATA") or ""):
         default = os.path.join(env["LOCALAPPDATA"], "agy", "bin", "agy.exe")
         if os.path.isfile(default):
             return default
@@ -4173,7 +4758,7 @@ def read_json_file(path, limit=1024 * 1024):
         with open(path, encoding="utf-8") as f:
             value = json.loads(f.read(limit))
         return value if isinstance(value, dict) else None
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
 
 
@@ -4201,13 +4786,12 @@ def agy_save(rec):
 AGY_LOCK_SECONDS = 15  # how long a send or stop waits for another nouez server's to finish
 
 
-class agy_lock:
-    """One lock per consultant, shared by every nouez server on this computer (a locked byte in
-    its folder's `lock` file): a send and a stop take it, so two sessions can't start turns at
-    once and a stop can't land while a turn is starting. The system frees it if a server dies."""
+class FileLock:
+    """A lock shared by every process on this computer: a locked byte in the file `path`. Waits
+    up to `seconds`, then raises BridgeError(busy). The system frees it if the holder dies."""
 
-    def __init__(self, cid):
-        self.cid = cid  # None: the lock for all Antigravity consultants, taken while a name is chosen
+    def __init__(self, path, seconds, busy):
+        self.path, self.seconds, self.busy = path, seconds, busy
 
     def _lock(self, fd, on):
         if os.name == "nt":
@@ -4219,11 +4803,9 @@ class agy_lock:
             fcntl.flock(fd, (fcntl.LOCK_EX | fcntl.LOCK_NB) if on else fcntl.LOCK_UN)
 
     def __enter__(self):
-        folder = agy_folder(self.cid) if self.cid else agy_root()
-        os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, "lock")
-        self.fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
-        deadline = time.monotonic() + AGY_LOCK_SECONDS
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+        deadline = time.monotonic() + self.seconds
         while True:
             try:
                 self._lock(self.fd, True)
@@ -4231,10 +4813,8 @@ class agy_lock:
             except OSError:
                 if time.monotonic() >= deadline:
                     os.close(self.fd)
-                    raise BridgeError(("Another Claude Code session is sending to or stopping this consultant"
-                                       if self.cid else "Another Claude Code session is starting an Antigravity "
-                                       "consultant") + "; nothing was done. Try again in a moment.") from None
-                time.sleep(0.1)
+                    raise BridgeError(self.busy) from None
+                time.sleep(0.05)
 
     def __exit__(self, *exc):
         try:
@@ -4244,12 +4824,48 @@ class agy_lock:
         os.close(self.fd)
 
 
+class agy_lock(FileLock):
+    """One lock per consultant, shared by every nouez server on this computer (a locked byte in
+    its folder's `lock` file): a send and a stop take it, so two sessions can't start turns at
+    once and a stop can't land while a turn is starting. The system frees it if a server dies."""
+
+    def __init__(self, cid):
+        self.cid = cid  # None: the lock for all Antigravity consultants, taken while a name is chosen
+
+    def __enter__(self):
+        folder = agy_folder(self.cid) if self.cid else agy_root()
+        FileLock.__init__(self, os.path.join(folder, "lock"), AGY_LOCK_SECONDS,
+                          ("Another Claude Code session is sending to or stopping this consultant"
+                           if self.cid else "Another Claude Code session is starting an Antigravity "
+                           "consultant") + "; nothing was done. Try again in a moment.")
+        return FileLock.__enter__(self)
+
+
+def codex_installed():
+    """Whether the Codex CLI is on PATH (outside the current folder)."""
+    return which("codex") is not None
+
+
+def no_consultant(to, recs):
+    """None, so the caller looks among Codex sessions; without Codex, the error saying `to` names
+    no consultant, instead of a complaint that Codex is missing."""
+    if codex_installed():
+        return None
+    if not recs and not agy_command():
+        raise BridgeError(f"No consultant named {to!r}. Neither Codex nor Antigravity (agy) is installed, so "
+                          "there are no consultants; `server.py doctor` shows what to install.")
+    names = ", ".join(r["name"] for r in recs)
+    raise BridgeError(f"No consultant named {to!r}. Codex isn't installed, so only Antigravity consultants "
+                      "exist" + (f": {names}." if names else ", and none is running. Start one with StartConsultant."))
+
+
 def agy_resolve(to, exact_only=False):
     """The Antigravity consultant `to` names (its name, id, or a unique id prefix or suffix), or
-    None if it names none, so the caller can look among Codex sessions instead."""
-    if not isinstance(to, str) or not to:
-        return None
+    None if it names none, so the caller can look among Codex sessions instead (an error when Codex
+    isn't installed)."""
     recs = agy_consultants()
+    if not isinstance(to, str) or not to:
+        return no_consultant(to, recs)
     exact = [r for r in recs if to in (r.get("name"), r.get("id"))]
     if len(exact) > 1:
         raise BridgeError(f"{to!r} names several Antigravity consultants: "
@@ -4257,12 +4873,12 @@ def agy_resolve(to, exact_only=False):
     if exact:
         return exact[0]
     if exact_only or len(to) < 6 or not re.fullmatch(r"[0-9a-f-]+", to):
-        return None
+        return no_consultant(to, recs)
     hits = [r for r in recs if r["id"].startswith(to) or r["id"].endswith(to)]
     if len(hits) > 1:
         raise BridgeError(f"{to!r} matches several Antigravity consultants: "
                           + ", ".join(r["name"] for r in hits) + ". Use the full name.")
-    return hits[0] if hits else None
+    return hits[0] if hits else no_consultant(to, recs)
 
 
 def agy_models(env=None, now=None):
@@ -4319,7 +4935,8 @@ def agy_model_id(current, model=None, effort=None, known=None):
         for c in candidates:
             if c in known:
                 return c
-        raise BridgeError(f"Antigravity has no model {candidates[-1]!r}. It lists: {', '.join(known)}.")
+        raise BridgeError(f"Antigravity has no model {candidates[-1]!r}. It lists: {', '.join(known)}. "
+                          "Pass one of them as `model`.")
     return candidates[0]
 
 
@@ -4679,6 +5296,11 @@ def agy_repo_consultants(cwd):
 
 def start_agy_consultant(args, cwd):
     new = flag(args, "new")
+    if not agy_command():
+        raise BridgeError("The Antigravity CLI (agy) isn't installed or can't be found: it isn't on PATH"
+                          + (" or in %LOCALAPPDATA%\\agy\\bin" if os.name == "nt" else "") + ".")
+    notice = safe_nouez_update_notice()
+    notice = f"\n{notice}" if notice else ""
     root, existing = agy_repo_consultants(cwd)
     if existing and not new:
         rec = existing[0]
@@ -4695,10 +5317,7 @@ def start_agy_consultant(args, cwd):
                    if ignored else "")
                 + "Send it work with SendConsultantMessage."
                 + (f"\nOther Antigravity consultants in this repo:\n{format_agy(others)}" if others else "")
-                + "\nOnly if the user asks for a separate consultant, call StartConsultant with new=true.")
-    if not agy_command():
-        raise BridgeError("The Antigravity CLI (agy) isn't installed or can't be found: it isn't on PATH"
-                          + (" or in %LOCALAPPDATA%\\agy\\bin" if os.name == "nt" else "") + ".")
+                + "\nOnly if the user asks for a separate consultant, call StartConsultant with new=true." + notice)
     model = agy_model_id(f"{AGY_MODEL}-{AGY_EFFORT}", args.get("model"), args.get("effort"), agy_models())
     instructions = args.get("instructions") or ""
     if not isinstance(instructions, str):
@@ -4720,7 +5339,7 @@ def start_agy_consultant(args, cwd):
             f"    model: {model} (Antigravity)\n"
             f"    permissions: read-only (agy denies file writes and edits, commands and MCP tools)\n"
             f"Send it work with SendConsultantMessage{ignored}. Each message runs one agy turn; the "
-            "consultant keeps its conversation between messages.")
+            "consultant keeps its conversation between messages." + notice)
 
 
 def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, reason, cancel, progress):
@@ -4924,7 +5543,7 @@ def stop_agy_consultant(rec):
         agy_save({**rec, "stopped": round(time.time(), 3)})
     return (f"Stopped {rec['name']}." + (" Ended its running turn." if ended else "")
             + (f" Its conversation stays in Antigravity: to pick it up yourself, run "
-               f"agy --conversation {conv} in {rec.get('cwd')}." if conv else ""))
+               f"{agy_shown()} --conversation {conv} in {rec.get('cwd')}." if conv else ""))
 
 
 def run_agy_waiter(rec, turn_id):
@@ -4953,8 +5572,11 @@ def agy_budget(now, agy_live=None):
     live = read_agy_usage() if agy_live is None else agy_live
     if live is None:
         return []
+    models = agy_models()
+    tail = ([f"  Models (model for StartConsultant with provider antigravity, effort the level): "
+             f"{agy_model_families(models)}"] if models else [])
     if live.get("error"):
-        return [f"Antigravity: usage not known ({live['error']})."]
+        return [f"Antigravity: usage not known ({live['error']})."] + tail
     lines = []
     for g in live.get("groups") or []:
         if not isinstance(g, dict) or not isinstance(g.get("name"), str):
@@ -4970,10 +5592,19 @@ def agy_budget(now, agy_live=None):
                 lines.append(f"  - {g['name']}: {text}")
     head = ("Antigravity (Google; the Claude and GPT models group runs those models on Google's quota, "
             "not Claude Code's):")
-    models = agy_models()
-    tail = ([f"  Models (model for StartConsultant with provider antigravity, effort the level): "
-             f"{agy_model_families(models)}"] if models else [])
     return [head] + (lines or ["  - no current quota window reported"]) + tail
+
+
+def agy_shown():
+    """agy as a command the user can type: `agy` when it's on PATH, else its full path (on Windows
+    in PowerShell's call form, since the installer folder isn't on PATH)."""
+    exe = agy_command()
+    if not exe or not rooted(exe) or which("agy"):
+        return "agy"
+    quoted = shell_literal(exe) or shell_word(exe, "powershell" if os.name == "nt" else "bash")
+    if not quoted:
+        return "agy"
+    return f"& {quoted}" if os.name == "nt" else quoted
 
 
 def agy_model_families(ids):
@@ -5597,30 +6228,35 @@ def run_top(argv):
 # --- MCP stdio server --------------------------------------------------------
 
 INSTRUCTIONS = (
-    "Whenever the user asks for a Codex consultant, call StartConsultant with cwd set to your "
-    "working directory, even if you don't remember one being open (earlier context may have been "
-    "compacted). It reuses a consultant it started earlier in this repo, keeping its context, or "
-    "starts a new read-only one; it never picks a Codex session the user opened. Talk to it with "
-    "SendConsultantMessage, passing the name it returns as `to`. Pass new=true only when the user "
-    "asks for a separate consultant. Message a session the user opened only when the user asks you "
-    "to, with allow_user_session=true. SendConsultantMessage returns about 5 seconds after delivery, "
-    "usually before the reply is ready; replies often take minutes. Do not wait for one. Instead run "
-    "the waiter command the result gives as a background command (in Claude Code: the Bash or "
-    "PowerShell tool with run_in_background), tell the user the consultation is under way, and carry on with other "
-    "work or end your turn so the user can keep working. The waiter exits with the reply when the "
-    "turn ends, which wakes you; then act on the reply or report it. Without background commands, "
-    "read the reply with GetConsultantReply and the returned turn_id when the user asks or when you "
-    "next need it. Pass wait=\"done\" only if the user asks you to wait "
-    "for the reply. A result that says 'still working' is not a reply, even if it shows output so "
-    "far: never treat it as done. Change a consultant's model or reasoning effort (SendConsultantMessage "
-    "model and effort) only when the user asks or the user's own instructions, such as their CLAUDE.md, "
-    "call for it. The change keeps the consultant's context and stays for later messages, so once the "
-    "harder part is done, send the usual values again. ConsultantBudget shows the usage left on "
-    "each subscription, with reset times, and model scores, for choosing a consultant's model and "
-    "effort by the user's own rules. A consultant on Google's Antigravity CLI (Gemini by default, or "
-    "another model agy lists) is "
-    "started with StartConsultant provider=\"antigravity\", only when the user asks for one or the "
-    "user's own rules call for it; it is used with the same tools, read-only, one message at a time."
+    "Consultants are read-only second opinions on another model, run on the Codex CLI or Google's "
+    "Antigravity CLI (agy), whichever is installed. Whenever the user asks for a consultant (\"ask "
+    "Codex\", \"ask Gemini\", a second opinion), call StartConsultant with cwd set to your working "
+    "directory, even if you don't remember one being open (earlier context may have been compacted). "
+    "It reuses a consultant it started earlier in this repo, keeping its context, or starts a new "
+    "read-only one; it never picks a Codex session the user opened. Without provider it uses Codex "
+    "when it is installed, otherwise Antigravity, and says which; pass provider=\"antigravity\" for "
+    "Antigravity when Codex is installed too, only when the user asks for it or the user's own rules "
+    "call for it. If neither CLI is installed, consultations are off and the Claude Code session tools "
+    "still work. Talk to a consultant with SendConsultantMessage, passing the name StartConsultant "
+    "returns as `to`. Pass new=true only when the user asks for a separate consultant. Message a "
+    "Codex session the user opened only when the user asks you to, with allow_user_session=true. "
+    "A Codex consultant can read files and run read-only commands; an Antigravity one can read files "
+    "but runs no commands, so put the diff, test output or command results it needs in the message. "
+    "SendConsultantMessage returns about 5 seconds after delivery, usually before the reply is ready; "
+    "replies often take minutes. Do not wait for one. Instead run the waiter command the result gives "
+    "as a background command (in Claude Code: the Bash or PowerShell tool with run_in_background), "
+    "tell the user the consultation is under way, and carry on with other work or end your turn so "
+    "the user can keep working. The waiter exits with the reply when the turn ends, which wakes you; "
+    "then act on the reply or report it. Without background commands, read the reply with "
+    "GetConsultantReply and the returned turn_id when the user asks or when you next need it. Pass "
+    "wait=\"done\" only if the user asks you to wait for the reply. A result that says 'still "
+    "working' is not a reply, even if it shows output so far: never treat it as done. An Antigravity "
+    "consultant takes one message at a time, so wait for its reply before the next. Change a "
+    "consultant's model or reasoning effort (SendConsultantMessage model and effort) only when the "
+    "user asks or the user's own instructions, such as their CLAUDE.md, call for it. The change keeps "
+    "the consultant's context and stays for later messages, so once the harder part is done, send "
+    "the usual values again. ConsultantBudget shows the usage left on each subscription, with reset "
+    "times, and model scores, for choosing a consultant's model and effort by the user's own rules."
 )
 
 TO_SCHEMA = {"type": "string", "description": "Consultant name, thread id, or unique id prefix/suffix."}
@@ -5639,26 +6275,30 @@ TOOLS = [
     {
         "name": "StartConsultant",
         "description": (
-            "Get a Codex (or, with provider antigravity, an Antigravity) consultant for a repo: reuse one that StartConsultant started there earlier "
+            "Get a consultant for a repo: reuse one that StartConsultant started there earlier "
             "(keeping its context), or start a new one. Call it whenever you need a consultant. "
-            "Consultants run on the local Codex app-server daemon in a read-only sandbox and never ask "
-            "for approvals: they can read files and run read-only commands for auditing, validation "
-            "and research, but cannot edit anything. Codex sessions the user opened are never reused; "
-            "they are listed in the result. Returns the consultant's name: pass it as `to` to the "
-            "other tools. Unless watch=false, the session is shown beside Claude Code (Windows "
-            "Terminal or tmux split pane, otherwise a new window) once it has its first message. "
-            "The result says so if the codex CLI or the daemon is behind the latest Codex release."
+            "Without provider it uses Codex when the codex CLI is installed, otherwise Antigravity "
+            "(agy), and says which; if neither is installed it says so, and the Claude Code session "
+            "tools still work. Consultants never edit anything and never ask for approvals. A Codex "
+            "consultant runs on the local Codex app-server daemon in a read-only sandbox: it can read "
+            "files and run read-only commands for auditing, validation and research. Unless "
+            "watch=false, it is shown beside Claude Code (Windows Terminal or tmux split pane, "
+            "otherwise a new window) once it has its first message, and the result says so if the "
+            "codex CLI or the daemon is behind the latest Codex release. An Antigravity consultant is "
+            "read-only by agy's deny rules: it reads files but runs no commands, has no pane, and "
+            "takes one message at a time. Codex sessions the user opened are never reused; they are "
+            "listed in the result. Returns the consultant's name: pass it as `to` to the other tools."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "cwd": {"type": "string", "description": "Absolute path of the project Codex should work in. Pass your working directory. Default: Claude Code's first workspace folder."},
+                "cwd": {"type": "string", "description": "Absolute path of the project the consultant works in. Pass your working directory. Default: Claude Code's first workspace folder."},
                 "model": {"type": "string", "description": "Model for a new consultant: a Codex model, or for provider antigravity an agy model such as gemini-4-neon (ConsultantBudget lists them). Default: the user's Codex config; for Antigravity, gemini-4-neon at level high. Ignored when an existing consultant is reused."},
-                "title": {"type": "string", "description": "Session title for a new session, shown in Codex. Ignored when an existing consultant is reused."},
+                "title": {"type": "string", "description": "Title for a new consultant (shown in Codex for a Codex one). Ignored when an existing consultant is reused."},
                 "instructions": {"type": "string", "description": "Standing instructions for a new consultant's role. Ignored when an existing consultant is reused."},
-                "watch": {"type": "boolean", "description": "Show the session in a pane beside Claude Code so the user can watch it work. Default true; pass false only if the user doesn't want a pane. Applies to later sends too."},
+                "watch": {"type": "boolean", "description": "Codex only: show the session in a pane beside Claude Code so the user can watch it work. Default true; pass false only if the user doesn't want a pane, or on a computer without a display. Applies to later sends too."},
                 "new": {"type": "boolean", "description": "Start a new session even though a consultant already works in this repo. Default false. Use only when the user asked for a separate consultant."},
-                "provider": {"type": "string", "enum": list(PROVIDERS), "description": "Which CLI the consultant runs on: codex (default), or antigravity for Google's Antigravity CLI (agy) and its models, such as gemini-4-neon. An Antigravity consultant is read-only by agy's deny rules (no file writes or edits, commands or MCP tools), has no pane, and takes one message at a time. Reuse looks only among consultants of the same provider. Use antigravity only when the user asks or their own rules call for it."},
+                "provider": {"type": "string", "enum": list(PROVIDERS), "description": "Which CLI the consultant runs on: codex, or antigravity for Google's Antigravity CLI (agy) and its models, such as gemini-4-neon. Default: codex when it is installed, otherwise antigravity. An Antigravity consultant is read-only by agy's deny rules (no file writes or edits, commands or MCP tools), has no pane, and takes one message at a time. Reuse looks only among consultants of the same provider. When both are installed, pass antigravity only when the user asks or their own rules call for it."},
                 "effort": {"type": "string", "description": "Antigravity only: the model level for a new consultant, such as low, medium, high or xhigh. Default high."},
             },
         },
@@ -5667,17 +6307,18 @@ TOOLS = [
     {
         "name": "ListConsultants",
         "description": (
-            "List Codex sessions (consultants) on this machine: sessions loaded on the local Codex "
-            "app-server daemon plus recent StartConsultant sessions it has unloaded. Each row gives "
-            "the name to pass to the other tools, the working directory, model, status, and who started it. "
-            "Pass cwd to see only the sessions working in that repo."
+            "List the consultants on this machine: Antigravity consultants StartConsultant started, "
+            "and Codex sessions (those loaded on the local Codex app-server daemon plus recent "
+            "StartConsultant sessions it has unloaded). Each row gives the name to pass to the other "
+            "tools, the working directory, model, status, and who started it. Says which CLIs aren't "
+            "installed. Pass cwd to see only the consultants working in that repo."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "cwd": {
                     "type": "string",
-                    "description": "Only list sessions whose working directory is inside the git work tree containing this path (nested repos included). Outside git: inside the Claude Code workspace folder that contains it, or inside the path itself.",
+                    "description": "Only list consultants whose working directory is inside the git work tree containing this path (nested repos included). Outside git: inside the Claude Code workspace folder that contains it, or inside the path itself.",
                 },
                 "include_all": {
                     "type": "boolean",
@@ -5690,23 +6331,25 @@ TOOLS = [
     {
         "name": "SendConsultantMessage",
         "description": (
-            "Send a message into a Codex session. By default it waits 5 seconds, enough to confirm delivery "
+            "Send a message to a consultant. By default it waits 5 seconds, enough to confirm delivery "
             "and return a quick reply; a longer answer is read later with GetConsultantReply, without waiting for it. "
-            "The message appears in that session as a new user turn (or steers the running turn if busy). "
-            "model and effort change the consultant's Codex model or reasoning effort from this message "
+            "The message starts a new turn. Codex: if the session is busy, it steers the running turn; "
+            "Antigravity: one message at a time, so a send to a busy consultant is refused. "
+            "An Antigravity consultant runs no commands: put the diff or output it needs in the message. "
+            "model and effort change the consultant's model or reasoning effort from this message "
             "on, keeping its context; they stay until changed, so pass the usual values again to go back. "
             "They can't change a running turn, so a send with them to a consultant nouez sees busy is refused. "
             "Address it by the name from ListConsultants, the thread id, or a unique id prefix/suffix. "
-            "Sessions the user opened are refused unless allow_user_session=true: they keep the user's "
-            "own permissions and may be able to edit files. May open the session's pane beside Claude Code."
+            "Codex sessions the user opened are refused unless allow_user_session=true: they keep the user's "
+            "own permissions and may be able to edit files. May open a Codex session's pane beside Claude Code."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "to": TO_SCHEMA,
                 "message": {"type": "string", "description": "The message to send."},
-                "from": {"type": "string", "description": "Sender label shown to Codex, e.g. your session name. Default 'Claude Code'."},
-                "owner_words": {"type": "string", "description": "Optional: text the user typed, quoted exactly as they wrote it (never a summary). Codex sees it in its own block, marked as the user's words, apart from your message."},
+                "from": {"type": "string", "description": "Sender label shown to the consultant, e.g. your session name. Default 'Claude Code'."},
+                "owner_words": {"type": "string", "description": "Optional: text the user typed, quoted exactly as they wrote it (never a summary). The consultant sees it in its own block, marked as the user's words, apart from your message."},
                 "revision": {"type": "boolean", "description": "Optional: add a line with the consultant's repository commit, branch and number of uncommitted paths, and ask it to name that revision in its answer. Default false."},
                 "model": {"type": "string", "description": "Model id for this message and later ones: Codex, e.g. gpt-6-astra; Antigravity, e.g. gemini-4-neon. Default: unchanged. Set it when the user asks, or when the user's own rules call for another model."},
                 "effort": {"type": "string", "description": "Reasoning effort (Codex) or model level (Antigravity) for this message and later ones, such as low, medium, high or xhigh; which levels exist depends on the model. Default: unchanged. Set it when the user asks, or when the user's own rules call for more or less effort."},
@@ -5746,7 +6389,7 @@ TOOLS = [
     {
         "name": "GetConsultantHistory",
         "description": (
-            "List a Codex session's recent turns, newest first, one line each: turn id, status, when it "
+            "List a consultant's recent turns, newest first, one line each: turn id, status, when it "
             "started and how long it took, who sent the message, and the first line of the message and "
             "of the reply. Read-only. Use it to see what a consultant has already been asked, or to "
             "find a turn id for GetConsultantReply."
@@ -5767,7 +6410,8 @@ TOOLS = [
             "Open a Codex session beside Claude Code (a split pane in Windows Terminal or tmux, otherwise a new terminal window) on the user's machine (`codex resume <id>`), "
             "so the user can watch it work or type into it. Does nothing if a terminal already shows it. "
             "If the session has no messages yet, the window opens when the next SendConsultantMessage "
-            "delivers one."
+            "delivers one. An Antigravity consultant has no pane: the result gives the agy command "
+            "that opens its conversation."
         ),
         "inputSchema": {"type": "object", "properties": {"to": TO_SCHEMA}, "required": ["to"]},
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -5775,10 +6419,11 @@ TOOLS = [
     {
         "name": "StopConsultant",
         "description": (
-            "Stop a Codex session that StartConsultant started: archive it, and end the `codex resume` "
-            "processes showing it so their terminal windows close (best effort). Needs the exact name "
-            "or full thread id. Refuses sessions without the StartConsultant tag, such as ones the "
-            "user opened (a guard against mistakes, not a security boundary)."
+            "Stop a consultant that StartConsultant started. Codex: archive the session, and end the "
+            "`codex resume` processes showing it so their terminal windows close (best effort); "
+            "sessions without the StartConsultant tag, such as ones the user opened, are refused (a "
+            "guard against mistakes, not a security boundary). Antigravity: end a turn still running and "
+            "mark it stopped, keeping its conversation in agy. Needs the exact name or full thread id."
         ),
         "inputSchema": {"type": "object", "properties": {"to": EXACT_TO_SCHEMA}, "required": ["to"]},
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
@@ -5828,8 +6473,9 @@ TOOLS = [
         "name": "CloseClaudeSession",
         "description": (
             "Close one Claude Code session running on the user's computer, for example a stuck one: "
-            "end its claude process. A session OpenClaudeSession opened also gets its window closed; "
-            "for others, the terminal stays open at the shell prompt. The transcript is kept, so the "
+            "end its claude process. On Windows, a session OpenClaudeSession opened also gets its window "
+            "closed; elsewhere its window closes only if the terminal closes when its command ends. Other "
+            "sessions' terminals stay open at the shell prompt. The transcript is kept, so the "
             "session can be resumed. Close only sessions the user named for closing: list them with "
             "ListClaudeSessions, show the user the list, and wait for them to choose. To close several, "
             "call it once per session. It never closes the session you run in."
@@ -6033,7 +6679,11 @@ def run_waiter(thread_id, turn_id):
     """`server.py wait <thread_id> <turn_id>`: wait until the turn ends, print its reply, return the
     exit code. Run as a background command, its exit wakes the client with the reply. Rides out a
     few failed connections, such as a daemon restart, rather than give up on a long turn."""
-    agy = agy_resolve(thread_id, exact_only=True)
+    try:
+        agy = agy_resolve(thread_id, exact_only=True)
+    except BridgeError as e:  # such as a consultants file it can't read: say so, don't crash
+        print(e)
+        return 1
     if agy:
         return run_agy_waiter(agy, turn_id)
     deadline = time.monotonic() + WAITER_SECONDS
@@ -6102,23 +6752,100 @@ def run_waiter(thread_id, turn_id):
         return 0
 
 
+def run_status(argv, timeout=20):
+    """(exit code, stdout and stderr together) of a command, or (None, "") if it can't run or
+    times out; like run_text, it can't hang on a grandchild holding the pipe."""
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError:
+        return None, ""
+    try:
+        out = proc.communicate(timeout=timeout)[0] or ""
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        return None, ""
+    return proc.returncode, out
+
+
 def run_doctor():
     """`server.py doctor`: check what nouez needs and say what to fix. Reads only; connecting may
-    start the Codex daemon, as any consultation would. Exit code 1 if something blocks consultations."""
-    problems = 0
+    start the Codex daemon, as any consultation would, and asking agy for its quota runs no model
+    turn. Claude Code and each consultant CLI are reported apart: Codex and Antigravity are each
+    optional. Exit code 1 if Python is too old or a Claude Code check fails, or if a consultant CLI
+    is installed but none works; one working CLI is enough, and a setup with neither is fine for the
+    session tools."""
+    problems, cli_problems = 0, 0
 
-    def say(ok, text):
-        nonlocal problems
-        problems += ok is False
-        print(f"[{'ok' if ok else 'problem' if ok is False else 'note'}] {text}")
+    def say(ok, text, cli=False):
+        nonlocal problems, cli_problems
+        if ok is False:
+            if cli:
+                cli_problems += 1  # counted at the end, only if no installed CLI works
+            else:
+                problems += 1
+        print(f"[{'ok' if ok else 'problem' if ok is False else 'note'}] {text}", flush=True)
 
-    say(True, f"nouez {SERVER_VERSION} at {os.path.abspath(__file__)}, Python {sys.version.split()[0]} "
-              f"at {sys.executable}")
-    exe = shutil.which("codex")
-    cli = codex_version(exe) if exe else None
-    say(bool(exe), f"codex CLI {cli or '(version unknown)'} at {exe}" if exe
-        else "codex is not on PATH: install the Codex CLI, then reconnect nouez in Claude Code (/mcp).")
-    if exe:
+    print("nouez and Claude Code:")
+    say(sys.version_info >= (3, 9), f"nouez {SERVER_VERSION} at {os.path.abspath(__file__)}, Python "
+        f"{sys.version.split()[0]} at {sys.executable}"
+        + ("" if sys.version_info >= (3, 9) else ": nouez needs Python 3.9 or later"))
+    claude = which("claude")
+    say(True if claude else None, f"claude at {claude} (for OpenClaudeSession)" if claude
+        else "claude isn't on PATH, so OpenClaudeSession can't open sessions (the other tools work)")
+    settings = os.path.join(claude_config_dir(), "settings.json")
+    try:
+        with open(settings, encoding="utf-8-sig") as f:
+            allow = ((json.load(f) or {}).get("permissions") or {}).get("allow") or []
+    except FileNotFoundError:
+        allow = []
+        print(f"    (there is no {settings} yet: create it with the rules below)")
+    except (OSError, ValueError, AttributeError) as e:
+        allow = None
+        say(None, f"couldn't read {settings} ({e}), so the waiter's allow rules weren't checked; "
+                  "`server.py allow-rule` prints them.")
+    if allow is not None and not allow_rules():
+        say(None, NO_ALLOW_RULE)
+    elif allow is not None:
+        missing = [r for r in allow_rules() if r not in allow]
+        if missing:
+            say(None, f"{settings} doesn't allow the waiter command, so Claude Code asks before each "
+                      "background wait (unless a project's settings allow it). To stop that, add to "
+                      "permissions.allow:\n    " + ",\n    ".join(json.dumps(r) for r in missing))
+        else:
+            say(True, f"{settings} allows the waiter command without asking")
+    if os.name == "nt":
+        wt = which("wt")
+        say(True if wt else None, "Windows Terminal is installed: Codex panes open beside Claude Code" if wt
+            else "Windows Terminal isn't on PATH: Codex panes open as separate windows")
+    elif sys.platform != "darwin":
+        term = terminal_emulator()[0]
+        tmux = which("tmux")
+        say(True if term or tmux else None,
+            ", ".join(filter(None, [f"tmux at {tmux} (panes beside Claude Code when it runs in tmux)" if tmux else "",
+                                    f"a terminal at {term} (windows)" if term else ""])) if term or tmux
+            else "neither tmux nor a terminal emulator (" + ", ".join(n for n, _ in TERMINALS) + ") was "
+                 "found: Codex panes and OpenClaudeSession can't open; pass watch=false")
+        if term and no_display():
+            say(None, f"{no_display()}: terminal windows can't open, so OpenClaudeSession can't, and Codex "
+                      "panes need Claude Code running in tmux (or pass watch=false)")
+
+    print("Consultants (Codex and Antigravity are each optional; either one is enough):")
+    working, installed = 0, 0
+    exe = which("codex")
+    if not exe:
+        say(None, "Codex isn't installed (`codex` isn't on PATH). To use it: install the Codex CLI, "
+                  "run `codex login`, then reconnect nouez in Claude Code (/mcp).")
+    else:
+        installed += 1
+        cli = codex_version(exe)
+        say(True, f"codex CLI {cli or '(version unknown)'} at {exe}")
+        code, out = run_status([exe, "login", "status"])
+        signed = code == 0
+        say(signed, "signed in to Codex: " + (out.strip().splitlines() or ["yes"])[-1] if signed
+            else "Codex isn't signed in" + (f" ({out.strip().splitlines()[-1][:120]})" if out.strip() else "")
+            + ": run `codex login`.", cli=True)
         try:
             client = CodexClient()
             try:
@@ -6126,33 +6853,46 @@ def run_doctor():
             finally:
                 client.close()
             say(True, f"the Codex app-server daemon answers (version {daemon or 'unknown'})")
+            working += signed
             notice = update_notice(client.info)
             if notice:
                 say(None, notice.split(" Tell the user")[0].strip())
         except (BridgeError, OSError) as e:
-            say(False, f"can't reach the Codex app-server daemon: {e}")
-    settings = os.path.join(claude_config_dir(), "settings.json")
-    try:
-        with open(settings, encoding="utf-8") as f:
-            allow = ((json.load(f) or {}).get("permissions") or {}).get("allow") or []
-    except (OSError, ValueError, AttributeError) as e:
-        allow = None
-        say(None, f"couldn't read {settings} ({e}), so the waiter's allow rules weren't checked.")
-    if allow is not None:
-        missing = [r for r in allow_rules() if r not in allow]
-        if missing:
-            say(None, f"{settings} doesn't allow the waiter command, so Claude Code asks before each "
-                      "background wait (unless a project's settings allow it). To stop that, add to "
-                      "permissions.allow:\n    " + ",\n    ".join(json.dumps(r) for r in missing))
+            say(False, f"can't reach the Codex app-server daemon: {e}", cli=True)
+    agy = agy_command()
+    if not agy:
+        say(None, "Antigravity isn't installed (`agy` isn't on PATH"
+            + (" or in %LOCALAPPDATA%\\agy\\bin" if os.name == "nt" else "") + "). To use it: install the "
+            "Antigravity CLI, run `agy` once to sign in, then reconnect nouez in Claude Code (/mcp).")
+    else:
+        installed += 1
+        version = version_of(run_text([agy, "--version"], timeout=20))
+        say(True, f"agy {version or '(version unknown)'} at {agy}"
+            + ("" if which("agy") else " (not on PATH; nouez finds it in the installer's folder)"))
+        print(f"    checking Antigravity's sign-in (asks agy for its quota; can take {AGY_USAGE_SECONDS} "
+              "seconds)...", flush=True)
+        usage = read_agy_usage()
+        why = (usage or {}).get("error") or "no answer"
+        if usage and not usage.get("error"):
+            say(True, "agy is signed in and reports its quota")
+            working += 1
+        elif "TimeoutExpired" in why:
+            say(False, f"agy didn't answer within {AGY_USAGE_SECONDS} seconds, so its sign-in is unknown: it "
+                       f"may be slow or offline. Try `{agy_shown()} models` in a terminal; if it asks you to "
+                       f"sign in, run `{agy_shown()}` once.", cli=True)
         else:
-            say(True, "Claude Code allows the waiter command without asking")
-    if os.name == "nt":
-        wt = shutil.which("wt")
-        say(True if wt else None, "Windows Terminal is installed: panes open beside Claude Code" if wt
-            else "Windows Terminal isn't on PATH: consultant panes open as separate windows")
-        claude = find_program("claude", os.environ.get("PATH", ""))
-        say(True if claude else None, f"claude at {claude} (for OpenClaudeSession)" if claude
-            else "claude isn't on PATH, so OpenClaudeSession can't open sessions")
+            say(False, f"agy didn't report its quota ({why}): run `{agy_shown()}` once in a terminal to sign "
+                       f"in, then `{agy_shown()} models` should list models.", cli=True)
+    if not installed:
+        say(None, "no consultant CLI is installed, so consultations are off; the Claude Code session tools "
+                  "(OpenClaudeSession, ListClaudeSessions, CloseClaudeSession) work. Install Codex or "
+                  "Antigravity to consult.")
+    elif working:
+        say(True, f"{working} of {installed} installed consultant CLI(s) work"
+            + ("" if exe else "; StartConsultant uses Antigravity")
+            + (": the problem above only matters for that CLI" if cli_problems else ""))
+    else:
+        problems += cli_problems or 1
     print("No problems found." if not problems else f"{problems} problem(s) found.")
     return 1 if problems else 0
 
@@ -6160,6 +6900,7 @@ def run_doctor():
 def main():
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
+    threading.Thread(target=prune_replies, daemon=True).start()  # old replies go even with no new one
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -6227,8 +6968,14 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["doctor"]:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.exit(run_doctor())
+    if sys.argv[1:2] == ["statusline"]:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.exit(run_statusline(sys.argv[2:]))
     if sys.argv[1:] == ["allow-rule"]:
-        print("Add these to permissions.allow in ~/.claude/settings.json:")
+        if not allow_rules():
+            print(NO_ALLOW_RULE)
+            sys.exit(1)
+        print(f"Add these to permissions.allow in {os.path.join(claude_config_dir(), 'settings.json')}:")
         print(",\n".join(json.dumps(rule) for rule in allow_rules()))
         sys.exit(0)
     main()

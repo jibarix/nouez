@@ -1,10 +1,18 @@
 """Verify a nouez change: cheap static checks on the diff, then nouez run for real.
 
     python -I .claude/skills/verify/verify.py static     checks on the working tree, a few seconds
+    python -I .claude/skills/verify/verify.py static --range BASE..HEAD
+                                                         the same checks on the commits in a range
+                                                         (CI: a push or a pull request)
     python -I .claude/skills/verify/verify.py live       doctor, MCP handshake, a real consultant
     python -I .claude/skills/verify/verify.py live --sessions
                                                          also opens, closes and resumes a real
                                                          Claude Code session (opens a window)
+    python -I .claude/skills/verify/verify.py live --setups
+                                                         also runs nouez as a newcomer would in
+                                                         each setup: Codex only, Antigravity only,
+                                                         both, neither (empty cache, the other CLI
+                                                         hidden; one short Antigravity message)
 
 Exit code 0 when every check passed, 1 otherwise. The live checks start server.py from this
 working copy, so they test the code on disk, not the server Claude Code has loaded. What they
@@ -47,11 +55,21 @@ def read(name):
 
 # ---------------------------------------------------------------- static checks
 
+RANGE = None  # "BASE..HEAD" with --range: the checks look at those commits, not the working tree
+
+
 def changed_files():
-    """Tracked files that differ from HEAD, plus untracked ones. -z: names with spaces or
-    non-ASCII characters come through unquoted."""
-    names = git("diff", "--name-only", "-z", "HEAD").split("\0") \
-        + git("ls-files", "-z", "--others", "--exclude-standard").split("\0")
+    """Tracked files that differ from HEAD, plus untracked ones; with --range, the files the
+    range's commits change. -z: names with spaces or non-ASCII characters come through unquoted."""
+    if RANGE:
+        done = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "-z", RANGE], capture_output=True,
+                              text=True, encoding="utf-8")
+        if done.returncode:
+            sys.exit(f"git diff {RANGE} failed, so the range can't be checked: {done.stderr.strip()}")
+        names = done.stdout.split("\0")
+    else:
+        names = git("diff", "--name-only", "-z", "HEAD").split("\0") \
+            + git("ls-files", "-z", "--others", "--exclude-standard").split("\0")
     return sorted({n for n in names if n and os.path.isfile(os.path.join(ROOT, n))})
 
 
@@ -128,7 +146,8 @@ def check_tex(files):
         # Only a hint that it was rebuilt: the PDF must differ from HEAD's and be no older than the
         # source. Whether it shows the new text is for a person (or Claude) to look at.
         changed = "docs/architecture.pdf" in files
-        newer = os.path.getmtime(os.path.join(ROOT, "docs", "architecture.pdf")) >= \
+        # A checkout gives every file the same time, so in a range only "changed too" counts.
+        newer = RANGE or os.path.getmtime(os.path.join(ROOT, "docs", "architecture.pdf")) >= \
             os.path.getmtime(os.path.join(ROOT, "docs", "architecture.tex"))
         report(changed and newer, "architecture.pdf rebuilt after architecture.tex",
                "" if changed and newer else "run pdflatex twice in docs/, then look at the changed pages")
@@ -136,7 +155,10 @@ def check_tex(files):
 
 def check_versions(files):
     version = re.search(r'^SERVER_VERSION = "([^"]+)"', read("server.py"), re.M).group(1)
-    tag = git("describe", "--tags", "--abbrev=0").strip()
+    # The latest tag before the change: with a range, at its base, so a release commit that is
+    # itself tagged isn't taken for a change without a new version.
+    base = RANGE.split("..")[0] if RANGE else "HEAD"
+    tag = git("describe", "--tags", "--abbrev=0", "--match", "v*", base).strip()
     if "server.py" in files and tag == f"v{version}":
         report(False, "version bumped", f"server.py changed but SERVER_VERSION is still {version}, the latest tag")
         return
@@ -156,7 +178,7 @@ def check_versions(files):
 
 def static():
     files = changed_files()
-    print(f"{len(files)} changed file(s): {', '.join(files) or 'none'}")
+    print(f"{len(files)} changed file(s){' in ' + RANGE if RANGE else ''}: {', '.join(files) or 'none'}")
     check_shadowing(files)
     check_tex(files)
     check_versions(files)
@@ -167,10 +189,10 @@ def static():
 class Client:
     """A minimal MCP client over stdio, for server.py from this working copy."""
 
-    def __init__(self):
-        self.proc = subprocess.Popen([sys.executable, SERVER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, text=True, encoding="utf-8", cwd=ROOT,
-                                     env={**os.environ, "NOUEZ_NO_USAGE_LOG": "1"})  # checks aren't usage
+    def __init__(self, env=None, cwd=ROOT):
+        self.proc = subprocess.Popen([sys.executable, "-I", SERVER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, text=True, encoding="utf-8", cwd=cwd,
+                                     env=env or {**os.environ, "NOUEZ_NO_USAGE_LOG": "1"})  # checks aren't usage
         self.next_id, self.replies, self.lock = 0, {}, threading.Condition()
         threading.Thread(target=self._read, daemon=True).start()
 
@@ -235,15 +257,29 @@ def find_consultant(client, title):
     return None
 
 
+def installed_clis():
+    """(Codex, Antigravity) as server.py sees them here."""
+    sys.path.insert(0, ROOT)
+    import server
+    return server.codex_installed(), bool(server.agy_command())
+
+
 def check_consultant(client):
     token = time.strftime("verify-%Y%m%d-%H%M%S-") + os.urandom(3).hex()
     title = f"nouez {token}"
+    codex, agy = installed_clis()
     text, err = client.call("StartConsultant", timeout=180, cwd=ROOT, new=True, watch=False, title=title,
                             instructions="You are a test. Answer in one word.")
-    match = re.search(r"^\s*id: (\S+)", text, re.M) if text.startswith("Started ") else None
+    if not codex and not agy:  # Claude Code only: no consultant, and a plain message saying so
+        report(err and "No consultant CLI is installed" in text,
+               "StartConsultant says no consultant CLI is installed (neither is here)", short(text))
+        return
+    match = re.search(r"^\s*id: (\S+)", text, re.M) if "Started " in text else None
     thread = match.group(1) if match else None
+    provider = "Codex" if codex else "Antigravity"
     try:
-        if not report(not err and bool(thread), "StartConsultant starts a new consultant", "" if thread else short(text)):
+        if not report(not err and bool(thread) and (codex or "so this is an Antigravity consultant" in text),
+                      f"StartConsultant starts a new {provider} consultant", "" if thread else short(text)):
             return
         text, err = client.call("SendConsultantMessage", timeout=400, to=thread, wait="done",
                                 message=f"{token}: reply with the single word ok, nothing else.")
@@ -364,7 +400,12 @@ def check_sessions(client):
         close_verify_sessions(client)
 
 
-def live(sessions):
+EXPECTED_TOOLS = {"StartConsultant", "ListConsultants", "SendConsultantMessage", "GetConsultantReply",
+                  "GetConsultantHistory", "WatchConsultant", "StopConsultant", "ConsultantBudget",
+                  "OpenClaudeSession", "ListClaudeSessions", "CloseClaudeSession"}
+
+
+def live(sessions, setups=False):
     doctor = subprocess.run([sys.executable, SERVER, "doctor"], capture_output=True, text=True, encoding="utf-8", cwd=ROOT)
     report(doctor.returncode == 0, "server.py doctor",
            "" if doctor.returncode == 0 else short(doctor.stdout + doctor.stderr, 600))
@@ -377,24 +418,230 @@ def live(sessions):
         client.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
         client.proc.stdin.flush()
         tools = {t["name"] for t in client.request("tools/list", {})["result"]["tools"]}
-        expected = {"StartConsultant", "ListConsultants", "SendConsultantMessage", "GetConsultantReply",
-                    "GetConsultantHistory", "WatchConsultant", "StopConsultant", "OpenClaudeSession",
-                    "ListClaudeSessions", "CloseClaudeSession"}
-        report(expected <= tools, "tools/list has every tool", ", ".join(sorted(expected - tools)))
+        report(EXPECTED_TOOLS <= tools, "tools/list has every tool", ", ".join(sorted(EXPECTED_TOOLS - tools)))
         check_consultant(client)
         if sessions:
             check_sessions(client)
     finally:
         client.close()
+    if setups:
+        check_setups()
+
+
+# ---------------------------------------------------------------- setups
+
+PROGRAM_EXTS = ("", ".exe", ".cmd", ".bat", ".ps1", ".com")
+
+
+def path_folders(value):
+    """PATH's folders as server.py's which() reads them: empty entries dropped, quotes stripped."""
+    return [d.strip().strip('"') for d in (value or "").split(os.pathsep) if d.strip().strip('"')]
+
+
+def program_files(folder, name):
+    return [f for f in (os.path.join(folder, name + e) for e in PROGRAM_EXTS) if os.path.isfile(f)]
+
+
+def link_program(source, target):
+    """Windows: the program itself in the mirror, so its arguments reach it as they are: a hard
+    link, else a symbolic one, else a copy. None if none of them works."""
+    import shutil
+    for make in (os.link, os.symlink, shutil.copy2):
+        try:
+            make(source, target)
+            return target
+        except OSError:
+            continue
+    return None
+
+
+def mirror_without(folder, hidden, into):
+    """A folder with every program of `folder` except `hidden`: symlinks on macOS and Linux,
+    one-line .cmd wrappers on Windows (a copied npm shim would look for its files beside the copy)."""
+    os.makedirs(into, exist_ok=True)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return into
+    for name in names:
+        stem, ext = os.path.splitext(name)
+        source = os.path.join(folder, name)
+        if (stem.lower() if os.name == "nt" else name) in hidden or not os.path.isfile(source):
+            continue
+        if os.name == "nt":
+            target = os.path.join(into, name)
+            # Native programs as themselves: a .cmd wrapper would pass their arguments through
+            # cmd's parsing. Scripts keep a wrapper, since a copied npm shim looks for its files
+            # beside itself.
+            if ext.lower() in (".exe", ".com") and link_program(source, target):
+                continue
+            if ext.lower() in (".exe", ".cmd", ".bat", ".com") and not os.path.exists(os.path.join(into, stem + ".cmd")):
+                with open(os.path.join(into, stem + ".cmd"), "w") as f:
+                    f.write(f'@"{source}" %*\n')
+        elif os.access(source, os.X_OK):
+            os.symlink(source, os.path.join(into, name))
+    return into
+
+
+def setup_env(codex, agy, scratch):
+    """The environment of a newcomer's setup: an empty nouez cache (and Codex home without Codex),
+    and Codex or agy hidden, program by program, where a setup leaves it out."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("NOUEZ_") or k == "NOUEZ_NO_UPDATE_CHECK"}
+    env["NOUEZ_NO_USAGE_LOG"] = "1"
+    hidden = {name for name, keep in (("codex", codex), ("agy", agy), ("antigravity", agy)) if not keep}
+    real_agy_bin = os.path.join(os.environ.get("LOCALAPPDATA", ""), "agy", "bin")
+    folders = []
+    for i, folder in enumerate(path_folders(env.get("PATH"))):
+        if any(program_files(folder, n) for n in hidden):
+            folder = mirror_without(folder, hidden, os.path.join(scratch, f"path-{i}"))
+        folders.append(folder)
+    if os.name == "nt":
+        env["LOCALAPPDATA"] = os.path.join(scratch, "localappdata")  # also hides agy's installer folder
+        os.makedirs(env["LOCALAPPDATA"])
+        if agy and not any(program_files(f, "agy") for f in folders) and os.path.isdir(real_agy_bin):
+            if any(program_files(real_agy_bin, n) for n in hidden):
+                real_agy_bin = mirror_without(real_agy_bin, hidden, os.path.join(scratch, "agy-bin"))
+            folders.append(real_agy_bin)
+    else:
+        env["XDG_CACHE_HOME"] = os.path.join(scratch, "cache")
+    if not codex:
+        env["CODEX_HOME"] = os.path.join(scratch, "codex-home")
+        os.makedirs(env["CODEX_HOME"])
+    env["PATH"] = os.pathsep.join(folders)
+    return env
+
+
+def check_setup(label, codex, agy):
+    import shutil
+    import tempfile
+    print(f"\n--- {label}")
+    scratch = tempfile.mkdtemp(prefix="nouez-setup-")
+    env = setup_env(codex, agy, scratch)
+    cwd = os.path.join(scratch, "project")
+    os.makedirs(cwd)
+    started = []
+    try:
+        doctor = subprocess.run([sys.executable, "-I", SERVER, "doctor"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", cwd=cwd, env=env, timeout=300)
+        out = doctor.stdout + doctor.stderr
+        want = {"Codex": ("codex CLI " if codex else "Codex isn't installed"),
+                "agy": ("agy is signed in" if agy else "Antigravity isn't installed")}
+        missing = [w for w in want.values() if w not in out]
+        if not codex and not agy and "no consultant CLI is installed" not in out:
+            missing.append("no consultant CLI is installed")
+        report(doctor.returncode == 0 and not missing, f"{label}: doctor exits 0 and reports each CLI",
+               short(out, 600) if doctor.returncode or missing else "")
+        top = subprocess.run([sys.executable, "-I", SERVER, "top", "--once"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", cwd=cwd, env={**env, "PYTHONIOENCODING": "utf-8"},
+                             timeout=180)
+        sections = [name for name, want in (("Codex", codex), ("Antigravity", agy)) if want and name not in top.stdout]
+        report(top.returncode == 0 and "nouez" in top.stdout and not sections,
+               f"{label}: top --once draws the screen with each installed CLI",
+               ("missing: " + ", ".join(sections) + ". " if sections else "")
+               + ("" if top.returncode == 0 and not sections else short(top.stdout + top.stderr)))
+        client = Client(env=env, cwd=cwd)
+        try:
+            client.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                          "clientInfo": {"name": "nouez-verify", "version": "1"}})
+            client.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+            client.proc.stdin.flush()
+            tools = {t["name"] for t in client.request("tools/list", {})["result"]["tools"]}
+            report(EXPECTED_TOOLS <= tools, f"{label}: tools/list has every tool", ", ".join(sorted(EXPECTED_TOOLS - tools)))
+            text, err = client.call("ListConsultants", cwd=cwd)
+            report(not err and (codex or "No consultants" in text), f"{label}: ListConsultants before any start",
+                   short(text))
+            text, err = client.call("ConsultantBudget", timeout=180)
+            quota = [what for what, ok in (
+                ("Codex usage", not codex or (re.search(r"^Codex( \(.+ plan\))?:\s*$", text, re.M) is not None
+                                              and "Codex: not installed" not in text and "usage unavailable" not in text)),
+                ("Codex: not installed", codex or "Codex: not installed" in text),
+                ("Antigravity quota", not agy or ("Antigravity" in text and "usage not known" not in text)),
+            ) if not ok]
+            report(not err and not quota, f"{label}: ConsultantBudget shows each installed CLI's usage",
+                   ("missing: " + ", ".join(quota) + ". " if quota else "") + (short(text, 300) if err or quota else ""))
+            text, err = client.call("ListClaudeSessions")
+            report(not err, f"{label}: ListClaudeSessions", short(text) if err else "")
+
+            def start(**args):
+                """(text, err, provider): provider is "Codex" or "Antigravity" for a start with an id."""
+                text, err = client.call("StartConsultant", timeout=240, cwd=cwd, new=True, watch=False,
+                                        title=f"nouez verify {label}", **args)
+                match = re.search(r"^\s*id: (\S+)", text, re.M)
+                model = re.search(r"^\s*model: .*\((.+)\)\s*$", text, re.M)
+                provider = None
+                if not err and match and "Started " in text:
+                    provider = "Antigravity" if model and model.group(1) == "Antigravity" else "Codex"
+                    started.append((match.group(1), provider))
+                return text, err, provider
+            text, err, provider = start()
+            expected = "Codex" if codex else "Antigravity" if agy else None
+            report(provider == expected, f"{label}: StartConsultant without provider gives "
+                   + (f"a {expected} consultant with an id" if expected else "no consultant"),
+                   "" if provider == expected else short(text))
+            if codex:
+                report(not err and "codex" in text.lower() and "Antigravity" not in text.split("\n")[0],
+                       f"{label}: StartConsultant without provider starts Codex", short(text) if err else "")
+            elif agy:
+                report(not err and text.startswith("Codex isn't installed, so this is an Antigravity consultant"),
+                       f"{label}: StartConsultant without provider starts Antigravity", short(text))
+            else:
+                report(err and "No consultant CLI is installed" in text,
+                       f"{label}: StartConsultant without provider says no CLI is installed", short(text))
+            text, err, provider = start(provider="antigravity")
+            report(provider == "Antigravity" if agy else (err and "isn't installed" in text and not provider),
+                   f"{label}: StartConsultant provider antigravity "
+                   + ("starts an Antigravity consultant with an id" if agy else "is refused"), short(text))
+            if not codex:
+                text, err, _ = start(provider="codex")
+                report(err and "Codex isn't installed" in text, f"{label}: StartConsultant provider codex is refused",
+                       short(text))
+            for cid, provider in started:  # every consultant started here answers once
+                text, err = client.call("SendConsultantMessage", timeout=600, to=cid, wait="done",
+                                        message="Reply with the single word ok, nothing else.",
+                                        kind="other", reason=f"verify setups: {label}")
+                reply = text.split(":", 1)[1].strip() if text.startswith("Reply from ") else ""
+                report(not err and re.match(r"ok\b", reply, re.I) is not None,
+                       f"{label}: the {provider} consultant answers", short(text, 200))
+        finally:
+            for cid, _ in started:
+                text, err = client.call("StopConsultant", to=cid)
+                report(not err, f"{label}: StopConsultant {cid}", short(text) if err else "")
+            client.close()
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def check_setups():
+    """Each newcomer setup: Codex only, Antigravity only, both, neither."""
+    have_codex = bool(program_files_on_path("codex"))
+    have_agy = bool(program_files_on_path("agy")) or os.path.isfile(
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "agy", "bin", "agy.exe"))
+    for label, codex, agy in (("Codex only", True, False), ("Antigravity only", False, True),
+                              ("both", True, True), ("neither", False, False)):
+        if (codex and not have_codex) or (agy and not have_agy):
+            print(f"\n--- {label}: skipped, " + ("Codex" if codex and not have_codex else "agy") + " isn't installed here")
+            continue
+        check_setup(label, codex, agy)
+
+
+def program_files_on_path(name):
+    return [f for d in path_folders(os.environ.get("PATH")) for f in program_files(d, name)]
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1:2]
+    mode, flags = sys.argv[1:2], sys.argv[2:]
+    if mode == ["static"] and flags[:1] == ["--range"] and len(flags) == 2:
+        RANGE = flags.pop()
+        flags.pop()
+        if not re.fullmatch(r"[0-9A-Za-z_./^~-]+\.\.[0-9A-Za-z_./^~-]+", RANGE) or RANGE.startswith("-"):
+            sys.exit(f"--range takes BASE..HEAD, not {RANGE!r}")
+    allowed = {"static": set(), "live": {"--sessions", "--setups"}}.get(mode[0] if mode else "")
+    if allowed is None or set(flags) - allowed:
+        sys.exit(f"Unknown option(s): {' '.join(sorted(set(flags) - (allowed or set())))}\n{__doc__}"
+                 if allowed is not None else __doc__)
     if mode == ["static"]:
         static()
-    elif mode == ["live"]:
-        live("--sessions" in sys.argv[2:])
     else:
-        sys.exit(__doc__)
+        live("--sessions" in flags, "--setups" in flags)
     print(f"\n{'All checks passed.' if not failures else f'{len(failures)} check(s) failed.'}")
     sys.exit(1 if failures else 0)

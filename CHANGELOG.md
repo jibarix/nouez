@@ -6,6 +6,55 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-22
+
+nouez now sets up for anyone who clones it: with Codex, Antigravity, both or neither, on Windows, macOS or Linux. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version. A running status screen restarts on it by itself.
+
+### Changed
+
+- **StartConsultant without `provider` uses Codex when the codex CLI is installed, otherwise Antigravity**, and says so in its result. With neither installed it names both CLIs and `server.py doctor`, and says the Claude Code session tools still work. An explicit `provider` is kept as before.
+- Without Codex, the consultant tools work with Antigravity consultants: ListConsultants lists them (or none, with the next step) instead of failing, and an unknown name gets "No consultant named …" with the Antigravity ones, not "`codex` CLI not found". ConsultantBudget says "Codex: not installed" in one line, and `top` leaves out the Codex card and badge.
+- What Claude reads (the MCP instructions and tool descriptions) names both providers, marks what only Codex does (the daemon, panes, steering, shell commands), and says to put a diff or output in an Antigravity message, since agy can't run commands.
+- `server.py doctor` reports Claude Code, Codex (on PATH, daemon, signed in) and Antigravity (found, version, signed in) each on its own, and reports a problem only when no consultant CLI works. It checks Python 3.9 or later for real, finds `claude` on every system, checks for tmux or a terminal emulator on Linux, and prints the allow rule's hint when Claude Code has no settings file yet.
+- The allow rule for the waiter has a PowerShell form only on Windows.
+- The waiter command quotes the server's path for the shell it is run in. When the Bash and PowerShell forms differ, the result gives both; a path that can't be quoted safely gets GetConsultantReply instead.
+- README: setup rewritten for each of the four setups, with a table of what works in each, install and sign-in steps for each CLI, and `doctor` as the last step. New: how to install the shipped consult skill, how to add or change the Artificial Analysis key, the files nouez keeps and where, and what goes over the network.
+- Linux panes and windows try more terminal emulators (konsole, xfce4-terminal, kitty, alacritty, wezterm, foot), in one list that doctor shares.
+
+### Added
+
+- `skills/consult/SKILL.md`: a consult skill for any setup, which picks a consultant's model and effort by the kind of question, the providers installed and the usage left. Copy it to `~/.claude/skills/consult/`.
+- `server.py statusline`: a status-line command that saves Claude Code's usage windows for ConsultantBudget and `top` (under a lock, keeping the newer window, written atomically), prints a short status line or nothing with `--quiet`, and never fails. It replaces the PowerShell snippet in the README and works on every system.
+- `verify.py live --setups` runs nouez as a clone with Codex only, Antigravity only, both and neither would, each with an empty cache and the left-out CLI hidden. Unknown options are refused.
+- CI: the static checks and unit tests on Windows, macOS and Linux with Python 3.9 and 3.12.
+- REVIEW.md item 11: changes to providers or setup are checked against every setup.
+
+### Fixed
+
+- On Python 3.9 and 3.10, a timestamp with other than 3 or 6 digits of fractional seconds (as Antigravity writes them) couldn't be read.
+- A pane or window whose launcher failed (a tmux split, an emulator without a display, or on Windows `wt.exe`, or without it the console window, whose own process is now watched; codex's errors show in that window) was reported as opened. nouez now waits a moment, reports the error with what to run yourself, and suggests `watch: false` with no display.
+- On macOS, the command for a new Terminal window went into the AppleScript's source. It is now passed as an argument, so no text in it can change what runs.
+- A program in the current folder named `codex`, `agy`, `claude` or `tmux` could be run in place of the real one. Programs are now looked up on PATH's absolute folders only (on Windows, ones with a drive or share), doctor, the tools and the commands shown all use the same path, and no watch pane opens when `codex` can't be found.
+- On macOS and Linux, CloseClaudeSession signalled the registry's pid without checking it. It now checks that the process is that Claude Code session (its program by name, a version the native installer keeps, or Node or Bun running Claude Code's `cli.js`; a start `ps` places before the session's registration; and Claude Code's registry still holding that session's entry for the pid, which a new process with the pid writes over) and not a process the server runs under, just before it signals, and declines when it can't tell, also when `ps` can't show every process the server runs under.
+- nouez's files could land in the current folder with a relative `XDG_CACHE_HOME`, and long replies went to the shared temp folder. Its folder is now always absolute and, on macOS and Linux, readable by you only: one that is another user's, a link, in a folder other users can change, or can't be made private is not used: nouez keeps its files in a private `nouez-<uid>` folder in the temp folder, shared by all its processes, with a note saying so (only if that isn't usable either does a process get one of its own, and the note says what that loses). Long replies are saved in it as `replies/reply-<turn id>.md`, written whole or not at all, and deleted after 14 days (checked when nouez starts and when it saves another); only files with that name are deleted, and a `replies` folder that is a link or a junction is left alone.
+- StartConsultant said it reused an Antigravity consultant even after agy was removed. It now checks agy first, ConsultantBudget lists agy's models even when its quota call fails, and an unavailable default model gets an error that says what to do.
+- With neither consultant CLI installed, an unknown consultant name got "Codex isn't installed" alone. It now says neither is installed and points to `server.py doctor`.
+- On Windows with agy outside PATH, doctor told you to run a bare `agy` to sign in. It now gives the command by its full path.
+- Doctor's no-display note on Linux was left out when tmux was installed, though OpenClaudeSession needs a display either way. It now always shows, and says what it stops.
+- Off Windows, CloseClaudeSession said the terminal stayed open even where it closes. It now says the window closes if the terminal closes when its command ends, and stays at a prompt otherwise.
+- A message to a Codex consultant was steered into a turn typed in its watch pane, which may not be read-only. nouez now steers only a turn this server started, by its own record (a turn's text, or the turn it carries on, proves nothing), and otherwise says nothing was sent and to wait for that turn.
+- When `claude` is a batch script (`claude.cmd`), OpenClaudeSession passed the first message through cmd, which can read characters in it as commands. It now opens the session without it and shows the message to paste.
+- A path to agy, Python or nouez with characters a shell reads specially could give a command that doesn't run: doctor's sign-in command is quoted for the shell, a path with `*` gets no allow rule (the rule would match other paths too; `allow-rule` says so and exits 1), and a pane that can't be opened safely on Windows gives the PowerShell command to run when PowerShell can pass it to codex unchanged.
+- With `LOCALAPPDATA` relative, nouez could look for agy under the current folder. It now only uses an absolute one.
+- On Python 3.9 and 3.10, a Codex `config.toml` with a line nouez's small reader can't follow (an array or inline table, a value over several lines, a key given twice, or a value that isn't TOML) could give the wrong trust for the watch pane's folder. Such a file now counts as unknown, so the pane asks.
+- Without Codex, StartConsultant passed a Codex model on to Antigravity when `agy models` didn't answer. It now uses Antigravity's default and says the model couldn't be checked.
+- `server.py wait` printed a traceback when it couldn't read the Antigravity consultants file. It prints the error and exits 1.
+- Doctor exited 1 when one consultant CLI was signed out though the other worked. One working CLI is now enough; the other's problem is shown. An agy that doesn't answer within 60 seconds is reported as slow or offline, not as signed out.
+- The status line could save a window that had already reset, and could fail on a huge number or deeply nested JSON. It now drops such a window (from the line it prints and the usage log too), reads such input as nothing, and never fails. ConsultantBudget and `top` give each Claude Code window the pace of its own reading, so an old reading kept beside a fresh one shows no pace.
+- README: the stdin form of `codex login --with-api-key` for each shell, and the status screen's network use (the Codex daemon's usage and agy's quota) instead of "Nothing leaves your computer".
+- The consult skill uses a provider or model the user names before its own routing, and says so when that one isn't available.
+- Tests and CI: tests that assumed Windows run on every system; the shell test uses Git Bash on Windows, not WSL's `bash`; Python 3.9 runs on `ubuntu-24.04`; the static checks run on the pushed or pull-request range (`verify.py static --range`, which fails when git can't read the range); and `verify.py live --setups` reads PATH as nouez does, keeps native programs as they are, and checks each setup's providers, ids, usage and a reply from each consultant.
+
 ## [0.17.0] - 2026-11-22
 
 A new look for the status screen, from a design review. A running screen restarts on it by itself. Reconnect `consultants` with `/mcp` in each open Claude Code session so it reports the new version.
@@ -430,7 +479,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/jibarix/nouez/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/jibarix/nouez/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/jibarix/nouez/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/jibarix/nouez/compare/v0.15.0...v0.15.1
