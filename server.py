@@ -3924,9 +3924,9 @@ def full_row(scr, owner, label, state, now):
 
 
 def compact_row(scr, label, state):
-    """A window in a narrow card: 45 cells."""
+    """A window in a narrow card: 46 cells."""
     reset = time.strftime("%a %H:%M", time.localtime(state["resets_at"]))
-    return f"{label[:7]:<8}{window_gauge(scr, state, 10)}  " + scr.dim(f"{state['short'][:11]:<11}") + reset
+    return f"{label[:7]:<8}{window_gauge(scr, state, 10)}  " + scr.dim(f"{state['short'][:11]:<11}") + " " + reset
 
 
 def window_row(scr, owner, label, used, resets_at, length, now, sampled=None):
