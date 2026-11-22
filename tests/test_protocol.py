@@ -27,10 +27,11 @@ import server  # noqa: E402
 
 def setUpModule():
     # Whether this machine has Codex mustn't change the results: tests take it as installed unless
-    # they say otherwise.
-    patcher = mock.patch.object(server, "codex_installed", lambda: True)
-    patcher.start()
-    unittest.addModuleCleanup(patcher.stop)
+    # they say otherwise. Set directly, not with a started patch, which a test's
+    # mock.patch.stopall would stop too.
+    real = server.codex_installed
+    server.codex_installed = lambda: True
+    unittest.addModuleCleanup(setattr, server, "codex_installed", real)
 
 # Tests never write to the user's usage log; the log's own tests turn it back on for a temp file.
 os.environ["NOUEZ_NO_USAGE_LOG"] = "1"
@@ -339,8 +340,8 @@ class ReplyTest(unittest.TestCase):
         real_open, real_fstat, theirs = os.open, os.fstat, set()
         def fake_open(path, *a, **k):
             fd = real_open(path, *a, **k)
-            if os.path.basename(path) == "nouez":
-                theirs.add(fd)
+            # a closed fd's number is given out again, so each open says whose folder it is
+            (theirs.add if os.path.basename(path) == "nouez" else theirs.discard)(fd)
             return fd
         def fstat(fd):
             st = real_fstat(fd)
