@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.14.1\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.15.0\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -1364,8 +1364,8 @@ thread.
 
 When the Antigravity CLI is installed (\code{agy} on \code{PATH}, or on Windows
 \code{\%LOCALAPPDATA\%\textbackslash agy\textbackslash bin\textbackslash agy.exe}), the screen also
-runs \code{agy -p /usage -{}-output-format json} once a minute, with \code{-{}-settings} denying
-file writes, edits, commands, MCP tools and scheduling. \code{/usage} is a read-only command: it
+runs \code{agy -p /usage -{}-output-format json} once a minute, with the deny rules of
+section~\ref{sec:agy}. \code{/usage} is a read-only command: it
 answers with \code{num\_turns} 0 and no tokens. nouez reads \code{command.data.groups}, each a
 \code{name} and \code{buckets} with \code{window} (\code{weekly} or \code{5h}),
 \code{remaining\_fraction} and \code{reset\_time}, and shows the percentage used,
@@ -1389,6 +1389,81 @@ Only files changed in the last 13 weeks are read. For each, \code{usage-weeks.js
 offset read to (only whole lines count), the last 20 message ids, and its counts per week, so a
 later scan reads only what was added. A file that got shorter is read again from the start; a file
 that's gone drops out.
+
+\subsection{Antigravity consultants}
+\label{sec:agy}
+
+With \code{provider: "antigravity"}, \code{StartConsultant} makes a consultant on Google's
+Antigravity CLI instead of the Codex daemon. There is no daemon: each message runs one
+\code{agy -p} process in the background, and nouez keeps the state in files under
+\code{agy/} in its cache folder. \code{agy/}\textit{id}\code{/consultant.json} holds the name,
+folder, model, title and standing instructions. \code{turns/}\textit{turn}\code{.json} holds a
+turn's process id and start time, its model and the message as shown in history, beside its
+\code{.in}, \code{.out} and \code{.err} files. The id is a UUID nouez makes; agy's own
+conversation id comes from the first turn's events. Names are
+\code{agy-}\textit{folder}\code{-}\textit{last 6 of the id}; the other tools try these names
+first and fall back to Codex.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[x=0.92cm,y=0.7cm]
+  \lifelines{0/Claude Code/cc, 5/nouez/nz, 10.5/agy -p/cx, 15.5/Files/os}{6.6}
+  \msg{1.2}{0}{5}{tools/call SendConsultantMessage}
+  \msg{2.1}{5}{15.5}{write turn .json and .in}
+  \msg{3.0}{5}{10.5}{start, detached; stdin from .in}
+  \ret{3.9}{10.5}{15.5}{events to .out}
+  \msg{4.8}{5}{15.5}{poll .out and the process}
+  \ret{5.8}{5}{0}{reply, or turn id and waiter}
+\end{tikzpicture}
+\caption{One message to an Antigravity consultant. The process outlives nouez, so a reconnect or
+a waiter finds the turn from its files.}
+\end{figure}
+
+\begin{wire}[nouez $\rightarrow$ agy: command line, then the one line on stdin]
+agy --input-format stream-json --output-format stream-json --disable-slash-commands
+    --model gemini-4-neon-high --print-timeout 30m --settings <deny rules>
+    [--conversation <agy conversation id>] -p ""
+{"event": "user", "message": {"content": "<preamble, instructions and message>"}}
+\end{wire}
+
+\begin{wire}[The deny rules: the value of the settings flag]
+{"permissions": {"deny": ["write_file(*)", "command(*)", "mcp(*)", "execute_url(*)"]}}
+\end{wire}
+
+Probed against agy 1.5.14: \code{write\_file(*)} blocks every editing tool (\code{write\_to\_file},
+\code{replace}, \code{multi\_replace}), inside and outside the folder; \code{command(*)} blocks
+\code{run\_command}. Subagents and the browser tools aren't available in \code{-p} mode. The
+\code{schedule} tool has no deny rule or setting; the first message's preamble asks the model not
+to use it, and \code{-{}-print-timeout} bounds a turn that waits on it.
+
+Each output line is an event with \code{event} and \code{conversation\_id}, and an object named
+after the event. nouez reads:
+
+\begin{itemize}
+\item \code{init}, for agy's conversation id;
+\item \code{step\_update}: \code{text\_delta}, for the output so far;
+\item \code{result}: \code{status}, \code{response}, \code{duration\_seconds} and
+  \code{finished\_reason};
+\item \code{result.usage}: \code{input\_tokens}, \code{output\_tokens}, \code{thinking\_tokens},
+  \code{cache\_read\_tokens} and \code{total\_tokens}.
+\end{itemize}
+
+A turn is
+\code{completed} on a \code{SUCCESS} result, \code{interrupted} when \code{finished\_reason} is
+\code{print\_timeout} or nouez stopped it, and \code{failed} on another status or when the process
+ended without a result (with the last lines of \code{.err}). Without a result, it is
+\code{inProgress} while its process runs, checked by process id and start time, or for 30\,s after
+the turn started while the process can't be seen yet.
+
+A message sent while a turn runs is refused, since agy can't steer one. The first message carries
+a read-only preamble and the standing instructions; later ones pass \code{-{}-conversation}. A
+\code{model} or \code{effort} on \code{SendConsultantMessage} picks the id from
+\code{agy models} (cached an hour): the family with the level appended, such as
+\code{gemini-4-neon-low}. \code{StopConsultant} ends a running turn with
+\code{taskkill /F /T} and marks the turn and the consultant stopped; the files stay, and agy keeps the
+conversation. Replies are logged with \code{provider: "antigravity"} and \code{tokens}, and each
+send with Antigravity's quota groups under \code{usage.antigravity}. \code{top} adds their
+\code{output\_tokens} per week as Gemini.
 
 \subsection{Claude Code sessions}
 \label{sec:claude-tools}
@@ -1704,6 +1779,10 @@ Default \code{wait} & 5 s / 0 s & SendConsultantMessage / GetConsultantReply \\
 \code{AA\_RETRY\_SECONDS} & 6 h & wait after a failed fetch of model scores \\
 \code{AA\_SHOWN} & 8 & top-scoring models shown per maker \\
 \code{CLAUDE\_USAGE\_STALE} & 30 min & age at which Claude Code's saved usage is flagged \\
+\code{AGY\_TURN\_LIMIT} & 30 min & \code{-{}-print-timeout} of an Antigravity turn \\
+\code{AGY\_START\_GRACE} & 30 s & a turn with no process seen yet counts as running \\
+\code{AGY\_MODELS\_SECONDS} & 1 h & how long the list from \code{agy models} is used \\
+\code{AGY\_USAGE\_SECONDS} & 60 s & wait for \code{agy -p /usage} \\
 \bottomrule
 \end{tabular}
 \end{center}

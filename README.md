@@ -18,6 +18,7 @@ The same server also helps when you drive Claude Code from your phone with Remot
 - Python 3.9+ (standard library only, nothing to install)
 - [Claude Code](https://docs.claude.com/en/docs/claude-code)
 - The [Codex CLI](https://github.com/openai/codex) on your `PATH`, logged in
+- Optional: Google's Antigravity CLI (`agy`), signed in, for consultants on Gemini models (see [Antigravity consultants](#antigravity-consultants))
 
 ### Tested with
 
@@ -25,11 +26,11 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.14.1 |
+| nouez | 0.15.0 |
 | Claude Code | 2.1.330 |
 | Codex CLI | 0.170.0 |
 | Codex app-server daemon | 0.171.0 |
-| Antigravity CLI (optional, for `top`) | 1.5.14 |
+| Antigravity CLI (optional: Antigravity consultants, its quota) | 1.5.14 |
 | Python | 3.11.9 |
 | OS | Windows 11 |
 
@@ -241,13 +242,29 @@ A verdict line first makes the reply easy to act on, and "what you didn't check"
 - **Idle consultants.** After about a minute without activity, the Codex daemon unloads a consultant. It still appears in `ListConsultants`, and the next message reloads it with the same sandbox and history.
 - **Clean up.** Ask Claude to stop consultants when you're done, so they don't pile up in your Codex session list. Stopping archives a session rather than deleting it, and closes its watch window. On Windows, only windows the bridge opened are closed. On macOS and Linux, any `codex resume <id>` process for that session is ended, and a macOS Terminal window stays open at a shell prompt.
 
+### Antigravity consultants
+
+A consultant can also run on Google's Antigravity CLI (`agy`) and its Gemini models, so a second opinion can come from a third family of models and from Google's quota instead of the Codex subscription. Claude starts one with `StartConsultant` and `provider: "antigravity"`, only when you ask or your own rules say when, and then uses it with the same tools as a Codex consultant. It starts on `gemini-4-neon` at level `high`; `model` and `effort` pick another (`ConsultantBudget` lists the models), and `SendConsultantMessage` changes them for later messages while the conversation keeps its context.
+
+How it differs from a Codex consultant:
+
+- **Read-only by agy's own rules.** Every turn runs `agy -p` with deny rules for file writes and edits, commands, MCP tools and URL actions, and with slash commands off. Its browser tools aren't available in this mode. It can read files, search and read web pages.
+- **One message at a time.** Each message runs one agy turn in the background. A message sent while a turn runs is refused, with nothing sent, since agy can't steer a running turn. Wait for the reply, or stop the consultant.
+- **No pane.** `WatchConsultant` gives the command to open its conversation in agy yourself (`agy --conversation <id>`) instead.
+- **A 30-minute limit per turn.** A turn still running then ends with what it has, reported as interrupted.
+- `StopConsultant` ends a running turn and forgets the consultant; its conversation stays in agy.
+
+nouez keeps each consultant, and each turn's input and output, in `nouez/agy/` in your cache folder. Replies are logged with their token counts, which `server.py top` shows as Gemini in the offload table.
+
 ### Usage log and status screen
 
 nouez notes each consultation in `nouez/usage-log.jsonl` in your cache folder (`%LOCALAPPDATA%` on Windows, `~/.cache` elsewhere), one JSON line per event:
 
 - **start:** a consultant started or reused, with its project and model.
 - **send:** a message: the consultant, project, model and effort, which of those it changed, whether it steered a running turn, `kind` and `reason` if Claude gave them, its length in characters, whether it quoted your words, and each subscription's usage at that moment (as `ConsultantBudget` would show it).
-- **reply:** how the turn ended: status, time taken, length, and the verdict read from the reply's first line (`yes`, `changes` or `no`).
+- **reply:** how the turn ended: status, time taken, length, and the verdict read from the reply's first line (`yes`, `changes` or `no`); for an Antigravity consultant, also its token counts.
+
+Events of Antigravity consultants carry `provider: "antigravity"`, and their sends also record Antigravity's quota at that moment.
 
 It never holds the text of a message or reply. Past 20 MB it is renamed with the date and a new one starts. Set `NOUEZ_NO_USAGE_LOG=1` in nouez's environment to turn it off.
 
@@ -261,7 +278,7 @@ It shows:
 
 - **Usage:** each Codex and Claude Code window, with a bar, the reset, and where the pace lands at the reset (red when used up or running out first, yellow over 90%). Codex is read live from the daemon once a minute; without the daemon, from Codex's last session file. Claude Code's comes from the status line file (see [Choosing a consultant](#choosing-a-consultant)). If the Antigravity CLI (`agy`) is installed, on your `PATH` or where its installer puts it on Windows, each of its quota groups too, read once a minute with `agy -p /usage`, which runs no model turn and uses no quota. The "AG Claude+GPT" group is Claude and GPT models run inside Antigravity on Google's quota, apart from Claude Code's.
 - **Consultations:** messages sent, steered and with a changed model or effort; counts by model, kind, project and verdict; the median and slowest reply times; and review loops that went past three CHANGES rounds in a row.
-- **Offload:** for each of the last 8 weeks, the output tokens of Claude Code (and its subagents) beside those of nouez consultants and of your own Codex sessions, and the share that wasn't Anthropic's; then Claude Code's output by model. These come from the Claude Code transcripts (`~/.claude/projects`) and Codex session files (`~/.codex/sessions`) on this computer. The first run reads the last 13 weeks of them, which can take a minute; the counts are kept in `nouez/usage-weeks.json` and later runs read only what was added.
+- **Offload:** for each of the last 8 weeks, the output tokens of Claude Code (and its subagents) beside those of nouez's Codex consultants, of your own Codex sessions and of Antigravity consultants (Gemini, from the usage log), and the share that wasn't Anthropic's; then Claude Code's output by model. These come from the Claude Code transcripts (`~/.claude/projects`) and Codex session files (`~/.codex/sessions`) on this computer. The first run reads the last 13 weeks of them, which can take a minute; the counts are kept in `nouez/usage-weeks.json` and later runs read only what was added.
 
 Keys: `1`, `7`, `3` or `a` to show 1, 7 or 30 days of consultations or all of them; `r` to refresh now; `q` or Esc to quit. `--days N` picks the period to start with, and `--once` prints one screen and exits. Nothing leaves your computer.
 
@@ -278,7 +295,7 @@ Keys: `1`, `7`, `3` or `a` to show 1, 7 or 30 days of consultations or all of th
 | `OpenClaudeSession` | Opens a new terminal window running an interactive Claude Code session with Remote Control in `cwd` (required), named `name` (default: the folder's name), optionally with a first `prompt`, or picking up an earlier conversation held in that folder with `resume` (a session id, or `latest`). It starts on Opus (`model`, default `opus`, the latest Opus) at medium effort (`effort`: `low`, `medium`, `high`, `xhigh` or `max`); Claude passes others only when you ask. The session saves its transcript like one you started yourself. `create: true` makes the folder if it doesn't exist. In a folder Claude Code hasn't been trusted in, it opens nothing unless `trust: true` is given (you said you trust the folder: nouez records that, after a backup) or `open_untrusted: true` (it opens a session that waits at the trust question). In a trusted folder it then checks for up to 30 seconds that the new session is running and connected to Remote Control, and says if another session was already running in that folder. |
 | `ListClaudeSessions` | Lists the interactive Claude Code sessions registered in your Claude Code config folder: name, process id, folder, status, Remote Control, and which one is the caller. |
 | `CloseClaudeSession` | Closes one of them by `name` (or `pid` when names repeat), keeping its transcript. Never the caller. |
-| `ConsultantBudget` | Shows the usage left on your Codex subscription and Claude Code's own, with reset times and pace, the Codex models and effort levels, and Artificial Analysis model scores. Reads only; see [Choosing a consultant](#choosing-a-consultant). |
+| `ConsultantBudget` | Shows the usage left on your Codex subscription and Claude Code's own and, with `agy` installed, Antigravity's quota groups, with reset times and pace; the Codex and Antigravity models and their levels; and Artificial Analysis model scores. Reads only; see [Choosing a consultant](#choosing-a-consultant). |
 | `StopConsultant` | Archives a session that `StartConsultant` started and closes any terminal window watching it. Needs the exact name or full thread id. Refuses sessions you opened yourself. |
 
 `StartConsultant` arguments (all optional):
@@ -291,6 +308,8 @@ Keys: `1`, `7`, `3` or `a` to show 1, 7 or 30 days of consultations or all of th
 | `instructions` | | Standing instructions for the consultant's role (new sessions only) |
 | `watch` | `true` | Show the session in a pane beside Claude Code once it has its first message, and again on later messages if the pane was closed |
 | `new` | `false` | Start a new session even though a consultant already works in this project |
+| `provider` | `codex` | `antigravity` for a consultant on the Antigravity CLI (see [Antigravity consultants](#antigravity-consultants)) |
+| `effort` | `high` | Antigravity only: the model level of a new consultant |
 
 `SendConsultantMessage` arguments:
 
@@ -404,8 +423,9 @@ python -m unittest discover tests
 - Telling the caller's own session apart is thorough only on Windows, where nouez walks the whole chain of parent processes. Elsewhere it knows only its immediate parent, so if a wrapper sits between Claude Code and nouez, `CloseClaudeSession` may not recognise the caller.
 - Nothing can start a session on the computer from your phone unless something there is already running and connected: an open Claude Code session with Remote Control, for instance.
 - The trust check reads git's files, not Claude Code's code. For a worktree whose git data was moved out with `--separate-git-dir`, it says it can't tell, except when that git folder is named `.git` and sits beside other files: then nouez, like `git worktree list`, takes that folder for the main checkout.
-- `ConsultantBudget` names models as Artificial Analysis does ("GPT-6.2 Sol (high)"), not by Codex model id; matching them is left to Claude. Artificial Analysis scores API access at set effort levels, which may differ from a subscription's. Antigravity's quota is shown by `server.py top` only, not by `ConsultantBudget`.
+- `ConsultantBudget` names models as Artificial Analysis does ("GPT-6.2 Sol (high)"), not by Codex model id; matching them is left to Claude. Artificial Analysis scores API access at set effort levels, which may differ from a subscription's.
 - `server.py top` counts tokens from Claude Code's transcripts and Codex's session files, which neither documents; an update to either could change them. Output tokens only: a reply's input and cached tokens aren't counted.
+- An Antigravity consultant can't be kept from agy's `schedule` tool: agy has no deny rule or setting for it. Scheduling changes no files, but it can keep a turn waiting until the 30-minute limit. nouez tells the model not to schedule anything. agy's `-p` mode and its event stream aren't documented as stable; an agy update could change them.
 - Only the 50 most recent saved sessions are checked for unloaded consultants. Older ones can still be reached by their full thread id.
 - Uses the experimental Codex app-server protocol (`thread/start`, `thread/resume`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/name/set`, `thread/turns/list`, `thread/archive`, `turn/start`, `turn/steer`, `account/rateLimits/read`, `model/list`), which may change between Codex releases. See [Tested with](#tested-with).
 

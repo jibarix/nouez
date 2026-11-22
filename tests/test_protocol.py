@@ -26,6 +26,10 @@ import server  # noqa: E402
 # Tests never write to the user's usage log; the log's own tests turn it back on for a temp file.
 os.environ["NOUEZ_NO_USAGE_LOG"] = "1"
 
+# Tests never see the user's own Antigravity consultants; AgyTest points this at its own folder.
+_AGY_EMPTY = tempfile.mkdtemp(prefix="nouez-test-agy-")
+server.agy_root = lambda: os.path.join(_AGY_EMPTY, "agy")
+
 server.CONNECT_SECONDS = 0  # OpenClaudeSession tests look for the new session once, not for 15 s
 
 
@@ -1903,7 +1907,7 @@ class AdditionsTest(HandlerTest):
         self.assertNotIn("until changed", out)
         self.use(FakeDaemon([thread], answer="the answer"))
         out = server.send_consultant_message({"to": thread["id"], "message": "hi"})
-        self.assertIn("\n\n(codex-nouez-runs01 runs on model gpt-6.1-sol, effort high.)", out)
+        self.assertIn(f"\n\n({server.short_name(thread)} runs on model gpt-6.1-sol, effort high.)", out)
 
     def test_owner_words_and_revision_are_added_only_when_asked(self):
         thread = self.consultant("ownr01")
@@ -2134,9 +2138,11 @@ class BudgetTest(unittest.TestCase):
     def test_handler_reports_codex_failure_inline(self):
         with mock.patch.object(server, "CodexClient", side_effect=server.BridgeError("daemon down")), \
              mock.patch.object(server, "claude_budget", return_value=["Claude Code: x"]), \
-             mock.patch.object(server, "aa_scores", return_value=({}, "no key")):
+             mock.patch.object(server, "aa_scores", return_value=({}, "no key")), \
+             mock.patch.object(server, "agy_budget", return_value=["Antigravity (Google): y"]):
             out = server.consultant_budget({})
         self.assertIn("Codex: usage unavailable (daemon down).", out)
+        self.assertIn("Antigravity (Google): y", out)
         self.assertIn("Claude Code: x", out)
         self.assertIn("Model scores: no key.", out)
 
@@ -2402,6 +2408,269 @@ class UsageLogTest(HandlerTest):
             open(os.path.join(d, "agy", "bin", "agy.exe"), "w").close()
             want = os.path.join(d, "agy", "bin", "agy.exe") if os.name == "nt" else None
             self.assertEqual(server.agy_command({"PATH": "x", "LOCALAPPDATA": d}), want)
+
+def agy_lines(*events):
+    return "".join(json.dumps(e) + "\n" for e in events)
+
+
+AGY_INIT = {"event": "init", "conversation_id": "conv-1234-abcd", "init": {"model": "gemini-4-neon-high"}}
+
+
+def agy_result(text, status="SUCCESS", **extra):
+    return {"event": "result", "result": {"conversation_id": "conv-1234-abcd", "status": status, "response": text,
+                                          "duration_seconds": 7.5, "usage": {"input_tokens": 900, "output_tokens": 120,
+                                                                             "thinking_tokens": 80, "total_tokens": 1020},
+                                          **extra}}
+
+
+class AgyTest(unittest.TestCase):
+    """0.15.0: consultants on the Antigravity CLI, with a fake agy process."""
+
+    MODELS = ["gemini-4-neon-high", "gemini-4-neon-low", "gemini-4-neon-xhigh", "gemini-pro-orchestrator-neon",
+              "gemini-3.8-flash-low"]
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.work, True)
+        for name, value in (("nouez_cache_dir", lambda: self.dir), ("agy_root", lambda: os.path.join(self.dir, "agy")),
+                            ("agy_command", lambda env=None: "agy"), ("agy_models", lambda env=None, now=None: self.MODELS),
+                            ("agy_spawn", self.spawn), ("POLL_SECONDS", 0.01), ("CodexClient", FakeDaemon([])), ("read_agy_usage", lambda: None),
+                            ("revision_line", lambda cwd: "[Revision: commit abc]\n")):
+            patcher = mock.patch.object(server, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        self.log = os.path.join(self.dir, server.USAGE_LOG_FILE)
+        self.runs = []      # (argv, cwd, stdin text) per spawned turn
+        self.replies = []   # what each fake run writes: a list of events, or None to keep running
+        self.running = False
+
+    def spawn(self, argv, cwd, stdin_path, out_path, err_path):
+        with open(stdin_path, encoding="utf-8") as f:
+            self.runs.append((argv, cwd, f.read()))
+        events = self.replies.pop(0) if self.replies else None
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(agy_lines(AGY_INIT, *(events or [])))
+        open(err_path, "w").close()
+        self.running = events is None
+        return mock.Mock(pid=4242)
+
+    def alive(self, pid, start=None):
+        return self.running
+
+    def start(self, **args):
+        out = server.start_consultant({"cwd": self.work, "provider": "antigravity", **args})
+        return out, out.split()[1].rstrip(",.")
+
+    def events(self):
+        with open(self.log, encoding="utf-8") as f:
+            return [json.loads(line) for line in f]
+
+    def test_model_ids(self):
+        known = self.MODELS
+        self.assertEqual(server.agy_model_id("gemini-4-neon-high", known=known), "gemini-4-neon-high")
+        self.assertEqual(server.agy_model_id("gemini-4-neon-high", effort="low", known=known), "gemini-4-neon-low")
+        self.assertEqual(server.agy_model_id("gemini-4-neon-low", "gemini-4-neon", known=known), "gemini-4-neon-low")
+        self.assertEqual(server.agy_model_id("gemini-4-neon-high", "gemini-3.8-flash", "low", known), "gemini-3.8-flash-low")
+        self.assertEqual(server.agy_model_id("gemini-4-neon-high", "gemini-pro-orchestrator-neon", known=known),
+                         "gemini-pro-orchestrator-neon")
+        self.assertEqual(server.agy_model_id("gemini-4-neon-high", "gemini-4-neon-xhigh"), "gemini-4-neon-xhigh")
+        with self.assertRaisesRegex(server.BridgeError, "has no model 'gemini-3.8-flash-high'. It lists"):
+            server.agy_model_id("gemini-4-neon-high", "gemini-3.8-flash", known=known)
+        with self.assertRaisesRegex(server.BridgeError, "`effort` must be one of"):
+            server.agy_model_id("gemini-4-neon-high", effort="ultra")
+        with self.assertRaisesRegex(server.BridgeError, "`model` must be an Antigravity model id"):
+            server.agy_model_id("gemini-4-neon-high", "Gemini 4; rm -rf")
+        self.assertEqual(server.agy_model_families(known),
+                         "gemini-4-neon (low, high, xhigh), gemini-pro-orchestrator-neon, gemini-3.8-flash (low)")
+
+    def test_start_reuse_and_provider(self):
+        with self.assertRaisesRegex(server.BridgeError, "`provider` must be one of codex, antigravity"):
+            server.start_consultant({"cwd": self.work, "provider": "gemini"})
+        out, name = self.start(effort="low", title="t", instructions="Be brief.")
+        self.assertTrue(name.startswith("agy-"))
+        self.assertIn("model: gemini-4-neon-low (Antigravity)", out)
+        self.assertIn("read-only", out)
+        again, same = self.start(model="gemini-4-neon")
+        self.assertEqual(same, name)
+        self.assertIn("nothing new was started", again)
+        self.assertIn("Ignored model", again)
+        _, other = self.start(new=True)
+        self.assertNotEqual(other, name)
+        listed = server.list_consultants({"cwd": self.work})
+        self.assertIn("2 Antigravity consultant(s)", listed)
+        self.assertIn(name, listed)
+        self.assertEqual([e["provider"] for e in self.events() if e["event"] == "start"], ["antigravity"] * 2)
+        with mock.patch.object(server, "agy_command", lambda env=None: None):
+            with self.assertRaisesRegex(server.BridgeError, "Antigravity CLI .* can't be found"):
+                server.start_consultant({"cwd": tempfile.gettempdir(), "provider": "antigravity", "new": True})
+
+    def test_send_reply_history_stop(self):
+        _, name = self.start(instructions="Answer in French.")
+        self.replies = [[{"event": "step_update", "step_update": {"text_delta": "pomme"}}, agy_result("pomme\n")]]
+        out = server.send_consultant_message({"to": name, "message": "Which fruit?", "wait": 5, "kind": "quick-check",
+                                              "owner_words": "fruit?", "revision": True})
+        self.assertIn(f"Reply from {name}:\n\npomme", out)
+        argv, cwd, sent = self.runs[0]
+        self.assertEqual(cwd, self.work)
+        self.assertEqual(argv[-2:], ["-p", ""])
+        self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), server.AGY_READ_ONLY)
+        self.assertIn("--disable-slash-commands", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-4-neon-high")
+        self.assertEqual(argv[argv.index("--print-timeout") + 1], server.AGY_TURN_LIMIT)
+        self.assertNotIn("--conversation", argv)
+        content = json.loads(sent)["message"]["content"]
+        self.assertEqual(json.loads(sent)["event"], "user")
+        self.assertTrue(content.startswith(server.AGY_PREAMBLE))
+        self.assertIn("<<<\nAnswer in French.\n>>>", content)
+        self.assertIn("[Message from Claude Code via the consultants bridge]\n[Revision: commit abc]", content)
+        self.assertIn("The user's own words, as they typed them:\n<<<\nfruit?\n>>>", content)
+
+        # The next turn continues the conversation, on a new level, without the preamble; it runs on.
+        self.replies = [None]
+        with mock.patch.object(server, "pid_alive", self.alive):
+            out = server.send_consultant_message({"to": name, "message": "And now?", "effort": "low", "wait": 0})
+            self.assertIn("Delivered to", out)
+            self.assertIn(f"server.py wait {server.agy_resolve(name)['id']} ", out)
+            argv, _, sent = self.runs[1]
+            self.assertEqual(argv[argv.index("--conversation") + 1], "conv-1234-abcd")
+            self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), server.AGY_READ_ONLY)  # every turn
+            self.assertEqual(argv[argv.index("--model") + 1], "gemini-4-neon-low")
+            self.assertFalse(json.loads(sent)["message"]["content"].startswith(server.AGY_PREAMBLE))
+            with self.assertRaisesRegex(server.BridgeError, "still working on turn .* nothing was sent"):
+                server.send_consultant_message({"to": name, "message": "Third", "wait": 0})
+            self.assertEqual(len(self.runs), 2)
+            busy = server.get_consultant_reply({"to": name})
+            self.assertIn("this is not a reply", busy)
+            self.assertIn("status: busy", server.list_consultants({}))
+            history = server.get_consultant_history({"to": name})
+            self.assertRegex(history, r"\[inProgress, .*\] from Claude Code: \"And now\?\"")
+            self.assertRegex(history, r"\[completed, .*took 7s\] from Claude Code \(with the user's words\): "
+                                      r"\"Which fruit\?\" -> \"pomme\"")
+            self.assertEqual(server.agy_resolve(name)["model"], "gemini-4-neon-low")
+            with mock.patch.object(server, "run_text") as kill:
+                stopped = server.stop_consultant({"to": name})
+            if os.name == "nt":
+                self.assertEqual(kill.call_args.args[0][:4], ["taskkill", "/F", "/T", "/PID"])
+        self.assertIn("Ended its running turn", stopped)
+        self.assertIn("agy --conversation conv-1234-abcd", stopped)
+        self.assertIsNone(server.agy_resolve(name))
+        cid = [e for e in self.events() if e["event"] == "start"][0]["thread"]
+        last = server.agy_turns(cid, 1)[0]
+        self.assertEqual(last["status"], "interrupted")
+
+        # The log: sends with provider and model, a reply with tokens. Never the message text.
+        time.sleep(0.2)  # the send's usage snapshot is written from a thread
+        events = self.events()
+        sends = [e for e in events if e["event"] == "send"]
+        self.assertEqual([(e["provider"], e["model"], e["effort"]) for e in sends],
+                         [("antigravity", "gemini-4-neon-high", "high"), ("antigravity", "gemini-4-neon-low", "low")])
+        self.assertEqual(sends[1]["changed"], ["model"])
+        reply = [e for e in events if e["event"] == "reply"][0]
+        self.assertEqual((reply["provider"], reply["tokens"]["output_tokens"], reply["ms"]), ("antigravity", 120, 7500))
+        with open(self.log, encoding="utf-8") as f:
+            self.assertNotIn("Which fruit", f.read())
+
+    def test_turn_outcomes(self):
+        _, name = self.start()
+        cid = server.agy_resolve(name)["id"]
+        cases = [
+            ([agy_result("", status="ERROR", error="quota exhausted")], "failed", "Antigravity: quota exhausted"),
+            ([agy_result("half", finished_reason="print_timeout")], "interrupted", "Antigravity ended the turn at nouez's 30m limit"),
+            ([], "failed", "agy ended without a result: boom"),
+        ]
+        for events, status, error in cases:
+            with self.subTest(status=status, error=error):
+                self.replies = [events]
+                with mock.patch.object(server, "pid_alive", lambda pid, start=None: False):
+                    server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+                    tid = server.agy_turn_ids(cid)[0]
+                    with open(os.path.join(server.agy_folder(cid), "turns", tid + ".err"), "w") as f:
+                        f.write("starting\nboom\n")
+                    out = server.get_consultant_reply({"to": name})
+                self.assertIn(f"turn {tid} {status}. {error}", out)
+                if status == "failed":
+                    self.assertIn("failed in Antigravity", out)
+                    self.assertNotIn("Codex", out)
+
+    def test_waiter_and_watch(self):
+        _, name = self.start()
+        rec = server.agy_resolve(name)
+        self.replies = [[agy_result("done here")]]
+        server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+        tid = server.agy_turn_ids(rec["id"])[0]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(server.run_waiter(rec["id"], tid), 0)
+            self.assertEqual(server.run_waiter(rec["id"], "0199aaaa-0000-0000-0000-000000000000"), 1)
+        self.assertIn("The consultant's turn has ended (Antigravity consultant", out.getvalue())
+        self.assertIn("done here", out.getvalue())
+        self.assertIn("has no turn 0199aaaa", out.getvalue())
+        watch = server.watch_consultant({"to": name})
+        self.assertIn("no live pane", watch)
+        self.assertIn("agy --conversation conv-1234-abcd", watch)
+        self.assertIn("characters 2-9 of 9", server.get_consultant_reply({"to": name, "offset": 2}))
+
+    def test_conversation_id_is_never_an_option(self):
+        _, name = self.start()
+        cid = server.agy_resolve(name)["id"]
+        for conv, want in (("--dangerously-skip-permissions", None), ("-abcdefgh", None), ("short", None),
+                           ("a b c d e f g h", None), ("conv-1234-abcd", "conv-1234-abcd")):
+            with self.subTest(conv=conv):
+                self.replies = [[agy_result("ok")]]
+                with mock.patch.object(server, "pid_alive", lambda pid, start=None: False):
+                    server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+                # The newest turn's events name this conversation; older turns name only rejected ones.
+                with open(os.path.join(server.agy_folder(cid), "turns", server.agy_turn_ids(cid)[0] + ".jsonl"),
+                          "w", encoding="utf-8") as f:
+                    f.write(agy_lines({"event": "result", "conversation_id": conv, "result": {"status": "SUCCESS"}}))
+                self.assertEqual(server.agy_conversation(cid), want)
+
+    def test_resolve(self):
+        _, a = self.start()
+        _, b = self.start(new=True)
+        ra, rb = server.agy_resolve(a), server.agy_resolve(b)
+        self.assertEqual(server.agy_resolve(ra["id"][-6:]), ra)
+        self.assertEqual(server.agy_resolve(ra["id"][:8]) if ra["id"][:8] != rb["id"][:8] else ra, ra)
+        self.assertIsNone(server.agy_resolve(ra["id"][-6:], exact_only=True))
+        self.assertIsNone(server.agy_resolve("codex-nouez-abcdef"))
+        self.assertIsNone(server.agy_resolve(""))
+
+    def test_budget_and_offload(self):
+        now = time.time()
+
+        def reset(secs):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + secs))
+        live = {"groups": [{"name": "Gemini Models", "buckets": [
+            {"window": "weekly", "remaining_fraction": 0.75, "reset_time": reset(3 * 86400)}]}]}
+        text = "\n".join(server.agy_budget(now, live))
+        self.assertIn("Antigravity (Google;", text)
+        self.assertRegex(text, r"Gemini Models: weekly window: 25(\.0)?% used")
+        self.assertIn("gemini-4-neon (low, high, xhigh)", text)
+        self.assertEqual(server.agy_budget(now, {"error": "agy: not signed in"}),
+                         ["Antigravity: usage not known (agy: not signed in)."])
+        with mock.patch.object(server, "read_agy_usage", lambda: None):
+            self.assertEqual(server.agy_budget(now), [])
+        self.assertEqual(server.agy_snapshot(live["groups"]), {"AG Gemini": {"weekly": 25.0}})
+
+        week = server.week_of(now)
+        replies = [{"event": "reply", "ts": now, "turn": "t1", "provider": "antigravity", "tokens": {"output_tokens": 3000}},
+                   {"event": "reply", "ts": now, "turn": "t1", "provider": "antigravity", "tokens": {"output_tokens": 3000}},
+                   {"event": "reply", "ts": now, "turn": "t2", "status": "completed", "ms": 10}]
+        summary = server.log_summary(replies)
+        self.assertEqual(summary["gemini_week"], {week: 3000})
+        scr = server.Screen(False)
+        weeks = {week: {"claude": 9000, "subagents": 0, "consultants": 0, "codex": 0, "models": {}}}
+        rows = "\n".join(server.offload_rows(scr, weeks, {}, False, summary["gemini_week"]))
+        self.assertIn("Gemini", rows)
+        self.assertRegex(rows, week + r" .* 3k .* 25%")
+        only = "\n".join(server.offload_rows(scr, {}, {}, False, {week: 1000}))
+        self.assertRegex(only, week + r" .*100%")
+
 
 if __name__ == "__main__":
     unittest.main()

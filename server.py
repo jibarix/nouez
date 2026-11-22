@@ -43,9 +43,10 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.14.1"
+SERVER_VERSION = "0.15.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -751,7 +752,11 @@ def format_turn(name, turn, limit=MAX_REPLY_CHARS):
     if turn["status"] != "completed":
         err = (turn.get("error") or {}).get("message", "")
         hint = ""
-        if turn["status"] == "interrupted":
+        if turn.get("provider") == "antigravity":
+            hint = ("" if turn["status"] == "interrupted" else
+                    "\nThe turn failed in Antigravity (the error above is agy's), not in nouez. Sending the "
+                    "message again is safe: the consultant keeps its conversation.")
+        elif turn["status"] == "interrupted":
             hint = (f"\nIf Codex carries this turn on (as after a daemon restart), GetConsultantReply with turn_id "
                     f"{turn['id']} follows it there, unless a message has since been sent into that turn; then "
                     f"GetConsultantHistory lists it as \"Codex carrying on the work of turn ...\": read it by its "
@@ -2248,26 +2253,49 @@ def format_threads(threads):
 
 def list_consultants(args, cancel=None, progress=None):
     include_all = flag(args, "include_all")
-    client = CodexClient()
+    if args.get("cwd"):
+        root, agy = agy_repo_consultants(args["cwd"])
+    else:
+        root, agy = None, agy_consultants()
+    codex_note = ""
     try:
-        if args.get("cwd"):
-            root, threads = repo_consultants(client, args["cwd"])
-        else:
-            root, threads = None, load_consultants(client, include_all)
-    finally:
-        client.close()
-    if not threads:
-        where = f" in {root}" if root else ""
+        client = CodexClient()
+        try:
+            if args.get("cwd"):
+                root, threads = repo_consultants(client, args["cwd"])
+            else:
+                threads = load_consultants(client, include_all)
+        finally:
+            client.close()
+    except BridgeError as e:
+        if not agy:
+            raise
+        threads, codex_note = [], f"Codex sessions unavailable: {e}"
+    where = f" in {root}" if root else ""
+    if not threads and not agy:
         return f"No Codex sessions{where}. Start one with StartConsultant, or open Codex in a terminal."
-    if root:
-        return f"{len(threads)} Codex session(s) in {root}:\n" + format_threads(threads)
-    return f"{len(threads)} Codex session(s):\n" + format_threads(threads)
+    parts = []
+    if threads:
+        parts.append(f"{len(threads)} Codex session(s){where}:\n" + format_threads(threads))
+    elif codex_note:
+        parts.append(codex_note)
+    if agy:
+        parts.append(f"{len(agy)} Antigravity consultant(s){where}:\n" + format_agy(agy))
+    return "\n".join(parts)
+
+
+PROVIDERS = ("codex", "antigravity")
 
 
 def start_consultant(args, cancel=None, progress=None):
     cwd = os.path.abspath(args.get("cwd") or default_cwd())
     if not os.path.isdir(cwd):
         raise BridgeError(f"cwd is not a directory: {cwd}")
+    provider = args.get("provider") or "codex"
+    if provider not in PROVIDERS:
+        raise BridgeError(f"`provider` must be one of {', '.join(PROVIDERS)}, not {provider!r}.")
+    if provider == "antigravity":
+        return start_agy_consultant(args, cwd)
     # Consultants audit, validate and research; they never edit. No terminal is attached to
     # answer approval prompts, so never ask; the read-only sandbox is the limit.
     params = {"cwd": cwd, "sandbox": SANDBOX, "approvalPolicy": "never", "threadSource": BRIDGE_SOURCE}
@@ -2411,6 +2439,9 @@ def send_consultant_message(args, cancel=None, progress=None):
     if owner_words:
         message = (f"The user's own words, as they typed them:\n<<<\n{owner_words}\n>>>\n\n"
                    f"The rest of this message is {sender}'s.\n\n{message}")
+    agy = agy_resolve(to)
+    if agy:
+        return send_agy_message(agy, args, message, sender, owner_words, timeout, kind, reason, cancel, progress)
 
     client = CodexClient()
     try:
@@ -2516,6 +2547,9 @@ def get_consultant_reply(args, cancel=None, progress=None):
     to = target(args)
     timeout = wait_seconds(args, 0)
     offset = count_arg(args, "offset", 0)
+    agy = agy_resolve(to)
+    if agy:
+        return get_agy_reply(agy, args, timeout, offset, cancel, progress)
     client = CodexClient()
     try:
         thread = resolve(client, to)
@@ -2568,6 +2602,9 @@ HISTORY_DEFAULT = 20
 def get_consultant_history(args, cancel=None, progress=None):
     to = target(args)
     limit = count_arg(args, "limit", HISTORY_DEFAULT, 1, REPLY_LOOKBACK)
+    agy = agy_resolve(to)
+    if agy:
+        return agy_history(agy, limit)
     client = CodexClient()
     try:
         thread = resolve(client, to)
@@ -2586,6 +2623,13 @@ def get_consultant_history(args, cancel=None, progress=None):
 
 def watch_consultant(args, cancel=None, progress=None):
     to = target(args)
+    agy = agy_resolve(to)
+    if agy:
+        conv = agy_conversation(agy["id"])
+        return (f"{agy['name']} is an Antigravity consultant: it has no live pane, since each message runs "
+                "one agy turn in the background. GetConsultantHistory lists its turns."
+                + (f" To open its conversation in agy yourself, run agy --conversation {conv} "
+                   f"in {agy.get('cwd')}." if conv else ""))
     client = CodexClient()
     try:
         thread = resolve(client, to)
@@ -2610,6 +2654,9 @@ def watch_consultant(args, cancel=None, progress=None):
 
 def stop_consultant(args, cancel=None, progress=None):
     to = target(args)
+    agy = agy_resolve(to, exact_only=True)
+    if agy:
+        return stop_agy_consultant(agy)
     client = CodexClient()
     try:
         thread = resolve(client, to, exact_only=True)
@@ -2938,6 +2985,9 @@ def consultant_budget(args, cancel=None, progress=None):
     out.append("")
     out += claude_budget(now)
     out.append("")
+    agy = agy_budget(now)
+    if agy:
+        out += agy + [""]
     check_cancel(cancel)
     cache, note = aa_scores(now, refresh=flag(args, "refresh"))
     out += aa_lines(cache, note, now)
@@ -3055,7 +3105,9 @@ def record_reply(thread_id, name, turn, path=None):
     reply = turn_reply(turn)
     record_usage({"event": "reply", "consultant": name, "thread": thread_id, "turn": turn.get("id"),
                   "status": turn.get("status"), "ms": number(turn.get("durationMs")),
-                  "chars": len(reply), "verdict": verdict_of(reply)}, path)
+                  "chars": len(reply), "verdict": verdict_of(reply),
+                  **({"provider": turn["provider"]} if turn.get("provider") else {}),
+                  **({"tokens": turn["usage"]} if isinstance(turn.get("usage"), dict) else {})}, path)
 
 
 # --- Status screen: `server.py top` ---------------------------------------------
@@ -3305,7 +3357,18 @@ def log_summary(events, since=None):
         "loops": sorted(loops, key=lambda x: -x["rounds"]),
         "reply_seconds": (median(times), sorted(times)[int(len(times) * 0.9)] if times else None),
         "per_week": count(week_of(e["ts"]) for e in sends),
+        "gemini_week": gemini_weeks(replies),
     }
+
+
+def gemini_weeks(replies):
+    """Output tokens per week of the Antigravity consultants' turns, from their reply events."""
+    weeks = collections.Counter()
+    for r in replies:
+        out = number((r.get("tokens") or {}).get("output_tokens")) if isinstance(r.get("tokens"), dict) else None
+        if r.get("provider") == "antigravity" and out:
+            weeks[week_of(r["ts"])] += int(out)
+    return weeks
 
 
 def token_text(n):
@@ -3469,7 +3532,10 @@ def agy_rows(scr, now, agy_live):
     return rows or [f"  {'Antigravity':<16}" + scr.dim("no current quota window reported")]
 
 
-AGY_READ_ONLY = {"permissions": {"deny": ["write_file(*)", "edit_file(*)", "command(*)", "mcp(*)", "schedule(*)"]}}
+# The actions agy can deny: file writes and edits (write_file covers every editing tool), commands,
+# MCP tools and URL actions. agy has no deny action for its schedule tool; see AGY_PREAMBLE.
+AGY_READ_ONLY = {"permissions": {"deny": ["write_file(*)", "command(*)", "mcp(*)", "execute_url(*)"]}}
+AGY_USAGE_SECONDS = 60  # agy -p /usage can take over 20 s on a busy computer
 
 
 def agy_command(env=None):
@@ -3494,7 +3560,7 @@ def read_agy_usage():
     try:
         done = subprocess.run([agy, "-p", "/usage", "--output-format", "json", "--settings", json.dumps(AGY_READ_ONLY)],
                               capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              stdin=subprocess.DEVNULL, timeout=30, cwd=tempfile.gettempdir(),
+                              stdin=subprocess.DEVNULL, timeout=AGY_USAGE_SECONDS, cwd=tempfile.gettempdir(),
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"error": f"agy didn't answer ({type(e).__name__})"}
@@ -3509,6 +3575,610 @@ def read_agy_usage():
         break
     last = (done.stderr.strip().splitlines() or ["no quota in its answer"])[-1]
     return {"error": f"agy: {last[:120]}"}
+
+
+# --- Antigravity consultants ---------------------------------------------------
+# A consultant on Google's Antigravity CLI (`agy`). Each message runs one `agy` process in print
+# mode, detached, so the turn outlives the call and the MCP server: the message goes in on stdin
+# (no command line limit), the NDJSON events go to a file, and the next message continues the
+# same agy conversation with --conversation. Every run carries AGY_READ_ONLY. nouez keeps, under
+# nouez/agy/<consultant id>/, the consultant's record and each turn's message, events and error
+# output, on this computer only. A turn is shaped like a Codex turn (status, items, startedAt,
+# durationMs), so the reply, history and log code is shared.
+
+AGY_PREFIX = "agy-"
+AGY_DIR = "agy"
+AGY_MODEL = "gemini-4-neon"   # the model family a new Antigravity consultant starts on
+AGY_EFFORT = "high"           # and its level
+AGY_LEVELS = ("low", "medium", "high", "xhigh", "max")
+AGY_MODEL_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{0,79}")
+AGY_MODELS_SECONDS = 60 * 60  # how long a list from `agy models` is trusted
+AGY_START_GRACE = 30          # a turn whose process can't be seen yet counts as running this long
+AGY_TURN_LIMIT = "30m"        # agy's --print-timeout: a turn still running then ends with what it has
+AGY_PREAMBLE = ("You are a read-only consultant, asked by another AI agent through the nouez bridge. "
+                "You can read files, search and read web pages; writing or editing files, running "
+                "commands and MCP tools are denied by the user's settings, so don't try them. Don't "
+                "schedule tasks or start background work: the turn ends when you reply. Answer in your reply.")
+_agy_models = {"at": 0, "ids": None}
+_agy_guard = threading.Lock()
+
+
+def agy_root():
+    return os.path.join(nouez_cache_dir(), AGY_DIR)
+
+
+def agy_folder(cid):
+    return os.path.join(agy_root(), cid)
+
+
+def read_json_file(path, limit=1024 * 1024):
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = json.loads(f.read(limit))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def agy_consultants(include_stopped=False):
+    """Every Antigravity consultant nouez started on this computer, newest first."""
+    found = []
+    try:
+        names = os.listdir(agy_root())
+    except OSError:
+        return []
+    for cid in names:
+        if not FULL_ID.fullmatch(cid):
+            continue
+        rec = read_json_file(os.path.join(agy_root(), cid, "consultant.json"))
+        if rec and rec.get("id") == cid and (include_stopped or not rec.get("stopped")):
+            found.append(rec)
+    return sorted(found, key=lambda r: r.get("created") or 0, reverse=True)
+
+
+def agy_save(rec):
+    write_json_atomic(os.path.join(agy_folder(rec["id"]), "consultant.json"), rec)
+
+
+def agy_resolve(to, exact_only=False):
+    """The Antigravity consultant `to` names (its name, id, or a unique id prefix or suffix), or
+    None if it names none, so the caller can look among Codex sessions instead."""
+    if not isinstance(to, str) or not to:
+        return None
+    recs = agy_consultants()
+    for rec in recs:
+        if to in (rec.get("name"), rec.get("id")):
+            return rec
+    if exact_only or len(to) < 6 or not re.fullmatch(r"[0-9a-f-]+", to):
+        return None
+    hits = [r for r in recs if r["id"].startswith(to) or r["id"].endswith(to)]
+    if len(hits) > 1:
+        raise BridgeError(f"{to!r} matches several Antigravity consultants: "
+                          + ", ".join(r["name"] for r in hits) + ". Use the full name.")
+    return hits[0] if hits else None
+
+
+def agy_models(env=None, now=None):
+    """The model ids `agy models` lists (no model turn), kept for an hour; None if it can't be read."""
+    now = now or time.time()
+    with _agy_guard:
+        if _agy_models["ids"] is not None and now - _agy_models["at"] < AGY_MODELS_SECONDS:
+            return _agy_models["ids"]
+    exe = agy_command(env)
+    if not exe:
+        return None
+    try:
+        p = subprocess.run([exe, "models"], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", stdin=subprocess.DEVNULL, timeout=30,
+                           cwd=tempfile.gettempdir(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    ids = [line.split("\t", 1)[0].strip() for line in p.stdout.splitlines() if "\t" in line]
+    ids = [i for i in ids if AGY_MODEL_NAME.fullmatch(i)]
+    if not ids:
+        return None
+    with _agy_guard:
+        _agy_models.update(at=now, ids=ids)
+    return ids
+
+
+def agy_level(model):
+    """The level a model id ends in (gemini-4-neon-high -> high), or None."""
+    tail = model.rsplit("-", 1)[-1] if "-" in model else ""
+    return tail if tail in AGY_LEVELS else None
+
+
+def agy_base(model):
+    return model.rsplit("-", 1)[0] if agy_level(model) else model
+
+
+def agy_model_id(current, model=None, effort=None, known=None):
+    """The model id to run: `model` (a family such as gemini-4-neon, or a full id such as
+    gemini-4-neon-high) at level `effort`, each defaulting to the consultant's `current` model.
+    With the list of known ids, prefer an id that exists, so a model without levels stays as is."""
+    for key, value in (("model", model), ("effort", effort)):
+        if value not in (None, "") and (not isinstance(value, str) or not AGY_MODEL_NAME.fullmatch(value)):
+            raise BridgeError(f"`{key}` must be an Antigravity {'model id' if key == 'model' else 'level'}, "
+                              f"such as {'gemini-4-neon' if key == 'model' else 'high'}, not {value!r}.")
+    if effort and effort not in AGY_LEVELS:
+        raise BridgeError(f"`effort` must be one of {', '.join(AGY_LEVELS)} for an Antigravity consultant, "
+                          f"not {effort!r}; which levels a model has, `agy models` lists.")
+    base = agy_base(model or current)
+    level = effort or (agy_level(model) if model else None) or agy_level(current)
+    candidates = [f"{base}-{level}" if level else base]
+    if model and not effort:
+        candidates.insert(0, model)  # a full id given as is
+    if known:
+        for c in candidates:
+            if c in known:
+                return c
+        raise BridgeError(f"Antigravity has no model {candidates[-1]!r}. It lists: {', '.join(known)}.")
+    return candidates[0]
+
+
+def pid_alive(pid, start=None):
+    """Whether the process is still running (and, on Windows, is the one started at `start`)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        now = process_start(pid)
+        return now is not None and (start is None or now == start)
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def agy_turn_ids(cid):
+    """The consultant's turn ids, newest first."""
+    folder = os.path.join(agy_folder(cid), "turns")
+    metas = []
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    for name in names:
+        if name.endswith(".json") and FULL_ID.fullmatch(name[:-5]):
+            meta = read_json_file(os.path.join(folder, name))
+            if meta:
+                metas.append((meta.get("started") or 0, name[:-5]))
+    return [tid for _, tid in sorted(metas, reverse=True)]
+
+
+def agy_events(path):
+    """The NDJSON events an agy run has written so far; a half-written last line is skipped."""
+    events = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and isinstance(e.get("event"), str):
+                    events.append(e)
+    except OSError:
+        pass
+    return events
+
+
+def agy_turn(cid, turn_id, now=None):
+    """A turn in the shape Codex gives one, or None if the consultant has no such turn."""
+    folder = os.path.join(agy_folder(cid), "turns")
+    meta = read_json_file(os.path.join(folder, turn_id + ".json"))
+    if not meta:
+        return None
+    try:
+        with open(os.path.join(folder, turn_id + ".in"), encoding="utf-8") as f:
+            sent = json.loads(f.readline())["message"]["content"]
+    except (OSError, ValueError, KeyError, TypeError):
+        sent = ""
+    events = agy_events(os.path.join(folder, turn_id + ".jsonl"))
+    result = next((e.get("result") for e in reversed(events) if e["event"] == "result"), None)
+    result = result if isinstance(result, dict) else None
+    started = number(meta.get("started")) or 0
+    now = now or time.time()
+    turn = {"id": turn_id, "provider": "antigravity", "startedAt": int(started), "model": meta.get("model"),
+            "items": [{"type": "userMessage", "content": [{"type": "text", "text": meta.get("shown") or sent}]}]}
+    conv = next((e.get("conversation_id") for e in events if isinstance(e.get("conversation_id"), str)), None)
+    if conv:
+        turn["conversation"] = conv
+    if result:
+        text = result.get("response") if isinstance(result.get("response"), str) else ""
+        turn["items"].append({"type": "agentMessage", "text": text, "phase": "final_answer"})
+        ok = result.get("status") == "SUCCESS"
+        turn["status"] = "completed" if ok else ("interrupted" if meta.get("stopped") else "failed")
+        if not ok:
+            turn["error"] = {"message": f"Antigravity: {result.get('error') or result.get('status')}"}
+        elif result.get("finished_reason") == "print_timeout":
+            turn["status"] = "interrupted"
+            turn["error"] = {"message": f"Antigravity ended the turn at nouez's {AGY_TURN_LIMIT} limit "
+                                        "(--print-timeout); the reply may be incomplete."}
+        secs = number(result.get("duration_seconds"))
+        turn["durationMs"] = int(secs * 1000) if secs is not None else None
+        if isinstance(result.get("usage"), dict):
+            turn["usage"] = {k: v for k, v in result["usage"].items() if number(v) is not None}
+        return turn
+    deltas = "".join(s.get("text_delta", "") for e in events if e["event"] == "step_update"
+                     for s in [e.get("step_update") or {}] if isinstance(s.get("text_delta"), str))
+    if deltas:
+        turn["items"].append({"type": "agentMessage", "text": deltas, "phase": "commentary"})
+    running = (not meta.get("stopped")
+               and (pid_alive(meta.get("pid"), meta.get("pid_start"))
+                    or (not meta.get("pid") and now - started < AGY_START_GRACE)))
+    if running:
+        turn["status"] = "inProgress"
+        return turn
+    turn["durationMs"] = None
+    if meta.get("stopped"):
+        turn["status"] = "interrupted"
+        turn["error"] = {"message": "Stopped by StopConsultant."}
+        return turn
+    try:
+        with open(os.path.join(folder, turn_id + ".err"), encoding="utf-8", errors="replace") as f:
+            err = [line.strip() for line in f.read()[-4000:].splitlines() if line.strip()]
+    except OSError:
+        err = []
+    turn["status"] = "failed"
+    turn["error"] = {"message": "agy ended without a result" + (f": {err[-1][:300]}" if err else ".")}
+    return turn
+
+
+def agy_turns(cid, limit):
+    turns = []
+    for tid in agy_turn_ids(cid)[:limit]:
+        t = agy_turn(cid, tid)
+        if t:
+            turns.append(t)
+    return turns
+
+
+def agy_conversation(cid):
+    """The agy conversation the consultant's turns continue, from its newest turn that has one."""
+    for tid in agy_turn_ids(cid):
+        events = agy_events(os.path.join(agy_folder(cid), "turns", tid + ".jsonl"))
+        conv = next((e.get("conversation_id") for e in events if isinstance(e.get("conversation_id"), str)), None)
+        if conv and re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z-]{7,79}", conv):  # never read as an option
+            return conv
+    return None
+
+
+def agy_detach_flags():
+    if os.name != "nt":
+        return {"start_new_session": True}
+    return {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+
+
+def agy_spawn(argv, cwd, stdin_path, out_path, err_path):
+    """Start agy detached from this process, its output going to files. On Windows, also outside
+    Claude Code's job object when the job allows it, so the turn survives a reconnect."""
+    with open(stdin_path, "rb") as fin, open(out_path, "wb") as fout, open(err_path, "wb") as ferr:
+        kwargs = dict(cwd=cwd, stdin=fin, stdout=fout, stderr=ferr, **agy_detach_flags())
+        if os.name == "nt":
+            try:
+                return subprocess.Popen(argv, **{**kwargs, "creationflags": kwargs["creationflags"] | 0x01000000})
+            except OSError:  # CREATE_BREAKAWAY_FROM_JOB refused: the job doesn't allow it
+                pass
+        return subprocess.Popen(argv, **kwargs)
+
+
+def agy_start_turn(rec, text, model, conversation, shown):
+    """Write the turn's files and start its agy process. Returns the turn id."""
+    exe = agy_command()
+    if not exe:
+        raise BridgeError("The Antigravity CLI (agy) isn't installed or can't be found: it isn't on PATH"
+                          + (" or in %LOCALAPPDATA%\\agy\\bin" if os.name == "nt" else "") + ".")
+    folder = os.path.join(agy_folder(rec["id"]), "turns")
+    os.makedirs(folder, exist_ok=True)
+    turn_id = str(uuid.uuid4())
+    base = os.path.join(folder, turn_id)
+    with open(base + ".in", "w", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps({"event": "user", "message": {"content": text}}, ensure_ascii=False) + "\n")
+    meta = {"id": turn_id, "started": round(time.time(), 3), "model": model, "shown": shown}
+    write_json_atomic(base + ".json", meta)
+    argv = [exe, "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands",
+            "--model", model, "--print-timeout", AGY_TURN_LIMIT,
+            "--settings", json.dumps(AGY_READ_ONLY, separators=(",", ":"))]
+    if conversation:
+        argv += ["--conversation", conversation]
+    argv += ["-p", ""]
+    try:
+        proc = agy_spawn(argv, rec["cwd"], base + ".in", base + ".jsonl", base + ".err")
+    except OSError as e:
+        meta["stopped"] = True
+        write_json_atomic(base + ".json", meta)
+        raise BridgeError(f"Could not start agy: {e}") from None
+    meta.update(pid=proc.pid, pid_start=process_start(proc.pid) if os.name == "nt" else None)
+    write_json_atomic(base + ".json", meta)
+    return turn_id
+
+
+def agy_wait(cid, turn_id, timeout, cancel, on_poll=None):
+    """Poll until the turn ends. Returns (done, turn)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        turn = agy_turn(cid, turn_id)
+        if turn is None:
+            raise BridgeError(f"The turn {turn_id} has gone: its files were removed.")
+        if turn["status"] != "inProgress":
+            return True, turn
+        if on_poll:
+            on_poll(turn_id, turn)
+        now = time.monotonic()
+        if now >= deadline:
+            return False, turn
+        check_cancel(cancel)
+        time.sleep(min(POLL_SECONDS, deadline - now))
+
+
+def agy_name(cwd, cid):
+    base = os.path.basename(cwd.rstrip("\\/")) or "agy"
+    return f"{AGY_PREFIX}{base}-{cid[-6:]}".lower()
+
+
+def format_agy(recs):
+    lines = []
+    for rec in recs:
+        latest = agy_turns(rec["id"], 1)
+        busy = latest and latest[0]["status"] == "inProgress"
+        lines.append(
+            f"- {rec['name']}\n"
+            f"    id: {rec['id']}\n"
+            f"    cwd: {rec.get('cwd')}\n"
+            f"    model: {rec.get('model')} (Antigravity)\n"
+            f"    status: {'busy' if busy else 'idle'}\n"
+            f"    started by: StartConsultant" + (f"\n    title: {rec['title']}" if rec.get("title") else ""))
+    return "\n".join(lines)
+
+
+def agy_repo_consultants(cwd):
+    root = repo_root(cwd)
+    return root, [r for r in agy_consultants() if r.get("cwd") and is_under(r["cwd"], root)]
+
+
+def start_agy_consultant(args, cwd):
+    new = flag(args, "new")
+    root, existing = agy_repo_consultants(cwd)
+    if existing and not new:
+        rec = existing[0]
+        recent = agy_turns(rec["id"], REPLY_LOOKBACK)
+        ignored = [k for k in ("model", "effort", "title", "instructions") if args.get(k)]
+        others = existing[1:]
+        count = f"{len(recent)}{'+' if len(recent) >= REPLY_LOOKBACK else ''} turn(s)"
+        return (f"Using {rec['name']}, which already works in {root}; nothing new was started.\n"
+                + format_agy([rec]) + "\n"
+                + f"    started: {when(rec.get('created')) or 'unknown'}; {count}\n"
+                + (f"    last turn: {describe_turn(recent[0])}\n" if recent else "")
+                + (f"Ignored {', '.join(ignored)}: they apply only to a new consultant (new=true). To change "
+                   "the model or level and keep the context, pass model or effort to SendConsultantMessage.\n"
+                   if ignored else "")
+                + "Send it work with SendConsultantMessage."
+                + (f"\nOther Antigravity consultants in this repo:\n{format_agy(others)}" if others else "")
+                + "\nOnly if the user asks for a separate consultant, call StartConsultant with new=true.")
+    if not agy_command():
+        raise BridgeError("The Antigravity CLI (agy) isn't installed or can't be found: it isn't on PATH"
+                          + (" or in %LOCALAPPDATA%\\agy\\bin" if os.name == "nt" else "") + ".")
+    model = agy_model_id(f"{AGY_MODEL}-{AGY_EFFORT}", args.get("model"), args.get("effort"), agy_models())
+    instructions = args.get("instructions") or ""
+    if not isinstance(instructions, str):
+        raise BridgeError("`instructions` must be a string.")
+    title = args.get("title") if isinstance(args.get("title"), str) else None
+    cid = str(uuid.uuid4())
+    rec = {"id": cid, "name": agy_name(cwd, cid), "cwd": cwd, "model": model, "created": round(time.time(), 3),
+           "instructions": instructions or None, "title": title}
+    os.makedirs(agy_folder(cid), exist_ok=True)
+    agy_save(rec)
+    record_usage({"event": "start", "consultant": rec["name"], "thread": cid, "new": True, "provider": "antigravity",
+                  "project": os.path.basename(os.path.normpath(cwd)) or None, "model": model})
+    ignored = " (watch doesn't apply: an Antigravity consultant has no pane)" if args.get("watch") is True else ""
+    return (f"Started {rec['name']}\n"
+            f"    id: {cid}\n"
+            f"    cwd: {cwd}\n"
+            f"    model: {model} (Antigravity)\n"
+            f"    permissions: read-only (agy denies file writes and edits, commands and MCP tools)\n"
+            f"Send it work with SendConsultantMessage{ignored}. Each message runs one agy turn; the "
+            "consultant keeps its conversation between messages.")
+
+
+def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, reason, cancel, progress):
+    """SendConsultantMessage for an Antigravity consultant."""
+    cid, name = rec["id"], rec["name"]
+    model = rec.get("model") or f"{AGY_MODEL}-{AGY_EFFORT}"
+    if args.get("model") or args.get("effort"):
+        model = agy_model_id(model, args.get("model"), args.get("effort"), agy_models())
+    stamp = revision_line(rec.get("cwd")) if flag(args, "revision") else ""
+    shown = f"[Message from {sender} via the consultants bridge]\n{stamp}\n{message}"
+    with send_lock(cid):
+        check_cancel(cancel)
+        current = agy_turns(cid, 1)
+        if current and current[0]["status"] == "inProgress":
+            raise BridgeError(
+                f"{name} is still working on turn {current[0]['id']}. An Antigravity turn can't take a "
+                f"message while it runs; nothing was sent. Read that turn's reply first (GetConsultantReply "
+                f"with turn_id {current[0]['id']}, or its waiter), then send again.")
+        conversation = agy_conversation(cid)
+        text = shown
+        if not conversation:
+            standing = (f"Standing instructions for this consultation:\n<<<\n{rec['instructions']}\n>>>\n\n"
+                        if rec.get("instructions") else "")
+            text = f"{AGY_PREAMBLE}\n\n{standing}{shown}"
+        turn_id = agy_start_turn(rec, text, model, conversation, shown)
+        changed = model != rec.get("model")
+        if changed:
+            rec = {**rec, "model": model}
+            agy_save(rec)
+    mode = f"started a new turn on {model}" + (", which the consultant keeps for later messages until changed"
+                                                if changed else "")
+    if not usage_log_off():
+        event = {"event": "send", "consultant": name, "thread": cid, "turn": turn_id, "provider": "antigravity",
+                 "project": os.path.basename(os.path.normpath(rec.get("cwd") or "")) or None, "mode": "new",
+                 "model": model, "effort": agy_level(model), "changed": ["model"] if changed else None,
+                 "kind": kind, "reason": reason, "chars": len(message), "owner_words": bool(owner_words) or None}
+        sent_at = time.time()
+
+        def log_send():  # agy's quota takes a few seconds to read: don't hold the reply for it
+            snap = usage_snapshot(None)
+            agy = read_agy_usage()
+            if agy and agy.get("groups"):
+                snap["antigravity"] = agy_snapshot(agy["groups"])
+            record_usage({**event, "usage": snap}, now=sent_at)
+        threading.Thread(target=log_send, daemon=True).start()
+    if not timeout:
+        return f"Delivered to {name} ({mode}, turn {turn_id}). {read_later(cid, turn_id)}"
+    done, turn = agy_wait(cid, turn_id, timeout, cancel, progress_reporter(progress, name))
+    if done:
+        record_reply(cid, name, turn)
+        return format_turn(name, turn) + f"\n\n({name} runs on {model}.)"
+    return still_working(name, turn_id, turn,
+                         f"Delivered ({mode}), but no reply within {timeout:.0f}s. Don't send the message "
+                         f"again. {read_later(cid, turn_id)}")
+
+
+def agy_snapshot(groups):
+    """Percent used per Antigravity quota group and window, for the usage log."""
+    snap = {}
+    for g in groups if isinstance(groups, list) else []:
+        if not isinstance(g, dict) or not isinstance(g.get("name"), str):
+            continue
+        for b in g.get("buckets") or []:
+            frac = number(b.get("remaining_fraction")) if isinstance(b, dict) else None
+            if frac is not None:
+                window = window_label(AGY_WINDOWS.get(b.get("window"), 0)) if b.get("window") in AGY_WINDOWS else b.get("window")
+                snap.setdefault(AGY_GROUPS.get(g["name"], g["name"]), {})[str(window)] = round(100 * (1 - frac), 1)
+    return snap
+
+
+def get_agy_reply(rec, args, timeout, offset, cancel, progress):
+    cid, name = rec["id"], rec["name"]
+    turn_id = args.get("turn_id")
+    if turn_id:
+        turn = agy_turn(cid, turn_id) if isinstance(turn_id, str) and FULL_ID.fullmatch(turn_id) else None
+        if not turn:
+            return f"{name} has no turn {turn_id}."
+    else:
+        turns = agy_turns(cid, 1)
+        if not turns:
+            return f"{name} has no messages yet."
+        turn = turns[0]
+    if turn["status"] == "inProgress":
+        done = False
+        if timeout > 0:
+            done, turn = agy_wait(cid, turn["id"], timeout, cancel, progress_reporter(progress, name))
+        if not done:
+            return still_working(name, turn["id"], turn,
+                                 f"To be woken when it is ready, run in the background:\n"
+                                 f"{waiter_command(cid, turn['id'])}\nOr check again later with turn_id "
+                                 f"{turn['id']}; pass wait=\"done\" only if the user wants you to wait for it.")
+    record_reply(cid, name, turn)
+    if offset:
+        reply = turn_reply(turn)
+        if offset >= len(reply):
+            return f"The reply from {name} (turn {turn['id']}) has {len(reply)} characters; offset {offset} is past its end."
+        end = min(len(reply), offset + MAX_REPLY_CHARS)
+        return (f"Reply from {name} (turn {turn['id']}, {turn['status']}), characters {offset}-{end} "
+                f"of {len(reply)}:\n\n{reply[offset:end]}"
+                + (f"\n\n[More: read on with offset {end}.]" if end < len(reply) else ""))
+    return format_turn(name, turn)
+
+
+def agy_history(rec, limit):
+    turns = agy_turns(rec["id"], limit)
+    if not turns:
+        return f"{rec['name']} has no messages yet."
+    now = time.time()
+    rows = "\n".join(f"- {describe_turn(t, now)}" for t in turns)
+    return (f"{rec['name']} (Antigravity, started {when(rec.get('created'), now) or 'at an unknown time'}): its "
+            f"{len(turns)} most recent turn(s), newest first. Read a whole reply with GetConsultantReply "
+            f"and the turn id.\n{rows}")
+
+
+def stop_agy_consultant(rec):
+    """Mark the consultant stopped and end a turn still running. Its files and agy's conversation stay."""
+    ended = 0
+    for tid in agy_turn_ids(rec["id"])[:5]:
+        path = os.path.join(agy_folder(rec["id"]), "turns", tid + ".json")
+        meta = read_json_file(path)
+        if not meta or meta.get("stopped"):
+            continue
+        turn = agy_turn(rec["id"], tid)
+        if turn and turn["status"] == "inProgress":
+            write_json_atomic(path, {**meta, "stopped": True})
+            if pid_alive(meta.get("pid"), meta.get("pid_start")):
+                if os.name == "nt":
+                    run_text(["taskkill", "/F", "/T", "/PID", str(meta["pid"])], timeout=10)
+                else:
+                    try:
+                        os.killpg(meta["pid"], signal.SIGTERM)
+                    except OSError:
+                        pass
+                ended += 1
+    conv = agy_conversation(rec["id"])
+    agy_save({**rec, "stopped": round(time.time(), 3)})
+    return (f"Stopped {rec['name']}." + (" Ended its running turn." if ended else "")
+            + (f" Its conversation stays in Antigravity: to pick it up yourself, run "
+               f"agy --conversation {conv} in {rec.get('cwd')}." if conv else ""))
+
+
+def run_agy_waiter(rec, turn_id):
+    """`server.py wait` for an Antigravity consultant's turn."""
+    name, cid = rec["name"], rec["id"]
+    if not FULL_ID.fullmatch(turn_id) or not agy_turn(cid, turn_id):
+        print(f"{name} has no turn {turn_id}.")
+        return 1
+    try:
+        done, turn = agy_wait(cid, turn_id, WAITER_SECONDS, None)
+    except BridgeError as e:
+        print(f"Stopped waiting for turn {turn_id}: {e}")
+        return 1
+    if not done:
+        print(still_working(name, turn_id, turn, f"Waited {WAITER_SECONDS // 60} minutes. To keep waiting, "
+                            f"run the same command again in the background:\n{waiter_command(cid, turn_id)}"))
+        return 0
+    record_reply(cid, name, turn)
+    print(f"The consultant's turn has ended (Antigravity consultant {cid}, turn {turn_id}).\n")
+    print(format_turn(name, turn, WAITER_REPLY_CHARS))
+    return 0
+
+
+def agy_budget(now, agy_live=None):
+    """Lines on Antigravity's quota groups for ConsultantBudget, or [] if agy isn't installed."""
+    live = read_agy_usage() if agy_live is None else agy_live
+    if live is None:
+        return []
+    if live.get("error"):
+        return [f"Antigravity: usage not known ({live['error']})."]
+    lines = []
+    for g in live.get("groups") or []:
+        if not isinstance(g, dict) or not isinstance(g.get("name"), str):
+            continue
+        for b in g.get("buckets") or []:
+            if not isinstance(b, dict) or number(b.get("remaining_fraction")) is None:
+                continue
+            length = AGY_WINDOWS.get(b.get("window"))
+            text = window_text(window_label(length) if length else str(b.get("window") or "usage"),
+                               round(100 * (1 - b["remaining_fraction"]), 1), iso_seconds(b.get("reset_time")),
+                               length, now)
+            if text:
+                lines.append(f"  - {g['name']}: {text}")
+    head = ("Antigravity (Google; the Claude and GPT models group runs those models on Google's quota, "
+            "not Claude Code's):")
+    models = agy_models()
+    tail = ([f"  Models (model for StartConsultant with provider antigravity, effort the level): "
+             f"{agy_model_families(models)}"] if models else [])
+    return [head] + (lines or ["  - no current quota window reported"]) + tail
+
+
+def agy_model_families(ids):
+    """gemini-4-neon (low, medium, high, xhigh), gemini-pro-orchestrator-neon, ...: in agy's order."""
+    families = {}
+    for model in ids:
+        families.setdefault(agy_base(model), []).append(agy_level(model))
+    order = {level: i for i, level in enumerate(AGY_LEVELS)}
+    return ", ".join(base + (f" ({', '.join(sorted(filter(None, levels), key=order.get))})" if any(levels) else "")
+                     for base, levels in families.items())
 
 
 def columns(blocks, width=26):
@@ -3563,20 +4233,27 @@ def consultation_rows(scr, summary, days):
     return rows
 
 
-def offload_rows(scr, weeks, per_week, scanning):
-    """Output tokens by week, and the share made by models that aren't Anthropic's."""
+def offload_rows(scr, weeks, per_week, scanning, gemini=None):
+    """Output tokens by week, and the share made by models that aren't Anthropic's: Codex
+    consultants and the user's own Codex sessions from their files, Antigravity consultants
+    (Gemini) from the usage log."""
+    gemini = gemini or {}
+    empty = {"claude": 0, "subagents": 0, "consultants": 0, "codex": 0, "models": {}}
+    weeks = {**{w: empty for w in gemini}, **weeks}
     if not weeks:
         return [scr.dim("  Reading transcripts for the first time…" if scanning else
                         "  No Claude Code or Codex sessions in the last weeks.")]
     rows = [f"  {'week of':<11}{'Claude':>9}{'subagents':>11}{'consultants':>13}{'own Codex':>11}"
-            f"{'messages':>10}   not Anthropic"]
+            f"{'Gemini':>8}{'messages':>10}   not Anthropic"]
     for week in sorted(weeks)[-TOP_WEEKS:]:
         w = weeks[week]
-        total = w["claude"] + w["subagents"] + w["consultants"] + w["codex"]
-        other = w["consultants"] + w["codex"]
+        g = gemini.get(week, 0)
+        total = w["claude"] + w["subagents"] + w["consultants"] + w["codex"] + g
+        other = w["consultants"] + w["codex"] + g
         share = 100 * other / total if total else 0
         rows.append(f"  {week:<11}{token_text(w['claude']):>9}{token_text(w['subagents']):>11}"
-                    f"{token_text(w['consultants']):>13}{token_text(w['codex']):>11}{per_week.get(week, 0):>10}"
+                    f"{token_text(w['consultants']):>13}{token_text(w['codex']):>11}{token_text(g):>8}"
+                    f"{per_week.get(week, 0):>10}"
                     f"   {scr.paint(bar(share, 12), '36')} {share:>3.0f}%")
     recent = sorted(weeks)[-4:]
     models = collections.Counter()
@@ -3586,8 +4263,8 @@ def offload_rows(scr, weeks, per_week, scanning):
     if total:
         parts = [f"{m.replace('claude-', '')} {100 * n / total:.0f}%" for m, n in models.most_common(5) if n]
         rows += ["", f"  Claude output by model, last {len(recent)} weeks: " + " · ".join(parts)]
-    rows.append(scr.dim("  Output tokens, from the transcripts on this computer. \"messages\" counts consultations "
-                        "logged that week."))
+    rows.append(scr.dim("  Output tokens, from the transcripts on this computer; Gemini from the usage log's "
+                        "Antigravity replies. \"messages\" counts consultations logged that week."))
     return rows
 
 
@@ -3601,7 +4278,8 @@ def top_frame(scr, now, days, codex_live, scan, events, scanning, width=100, agy
     lines += [scr.bold("SUBSCRIPTIONS")] + subscription_rows(scr, now, codex_live, scan.get("codex_limits"), agy_live=agy_live)
     lines += ["", scr.bold("CONSULTATIONS")] + consultation_rows(scr, summary, days)
     lines += ["", scr.bold("OFFLOAD") + scr.dim("  (work done by consultants and Codex instead of Claude Code)")]
-    lines += offload_rows(scr, weekly_tokens(scan), log_summary(events)["per_week"], scanning)
+    everything = log_summary(events)
+    lines += offload_rows(scr, weekly_tokens(scan), everything["per_week"], scanning, everything["gemini_week"])
     lines += ["", scr.dim(f"  log: {usage_log_file()}")]
     return [fit(line, width) for line in lines]
 
@@ -3765,7 +4443,9 @@ INSTRUCTIONS = (
     "call for it. The change keeps the consultant's context and stays for later messages, so once the "
     "harder part is done, send the usual values again. ConsultantBudget shows the usage left on "
     "each subscription, with reset times, and model scores, for choosing a consultant's model and "
-    "effort by the user's own rules."
+    "effort by the user's own rules. A consultant on Google's Antigravity CLI (Gemini models) is "
+    "started with StartConsultant provider=\"antigravity\", only when the user asks for one or the "
+    "user's own rules call for it; it is used with the same tools, read-only, one message at a time."
 )
 
 TO_SCHEMA = {"type": "string", "description": "Consultant name, thread id, or unique id prefix/suffix."}
@@ -3784,7 +4464,7 @@ TOOLS = [
     {
         "name": "StartConsultant",
         "description": (
-            "Get a Codex consultant for a repo: reuse one that StartConsultant started there earlier "
+            "Get a Codex (or, with provider antigravity, an Antigravity) consultant for a repo: reuse one that StartConsultant started there earlier "
             "(keeping its context), or start a new one. Call it whenever you need a consultant. "
             "Consultants run on the local Codex app-server daemon in a read-only sandbox and never ask "
             "for approvals: they can read files and run read-only commands for auditing, validation "
@@ -3798,11 +4478,13 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "cwd": {"type": "string", "description": "Absolute path of the project Codex should work in. Pass your working directory. Default: Claude Code's first workspace folder."},
-                "model": {"type": "string", "description": "Codex model for a new session. Default: the user's Codex config. Ignored when an existing consultant is reused."},
+                "model": {"type": "string", "description": "Model for a new consultant: a Codex model, or for provider antigravity an agy model such as gemini-4-neon (ConsultantBudget lists them). Default: the user's Codex config; for Antigravity, gemini-4-neon at level high. Ignored when an existing consultant is reused."},
                 "title": {"type": "string", "description": "Session title for a new session, shown in Codex. Ignored when an existing consultant is reused."},
                 "instructions": {"type": "string", "description": "Standing instructions for a new consultant's role. Ignored when an existing consultant is reused."},
                 "watch": {"type": "boolean", "description": "Show the session in a pane beside Claude Code so the user can watch it work. Default true; pass false only if the user doesn't want a pane. Applies to later sends too."},
                 "new": {"type": "boolean", "description": "Start a new session even though a consultant already works in this repo. Default false. Use only when the user asked for a separate consultant."},
+                "provider": {"type": "string", "enum": list(PROVIDERS), "description": "Which CLI the consultant runs on: codex (default), or antigravity for Google's Antigravity CLI (agy) and its models, such as gemini-4-neon. An Antigravity consultant is read-only by agy's deny rules (no file writes or edits, commands or MCP tools), has no pane, and takes one message at a time. Reuse looks only among consultants of the same provider. Use antigravity only when the user asks or their own rules call for it."},
+                "effort": {"type": "string", "description": "Antigravity only: the model level for a new consultant, such as low, medium, high or xhigh. Default high."},
             },
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False},
@@ -3851,8 +4533,8 @@ TOOLS = [
                 "from": {"type": "string", "description": "Sender label shown to Codex, e.g. your session name. Default 'Claude Code'."},
                 "owner_words": {"type": "string", "description": "Optional: text the user typed, quoted exactly as they wrote it (never a summary). Codex sees it in its own block, marked as the user's words, apart from your message."},
                 "revision": {"type": "boolean", "description": "Optional: add a line with the consultant's repository commit, branch and number of uncommitted paths, and ask it to name that revision in its answer. Default false."},
-                "model": {"type": "string", "description": "Codex model id for this message and later ones, e.g. gpt-6-astra. Default: unchanged. Set it when the user asks, or when the user's own rules call for another model."},
-                "effort": {"type": "string", "description": "Codex reasoning effort for this message and later ones, such as low, medium, high or xhigh; which levels exist depends on the model. Default: unchanged. Set it when the user asks, or when the user's own rules call for more or less effort."},
+                "model": {"type": "string", "description": "Model id for this message and later ones: Codex, e.g. gpt-6-astra; Antigravity, e.g. gemini-4-neon. Default: unchanged. Set it when the user asks, or when the user's own rules call for another model."},
+                "effort": {"type": "string", "description": "Reasoning effort (Codex) or model level (Antigravity) for this message and later ones, such as low, medium, high or xhigh; which levels exist depends on the model. Default: unchanged. Set it when the user asks, or when the user's own rules call for more or less effort."},
                 "kind": {"type": "string", "enum": list(CONSULT_KINDS), "description": "Optional: what kind of consultation this is, for the user's usage log (nouez/usage-log.jsonl on this computer). Default: not recorded."},
                 "reason": {"type": "string", "description": f"Optional: one line on why this consultant, model and effort, for the same log (up to {REASON_CHARS} characters). Never the message itself."},
                 "wait": wait_schema(SEND_WAIT_SECONDS),
@@ -3990,8 +4672,9 @@ TOOLS = [
         "name": "ConsultantBudget",
         "description": (
             "Show what a consultation would cost and what each model scores, to choose a consultant's "
-            "model and effort: the usage used on the Codex subscription and Claude Code's own (each "
-            "window with its reset time and where the current pace lands), the Codex models and their "
+            "model and effort: the usage used on the Codex subscription, Claude Code's own and, when "
+            "the Antigravity CLI is installed, Antigravity's quota groups (each window with its reset "
+            "time and where the current pace lands), the Codex and Antigravity models and their "
             "effort levels, and Artificial Analysis Intelligence Index scores for OpenAI, Google and "
             "Anthropic models (fetched about weekly and kept; credit Artificial Analysis when you show "
             "them). Call it before choosing a model or effort for a consultation when the user's own "
@@ -4175,6 +4858,9 @@ def run_waiter(thread_id, turn_id):
     """`server.py wait <thread_id> <turn_id>`: wait until the turn ends, print its reply, return the
     exit code. Run as a background command, its exit wakes the client with the reply. Rides out a
     few failed connections, such as a daemon restart, rather than give up on a long turn."""
+    agy = agy_resolve(thread_id, exact_only=True)
+    if agy:
+        return run_agy_waiter(agy, turn_id)
     deadline = time.monotonic() + WAITER_SECONDS
     failures = 0  # in a row: reset by each connection that works
     asked, dropped, daemons = turn_id, False, []  # daemons: the versions seen, in order

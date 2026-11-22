@@ -6,6 +6,27 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-22
+
+Consultants on Google's Antigravity CLI, for second opinions from Gemini models on Google's quota. Tested with Claude Code 2.1.330, Codex CLI 0.170.0 with app-server daemon 0.171.0, Antigravity CLI 1.5.14, Python 3.11.9 on Windows 11. After updating, reconnect `consultants` with `/mcp` in each open Claude Code session; open sessions keep running the old server until then.
+
+### Added
+
+- `StartConsultant` takes `provider`: `antigravity` starts a consultant on the Antigravity CLI (`agy`), on `gemini-4-neon` at level `high` unless `model` or the new `effort` says otherwise, and reuses one already in the repo unless `new: true`. `SendConsultantMessage`, `GetConsultantReply`, `GetConsultantHistory`, `ListConsultants` and `StopConsultant` work with it as with a Codex consultant, and the waiter command too. Each message runs one `agy -p` turn in the background, continuing the consultant's conversation.
+  - Read-only by agy's deny rules: file writes and edits, commands, MCP tools and URL actions, with slash commands off. Probed against agy 1.5.14; its browser tools aren't available in this mode.
+  - One message at a time: a message sent while a turn runs is refused, with nothing sent. Each turn ends after 30 minutes at most, reported as interrupted. It has no pane: `WatchConsultant` gives the `agy --conversation` command instead.
+  - `model` and `effort` on `SendConsultantMessage` change the agy model level for later messages; an id agy doesn't list is refused.
+- `ConsultantBudget` shows Antigravity's quota groups and its models, grouped by family with their levels, when `agy` is installed.
+- The usage log records Antigravity consultants' events with `provider`, their replies' token counts, and Antigravity's quota at each send. `server.py top` adds a Gemini column to the offload table, counted in the share that wasn't Anthropic's.
+
+### Changed
+
+- `top` and `ConsultantBudget` wait up to 60 seconds for `agy -p /usage`, not 30: on a busy computer it took over 20, and `top` showed "agy didn't answer".
+
+### Known issues
+
+- agy's `schedule` tool can't be denied. It changes no files, but a turn that schedules something waits until the 30-minute limit. nouez asks the model not to schedule.
+
 ## [0.14.1] - 2026-11-22
 
 `server.py top` shows Antigravity's quota, and the status line addition keeps Claude Code's numbers steady when several sessions are open. Tested with Claude Code 2.1.330, Codex CLI 0.170.0 with app-server daemon 0.171.0, Antigravity CLI 1.5.14, Python 3.11.9 on Windows 11. After updating, reconnect `consultants` with `/mcp` in each open Claude Code session; open sessions keep running the old server until then.
@@ -330,7 +351,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.14.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/jibarix/nouez/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/jibarix/nouez/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/jibarix/nouez/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/jibarix/nouez/compare/v0.12.4...v0.13.0
