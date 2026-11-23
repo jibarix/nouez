@@ -1,6 +1,6 @@
 ---
 name: consult
-description: Consult a second model through nouez (a Codex or Antigravity consultant) with the model and effort chosen by the kind of consultation, the consultants installed, and the usage left on each subscription. Use whenever you are about to ask a consultant for a review, a bug hunt, a plan critique, research or a fact check, or when the user says "consult", "ask Codex", "ask Gemini" or "second opinion".
+description: Consult a second model through nouez (a Codex or Antigravity consultant) with the model and effort chosen by the kind of consultation, the consultants installed, and the usage left on each subscription. Use whenever you are about to ask a consultant for a review, a bug hunt, a plan critique, research or a fact check; before substantial read-only work that the user's own instructions (such as their CLAUDE.md) send to a consultant, without waiting to be asked; or when the user says "consult", "ask Codex", "ask Gemini" or "second opinion".
 ---
 
 # Consult with the right model

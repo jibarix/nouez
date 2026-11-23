@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.18.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.18.1\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -97,11 +97,12 @@
 \begin{abstract}
 \noindent nouez is an MCP server that lets Claude Code consult live Codex sessions, and open, list and
 close Claude Code sessions on the same computer. This document
-describes nouez 0.12.4: how the pieces fit together, and an example of every message nouez sends
+describes how the pieces fit together, with an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, the commands nouez runs on
 the operating system, and its one request to GitHub, which looks for a newer nouez release. The daemon also sends notifications and its own requests, which nouez
-discards and this document leaves out. Message shapes are as captured in runs with Claude Code
+discards and this document leaves out. Message shapes are as captured in runs of nouez 0.12.4,
+unless a section names a later version, with Claude Code
 2.1.295 and Codex app-server daemon 0.162.0; client behaviour described here (the discovery
 probe, progress tokens, the 120-second move to the background) was observed in those runs and is
 not something nouez controls. Ids are invented, long objects are trimmed to the fields nouez

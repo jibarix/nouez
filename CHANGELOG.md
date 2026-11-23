@@ -6,6 +6,16 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-23
+
+Claude consults when your own instructions call for it, not only when you ask. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version. Reconnecting loads the server only: if you copied the consult skill, copy its new description into your installed copy too.
+
+### Changed
+
+- The MCP instructions tell Claude to start a consultant when the user's own instructions (their CLAUDE.md or a skill) call for one, as well as when the user asks.
+- The shipped consult skill's description says to use it before substantial read-only work that the user's instructions send to a consultant, without waiting to be asked.
+- README: a new section, "A dispatcher for every project", on what Remote Control does alone (a `claude remote-control` server is tied to the folder it runs in and its worktrees, and takes new sessions only while it runs) and how a dispatcher folder with nouez reaches every project from the phone, with a `CLAUDE.md` to adapt, its permission rules, starting it at sign-in, and what archiving a conversation did with Claude Code 2.1.330. Tips: a `~/.claude/CLAUDE.md` example for consulting without being asked.
+
 ## [0.18.0] - 2026-11-22
 
 nouez now sets up for anyone who clones it: with Codex, Antigravity, both or neither, on Windows, macOS or Linux. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version. A running status screen restarts on it by itself.
@@ -479,7 +489,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/jibarix/nouez/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/jibarix/nouez/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/jibarix/nouez/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/jibarix/nouez/compare/v0.15.1...v0.16.0

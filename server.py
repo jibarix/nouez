@@ -65,7 +65,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.18.0"
+SERVER_VERSION = "0.18.1"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -6230,7 +6230,8 @@ def run_top(argv):
 INSTRUCTIONS = (
     "Consultants are read-only second opinions on another model, run on the Codex CLI or Google's "
     "Antigravity CLI (agy), whichever is installed. Whenever the user asks for a consultant (\"ask "
-    "Codex\", \"ask Gemini\", a second opinion), call StartConsultant with cwd set to your working "
+    "Codex\", \"ask Gemini\", a second opinion), or the user's own instructions (such as their "
+    "CLAUDE.md or a skill) call for one, call StartConsultant with cwd set to your working "
     "directory, even if you don't remember one being open (earlier context may have been compacted). "
     "It reuses a consultant it started earlier in this repo, keeping its context, or starts a new "
     "read-only one; it never picks a Codex session the user opened. Without provider it uses Codex "

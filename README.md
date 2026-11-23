@@ -11,7 +11,7 @@ Two coding agents look at a problem differently. This bridge gives each one a fi
 
 Without the bridge, you run two terminals and copy text between them. With it, Claude starts a consultant in the background, sends it questions, reads the answers and keeps working, all from your single Claude Code terminal. If you prefer to watch Codex work, you can still open it yourself and Claude will talk to that session instead.
 
-The same server also helps when you drive Claude Code from your phone with Remote Control: a session can open a new Claude Code session in another project on the computer, list the ones running, and close a stuck one (see [A new Claude Code session from your phone](#a-new-claude-code-session-from-your-phone)).
+The same server also helps when you drive Claude Code from your phone with Remote Control: a session can open a new Claude Code session in another project on the computer, list the ones running, and close a stuck one (see [A new Claude Code session from your phone](#a-new-claude-code-session-from-your-phone)). A `claude remote-control` server alone is tied to the folder it runs in (and, with `--spawn worktree`, worktrees of it); with a [dispatcher](#a-dispatcher-for-every-project), one server reaches every project and can start new ones.
 
 ## Requirements
 
@@ -36,7 +36,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.18.0 |
+| nouez | 0.18.1 |
 | Claude Code | 2.1.330 |
 | Codex CLI | 0.170.0 |
 | Codex app-server daemon | 0.171.0 |
@@ -164,6 +164,42 @@ Claude Code asks whether you trust a folder the first time it runs there, and a 
 
 To see what's running, ask any session *"which Claude sessions are open?"*. `ListClaudeSessions` lists the interactive Claude Code sessions registered in your Claude Code config folder, whoever started them, each with its name, folder, status and whether Remote Control is on. To close one, such as a stuck one, say which: *"close hours-tracker"*. `CloseClaudeSession` ends its `claude` process. On Windows, a session `OpenClaudeSession` opened also gets its window closed. Elsewhere nouez ends only the `claude` process: a window `OpenClaudeSession` opened then closes if the terminal closes when its command ends, as most Linux terminals do, and stays at a prompt otherwise (macOS Terminal). A session you started yourself leaves its terminal at the shell prompt. On macOS and Linux nouez first checks with `ps` that the process is still Claude Code, started no later than the session was registered, and isn't one nouez itself runs under; if it can't confirm that, it signals nothing and says why. The transcript stays, so `claude --resume` in that folder picks it up again. Claude shows you the list and closes only the sessions you pick, one call each, and never the one you're talking to. The list comes from `~/.claude/sessions`, which Claude Code keeps but doesn't document, so a future Claude Code version could change it.
 
+### A dispatcher for every project
+
+Remote Control on its own works like this. While `claude remote-control` runs in a folder on your computer and is connected, the Claude app offers the computer: tap new session, pick it, and the session runs there. That server starts every new session in its own folder (or, with `--spawn worktree`, in a new worktree of it); the app has no folder picker for it. Reaching a second project means starting another server in that project's folder, at the computer, and after a restart or a sign-out none is running until you start it again. (The Claude desktop app can offer several registered folders instead, while it is open.)
+
+With nouez, one Remote Control server reaches every project. A session in it can open a session in any folder with `OpenClaudeSession`, make a folder for a new project, and record your trust answer, all from the phone. Each session it opens runs in the project's own folder, so that project's `CLAUDE.md`, settings and memory load, and with nouez registered for every project (`--scope user`) it can consult as usual.
+
+The tidiest home for that server is a small folder of its own, a dispatcher, whose `CLAUDE.md` gives it only that job. Make the folder, then in a terminal there run the exact command once, interactively, so you can answer Claude Code's trust question and any first-use question Remote Control asks (with no terminal, a server waiting at one never connects):
+
+```sh
+claude remote-control --name dispatcher --spawn same-dir
+```
+
+Check that it connects and that the app offers it, then stop it with Ctrl+C. `--spawn same-dir` picks the mode on the command line, so the server never stops to ask which one to use. A `CLAUDE.md` to adapt:
+
+```markdown
+This folder is a dispatcher: the user drives it from the Claude phone app to work in other
+projects. Don't do project work here.
+- List the folders in ~/Projects when asked, marking git repositories.
+- Open a project with OpenClaudeSession (cwd: its folder) and say the session's name.
+- Make a new project only directly in ~/Projects, with create: true, when the user asks for one.
+- Never pass trust: true on the first call. When OpenClaudeSession says Claude Code hasn't been
+  trusted in a folder, that folder is the one trust would be recorded for (for a git worktree,
+  its main checkout). If it isn't inside ~/Projects, or the result says it can't tell, decline.
+  Otherwise show the user that folder, and the hooks in .claude/settings.json and
+  .claude/settings.local.json and the servers in .mcp.json of both that folder and the folder
+  the session will open in, and wait for a plain yes.
+- List sessions with ListClaudeSessions; close only a session the user names.
+- Don't start consultants here.
+```
+
+Allowing `mcp__consultants__OpenClaudeSession`, `mcp__consultants__ListClaudeSessions` and `mcp__consultants__CloseClaudeSession` in the dispatcher's `.claude/settings.json` (`permissions.allow`) spares you a prompt for each.
+
+To have it there after a restart, start the same command hidden at sign-in, with the dispatcher folder as its working directory: on Windows a Task Scheduler task with an "At log on" trigger, on macOS a launch agent, on Linux a systemd user service. nouez doesn't install one. A sign-in trigger starts it once, so if it can exit (a long network outage, say), run it under something that starts it again. It needs you signed in and the computer awake: a sleeping laptop is out of reach. A locked screen doesn't stop running programs, but reaching a locked computer from the phone hasn't been tested with nouez. Remote Control connects out to Anthropic; with Claude Code 2.1.330 the server listened on no port.
+
+What we saw with Claude Code 2.1.330, in a conversation the server started from the app: `/exit` isn't available there ("isn't available in this environment"). Archiving the conversation in the app ended that conversation's process on the computer, while `claude remote-control` kept running (it showed "Ready" and 0 of 32 sessions), so the computer stayed in the app and a new conversation could start there. Sessions `OpenClaudeSession` opens run in their own terminal windows and weren't part of that test.
+
 ### Choosing model and effort
 
 A Codex consultant uses the model and reasoning effort from your Codex config (`model` and `model_reasoning_effort` in `~/.codex/config.toml`); an Antigravity one starts on `gemini-4-neon` at level `high` (`ConsultantBudget` lists agy's models and their levels). Claude can change either one for a hard question without starting over: `SendConsultantMessage` takes `model` and `effort`, the consultant keeps its context, and the setting stays for later messages until Claude sends the usual values again. nouez tells Claude to do this only when you ask, or when your own instructions say when. Which model suits which work is your call, so nouez doesn't decide it for you.
@@ -274,6 +310,7 @@ A verdict line first makes the reply easy to act on, and "what you didn't check"
 
 - **Give the consultant context.** A consultant can read the files in its own working directory, so start it in the same repo. Tell Claude to include the specific file, diff or question in the message; an Antigravity consultant can't run commands, so it needs the diff or output itself.
 - **Give Claude standing instructions.** A line in your project's `CLAUDE.md` makes the workflow automatic, for example: *"Before committing non-trivial changes, ask the consultant to review the diff and address its findings. Reuse the existing consultant for this repo if there is one; otherwise start one."* (Say "the Codex consultant" only if you have Codex: it makes Claude ask for Codex by name.)
+- **Consult without being asked.** Lines in `~/.claude/CLAUDE.md` apply in every project, and nouez and the shipped consult skill tell Claude to consult when your own instructions call for it. For example: *"Before substantial read-only work, consult without waiting for me to ask: reviewing a non-trivial diff before a commit, diagnosing a failure whose cause isn't obvious, critiquing a plan, or research across several sources. Keep writing code and one-line fixes in this session."*
 - **Give the consultant a brief and ask for a verdict.** `StartConsultant` takes standing `instructions`, and each message can carry its own brief. A brief that says what is being decided gets a more useful answer than a role. See [A brief and a verdict](#a-brief-and-a-verdict).
 - **Pass on the user's words.** When Claude is acting on something you asked for, it can send your words with `owner_words`, kept apart from its own reading of them, so the consultant checks the work against what you said rather than against Claude's summary.
 - **Tie a review to a revision.** `revision: true` starts the message with the repo's commit, branch and number of uncommitted paths, and asks the consultant to name that revision in its answer, so a verdict can't be mistaken for one about a later state of the code.
@@ -489,7 +526,7 @@ python -m unittest discover tests
 - Finding Claude Code's own Windows Terminal window, and closing a session's window, are Windows-only. Elsewhere the pane opens as before, and closing a session ends its `claude` process; its window closes only if the terminal closes when its command ends.
 - On macOS, the first Codex pane or `OpenClaudeSession` window makes macOS ask whether the app Claude Code runs in may control Terminal. Allow it, or nothing opens (System Settings → Privacy & Security → Automation changes it later).
 - Telling the caller's own session apart is thorough only on Windows, where nouez walks the whole chain of parent processes. Elsewhere it walks the chain with `ps`, and refuses any session it runs under; if `ps` can't be run, it knows only its immediate parent.
-- Nothing can start a session on the computer from your phone unless something there is already running and connected: an open Claude Code session with Remote Control, for instance.
+- Nothing can start a session on the computer from your phone unless something there is already running and connected: an open Claude Code session with Remote Control, for instance, or a [dispatcher](#a-dispatcher-for-every-project) started at sign-in.
 - The trust check reads git's files, not Claude Code's code. For a worktree whose git data was moved out with `--separate-git-dir`, it says it can't tell, except when that git folder is named `.git` and sits beside other files: then nouez, like `git worktree list`, takes that folder for the main checkout.
 - `ConsultantBudget` names models as Artificial Analysis does ("GPT-6.2 Sol (high)"), not by Codex model id; matching them is left to Claude. Artificial Analysis scores API access at set effort levels, which may differ from a subscription's.
 - `server.py top` counts tokens from Claude Code's transcripts and Codex's session files, which neither documents; an update to either could change them. Output tokens only: a reply's input and cached tokens aren't counted.
