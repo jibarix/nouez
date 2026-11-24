@@ -402,7 +402,8 @@ def check_sessions(client):
 
 EXPECTED_TOOLS = {"StartConsultant", "ListConsultants", "SendConsultantMessage", "GetConsultantReply",
                   "GetConsultantHistory", "WatchConsultant", "StopConsultant", "ConsultantBudget",
-                  "OpenClaudeSession", "ListClaudeSessions", "CloseClaudeSession"}
+                  "OpenClaudeSession", "ListClaudeSessions", "CloseClaudeSession", "ListProjects",
+                  "OpenStatusScreen"}
 
 
 def live(sessions, setups=False):

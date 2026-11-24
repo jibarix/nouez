@@ -35,6 +35,8 @@ def setUpModule():
 
 # Tests never write to the user's usage log; the log's own tests turn it back on for a temp file.
 os.environ["NOUEZ_NO_USAGE_LOG"] = "1"
+# Nor run `claude auth status`: whether this machine's sign-in ends soon mustn't change a result.
+os.environ["NOUEZ_NO_LOGIN_CHECK"] = "1"
 
 # Tests never see the user's own Antigravity consultants; AgyTest points this at its own folder.
 _AGY_EMPTY = tempfile.mkdtemp(prefix="nouez-test-agy-")
@@ -181,7 +183,7 @@ class ProtocolTest(unittest.TestCase):
         tools = {t["name"]: t["annotations"] for t in self.server.request(8, "tools/list")["result"]["tools"]}
         read_only = {name for name, a in tools.items() if a.get("readOnlyHint")}
         self.assertEqual(read_only, {"ListConsultants", "GetConsultantReply", "GetConsultantHistory", "ListClaudeSessions",
-                                     "ConsultantBudget"})
+                                     "ListProjects", "ConsultantBudget"})
         destructive = {name for name, a in tools.items() if a.get("destructiveHint")}
         self.assertEqual(destructive, {"StopConsultant", "CloseClaudeSession"})
 
@@ -690,6 +692,8 @@ class TrustTest(unittest.TestCase):
                                                     "XDG_STATE_HOME": self.data_home})
         patch.start()
         self.addCleanup(patch.stop)
+        server._trust_reports.clear()
+        self.addCleanup(server._trust_reports.clear)
         self.projects = os.path.join(self.tmp, "Projects")
         self.plain = os.path.join(self.projects, "plain", "sub")
         self.repo = os.path.join(self.projects, "repo")
@@ -793,6 +797,10 @@ class TrustTest(unittest.TestCase):
     def test_trust_records_the_repository_and_backs_up_first(self):
         with open(self.state, encoding="utf-8") as f:
             before = f.read()
+        out, opened = self.open({"cwd": os.path.join(self.repo, "src"), "trust": True})
+        self.assertFalse(opened)  # 0.19.0: the folder's report comes first
+        self.assertIn("Not trusted yet", out)
+        self.assertEqual(self.backups(), [])
         out, opened = self.open({"cwd": os.path.join(self.repo, "src"), "trust": True})
         self.assertTrue(opened)
         self.assertIn("Recorded the user's trust in " + self.slash(self.repo), out)
@@ -902,11 +910,20 @@ class TrustTest(unittest.TestCase):
         for name in (os.path.join(".claude", "settings.json"), ".mcp.json"):
             with open(os.path.join(self.plain, name), "w") as f:
                 f.write("{}")
-        with mock.patch.object(server, "open_window", return_value="a window") as open_window:
-            out = server.open_claude_session({"cwd": self.plain})
-        os.remove(open_window.call_args[0][1][-1])
+        # 0.19.0: trusted only through a folder above it, with settings of its own: asked first,
+        # with the report, rather than opened to wait at the trust question.
+        out, opened = self.open({"cwd": self.plain})
+        self.assertFalse(opened)
+        self.assertIn("trusted only through a folder above it", out)
+        self.assertIn("nothing that runs or allows anything", out)
+        out, opened = self.open({"cwd": self.plain, "open_untrusted": True})
+        self.assertTrue(opened)
         self.assertIn(".claude/settings.json may bring the trust question back", out)
         self.assertIn(".mcp.json servers are approved separately", out)
+        # trust=true after the report records it and opens one window.
+        out, opened = self.open({"cwd": self.plain, "trust": True})
+        self.assertTrue(opened)
+        self.assertIn("Recorded the user's trust", out)
         # Trusted exactly: only the MCP servers may still ask.
         self.write({"projects": {self.slash(self.plain): {"hasTrustDialogAccepted": True}}})
         with mock.patch.object(server, "open_window", return_value="a window") as open_window:
@@ -1769,7 +1786,7 @@ class LaunchTest(unittest.TestCase):
                 raise server.BridgeError(f"{how} didn't open (exit code 1)")
             return how
         cwd = tempfile.gettempdir()
-        with mock.patch.object(server.sys, "platform", "linux"), mock.patch.object(server.os, "name", "posix"),              mock.patch.object(server, "launch", fake_launch), mock.patch.dict(server.os.environ, {"TMUX": "", "DISPLAY": ":0"}),              mock.patch.object(server, "pane_resume", lambda codex, tid, cwd: ["codex", "resume", tid]):
+        with mock.patch.object(server.sys, "platform", "linux"), mock.patch.object(server.os, "name", "posix"),              mock.patch.object(server, "launch", fake_launch), mock.patch.dict(server.os.environ, {"TMUX": "", "DISPLAY": ":0"}),              mock.patch.object(server, "pane_resume", lambda codex, tid, cwd, remote: ["codex", "resume", tid]):
             with mock.patch.object(server, "which", lambda name, env=None: {"wezterm": "/usr/bin/wezterm"}.get(name)):
                 self.assertEqual(server.open_terminal(cwd, "t-1"), "wezterm")
                 self.assertEqual(calls[-1], ["/usr/bin/wezterm", "start", "--", "codex", "resume", "t-1"])
@@ -3704,12 +3721,36 @@ class PaneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             for folder in (tmp, os.path.join(tmp, "a b")):
                 os.makedirs(folder, exist_ok=True)
-                with mock.patch.object(server, "codex_trust_levels", return_value={}):
-                    resume = server.pane_resume("C:\\Program Files\\c\\codex.exe", self.TID, folder)
-                self.assertIn("-c", resume[5:])  # the trust option too
+                resume = server.pane_resume("C:\\Program Files\\c\\codex.exe", self.TID, folder)
+                # the daemon's app server, not one of its own in the pane, which the thread's lock keeps out
+                self.assertEqual(resume[5:], ["--remote", "unix://", "-c", "check_for_update_on_startup=false"])
                 line = f'C:\\WINDOWS\\system32\\cmd.exe /d /s /k "{subprocess.list2cmdline(resume)}"'
                 self.assertTrue(server.is_nouez_pane(line, self.TID), line)
                 self.assertFalse(server.is_nouez_pane(line, self.TID[:-1] + "e"))
+            sock = os.path.join(tmp, "a b", "x.sock")
+            resume = server.pane_resume("codex", self.TID, tmp, "unix://" + sock)
+            self.assertEqual(resume[5:7], ["--remote", "unix://" + sock])
+            line = f'C:\WINDOWS\system32\cmd.exe /d /s /k "{subprocess.list2cmdline(resume)}"'
+            self.assertTrue(server.is_nouez_pane(line, self.TID), line)
+
+    def test_pane_reaches_the_daemons_own_socket(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sock = os.path.join(tmp, "app-server-control", "app-server-control.sock")
+            self.assertEqual(server.daemon_socket({"codexHome": tmp}), "unix://")  # no socket there yet
+            os.makedirs(os.path.dirname(sock))
+            open(sock, "w").close()
+            self.assertEqual(server.daemon_socket({"codexHome": tmp}), "unix://" + sock)
+            for info in (None, {}, {"codexHome": "relative"}, {"codexHome": 3}):
+                self.assertEqual(server.daemon_socket(info), "unix://")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "a&b")
+            os.makedirs(os.path.join(home, "app-server-control"))
+            open(os.path.join(home, "app-server-control", "app-server-control.sock"), "w").close()
+            with mock.patch.object(server.os, "name", "nt"):
+                self.assertEqual(server.daemon_socket({"codexHome": home}), "unix://")  # not for a cmd line
+            with mock.patch.object(server.os, "name", "posix"):  # shlex quotes it for a shell
+                self.assertEqual(server.daemon_socket({"codexHome": home}),
+                                 "unix://" + os.path.join(home, "app-server-control", "app-server-control.sock"))
 
     def test_pane_key_is_made_once(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(server, "nouez_cache_dir", return_value=tmp):
@@ -3781,68 +3822,6 @@ class PaneTest(unittest.TestCase):
         self.assertEqual(server.shell_command('cmd /d /s /k ""C:\\a b\\c.exe" r "x y""'), '"C:\\a b\\c.exe" r "x y"')
         self.assertEqual(server.shell_command("C:\\WINDOWS\\system32\\cmd.exe /K codex resume x"), "codex resume x")
         self.assertIsNone(server.shell_command("cmd /c codex resume x"))
-
-    def test_viewer_trusts_its_folder_for_one_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = os.path.join(tmp, "Repo Name")
-            sub = os.path.join(repo, "sub")
-            os.makedirs(os.path.join(repo, ".git"))
-            os.makedirs(sub)
-            key = server.codex_project_key
-            options = server.viewer_options(sub, home=tmp)
-            self.assertEqual(options[:2], ["-c", "check_for_update_on_startup=false"])
-            self.assertEqual(options[2:], ["-c", f"projects={{'{key(sub)}'={{trust_level='trusted'}},"
-                                                 f"'{key(repo)}'={{trust_level='trusted'}}}}"])
-            self.assertEqual(server.viewer_options(repo, home=tmp)[3],
-                             f"projects={{'{key(repo)}'={{trust_level='trusted'}}}}")
-            odd = os.path.join(tmp, "a&b")
-            os.makedirs(odd)
-            self.assertEqual(server.viewer_options(odd, home=tmp), ["-c", "check_for_update_on_startup=false"])
-            # A folder the user marked untrusted stays so: Codex asks as usual.
-            with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as f:
-                f.write(f"model = \"x\"\n\n[projects.'{key(repo)}']\ntrust_level = \"untrusted\"\n")
-            self.assertEqual(server.viewer_options(sub, home=tmp), ["-c", "check_for_update_on_startup=false"])
-            with mock.patch.dict(sys.modules, {"tomllib": None}):  # Python before 3.11
-                self.assertEqual(server.codex_trust_levels(tmp), {key(repo): "untrusted"})
-                self.assertEqual(server.viewer_options(sub, home=tmp), ["-c", "check_for_update_on_startup=false"])
-            # Written another way, as valid TOML the line reader doesn't follow: uncertain, so Codex asks.
-            with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as f:
-                f.write(f"projects = {{ '{key(repo)}' = {{ trust_level = \"untrusted\" }} }}\n")
-            self.assertEqual(server.viewer_options(sub, home=tmp), ["-c", "check_for_update_on_startup=false"])
-            with mock.patch.dict(sys.modules, {"tomllib": None}):
-                self.assertIsNone(server.codex_trust_levels(tmp))
-                self.assertEqual(server.viewer_options(sub, home=tmp), ["-c", "check_for_update_on_startup=false"])
-            with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as f:
-                f.write("not = [toml\n")
-            self.assertEqual(server.viewer_options(sub, home=tmp), ["-c", "check_for_update_on_startup=false"])
-            with mock.patch.dict(sys.modules, {"tomllib": None}):  # 0.18.0: malformed is unsure, not empty
-                self.assertIsNone(server.codex_trust_levels(tmp))
-            # 0.18.0: brackets matched by kind, and only TOML's own bare values
-            for text, readable in (("not = [}\n", False), ("not = bareword\n", False), ("a = [1, {b = }]\n", False),
-                                   ('a = [1, "x", { b = true }]\n', False), ("a = [1,,2]\n", False), ("a = {1}\n", False),
-                                   ("a = 1\na = 2\n", False), ("[t]\na = 1\n[t]\nb = 2\n", False),
-                                   ("c = 1979-05-27T07:32:00Z\n[t]\na = 1\n[u]\na = 'x'\n", True),
-                                   ("a = 1_000\nb = -3.5e2\nc = false\n", True)):
-                with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as f:
-                    f.write(text)
-                with mock.patch.dict(sys.modules, {"tomllib": None}):
-                    self.assertEqual(server.codex_trust_levels(tmp) is not None, readable, text)
-            # Valid TOML the line reader can't follow, or an odd shape: no trust where unsure, no crash.
-            escaped = f"[projects.'{key(repo)}']\ntrust_level = \"\\u0075ntrusted\"\n"
-            # untrusted: which readers must give no trust ("all", or "old" for the line reader only)
-            for text, untrusted in ((escaped, "all"), ('[projects."c:\\U0001F600"]\ntrust_level = "trusted"\n', "old"),
-                                    ('projects = "x"\n', "")):  # the last: only that it doesn't raise
-                with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as f:
-                    f.write(text)
-                for modules in ({}, {"tomllib": None}):
-                    with mock.patch.dict(sys.modules, modules):
-                        got = server.viewer_options(sub, home=tmp)  # never raises
-                    if untrusted == "all" or (untrusted == "old" and modules):
-                        self.assertEqual(got, ["-c", "check_for_update_on_startup=false"], (text, modules))
-
-    @unittest.skipUnless(os.name == "nt", "Windows paths")
-    def test_trust_key_folds_only_ascii(self):
-        self.assertEqual(server.codex_project_key("C:\\École\\Repo"), "c:\\École\\repo")
 
     @unittest.skipUnless(os.name == "nt", "Windows process list")
     def test_command_line_and_end_tree(self):
@@ -4142,6 +4121,502 @@ class RoundTwoFixesTest(unittest.TestCase):
         with mock.patch.object(server, "nouez_cache_dir", lambda: root):
             snap = server.usage_snapshot(client)
         self.assertEqual(snap.get("claude"), {server.window_label(7 * 86400): 40})
+
+
+class SignInTest(unittest.TestCase):
+    """0.19.0: Claude Code's sign-in end, from `claude auth status --text`, warned of a week ahead."""
+
+    LINE = "Sign-in ends: between 2026-12-05 and 2026-12-08 (2026-12-08T20:59:30.320Z)"
+
+    def setUp(self):
+        self.cache = tempfile.mkdtemp(prefix="nouez-test-login-")
+        self.addCleanup(shutil.rmtree, self.cache, True)
+        for patch in (mock.patch.object(server, "nouez_cache_dir", return_value=self.cache),
+                      mock.patch.object(server, "credentials_stamp", return_value=None),
+                      mock.patch.dict(os.environ, {"NOUEZ_NO_LOGIN_CHECK": ""}),
+                      mock.patch.object(server, "_login_next", 0.0), mock.patch.object(server, "_login_memo", None),
+                      mock.patch.object(server, "_login_checking", False)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        server._login_idle.set()
+
+    def save(self, checked, line=LINE, context=None):
+        found = server.parse_login_line(line) or {}
+        server.write_json_atomic(os.path.join(self.cache, server.LOGIN_CACHE_FILE),
+                                 {"checked": checked, "credentials": None,
+                                  "context": context or server.login_context(), **found})
+        return found
+
+    def settle(self):
+        for _ in range(100):
+            if not server._login_checking:
+                break
+            time.sleep(0.05)
+
+    def test_the_line_is_read_and_the_rest_dropped(self):
+        found = server.parse_login_line("Login method: Claude Max account\nEmail: a@b.c\n" + self.LINE + "\n")
+        self.assertEqual(found["line"], self.LINE)
+        end = server.iso_seconds("2026-12-08T20:59:30.320Z")
+        self.assertEqual(found["last"], end)
+        self.assertEqual(found["first"], end - 3 * 86400)  # the earlier date is 3 days before the end
+        self.assertIsNone(server.parse_login_line("Login method: API key\n"))
+        odd = server.parse_login_line("Sign-in ends: any day now")
+        self.assertEqual((odd["first"], odd["last"]), (None, None))
+
+    def test_each_form_claude_code_prints(self):
+        end = server.iso_seconds("2026-12-08T20:59:30.320Z")
+        soon = server.parse_login_line("Sign-in ends: any day now, by 2026-12-08 (2026-12-08T20:59:30.320Z)")
+        self.assertEqual((soon["first"], soon["last"]), (end - 3 * 86400, end))
+        gone = server.parse_login_line("Sign-in may have ended: between 2026-12-05 and 2026-12-08 (2026-12-08T20:59:30.320Z)")
+        self.assertIn("has ended", server.login_warning(end + 1, gone))
+        # Without the exact end, the later date counts to its end, not its start.
+        bare = server.parse_login_line("Sign-in ends: between 2026-12-05 and 2026-12-08")
+        self.assertEqual(bare["last"], time.mktime((2026, 12, 9, 0, 0, 0, 0, 0, -1)))
+        self.assertEqual(bare["first"], time.mktime((2026, 12, 5, 0, 0, 0, 0, 0, -1)))
+        self.assertEqual(server.parse_login_line("Sign-in ends: \x1b[31mred")["line"], "Sign-in ends: [31mred")
+
+    def test_days_are_calendar_days_and_the_seventh_counts(self):
+        state = server.parse_login_line("Sign-in ends: between 2026-12-05 and 2026-12-08")
+        week_before = time.mktime((2026, 11, 28, 0, 0, 0, 0, 0, -1))
+        self.assertEqual(server.login_days(state, week_before), 7)
+        self.assertIn("in 7 days", server.login_warning(week_before, state))
+        self.assertEqual(server.login_warning(week_before - 1, state), "")
+        self.assertEqual(server.login_days(state, time.mktime((2026, 12, 4, 23, 59, 0, 0, 0, -1))), 1)
+
+    def test_warned_only_within_a_week_of_the_earlier_date(self):
+        found = self.save(time.time())
+        first = found["first"]
+        with mock.patch.object(server, "check_login"):
+            self.assertEqual(server.login_warning(first - 8 * 86400), "")
+            soon = server.login_warning(first - 3 * 86400 + 60)
+            self.assertIn("in 3 days", soon)
+            self.assertIn("renew before", soon)
+            self.assertIn("claude auth login", soon)
+            self.assertIn("today", server.login_warning(first - 60))
+            self.assertIn("may already have ended", server.login_warning(first + 60))
+            self.assertIn("may already have ended", server.login_warning(first + 86400 + 60))
+            self.assertIn("has ended", server.login_warning(found["last"] + 1))
+
+    def test_an_old_reading_is_read_again_in_the_background(self):
+        self.save(time.time() - server.LOGIN_CHECK_SECONDS - 1)
+        with mock.patch.object(server, "read_login_line", return_value={"line": "Sign-in ends: later", "first": None,
+                                                                        "last": None}):
+            server.login_state()
+            self.settle()
+            self.assertEqual(server.login_state()["line"], "Sign-in ends: later")
+
+    def test_a_new_sign_in_is_noticed(self):
+        self.save(time.time())
+        with mock.patch.object(server, "credentials_stamp", return_value=12345.0), \
+                mock.patch.object(server, "read_login_line", return_value={}) as read:
+            server.login_state(wait=True)
+        read.assert_called_once()
+
+    def test_the_top_bar_keeps_the_sign_in_badge_whole(self):
+        found = self.save(time.time())
+        now = found["first"] - 12 * 86400
+        when = time.strftime("%b %d", time.localtime(found["first"])).replace(" 0", " ")
+        busy = {"rank": 3, "used": 95.0, "colour": "31"}
+        groups = [{"title": t, "entries": [(sub, "5-hour", busy)]}
+                  for t, sub in (("Codex", None), ("Claude Code", None), ("Antigravity", "Claude+GPT"))]
+        scr = server.Screen(False)
+        with mock.patch.object(server, "check_login"):
+            for width in (60, 100, 104, 200):
+                line = server.top_bar(scr, groups, 7, now, width)
+                self.assertIn(f"● sign-in {when}, 12d", line, (width, line))
+                self.assertLessEqual(server.visible(line), width, (width, line))
+
+    def test_off_with_the_switch(self):
+        self.save(time.time())
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_LOGIN_CHECK": "1"}):
+            self.assertIsNone(server.login_state())
+            self.assertEqual(server.with_login_warning("list"), "list")
+
+    def test_badge_and_budget_lines(self):
+        found = self.save(time.time())
+        first = found["first"]
+        scr = mock.Mock(paint=lambda text, colour: f"<{colour}>{text}")
+        with mock.patch.object(server, "check_login"):
+            when = time.strftime("%b %d", time.localtime(first)).replace(" 0", " ")
+            day_start = time.mktime(time.localtime(first)[:3] + (0, 0, 1, 0, 0, -1))
+            if day_start < first:  # the renewal day, before its exact moment: "today", as the warning says
+                self.assertEqual(server.login_badge(scr, day_start), f"<31>● sign-in {when}, today")
+            self.assertEqual(server.login_badge(scr, first - 8 * 86400), f"<90>● sign-in {when}, 8d")
+            self.assertEqual(server.login_badge(scr, first - 3 * 86400 + 60), f"<33>● sign-in {when}, 3d")
+            self.assertEqual(server.login_badge(scr, first - 86400), f"<31>● sign-in {when}, 1d")
+            self.assertEqual(server.login_badge(scr, found["last"] + 1), "<31>● sign-in ended")
+            self.assertEqual(server.login_badge(scr, first + 3600), "<31>● sign-in ending")
+            self.assertEqual(server.login_lines(first - 8 * 86400), ["  - " + self.LINE])
+            lines = server.login_lines(first - 86400 + 60)
+            self.assertEqual(lines[0], "  - " + self.LINE)
+            self.assertIn("ends soon", lines[1])
+
+    def test_another_sign_ins_reading_is_not_used(self):
+        self.save(time.time(), context={"config": "elsewhere", "env": []})
+        with mock.patch.object(server, "check_login") as check:
+            self.assertIsNone(server.login_state())
+        check.assert_called_once()
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}):
+            self.assertEqual(server.login_context()["env"], ["ANTHROPIC_API_KEY"])
+            self.assertNotIn("sk-test", json.dumps(server.login_context()))
+
+    def test_waits_for_a_reading_under_way(self):
+        self.save(time.time() - server.LOGIN_CHECK_SECONDS - 1)
+        server._login_checking = True
+        server._login_idle.clear()
+        self.addCleanup(server._login_idle.set)
+
+        def finish():
+            time.sleep(0.2)
+            self.save(time.time(), line="Sign-in ends: fresh")
+            server._login_checking = False
+            server._login_idle.set()
+        threading.Thread(target=finish).start()
+        self.assertEqual(server.login_state(wait=True)["line"], "Sign-in ends: fresh")
+
+    def test_a_reading_that_cant_be_saved_isnt_repeated_at_once(self):
+        with mock.patch.object(server, "write_json_atomic", side_effect=OSError("disk full")), \
+                mock.patch.object(server, "read_login_line", return_value={"line": "Sign-in ends: x"}) as read:
+            first = server.login_state(wait=True)
+            server.login_state(wait=True)
+        read.assert_called_once()
+        self.assertEqual(first["line"], "Sign-in ends: x")  # this process keeps its own reading
+
+    def test_a_save_that_returns_false_counts_as_not_saved(self):
+        self.save(time.time() - server.LOGIN_CHECK_SECONDS - 1, line="Sign-in ends: old")
+        with mock.patch.object(server, "write_json_atomic", return_value=False), \
+                mock.patch.object(server, "read_login_line", return_value={"line": "Sign-in ends: fresh"}) as read:
+            first = server.login_state(wait=True)
+            server.login_state(wait=True)
+        read.assert_called_once()  # not read again at once, though the file still holds the old one
+        self.assertEqual(first["line"], "Sign-in ends: fresh")  # the newer reading, not the stale file
+        self.assertGreater(server._login_next, time.time() + 60)
+
+    def test_the_reading_runs_in_the_home_folder(self):
+        with mock.patch.object(server, "find_program", return_value="claude"), \
+                mock.patch.object(server.subprocess, "run",
+                                  return_value=mock.Mock(stdout="Sign-in ends: x")) as run:
+            server.read_login_line()
+        self.assertEqual(run.call_args.kwargs["cwd"], os.path.expanduser("~"))
+
+    def test_one_reading_per_request(self):
+        self.save(time.time() - server.LOGIN_CHECK_SECONDS - 1)
+        with mock.patch.object(server, "read_login_line", return_value={"line": self.LINE}) as read:
+            server.login_lines(time.time())
+        read.assert_called_once()
+
+    def test_tools_carry_the_warning(self):
+        with mock.patch.object(server, "login_warning", return_value="Claude Code's sign-in ends soon."), \
+                mock.patch.object(server, "claude_sessions", return_value=[]):
+            self.assertIn("ends soon", server.list_claude_sessions({}))
+
+
+class ConfigReportTest(unittest.TestCase):
+    """0.19.0: what an untrusted folder's project settings would run, read before the user is asked."""
+
+    def folder(self, settings=None, local=None, mcp=None):
+        d = tempfile.mkdtemp(prefix="nouez-test-config-")
+        self.addCleanup(shutil.rmtree, d, True)
+        os.mkdir(os.path.join(d, ".claude"))
+        for rel, value in ((os.path.join(".claude", "settings.json"), settings),
+                           (os.path.join(".claude", "settings.local.json"), local), (".mcp.json", mcp)):
+            if value is not None:
+                with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
+                    f.write(value if isinstance(value, str) else json.dumps(value))
+        return d
+
+    def test_everything_that_runs_is_listed(self):
+        d = self.folder(settings={"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "sh go.sh"}]}]},
+                                  "statusLine": {"type": "command", "command": "status.sh"},
+                                  "apiKeyHelper": "key.sh", "env": {"PATH": "secret-ish"},
+                                  "permissions": {"allow": ["Bash(*)"], "defaultMode": "bypassPermissions"},
+                                  "enableAllProjectMcpServers": True, "brandNewKey": 1, "model": "opus"},
+                        mcp={"mcpServers": {"tools": {"command": "node", "args": ["srv.js"]}}})
+        report = server.config_report([d])
+        for part in ("SessionStart: sh go.sh", "statusLine runs: status.sh", "apiKeyHelper runs: key.sh",
+                     "env sets (1, values not shown): PATH", "pre-approves: Bash(*)", "bypassPermissions",
+                     "enableAllProjectMcpServers", "other settings: brandNewKey", "tools: runs node srv.js"):
+            self.assertIn(part, report)
+        self.assertNotIn("secret-ish", report)
+        self.assertNotIn("model", report)
+
+    def test_an_unreadable_file_is_never_none(self):
+        report, _, complete = server.config_review([self.folder(local="{broken")])
+        self.assertIn("couldn't be read", report)
+        self.assertNotIn("No project settings", report)
+        self.assertFalse(complete)
+        d = self.folder()
+        os.mkdir(os.path.join(d, ".mcp.json"))  # not a file
+        report, _, complete = server.config_review([d])
+        self.assertIn(".mcp.json: couldn't be read", report)
+        self.assertFalse(complete)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes")
+    def test_a_pipe_is_not_waited_on(self):
+        d = self.folder()
+        os.mkfifo(os.path.join(d, ".mcp.json"))
+        report, _, complete = server.config_review([d])
+        self.assertIn("not a regular file", report)
+        self.assertFalse(complete)
+
+    def test_details_that_matter_are_shown_and_secrets_hidden(self):
+        d = self.folder(settings={"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                                      {"type": "command", "command": "check.sh --token abc123"}]}]},
+                                  "enabledPlugins": {"good@market": True, "bad@market": False},
+                                  "extraKnownMarketplaces": {"market": {"source": {"source": "github", "repo": "o/r"}}},
+                                  "apiKeyHelper": "echo \x1b]8;;evil\u202e"},
+                        mcp={"mcpServers": {"db": {"command": "npx", "args": ["db", "--api-key", "sk-live-1"],
+                                                   "env": {"DB_PASSWORD": "hunter2"}},
+                                            "web": {"type": "http", "url": "https://u:pw@x.test/mcp?key=k1",
+                                                    "headers": {"Authorization": "Bearer t"}}}})
+        report = server.config_report([d])
+        for part in ("PreToolUse [Bash]: check.sh --token ***", "good@market (on)", "bad@market (off)",
+                     "market from", "o/r", "db: runs npx db --api-key ***", "env DB_PASSWORD (values not shown)",
+                     "web: http https://***@x.test/mcp?key=***", "headers Authorization", "\\u001b", "\\u202e",
+                     "shown as ***"):
+            self.assertIn(part, report)
+        for secret in ("abc123", "sk-live-1", "hunter2", "pw@", "k1", "Bearer", "\x1b", "\u202e"):
+            self.assertNotIn(secret, report)
+
+    def test_a_long_report_says_it_is_a_summary(self):
+        d = self.folder(settings={"permissions": {"allow": [f"Bash(cmd{i})" for i in range(30)]}})
+        report = server.config_report([d])
+        self.assertIn("and 10 more", report)
+        self.assertIn("This is a summary", report)
+        self.assertNotIn("summary", server.config_report([self.folder(settings={"apiKeyHelper": "a.sh"})]))
+
+    def test_the_fingerprint_sees_what_the_report_doesnt(self):
+        d = self.folder(settings={"env": {"A": "1"}})
+        text, before, _ = server.config_review([d])
+        with open(os.path.join(d, ".claude", "settings.json"), "w") as f:
+            json.dump({"env": {"A": "2"}}, f)
+        text2, after, _ = server.config_review([d])
+        self.assertEqual(text, text2)
+        self.assertNotEqual(before, after)
+
+    def test_no_settings(self):
+        d = tempfile.mkdtemp(prefix="nouez-test-config-")
+        self.addCleanup(shutil.rmtree, d, True)
+        self.assertIn("No project settings", server.config_report([d]))
+
+    def test_both_folders_once(self):
+        a, b = self.folder(settings={"apiKeyHelper": "a.sh"}), self.folder(settings={"apiKeyHelper": "b.sh"})
+        report = server.config_report([a, b, a])
+        self.assertIn("a.sh", report)
+        self.assertIn("b.sh", report)
+        self.assertEqual(report.count("a.sh"), 1)
+
+
+class TrustReportFirstTest(unittest.TestCase):
+    """0.19.0: trust=true records trust only once nouez has given the folder's report."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="nouez-test-trust-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        os.mkdir(os.path.join(self.dir, ".git"))
+        self.write({"apiKeyHelper": "key.sh"})
+        server._trust_reports.clear()
+        self.addCleanup(server._trust_reports.clear)
+        for patch in (mock.patch.object(server, "folder_trusted", return_value=False),
+                      mock.patch.object(server, "exactly_trusted", return_value=False)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def write(self, settings):
+        os.makedirs(os.path.join(self.dir, ".claude"), exist_ok=True)
+        with open(os.path.join(self.dir, ".claude", "settings.json"), "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+
+    def test_trust_on_the_first_call_gives_the_report(self):
+        with mock.patch.object(server, "trust_folder") as trust, mock.patch.object(server, "open_window") as window:
+            out = server.open_claude_session({"cwd": self.dir, "trust": True})
+        trust.assert_not_called()
+        window.assert_not_called()
+        self.assertIn("Not trusted yet", out)
+        self.assertIn("apiKeyHelper runs: key.sh", out)
+
+    def test_trust_after_the_report_is_recorded(self):
+        with mock.patch.object(server, "trust_folder", return_value=(self.dir, None)) as trust, \
+                mock.patch.object(server, "open_window") as window:
+            first = server.open_claude_session({"cwd": self.dir})
+            server.open_claude_session({"cwd": self.dir, "trust": True})
+        self.assertIn("apiKeyHelper runs: key.sh", first)
+        trust.assert_called_once()
+        window.assert_not_called()  # folder_trusted still says no in this test
+
+    def test_a_changed_folder_is_reported_again(self):
+        with mock.patch.object(server, "trust_folder", return_value=(self.dir, None)) as trust:
+            server.open_claude_session({"cwd": self.dir})
+            self.write({"apiKeyHelper": "other.sh"})
+            out = server.open_claude_session({"cwd": self.dir, "trust": True})
+        trust.assert_not_called()
+        self.assertIn("changed since", out)
+        self.assertIn("other.sh", out)
+
+    def test_a_folder_made_by_the_call_needs_no_report(self):
+        plain = tempfile.mkdtemp(prefix="nouez-test-plain-")
+        self.addCleanup(shutil.rmtree, plain, True)
+        new = os.path.join(plain, "fresh")
+        with mock.patch.object(server, "trust_folder", return_value=(new, None)) as trust:
+            server.open_claude_session({"cwd": new, "create": True, "trust": True})
+        trust.assert_called_once()
+
+    def test_a_folder_made_inside_a_repository_still_needs_the_report(self):
+        new = os.path.join(self.dir, "fresh")
+        with mock.patch.object(server, "trust_folder") as trust, mock.patch.object(server, "open_window") as window:
+            out = server.open_claude_session({"cwd": new, "create": True, "trust": True})
+        trust.assert_not_called()
+        window.assert_not_called()
+        self.assertIn("Not trusted yet", out)
+        self.assertIn("apiKeyHelper runs: key.sh", out)
+
+    def test_the_folder_the_session_starts_in_is_reported(self):
+        sub = os.path.join(self.dir, "sub")
+        os.makedirs(os.path.join(sub, ".claude"))
+        with open(os.path.join(sub, ".claude", "settings.json"), "w") as f:
+            json.dump({"statusLine": {"command": "sub.sh"}}, f)
+        out = server.open_claude_session({"cwd": sub})
+        self.assertIn("statusLine runs: sub.sh", out)
+        self.assertIn("apiKeyHelper runs: key.sh", out)
+
+    def test_a_changed_value_the_report_doesnt_show_is_reported_again(self):
+        self.write({"env": {"A": "1"}})
+        with mock.patch.object(server, "trust_folder", return_value=(self.dir, None)) as trust:
+            server.open_claude_session({"cwd": self.dir})
+            self.write({"env": {"A": "2"}})
+            out = server.open_claude_session({"cwd": self.dir, "trust": True})
+        trust.assert_not_called()
+        self.assertIn("changed since", out)
+
+    def test_unreadable_settings_are_never_trusted_from_here(self):
+        with open(os.path.join(self.dir, ".mcp.json"), "w") as f:
+            f.write("{broken")
+        with mock.patch.object(server, "trust_folder") as trust:
+            first = server.open_claude_session({"cwd": self.dir})
+            out = server.open_claude_session({"cwd": self.dir, "trust": True})
+        trust.assert_not_called()
+        self.assertIn("couldn't be read", first)
+        self.assertIn("won't record trust", first)
+        self.assertIn("Not trusted", out)
+
+    def test_a_cancelled_call_shows_nothing_so_remembers_nothing(self):
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(server.Cancelled):
+            server.open_claude_session({"cwd": self.dir}, cancel)
+        self.assertEqual(server._trust_reports, {})
+
+    def test_a_call_cancelled_after_it_finished_remembers_nothing(self):
+        cancel = threading.Event()
+        server._cancel_events["c1"] = cancel
+
+        def late_cancel(text):  # the cancellation arrives as the result is put together
+            cancel.set()
+            return text
+        msg = {"jsonrpc": "2.0", "id": "c1", "method": "tools/call",
+               "params": {"name": "OpenClaudeSession", "arguments": {"cwd": self.dir}}}
+        with mock.patch.object(server, "with_login_warning", side_effect=late_cancel), \
+                mock.patch.object(server, "respond") as respond:
+            server.dispatch(msg, cancel)
+        respond.assert_not_called()
+        self.assertEqual(server._trust_reports, {})
+        server._cancel_events.pop("c1", None)
+        with mock.patch.object(server, "respond", side_effect=OSError("pipe closed")):  # a failed write
+            with self.assertRaises(OSError):
+                server.dispatch(msg, threading.Event())
+        self.assertEqual(server._trust_reports, {})
+        with mock.patch.object(server, "respond") as respond:  # and one that isn't cancelled is kept
+            server.dispatch(msg, threading.Event())
+        respond.assert_called_once()
+        self.assertEqual(len(server._trust_reports), 1)
+
+    def test_report_paths_show_characters_that_dont_print(self):
+        odd = os.path.join(self.dir, "a\u202eb")
+        os.makedirs(os.path.join(odd, ".claude"))
+        with open(os.path.join(odd, ".claude", "settings.json"), "w") as f:
+            json.dump({"env": {"A": "1"}}, f)
+        report = server.config_report([odd])
+        self.assertIn("a\\u202eb", report)
+        self.assertNotIn("\u202e", report)
+
+    def test_trust_is_written_only_for_the_folder_the_user_was_asked_about(self):
+        other = tempfile.mkdtemp(prefix="nouez-test-other-")
+        self.addCleanup(shutil.rmtree, other, True)
+        with mock.patch.object(server, "trust_key", return_value=(other, False)):
+            with self.assertRaisesRegex(server.BridgeError, "Nothing was changed"):
+                server.trust_folder(self.dir, expect=self.dir)
+
+
+class ListProjectsTest(unittest.TestCase):
+    """0.19.0: ListProjects lists the folders beside the session's own, read from disk."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="nouez-test-projects-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        for name in ("alpha", "beta", ".hidden", "dispatcher"):
+            os.mkdir(os.path.join(self.root, name))
+        os.mkdir(os.path.join(self.root, "alpha", ".git"))
+        with open(os.path.join(self.root, "beta", ".mcp.json"), "w") as f:
+            f.write("{}")
+        with open(os.path.join(self.root, "notes.txt"), "w") as f:
+            f.write("x")
+        for patch in (mock.patch.object(server, "default_cwd", return_value=os.path.join(self.root, "dispatcher")),
+                      mock.patch.object(server, "trusted_folders", return_value={server._trust_norm(os.path.join(self.root, "alpha"))}),
+                      mock.patch.object(server, "claude_sessions", return_value=[
+                          {"name": "alpha-work", "cwd": os.path.join(self.root, "alpha", "src")}])):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_lists_the_folders_beside_its_own(self):
+        out = server.list_projects({})
+        self.assertIn(f"Folders in {self.root} (3; hidden folders left out: 1)", out)
+        self.assertIn("- alpha [git; trusted; running: alpha-work]", out)
+        self.assertIn("- beta [not trusted; has .mcp.json]", out)
+        self.assertIn("this session's folder", out)
+        self.assertNotIn("notes.txt", out)
+        self.assertNotIn(".hidden", out)
+
+    def test_folders_windows_marks_hidden_are_left_out(self):
+        with mock.patch.object(server, "hidden_on_windows", side_effect=lambda p: p.endswith("beta")):
+            out = server.list_projects({})
+        self.assertNotIn("beta", out)
+        self.assertIn("hidden folders left out: 2", out)
+
+    @unittest.skipUnless(os.name == "nt", "Windows file attributes")
+    def test_the_hidden_attribute_is_read(self):
+        import ctypes
+        path = os.path.join(self.root, "beta")
+        self.assertFalse(server.hidden_on_windows(path))
+        ctypes.windll.kernel32.SetFileAttributesW(path, 0x2)
+        self.assertTrue(server.hidden_on_windows(path))
+
+    def test_another_folder(self):
+        out = server.list_projects({"folder": os.path.join(self.root, "alpha")})
+        self.assertIn("No folders in", out)
+        with self.assertRaises(server.BridgeError):
+            server.list_projects({"folder": "relative"})
+
+
+class StatusScreenTest(unittest.TestCase):
+    """0.19.0: OpenStatusScreen opens `top` in the home folder."""
+
+    def test_opens_top_in_the_home_folder(self):
+        with mock.patch.object(server, "open_window", return_value="a new window") as window:
+            out = server.open_status_screen({"days": 30})
+        cwd, argv, _ = window.call_args[0]
+        self.assertEqual(cwd, os.path.expanduser("~"))
+        self.assertEqual(argv[-4:], [os.path.abspath(server.__file__), "top", "--days", "30"])
+        self.assertIn("ConsultantBudget", out)
+
+    def test_a_whole_number_sent_as_a_float_is_taken(self):
+        with mock.patch.object(server, "open_window", return_value="a new window") as window:
+            server.open_status_screen({"days": 7.0})
+        self.assertEqual(window.call_args[0][1][-1], "7")
+
+    def test_only_the_screens_periods(self):
+        for bad in (2, True, "7", 7.5):
+            with self.assertRaises(server.BridgeError):
+                server.open_status_screen({"days": bad})
 
 
 if __name__ == "__main__":

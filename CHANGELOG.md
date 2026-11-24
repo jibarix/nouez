@@ -6,6 +6,28 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-23
+
+Trusting a folder from the phone now starts from a report nouez writes of everything the folder would run, a session can list your projects, and nouez warns a week ahead when Claude Code's sign-in on the computer is about to end. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version. A running status screen restarts on it by itself.
+
+### Added
+
+- `ListProjects`: the folders in a folder, by default the one holding the session's own folder (for a dispatcher, your projects), each marked git, trusted (itself or through a folder above it) or not, with the Claude Code sessions running in it and its project settings files. Hidden folders (a dot name, or marked hidden on Windows) are left out. Reads only.
+- `OpenStatusScreen`: opens the status screen (`server.py top`) in a new terminal window on the computer, with 1, 7 or 30 days of consultations or all of them.
+- A sign-in warning. nouez reads the line `claude auth status --text` prints about when Claude Code's sign-in ends, keeps only that line in `nouez/claude-login.json`, and from 7 calendar days before the earlier date (3 days before the exact end the line gives) adds a warning, with how to renew, to the results of `OpenClaudeSession`, `ListClaudeSessions` and `ListProjects`. `ConsultantBudget` always shows the line; the status screen's top bar always shows the date to renew by and the days left, grey until the warning is on, then amber and red. It is read in the background when a server starts, about hourly (every 10 minutes in the last week) and when the credentials file's time changes; nouez never reads inside that file. `ConsultantBudget` waits for a reading that is due, up to about 25 seconds. The saved line is used only by servers with the same Claude Code config folder and sign-in variables (their names are saved, never their values). `NOUEZ_NO_LOGIN_CHECK=1` turns it off.
+
+### Changed
+
+- **`OpenClaudeSession` reports what an untrusted folder would run.** When it opens nothing because the folder isn't trusted, the result gives a report of `.claude/settings.json`, `.claude/settings.local.json` and `.mcp.json` in the folder trust would be recorded for, the checkout that opens and the folder itself: hooks with their matchers and other commands, the names of `env` variables (not their values), permission rules and mode, extra folders, MCP servers (variable and header names only), plugins on or off, marketplaces with their sources, and any setting it doesn't know. What looks like a password or key shows as `***`, characters that don't print are spelled out, and a shortened report says it is a summary. A file it can't read is reported as such, never as nothing. Claude is told to show it to the user with the question.
+- **`trust: true` works only after that report.** nouez records trust only for a folder whose report it gave earlier in the same conversation, with the files unchanged to the byte since; otherwise it gives the report again and records nothing. When a settings file can't be read it never records trust: the user looks on the computer. A folder the same call creates outside a git repository needs no report.
+- **A folder trusted only through one above it, with its own `.claude/settings.json`, is asked about first.** Such a folder can bring Claude Code's trust question back, so `OpenClaudeSession` no longer opens a window that may wait at it: it gives the report and asks, as for an untrusted folder. `open_untrusted: true` still opens it.
+- README: the dispatcher's example `CLAUDE.md` uses `ListProjects` and the report, the permissions to allow include the new read-only tools, and a tip on following a hidden dispatcher from the computer (https://claude.ai/code in a browser, and a log file for the server's own output).
+
+### Fixed
+
+- **A Codex consultant's pane showed "This conversation is open in another app" instead of the consultant.** Given nouez's `-c` options, `codex resume` started an app server of its own inside the pane, which can't take the thread from the Codex daemon nouez uses, so the pane was locked out from its first message. The pane now attaches to that daemon (`--remote` with the daemon's own socket, so a terminal with another `CODEX_HOME` reaches the same one). Close a locked pane; nouez opens a working one on the consultant's next message.
+- **So a pane now asks "Trust this folder?" in a folder Codex hasn't trusted.** A pane on the daemon asks the daemon, which takes no trust for one run, so nouez no longer passes one. Choosing **Trust and continue** saves the answer in your Codex config, and the pane doesn't ask there again.
+
 ## [0.18.1] - 2026-11-23
 
 Claude consults when your own instructions call for it, not only when you ask. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version. Reconnecting loads the server only: if you copied the consult skill, copy its new description into your installed copy too.
@@ -489,7 +511,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/jibarix/nouez/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/jibarix/nouez/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/jibarix/nouez/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/jibarix/nouez/compare/v0.16.0...v0.17.0
