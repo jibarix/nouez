@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -60,6 +61,25 @@ def _no_real_window(real):
 
 server.launch = _no_real_window(server.launch)
 server.launch_console = _no_real_window(server.launch_console)
+
+
+
+def dir_link(target, link):
+    """A link to a folder: a symbolic link, or on Windows without the right to make one, a junction."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            raise
+        import _winapi
+        _winapi.CreateJunction(target, link)
+
+
+def file_link(test, target, link):
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        test.skipTest("this account can't make symbolic links")
 
 
 class Server:
@@ -677,16 +697,64 @@ class NouezUpdateTest(unittest.TestCase):
         def answer(body):
             resp = mock.MagicMock()
             resp.__enter__.return_value.read.return_value = json.dumps(body).encode()
-            return resp
-        with mock.patch.object(server.urllib.request, "urlopen", return_value=answer({"tag_name": "v1.2.3"})) as op:
+            opener = mock.MagicMock()
+            opener.open.return_value = resp
+            return opener
+        with mock.patch.object(server, "web_opener", return_value=answer({"tag_name": "v1.2.3"})) as op:
             self.assertEqual(server.fetch_latest_release(), "1.2.3")
-        req = op.call_args[0][0]
+        req = op.return_value.open.call_args[0][0]
         self.assertEqual(req.full_url, server.RELEASES_URL)
         self.assertTrue(req.get_header("User-agent").startswith("nouez/"))
+        self.assertEqual(sorted(k.lower() for k in req.headers), ["accept", "user-agent"])  # nothing else is sent
         for body in ({"tag_name": "v1.2.3`; echo"}, {"tag_name": None}, ["v1.2.3"], {"tag_name": "1.2.3"},
                      {"tag_name": "v1.2.%s" % ("3" * 50)}):
-            with mock.patch.object(server.urllib.request, "urlopen", return_value=answer(body)):
+            with mock.patch.object(server, "web_opener", return_value=answer(body)):
                 self.assertIsNone(server.fetch_latest_release())
+
+    def test_redirect_to_another_site_is_refused(self):
+        """0.22.0: a redirect to another host or port is refused, so a key header never goes there."""
+        import http.server
+        got = []
+
+        class Other(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                got.append(dict(self.headers))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+
+        other = http.server.HTTPServer(("127.0.0.1", 0), Other)
+        target = f"http://127.0.0.1:{other.server_address[1]}/stolen"
+
+        class First(Other):
+            def do_GET(self):
+                if self.path.startswith("/same"):
+                    return Other.do_GET(self)
+                self.send_response(302)
+                self.send_header("Location", "/same" if self.path.startswith("/here") else target)
+                self.end_headers()
+
+        first = http.server.HTTPServer(("127.0.0.1", 0), First)
+        for srv in (other, first):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{first.server_address[1]}"
+            with mock.patch.object(server, "RELEASES_URL", base + "/away"),                  mock.patch.object(server, "AA_MODELS_URL", base + "/here"):
+                with self.assertRaises(urllib.error.HTTPError):
+                    server.fetch_json(base + "/away", {"x-api-key": "k-secret"}, 5, 1000)
+                self.assertEqual(got, [])  # the other server never heard from nouez
+                self.assertEqual(server.fetch_json(base + "/here?page=1", {"x-api-key": "k-secret"}, 5, 1000), {})
+                self.assertEqual(len(got), 1)  # a redirect on the same site is followed
+                with self.assertRaisesRegex(OSError, "no web request"):  # any other address: never asked
+                    server.fetch_json(target, {"x-api-key": "k-secret"}, 5, 1000)
+                self.assertEqual(len(got), 1)
+        finally:
+            for srv in (other, first):
+                srv.shutdown()
+                srv.server_close()
 
     def test_opt_out(self):
         for value, off in (("", False), ("0", False), ("false", False), ("1", True), ("yes", True)):
@@ -849,6 +917,57 @@ class TrustTest(unittest.TestCase):
         self.assertEqual(len(self.backups()), server.TRUST_BACKUPS_KEPT)
         self.assertTrue(all(server.folder_trusted(os.path.join(self.projects, f"p{i}"))
                             for i in range(server.TRUST_BACKUPS_KEPT + 3)))
+
+    def test_backups_never_go_through_a_link(self):
+        """0.22.0: a linked backup folder isn't written through, and then nothing is changed."""
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        folder = server.trust_backup_dir()
+        os.makedirs(os.path.dirname(folder))
+        dir_link(outside, folder)
+        with open(self.state, encoding="utf-8") as f:
+            before = f.read()
+        with self.assertRaisesRegex(server.BridgeError, "Nothing was changed"):
+            server.trust_folder(self.plain)
+        self.assertEqual(os.listdir(outside), [])
+        with open(self.state, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_a_linked_backup_is_neither_counted_nor_removed(self):
+        """0.22.0: only nouez's own backup files are trimmed."""
+        server.trust_folder(self.plain)
+        folder = server.trust_backup_dir()
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        link = os.path.join(folder, ".claude.json.19990101-000000.x.bak")
+        dir_link(outside, link)
+        with mock.patch.object(server, "TRUST_BACKUPS_KEPT", 1):
+            server.trust_folder(self.repo)
+        self.assertTrue(server.is_link(link))
+        self.assertEqual(len([b for b in self.backups() if not server.is_link(os.path.join(folder, b))]), 1)
+
+    def test_the_user_can_turn_trust_writing_off(self):
+        """0.22.0: with NOUEZ_NO_TRUST_WRITE=1, nouez never records trust, asked or not."""
+        for value, off in (("", False), ("0", False), ("no", False), ("1", True), ("yes", True)):
+            self.assertEqual(server.trust_write_off({"NOUEZ_NO_TRUST_WRITE": value}), off)
+        with open(self.state, encoding="utf-8") as f:
+            before = f.read()
+        with mock.patch.dict(server.os.environ, {"NOUEZ_NO_TRUST_WRITE": "1"}):
+            out, opened = self.open({"cwd": self.repo})
+            self.assertFalse(opened)
+            self.assertIn("NOUEZ_NO_TRUST_WRITE=1", out)  # Claude isn't told to ask for a yes it can't use
+            for _ in range(2):  # the second call, after the report, is refused too
+                with self.assertRaisesRegex(server.BridgeError, "NOUEZ_NO_TRUST_WRITE=1"):
+                    self.open({"cwd": self.repo, "trust": True})
+            with self.assertRaisesRegex(server.BridgeError, "NOUEZ_NO_TRUST_WRITE=1"):
+                server.trust_folder(self.repo)
+            new = os.path.join(os.path.dirname(self.repo), "made-for-nothing")
+            with self.assertRaisesRegex(server.BridgeError, "NOUEZ_NO_TRUST_WRITE=1"):
+                self.open({"cwd": new, "create": True, "trust": True})
+            self.assertFalse(os.path.exists(new))  # refused before the folder was made
+        with open(self.state, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(self.backups(), [])
 
     def test_trust_is_refused_where_claude_code_doesnt_keep_it(self):
         with open(self.state, encoding="utf-8") as f:
@@ -2773,6 +2892,160 @@ class RevisionTest(unittest.TestCase):
             self.assertEqual(f.read(), patch)
 
 
+class HardeningTest(unittest.TestCase):
+    """0.22.0: nouez's own folders, kept files and git calls."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        patcher = mock.patch.object(server, "nouez_cache_dir", return_value=self.dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.outside, True)
+
+    def old(self, path, days):
+        with open(path, "w") as f:
+            f.write("x")
+        t = time.time() - days * 86400
+        os.utime(path, (t, t))
+
+    def test_folders_that_are_links_are_refused(self):
+        dir_link(self.outside, os.path.join(self.dir, "replies"))
+        with self.assertRaises(OSError):
+            server.cache_folder("replies", "deeper", create=True)
+        self.assertEqual(os.listdir(self.outside), [])  # nothing made where the link points
+
+    def test_saved_json_never_goes_through_a_linked_folder(self):
+        """0.22.0: a cache file nouez saves isn't written where a folder link on its way points."""
+        dir_link(self.outside, os.path.join(self.dir, "agy"))
+        self.assertFalse(server.write_json_atomic(os.path.join(self.dir, "agy", "abc", "consultant.json"), {}))
+        self.assertTrue(server.write_json_atomic(os.path.join(self.dir, "fine", "x.json"), {"a": 1}))
+        self.assertEqual(os.listdir(self.outside), [])
+
+    def test_a_linked_pane_key_is_replaced_not_read(self):
+        """0.22.0: a pane key that is a link is neither read nor written through."""
+        target = os.path.join(self.outside, "planted")
+        with open(target, "wb") as f:
+            f.write(b"p" * 32)
+        file_link(self, target, os.path.join(self.dir, "pane-key"))
+        with mock.patch.object(server, "_pane_key", None):
+            key = server.pane_key()
+        self.assertNotEqual(key, b"p" * 32)
+        self.assertFalse(server.is_link(os.path.join(self.dir, "pane-key")))
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), b"p" * 32)
+
+    def test_locks_are_never_taken_through_a_link(self):
+        """0.22.0: a lock file, or an Antigravity folder, that is a link isn't opened."""
+        lock = os.path.join(self.dir, "usage-log.jsonl.lock")
+        dir_link(self.outside, lock)
+        with self.assertRaisesRegex(OSError, "is a link"):
+            with server.FileLock(lock, 1, "busy"):
+                pass
+        with mock.patch.object(server, "agy_root", return_value=os.path.join(self.dir, "agy")):
+            os.makedirs(os.path.join(self.dir, "agy"))
+            dir_link(self.outside, os.path.join(self.dir, "agy", "abc"))
+            with self.assertRaises(OSError):
+                with server.agy_lock("abc"):
+                    pass
+        self.assertEqual(os.listdir(self.outside), [])
+
+    def test_partial_clones_take_no_diff_with_an_old_git(self):
+        """0.22.0: a partial clone's diff is taken only by a git that can be told not to fetch."""
+        repo = os.path.join(self.dir, "repo")
+        os.makedirs(repo)
+        for cmd in (["init", "-q"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "t"],
+                    ["commit", "-q", "--allow-empty", "-m", "start"], ["config", "extensions.partialClone", "origin"]):
+            subprocess.run(["git", "-C", repo, *cmd], check=True, capture_output=True)
+        with open(os.path.join(repo, "new.txt"), "w") as f:
+            f.write("hello\n")
+        real = server.git_bytes
+
+        def old_git(cmd, *a, **k):
+            return (None, "unknown option") if "--no-lazy-fetch" in cmd else real(cmd, *a, **k)
+        with mock.patch.object(server, "git_bytes", side_effect=old_git):
+            line, diff, _ = server.revision(repo)
+        self.assertIn("partial clone", line)
+        self.assertEqual(diff, b"")
+        subprocess.run(["git", "-C", repo, "config", "--unset", "extensions.partialClone"], check=True)
+        subprocess.run(["git", "-C", repo, "config", "remote.origin.promisor", "2"], check=True)  # git: true
+        with mock.patch.object(server, "git_bytes", side_effect=old_git):
+            line, diff, _ = server.revision(repo)
+        self.assertIn("partial clone", line)  # a promisor remote fetches too
+        subprocess.run(["git", "-C", repo, "config", "--unset", "remote.origin.promisor"], check=True)
+        with mock.patch.object(server, "git_bytes", side_effect=old_git):
+            line, diff, _ = server.revision(repo)
+        self.assertNotIn("partial clone", line)
+        self.assertIn(b"hello", diff)  # nothing to fetch: an old git takes the diff
+        subprocess.run(["git", "-C", repo, "config", "extensions.partialClone", "origin"], check=True)
+        seen = []
+
+        def new_git(cmd, *a, **k):
+            seen.append(cmd)
+            return real(cmd, *a, **k)
+        with mock.patch.object(server, "git_bytes", side_effect=new_git):
+            line, diff, _ = server.revision(repo)
+        if diff:  # git 2.45 or later
+            self.assertIn(b"hello", diff)
+            self.assertTrue(all("--no-lazy-fetch" in c for c in seen if "diff" in c))
+        made = server.cache_folder("a", "b", create=True)
+        self.assertTrue(server.plain_folder(made))
+        if os.name != "nt":
+            self.assertEqual(os.stat(made).st_mode & 0o777, 0o700)
+
+    def test_startup_removes_old_files_only(self):
+        patches = server.cache_folder(server.PATCH_FOLDER, create=True)
+        old, new, other = (os.path.join(patches, n) for n in ("0123456789abcdef.patch", "fedcba9876543210.patch",
+                                                               "notes.txt"))
+        self.old(old, server.PATCH_KEEP_DAYS + 1)
+        self.old(new, 1)
+        self.old(other, 400)
+        server.tidy()
+        self.assertEqual(sorted(os.listdir(patches)), ["fedcba9876543210.patch", "notes.txt"])
+        # A patches folder that is a link isn't looked in
+        shutil.rmtree(patches)
+        planted = os.path.join(self.outside, "0123456789abcdef.patch")
+        self.old(planted, 400)
+        dir_link(self.outside, patches)
+        server.tidy()
+        self.assertTrue(os.path.exists(planted))
+
+    def test_a_saved_diff_replaces_a_link(self):
+        folder = server.cache_folder(server.PATCH_FOLDER, create=True)
+        target = os.path.join(self.outside, "victim")
+        with open(target, "wb") as f:
+            f.write(b"same")
+        file_link(self, target, os.path.join(folder, "0123456789abcdef.patch"))
+        path = server.save_patch(b"same", "0123456789abcdef")
+        self.assertFalse(os.path.islink(path))
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"same")
+
+    def test_git_never_fetches_for_a_diff(self):
+        with mock.patch.object(server, "run_bytes", return_value=(b"", "")) as run:
+            server.git_bytes(["git", "status"], 5, env={"A": "1"})
+        self.assertEqual(run.call_args.args[3], {"A": "1", "GIT_NO_LAZY_FETCH": "1"})
+
+    def test_usage_file_keeps_only_the_windows(self):
+        now = 1_000_000.0
+        got = server.merge_claude_usage(None, {"five_hour": {"used_percentage": 5, "resets_at": now + 60, "who": "x"},
+                                               "account": {"email": "someone@example.com"}}, now)
+        self.assertEqual(got["rate_limits"], {"five_hour": {"used_percentage": 5, "resets_at": now + 60,
+                                                            "observed": now}})
+
+    @unittest.skipUnless(os.name == "nt", "Windows")
+    def test_helper_check_reads_one_command_line(self):
+        line = "python x claude --name nouez-claude-1"
+        with mock.patch.object(server, "process_command_line", return_value=line) as cl, \
+             mock.patch.object(server, "run_text") as run:
+            self.assertTrue(server._is_nouez_helper(42))
+        cl.assert_called_once_with(42)
+        run.assert_not_called()  # no PowerShell
+        with mock.patch.object(server, "process_command_line", return_value=None):
+            self.assertFalse(server._is_nouez_helper(42))
+
+
 class OpenedSessionCheckTest(unittest.TestCase):
     def open(self, sessions_seen, tmp):
         with mock.patch.object(server, "open_window", return_value="a window") as open_window, \
@@ -3219,6 +3492,84 @@ class UsageLogTest(HandlerTest):
         self.assertEqual(len(glob.glob(os.path.join(self.dir, "usage-log-*.jsonl"))), 1)
         with mock.patch.object(server, "open", side_effect=OSError("disk full"), create=True):
             server.record_usage({"event": "c"}, self.log)  # logged to stderr, not raised
+
+    def test_log_is_renamed_monthly_and_old_logs_go(self):
+        """0.22.0: a log begun over a month ago is renamed; renamed logs go after a year or past the size cap."""
+        now = self.NOW
+        server.record_usage({"event": "a"}, self.log, now - 31 * 86400)
+        server.record_usage({"event": "b"}, self.log, now)
+        with open(self.log, encoding="utf-8") as f:
+            self.assertEqual([json.loads(x)["event"] for x in f], ["b"])
+        [first] = server.rotated_usage_logs(self.log)
+        self.assertEqual([e["event"] for e in self.events()], ["a", "b"])
+        # Renamed in the same second as another: a suffix, still read in order
+        same = first[:-len(".jsonl")] + "-1.jsonl"
+        with open(same, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": now - 1, "event": "a2"}) + "\n")
+        self.assertEqual([e["event"] for e in self.events()], ["a", "a2", "b"])
+        # A year untouched: deleted; the current log never is
+        old = os.path.join(self.dir, "usage-log-20200101-000000.jsonl")
+        with open(old, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": 1, "event": "ancient"}) + "\n")
+        year = time.time() - (server.USAGE_LOG_KEEP_DAYS + 1) * 86400
+        os.utime(old, (year, year))
+        os.utime(self.log, (year, year))
+        server.prune_usage_logs(self.log)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(self.log))
+        # Past the size cap: the oldest go first
+        with mock.patch.object(server, "USAGE_LOG_KEEP_BYTES", os.path.getsize(same)):
+            server.prune_usage_logs(self.log)
+        self.assertEqual(server.rotated_usage_logs(self.log), [same])
+
+    def test_log_is_written_privately(self):
+        """0.22.0: the log is this user's only, and never written through a link."""
+        server.record_usage({"event": "a"}, self.log)
+        if os.name != "nt":
+            self.assertEqual(os.stat(self.log).st_mode & 0o777, 0o600)
+        target = os.path.join(self.dir, "elsewhere.jsonl")
+        open(target, "w").close()
+        os.remove(self.log)
+        file_link(self, target, self.log)
+        server.record_usage({"event": "b"}, self.log)
+        self.assertEqual(os.path.getsize(target), 0)
+
+    def test_two_servers_rotating_lose_no_event(self):
+        """0.22.0: servers writing and renaming the log at once keep every event, once."""
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); import server\n"
+                "server.USAGE_LOG_BYTES = 300\n"
+                "server.USAGE_LOG_WAIT = 60\n"  # a slow machine waits rather than skips
+                "for i in range(60):\n"
+                "    server.record_usage({'event': 'e', 'who': sys.argv[3], 'i': i}, sys.argv[2])\n")
+        env = dict(os.environ, NOUEZ_NO_USAGE_LOG="")
+        procs = [subprocess.Popen([sys.executable, "-I", "-c", code, ROOT, self.log, who], env=env)
+                 for who in ("a", "b")]
+        for proc in procs:
+            self.assertEqual(proc.wait(60), 0)
+        seen = [(e["who"], e["i"]) for e in self.events()]
+        self.assertEqual(sorted(seen), sorted((who, i) for who in "ab" for i in range(60)))
+        self.assertGreater(len(server.rotated_usage_logs(self.log)), 5)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are POSIX")
+    def test_a_pipe_for_a_log_is_never_written(self):
+        """0.22.0: a pipe where the log goes is skipped, not opened: the append would wait under the lock."""
+        os.mkfifo(self.log)
+        start = time.monotonic()
+        server.record_usage({"event": "a"}, self.log)
+        self.assertLess(time.monotonic() - start, 1.5)
+        self.assertFalse(server.usage_log_due(self.log, self.NOW))
+
+    def test_a_linked_log_is_never_read_or_renamed(self):
+        """0.22.0: a log or renamed log that is a link (or a junction) is left alone."""
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        dir_link(outside, self.log)
+        dir_link(outside, os.path.join(self.dir, "usage-log-20261101-000000.jsonl"))
+        self.assertFalse(server.usage_log_due(self.log, self.NOW))
+        self.assertEqual(server.rotated_usage_logs(self.log), [])
+        self.assertEqual(self.events(), [])
+        server.rotate_usage_log(self.log, self.NOW)
+        self.assertTrue(server.is_link(self.log))
 
     def test_log_summary(self):
         t = self.NOW
@@ -4149,6 +4500,61 @@ class AgyTest(unittest.TestCase):
 
 
 
+    def test_turns_of_long_stopped_consultants_go(self):
+        """0.22.0: AGY_TURN_KEEP_DAYS after a stop, its turn files go; consultant.json keeps the conversation."""
+        _, name = self.start()
+        _, other = self.start(new=True)
+        for who in (name, other):
+            self.replies = [[agy_result("ok\n")]]
+            server.send_consultant_message({"to": who, "message": "hi", "wait": 5})
+        cid = server.agy_resolve(name)["id"]
+        running = os.path.join(self.dir, "agy", server.agy_resolve(other)["id"], "turns")
+        turns = os.path.join(self.dir, "agy", cid, "turns")
+        self.assertEqual(len(os.listdir(turns)), 4)  # .in, .json, .jsonl, .err
+        if os.name != "nt":
+            self.assertEqual(os.stat(turns).st_mode & 0o777, 0o700)
+        server.stop_consultant({"to": name})
+        server.prune_agy_turns(time.time())  # just stopped: kept
+        self.assertEqual(len(os.listdir(turns)), 4)
+        server.prune_agy_turns(time.time() + (server.AGY_TURN_KEEP_DAYS + 1) * 86400)
+        self.assertEqual(os.listdir(turns), [])
+        rec = server.read_json_file(os.path.join(self.dir, "agy", cid, "consultant.json"))
+        self.assertEqual(rec["conversation"], "conv-1234-abcd")
+        self.assertTrue(rec["turns_removed"])
+        self.assertEqual(len(os.listdir(running)), 4)  # a consultant still in use keeps its turns
+
+    def test_turns_that_couldnt_be_deleted_are_tried_again(self):
+        """0.22.0: a turn file that can't be deleted leaves the consultant to try at the next start."""
+        _, name = self.start()
+        self.replies = [[agy_result("ok\n")]]
+        server.send_consultant_message({"to": name, "message": "hi", "wait": 5})
+        cid = server.agy_resolve(name)["id"]
+        turns = os.path.join(self.dir, "agy", cid, "turns")
+        server.stop_consultant({"to": name})
+        later = time.time() + (server.AGY_TURN_KEEP_DAYS + 1) * 86400
+        with mock.patch.object(server.os, "remove", side_effect=PermissionError("in use")):
+            server.prune_agy_turns(later)
+        rec = server.read_json_file(os.path.join(self.dir, "agy", cid, "consultant.json"))
+        self.assertNotIn("turns_removed", rec)
+        self.assertEqual(rec["conversation"], "conv-1234-abcd")  # kept before anything went
+        self.assertEqual(len(os.listdir(turns)), 4)
+        server.prune_agy_turns(later)
+        self.assertEqual(os.listdir(turns), [])
+        rec = server.read_json_file(os.path.join(self.dir, "agy", cid, "consultant.json"))
+        self.assertTrue(rec["turns_removed"])
+
+    def test_turn_files_never_go_through_a_link(self):
+        """0.22.0: a turns folder that is a link isn't written through; nothing is sent."""
+        _, name = self.start()
+        cid = server.agy_resolve(name)["id"]
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        dir_link(outside, os.path.join(self.dir, "agy", cid, "turns"))
+        with self.assertRaisesRegex(server.BridgeError, "Nothing was sent"):
+            server.send_consultant_message({"to": name, "message": "hi", "wait": 0})
+        self.assertEqual(os.listdir(outside), [])
+        self.assertEqual(self.runs, [])
+
 class PaneTest(unittest.TestCase):
     """0.15.1: panes are found and closed from Windows' own process list, not WMI."""
     TID = "01a2ffff-0000-7000-8000-00000000abcd"
@@ -4806,6 +5212,73 @@ class ConfigReportTest(unittest.TestCase):
             self.assertIn(part, report)
         self.assertNotIn("secret-ish", report)
         self.assertNotIn("model", report)
+
+    def test_permission_rules_are_masked(self):
+        """0.22.0: a credential in a permission rule is shown as ***, like one in a command."""
+        d = self.folder(settings={"permissions": {"allow": ['Bash(curl -H "Authorization: Bearer abc123" https://x)',
+                                                            "Read(./src/**)"],
+                                                  "deny": ["Bash(deploy --token=zz9)"],
+                                                  "ask": "WebFetch(https://u:pw77@intranet/)"}})
+        report = server.config_review([d])[0]
+        for secret in ("abc123", "zz9", "pw77"):
+            self.assertNotIn(secret, report)
+        self.assertIn("Bearer ***", report)
+        self.assertIn("Read(./src/**)", report)
+
+    def test_header_secrets_without_a_space_and_unknown_fields_are_masked(self):
+        """0.22.0: X-API-Key:value is masked, and so is a secret in a permissions field nouez doesn't know."""
+        d = self.folder(settings={"permissions": {"allow": ["Bash(curl -H X-API-Key:EXAMPLE1 https://x)"],
+                                                  "brandNew": ["Authorization: Bearer EXAMPLE2"]}})
+        report = server.config_review([d])[0]
+        for secret in ("EXAMPLE1", "EXAMPLE2"):
+            self.assertNotIn(secret, report)
+        self.assertIn("brandNew", report)
+        d = self.folder(settings={"permissions": "Authorization: Bearer EXAMPLE3"})
+        self.assertNotIn("EXAMPLE3", server.config_review([d])[0])
+        d = self.folder(settings={"hooks": {"Stop": [{"hooks": [{"type": "prompt", "prompt": "use token=EXAMPLE4"},
+                                                                 "Authorization: Bearer EXAMPLE5"]}]}})
+        report = server.config_review([d])[0]
+        for secret in ("EXAMPLE4", "EXAMPLE5"):
+            self.assertNotIn(secret, report)
+        self.assertIn("prompt prompt: use token=***", report)
+
+    def test_a_file_changed_while_read_is_unreadable(self):
+        """0.22.0: when the path no longer names the file nouez opened, what was read isn't used."""
+        d = self.folder(settings={"hooks": {}})
+        path = os.path.join(d, ".claude", "settings.json")
+        real = os.lstat
+
+        def swapped(p, *a, **k):
+            st = real(p, *a, **k)
+            if os.path.normcase(os.path.abspath(p)) != os.path.normcase(os.path.abspath(path)):
+                return st
+            fields = list(st)
+            fields[stat_ino] += 1
+            return os.stat_result(fields)
+        stat_ino = 1
+        with mock.patch.object(server.os, "lstat", side_effect=swapped):
+            state, data = server.read_config_file(path)
+        self.assertEqual((state, data), ("unreadable: it changed while nouez read it", None))
+        self.assertIsNotNone(server.read_config_file(path)[1])
+
+    def test_linked_settings_are_not_read(self):
+        """0.22.0: a settings folder or file that is a link isn't followed, and blocks trust from here."""
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        with open(os.path.join(outside, "settings.json"), "w") as f:
+            json.dump({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "sh hidden.sh"}]}]}}, f)
+        d = tempfile.mkdtemp(prefix="nouez-test-config-")
+        self.addCleanup(shutil.rmtree, d, True)
+        dir_link(outside, os.path.join(d, ".claude"))
+        report, _, complete = server.config_review([d])
+        self.assertIn("is a link, which nouez doesn't follow", report)
+        self.assertNotIn("hidden.sh", report)
+        self.assertFalse(complete)
+        d2 = self.folder()
+        file_link(self, os.path.join(outside, "settings.json"), os.path.join(d2, ".mcp.json"))
+        report, _, complete = server.config_review([d2])
+        self.assertIn("is a link", report)
+        self.assertFalse(complete)
 
     def test_an_unreadable_file_is_never_none(self):
         report, _, complete = server.config_review([self.folder(local="{broken")])

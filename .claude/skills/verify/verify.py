@@ -385,6 +385,139 @@ def check_versions(files):
     report(not bad, f"version {version} everywhere", "missing in " + ", ".join(bad) if bad else "")
 
 
+# What SECURITY.md promises, checked in server.py's code. A failure means a change crosses one of
+# these lines: update SECURITY.md (and these rules) on purpose, or don't cross it.
+NETWORK_MODULES = {"socket", "http", "ftplib", "smtplib", "ssl", "telnetlib", "xmlrpc", "webbrowser", "asyncio",
+                   "poplib", "imaplib", "nntplib", "importlib"}
+NETWORK_SCOPES = {"fetch_json", "web_opener", "SameSiteRedirect"}  # the only code that uses urllib.request
+PATH_HELPERS = {"urllib.request.url2pathname", "urllib.request.pathname2url"}  # a file name, no request
+WEB_URLS = {"RELEASES_URL": "https://api.github.com/repos/jibarix/nouez/releases/latest",  # the only places
+            "AA_MODELS_URL": "https://artificialanalysis.ai/api/v2/language/models/free"}  # fetch_json may reach
+AGY_DENIED = {"write_file(*)", "command(*)", "mcp(*)", "execute_url(*)"}  # an Antigravity consultant's deny rules
+CREDENTIAL_FILES = ("auth.json", ".credentials.json")
+CREDENTIAL_SCOPES = {"credentials_stamp"}                            # may name one, to read its time only
+BYPASS_WORDS = ("--dangerously-skip-permissions", "bypassPermissions", "danger-full-access", "workspace-write",
+                "--yolo", "dangerously")
+FETCH_TOOLS = re.compile(r"(?<![\w-])(curl|wget|Invoke-WebRequest)(?![\w-])", re.I)  # whole words: "curly" is fine
+
+
+NAMED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def docstrings(tree):
+    """The ids of the module's, functions' and classes' docstring nodes."""
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, *NAMED)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                found.add(id(first.value))
+    return found
+
+
+def scoped(tree):
+    """(node, names of the functions and classes it is inside) for every node."""
+    out = []
+
+    def walk(node, scope):
+        out.append((node, scope))
+        inner = scope | {node.name} if isinstance(node, NAMED) else scope
+        for child in ast.iter_child_nodes(node):
+            walk(child, inner)
+    walk(tree, frozenset())
+    return out
+
+
+def dotted(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    return ".".join([node.id, *reversed(parts)]) if isinstance(node, ast.Name) else ""
+
+
+def boundary_problems(source):
+    """(line, problem) for each place in `source` that crosses a line SECURITY.md draws: a network
+    module, a web request outside fetch_json or to another URL, a credential file named outside
+    credentials_stamp or opened there, a permission-bypass word, or a consultant that isn't read-only."""
+    tree = ast.parse(source)
+    skip, bad = docstrings(tree), []
+    for node, scope in scoped(tree):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+            for name in names:
+                if name.split(".")[0] in NETWORK_MODULES:
+                    bad.append((line, f"imports {name}"))
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("urllib.request"):
+                bad.append((line, "imports from urllib.request: use fetch_json"))
+        elif isinstance(node, ast.Attribute) and dotted(node).startswith("urllib.request.") \
+                and dotted(node) not in PATH_HELPERS and not scope & NETWORK_SCOPES:
+            bad.append((line, f"{dotted(node)} outside fetch_json: every web request goes through it"))
+        elif isinstance(node, ast.Call):
+            name = dotted(node.func)
+            if name.split(".")[-1] in ("fetch_json", "web_opener") and not scope & NETWORK_SCOPES:
+                if name.endswith("web_opener"):
+                    bad.append((line, "web_opener called outside fetch_json"))
+                elif not node.args or not WEB_URLS.keys() & {n.id for n in ast.walk(node.args[0])
+                                                             if isinstance(n, ast.Name)}:
+                    bad.append((line, f"fetch_json to a URL that isn't one of {', '.join(sorted(WEB_URLS))}"))
+            if scope & CREDENTIAL_SCOPES and (name.split(".")[-1] in ("open", "read", "load", "loads", "read_text",
+                                                                       "read_bytes", "read_json_file", "copyfile")):
+                bad.append((line, f"{name}() in {', '.join(sorted(scope & CREDENTIAL_SCOPES))}, which may only read a time"))
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip:
+            text = node.value
+            if any(f in text for f in CREDENTIAL_FILES) and not scope & CREDENTIAL_SCOPES:
+                bad.append((line, f"names a credential file ({text!r}) outside credentials_stamp"))
+            for word in BYPASS_WORDS:
+                if word.lower() in text.lower():
+                    bad.append((line, f"the word {word!r}: nouez never bypasses permissions"))
+            for tool in FETCH_TOOLS.findall(text):
+                bad.append((line, f"the command {tool!r}: nouez makes its web requests through fetch_json only"))
+        elif isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                k = key.value if isinstance(key, ast.Constant) else None
+                v = value.value if isinstance(value, ast.Constant) else dotted(value)
+                if k == "approvalPolicy" and v != "never":
+                    bad.append((line, f"approvalPolicy {v!r}: consultants are never asked to approve"))
+                elif k == "sandbox" and v not in ("SANDBOX", "read-only"):
+                    bad.append((line, f"sandbox {v!r}: consultants are read-only"))
+                elif k == "sandboxPolicy" and not (isinstance(value, ast.Dict) and any(
+                        isinstance(a, ast.Constant) and a.value == "type" and isinstance(b, ast.Constant)
+                        and b.value == "readOnly" for a, b in zip(value.keys, value.values))):
+                    bad.append((line, "a sandboxPolicy that isn't readOnly"))
+        elif isinstance(node, ast.Assign) and not scope and any(
+                isinstance(t, ast.Name) and t.id == "SANDBOX" for t in node.targets):
+            if not (isinstance(node.value, ast.Constant) and node.value.value == "read-only"):
+                bad.append((line, "SANDBOX isn't \"read-only\""))
+        if (isinstance(node, ast.Assign) and not scope
+                and any(isinstance(t, ast.Name) and t.id == "AGY_READ_ONLY" for t in node.targets)):
+            try:
+                deny = set(ast.literal_eval(node.value)["permissions"]["deny"])
+            except (ValueError, TypeError, KeyError, SyntaxError):
+                deny = set()
+            if not AGY_DENIED <= deny:
+                bad.append((line, "AGY_READ_ONLY doesn't deny " + ", ".join(sorted(AGY_DENIED - deny))))
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for t in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                for n in ast.walk(t):
+                    name = n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else None
+                    if name in WEB_URLS and not (not scope and isinstance(node, ast.Assign)
+                                                 and isinstance(node.value, ast.Constant)
+                                                 and node.value.value == WEB_URLS[name]):
+                        bad.append((line, f"{name} isn't {WEB_URLS[name]}: SECURITY.md names that address"))
+    return sorted(set(bad))
+
+
+def check_boundaries():
+    """SECURITY.md's lines in server.py, checked on every run, not only when server.py changed."""
+    try:
+        bad = boundary_problems(read("server.py"))
+    except SyntaxError:
+        return  # check_shadowing reports it
+    report(not bad, "server.py stays inside SECURITY.md's lines", "; ".join(f"server.py:{n} {p}" for n, p in bad))
+
+
 def static():
     files = changed_files()
     print(f"{len(files)} changed file(s){' in ' + RANGE if RANGE else ''}: {', '.join(files) or 'none'}")
@@ -392,6 +525,7 @@ def static():
     check_unused(files)
     check_tex(files)
     check_versions(files)
+    check_boundaries()
 
 
 # ---------------------------------------------------------------- live checks

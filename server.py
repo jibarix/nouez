@@ -66,7 +66,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.21.0"
+SERVER_VERSION = "0.22.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -707,32 +707,87 @@ def plain_folder(path):
     return stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode) and not reparse
 
 
-def replies_folder(create=False):
-    """nouez's folder of saved long replies. Raises OSError if it or nouez's folder is a link or a
-    junction, or not a folder, so nothing is written or deleted wherever a link points."""
-    root = nouez_cache_dir()
-    folder = os.path.join(root, "replies")
+def checked_folder(root, *parts, create=False):
+    """The folder `parts` inside `root`, made (0700) if create. Raises OSError if it, `root` or a
+    folder between is a link or a junction, or not a folder, so nothing is written or deleted
+    wherever a link points."""
     if create:
-        os.makedirs(folder, mode=0o700, exist_ok=True)
-    for p in (root, folder):
-        if os.path.lexists(p) and not plain_folder(p):
-            raise OSError(f"{p} isn't a plain folder")
+        os.makedirs(root, mode=0o700, exist_ok=True)
+    path = root
+    for part in ("", *parts):
+        path = os.path.join(path, part) if part else path
+        if create and part and not os.path.lexists(path):
+            with contextlib.suppress(FileExistsError):  # another server made it meanwhile: checked below
+                os.mkdir(path, 0o700)
+        if os.path.lexists(path) and not plain_folder(path):  # checked before anything is made inside
+            raise OSError(f"{path} isn't a plain folder")
+    return path
+
+
+def cache_folder(*parts, create=False):
+    """A folder inside nouez's cache folder, checked as checked_folder does."""
+    return checked_folder(nouez_cache_dir(), *parts, create=create)
+
+
+def checked_parent(path):
+    """Make the folder `path` goes in, checked as checked_folder does from nouez's cache folder
+    down when it is inside it (the cache folder itself is trusted: README, Files), else just that
+    folder. Raises OSError for a link or a junction on the way."""
+    folder = os.path.dirname(os.path.abspath(path))
+    root = os.path.abspath(nouez_cache_dir())
+    try:
+        rel = os.path.relpath(folder, root)
+    except ValueError:  # another drive
+        rel = os.pardir
+    if rel == os.curdir:
+        return checked_folder(root, create=True)
+    if rel != os.pardir and not rel.startswith(os.pardir + os.sep):
+        return checked_folder(root, *rel.split(os.sep), create=True)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    if not plain_folder(folder):
+        raise OSError(f"{folder} isn't a plain folder")
     return folder
+
+
+def new_private_file(path):
+    """A new file at `path`, readable by this user only (0600 on macOS and Linux), open for writing
+    bytes. Fails if anything, a link included, is already there, so a planted link isn't followed."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    return os.fdopen(os.open(path, flags, 0o600), "wb")
+
+
+def prune_files(folder, names, cutoff):
+    """Delete the files in `folder` whose names match `names` and that weren't changed since
+    `cutoff`, never links or folders. Best effort; True if nothing that should go was left."""
+    done = True
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                try:
+                    if (names.fullmatch(entry.name) and entry.is_file(follow_symlinks=False)
+                            and entry.stat(follow_symlinks=False).st_mtime < cutoff):
+                        os.remove(entry.path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    done = False
+    except FileNotFoundError:
+        pass
+    except OSError:
+        done = False
+    return done
+
+
+def replies_folder(create=False):
+    """nouez's folder of saved long replies (see checked_folder)."""
+    return cache_folder("replies", create=create)
 
 
 def prune_replies(days=REPLY_FILE_DAYS):
     """Delete the saved replies not changed for `days` days: files with nouez's own names only,
     never links. Best effort; run when the server starts and before each save."""
-    cutoff = time.time() - days * 86400
     try:
-        with os.scandir(replies_folder()) as entries:
-            for entry in entries:
-                try:
-                    if (REPLY_FILE.fullmatch(entry.name) and entry.is_file(follow_symlinks=False)
-                            and entry.stat(follow_symlinks=False).st_mtime < cutoff):
-                        os.remove(entry.path)
-                except OSError:
-                    pass
+        prune_files(replies_folder(), REPLY_FILE, time.time() - days * 86400)
     except OSError:
         pass
 
@@ -1184,13 +1239,40 @@ def release_cache_file():
     return os.path.join(nouez_cache_dir(), "latest-release.json")
 
 
+class SameSiteRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect only to the same scheme, host and port. urllib keeps a request's own
+    headers on a redirect, so without this an Artificial Analysis key could go to another site."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old, new = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+        try:
+            same = (old.scheme, old.hostname, old.port) == (new.scheme, new.hostname, new.port)
+        except ValueError:  # a port that isn't a number
+            same = False
+        if not same:
+            return None  # urllib then raises HTTPError for the redirect itself
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def web_opener():
+    return urllib.request.build_opener(SameSiteRedirect)
+
+
+def fetch_json(url, headers, timeout, limit):
+    """GET `url` and return its JSON. The only way nouez makes a web request itself, to the URLs
+    SECURITY.md lists (verify.py static checks this): with nouez's name and version as the client,
+    the `headers` given, and no redirect to another site."""
+    if url.split("?", 1)[0] not in (RELEASES_URL, AA_MODELS_URL):
+        raise OSError(f"nouez makes no web request to {url}")
+    req = urllib.request.Request(url, headers={**headers, "User-Agent": f"nouez/{SERVER_VERSION}"})
+    with web_opener().open(req, timeout=timeout) as r:
+        return json.loads(r.read(limit).decode("utf-8"))
+
+
 def fetch_latest_release():
     """The version of the latest nouez release on GitHub, e.g. "0.9.0" for the tag "v0.9.0",
     or None. GitHub's latest-release answer leaves out drafts and pre-releases."""
-    req = urllib.request.Request(RELEASES_URL, headers={
-        "Accept": "application/vnd.github+json", "User-Agent": f"nouez/{SERVER_VERSION}"})
-    with urllib.request.urlopen(req, timeout=RELEASE_TIMEOUT) as r:
-        data = json.loads(r.read(1_000_000).decode("utf-8"))
+    data = fetch_json(RELEASES_URL, {"Accept": "application/vnd.github+json"}, RELEASE_TIMEOUT, 1_000_000)
     tag = data.get("tag_name") if isinstance(data, dict) else None
     if isinstance(tag, str) and tag.startswith("v") and RELEASE_VERSION.fullmatch(tag[1:]):
         return tag[1:]
@@ -1222,7 +1304,7 @@ def write_json_atomic(path, value):
     don't write into the same file; a failure leaves no temporary file behind. True if written."""
     tmp = None
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        checked_parent(path)
         fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path)[:-len(".json")] + ".", suffix=".tmp",
                                    dir=os.path.dirname(path))
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1798,20 +1880,25 @@ def pane_key():
             path, key = os.path.join(nouez_cache_dir(), "pane-key"), b""
 
             def read():
+                if os.path.lexists(path) and not regular_file(path):
+                    return b""  # a link or anything else there is replaced, never read
                 try:
                     with open(path, "rb") as f:
                         return f.read(64)
                 except FileNotFoundError:
                     return b""
             try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
+                checked_parent(path)
                 key = read()
                 if len(key) < 32:
                     # Made under a lock all servers take, and read again under it, so they all end
                     # on the same key; written in full under a name of its own, then moved into
                     # place in one step, so a reader never sees half of one. A short file can only
                     # be a damaged one, and is replaced.
-                    lock = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+                    if is_link(path + ".lock"):
+                        raise OSError(f"{path}.lock is a link; nouez doesn't lock through it")
+                    lock = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                                   | getattr(os, "O_BINARY", 0), 0o600)
                     locked = False
                     try:
                         for _ in range(50):
@@ -1823,14 +1910,14 @@ def pane_key():
                                 time.sleep(0.1)
                         key = read()
                         if locked and len(key) < 32:
-                            tmp = f"{path}.{os.getpid()}.tmp"
-                            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
+                            fd, tmp = tempfile.mkstemp(prefix="pane-key.", suffix=".tmp",
+                                                       dir=os.path.dirname(path))  # new and private (0600)
                             try:
                                 with os.fdopen(fd, "wb") as f:
                                     f.write(os.urandom(32))
                                 os.replace(tmp, path)
                             finally:
-                                if os.path.exists(tmp):
+                                if os.path.lexists(tmp):
                                     os.remove(tmp)
                             key = read()
                     finally:
@@ -2364,6 +2451,16 @@ CLAUDE_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,99}")  # an ali
 # provider ids such as gpt-oss:20b or org/model pass, and Codex rejects what the model doesn't support.
 CODEX_SETTING = re.compile(r"[^\s\x00-\x1f\x7f]{1,200}")
 TRUST_BACKUPS_KEPT = 20  # dated copies of Claude Code's state file kept before nouez's changes
+TRUST_BACKUP_FOLDER = "claude-json-backups"
+TRUST_WRITE_OFF = ("Not recording trust: NOUEZ_NO_TRUST_WRITE=1 is set, so nouez never changes Claude Code's "
+                   "settings. Nothing was changed; the user can answer Claude Code's own trust question on the "
+                   "computer (open_untrusted=true opens the session for that).")
+
+
+def trust_write_off(env=None):
+    """Whether the user turned off nouez's recording of trust (NOUEZ_NO_TRUST_WRITE=1)."""
+    value = (os.environ if env is None else env).get("NOUEZ_NO_TRUST_WRITE", "").strip().lower()
+    return value not in ("", "0", "false", "no")
 
 
 def trust_backup_dir():
@@ -2374,14 +2471,22 @@ def trust_backup_dir():
         base, fallback = os.environ.get("XDG_STATE_HOME"), os.path.join("~", ".local", "state")
     if not base or not rooted(base):  # a relative one would put the copies in the project
         base = os.path.expanduser(fallback)
-    return os.path.join(base, "nouez", "claude-json-backups")
+    return os.path.join(base, "nouez", TRUST_BACKUP_FOLDER)
 
 
 def backup_claude_state(text):
     """Save `text` (the state file as read) to a new dated backup, check it, and keep only the newest
-    TRUST_BACKUPS_KEPT. Returns the backup's path."""
+    TRUST_BACKUPS_KEPT. Returns the backup's path. The copies hold all of Claude Code's state file,
+    so their folder must be private (on macOS and Linux) and not a link, or nothing is changed."""
     folder = trust_backup_dir()
-    os.makedirs(folder, mode=0o700, exist_ok=True)
+    root = os.path.dirname(folder)
+    try:
+        problem = "" if os.name == "nt" else private_folder_problem(root) or private_folder_problem(folder)
+        if problem:
+            raise OSError(f"the folder {problem}")
+        checked_folder(root, TRUST_BACKUP_FOLDER, create=True)
+    except OSError as e:
+        raise BridgeError(f"Couldn't back up Claude Code's settings to {folder}: {e}. Nothing was changed.")
     stamp = time.strftime("%Y%m%d-%H%M%S")
     fd, path = tempfile.mkstemp(prefix=f".claude.json.{stamp}.", suffix=".bak", dir=folder)  # private (0600)
     try:
@@ -2396,7 +2501,8 @@ def backup_claude_state(text):
     dated = []
     for other in glob.glob(os.path.join(glob.escape(folder), ".claude.json.*.bak")):
         try:
-            dated.append((os.path.getmtime(other), other))
+            if regular_file(other):  # a link is neither counted nor removed
+                dated.append((os.lstat(other).st_mtime, other))
         except OSError:
             pass  # another nouez server removed it meanwhile
     for _, extra in sorted(dated)[:-TRUST_BACKUPS_KEPT]:
@@ -2423,7 +2529,10 @@ def trust_folder(path, expect=None):
     repository root in git (a linked worktree's main checkout). Before each change the file is copied
     to a new dated backup; only that one value changes; the file is checked again just before it is
     replaced, and read back after. Returns (folder, backup or None); None if it was already trusted.
-    With `expect`, the folder the user was asked about, nothing is written if that isn't still it."""
+    With `expect`, the folder the user was asked about, nothing is written if that isn't still it.
+    With NOUEZ_NO_TRUST_WRITE=1, never."""
+    if trust_write_off():
+        raise BridgeError(TRUST_WRITE_OFF)
     key, _ = trust_key(path)
     if key is None:
         raise BridgeError("Not recording trust: nouez can't tell which folder Claude Code keeps the trust "
@@ -2796,6 +2905,8 @@ SECRET_PATTERNS = (
     re.compile(r"([?&#][^=&#\s]+=)[^&#\s]+"),                                  # ?token=… in a URL
     re.compile(r"(?i)((?:^|\s)--?[\w-]*(?:token|secret|passw|key|auth|cred)[\w-]*)(=|\s+)(?!-)(\S+)"),  # --api-key …
     re.compile(r"(?i)\b([\w-]*(?:token|secret|passw|api_?key|auth|cred)[\w-]*=)(\S+)"),               # TOKEN=…
+    re.compile(r"(?i)\b((?:authorization|[\w-]*(?:token|secret|passw|api[_-]?key|cred)[\w-]*):\s*"
+               r"(?:(?:bearer|basic|token)\s+)?)([^\s\"')]+)"),                      # Authorization: Bearer …
 )
 
 
@@ -2807,6 +2918,7 @@ def _redacted(value):
     text = SECRET_PATTERNS[1].sub(r"\1***", text)
     text = SECRET_PATTERNS[2].sub(r"\1\2***", text)
     text = SECRET_PATTERNS[3].sub(r"\1***", text)
+    text = SECRET_PATTERNS[4].sub(r"\1***", text)
     if text != before:
         _mark("hidden")
     return text
@@ -2821,7 +2933,7 @@ def hook_commands(hooks):
             matcher = group.get("matcher") if isinstance(group, dict) else None
             for h in (entries if isinstance(entries, list) else [group]):
                 if not isinstance(h, dict):
-                    found.append((event, matcher, _short(h)))
+                    found.append((event, matcher, _short(_redacted(h))))
                     continue
                 kind = h.get("type") or "command"
                 if h.get("command") is not None:
@@ -2829,7 +2941,7 @@ def hook_commands(hooks):
                 elif h.get("url") is not None:
                     what = "calls " + _redacted(h["url"])
                 elif h.get("prompt") is not None:
-                    what = f"{kind} prompt: " + str(h["prompt"])
+                    what = f"{kind} prompt: " + _redacted(h["prompt"])
                 else:
                     what = f"{kind} with " + ", ".join(sorted(map(str, h)))
                 found.append((event, matcher, _short(what)))
@@ -2863,12 +2975,14 @@ def settings_report(data):
             if value is None or value == []:
                 continue
             label = {"allow": "pre-approves", "additionalDirectories": "adds folders"}.get(key, key)
-            lines.append(f"permissions {label}: " + (_listed(value) if isinstance(value, list) else _short(value)))
+            # A rule can carry a credential: Bash(curl -H "Authorization: Bearer …") or a URL with one.
+            lines.append(f"permissions {label}: " + (_listed(map(_redacted, value)) if isinstance(value, list)
+                                                     else _short(_redacted(value))))
         others = sorted(k for k in perms if k not in ("defaultMode", "allow", "ask", "deny", "additionalDirectories"))
         if others:
-            lines.append("other permissions settings: " + _listed(f"{k}: {_short(perms[k])}" for k in others))
+            lines.append("other permissions settings: " + _listed(f"{k}: {_short(_redacted(perms[k]))}" for k in others))
     elif perms is not None:
-        lines.append(f"permissions: {_short(perms)}")
+        lines.append(f"permissions: {_short(_redacted(perms))}")
     for key in ("enableAllProjectMcpServers", "enabledMcpjsonServers", "disabledMcpjsonServers"):
         if data.get(key) is not None:
             value = data[key]
@@ -2922,18 +3036,40 @@ def mcp_report(data):
     return [f"MCP servers ({len(servers)}): " + _listed(shown)]
 
 
+def is_link(path):
+    """Whether path is a symbolic link, or on Windows a junction."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    tags = (getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C), getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003))
+    return stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) in tags
+
+
+def linked_part(folder, rel):
+    """The first part of `rel` below `folder` (.claude, or the file itself) that is a link, or None."""
+    parts, path = os.path.normpath(rel).split(os.sep), folder
+    for part in parts:
+        path = os.path.join(path, part)
+        if is_link(path):
+            return path
+    return None
+
+
 def read_config_file(path):
     """(state, data): state is "absent", "unreadable: <why>" or the SHA-256 of the file's bytes,
     data its JSON object or None. Only a regular file up to REPORT_FILE_BYTES is read: opening
     doesn't wait on a pipe, and a folder that can't be looked in is unreadable, not absent."""
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+                     | getattr(os, "O_NOFOLLOW", 0))  # a link swapped in after the check fails here
     except (FileNotFoundError, NotADirectoryError):
         return "absent", None
     except OSError as e:
         return f"unreadable: {e.strerror or e}", None
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
             return "unreadable: not a regular file", None
         chunks, size = [], 0
         while size <= REPORT_FILE_BYTES:
@@ -2942,6 +3078,9 @@ def read_config_file(path):
                 break
             chunks.append(chunk)
             size += len(chunk)
+        now = os.lstat(path)  # the file read is still the one the path names (Windows has no O_NOFOLLOW)
+        if (now.st_dev, now.st_ino) != (opened.st_dev, opened.st_ino) or is_link(path):
+            return "unreadable: it changed while nouez read it", None
     except OSError as e:
         return f"unreadable: {e.strerror or e}", None
     finally:
@@ -2972,7 +3111,13 @@ def config_review(folders):
             seen.add(os.path.normcase(os.path.abspath(folder)))
             for rel in CONFIG_FILES:
                 path = os.path.join(folder, rel)
-                state, data = read_config_file(path)
+                link = linked_part(folder, rel)
+                # A link could point the report at any file of the user's (a credentials file, say);
+                # it isn't read, and the folder can't be trusted from here.
+                state, data = (f"unreadable: {link} is a link, which nouez doesn't follow", None) if link \
+                    else read_config_file(path)
+                if not link and data is not None and linked_part(folder, rel):  # made a link meanwhile
+                    state, data = "unreadable: it changed while nouez read it", None
                 states.append(f"{os.path.normcase(os.path.abspath(path))}\0{state}")
                 if state == "absent":
                     continue
@@ -3050,6 +3195,8 @@ def open_claude_session(args, cancel=None, progress=None):
         raise BridgeError(f"name {given!r} isn't usable: use letters, digits, spaces, '.', '_' and '-', "
                           "starting with a letter or digit, up to 64 characters. Nothing was opened.")
     created = False
+    if flag(args, "trust") and trust_write_off() and not os.path.isdir(cwd):
+        raise BridgeError(TRUST_WRITE_OFF)  # before a folder is made for nothing
     if flag(args, "create") and not os.path.exists(cwd):
         parent = os.path.dirname(cwd)
         if not os.path.isdir(parent):
@@ -3098,6 +3245,8 @@ def open_claude_session(args, cancel=None, progress=None):
               "computer, and answer Claude Code's own trust question there (open_untrusted=true opens the "
               "session for that).")
     if flag(args, "trust") and not exact:
+        if trust_write_off():
+            raise BridgeError(TRUST_WRITE_OFF)
         if key is None:  # raised here, not by trust_folder, which would look the folder up again
             raise BridgeError("Not recording trust: nouez can't tell which folder Claude Code keeps the trust "
                               "for here (the git layout is unusual). Nothing was changed; the user can answer "
@@ -3144,6 +3293,10 @@ def open_claude_session(args, cancel=None, progress=None):
                "their answer in Claude Code's settings as the trust dialog would (backing the file up first). "
                "If they're at the computer and would rather answer Claude Code's own question there, use "
                "open_untrusted=true.") if complete else unread
+        if trust_write_off():
+            ask = ("nouez is set never to record trust (NOUEZ_NO_TRUST_WRITE=1). Show the user the report below; "
+                   "they can answer Claude Code's own trust question on the computer, and open_untrusted=true "
+                   "opens the session for that.")
         return with_login_warning(" ".join(notes + [why, ask]) + "\n\n" + report)
     asks = []
     if trusted and key:
@@ -3390,8 +3543,7 @@ def _is_nouez_helper(pid):
     """Whether a process is the `server.py claude` helper OpenClaudeSession runs, which owns the window."""
     if os.name != "nt" or not isinstance(pid, int):
         return False
-    ps = f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"
-    line = run_text(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=20)
+    line = process_command_line(pid) or ""  # read straight from the system: no PowerShell, no WMI
     return " claude " in line and "nouez-claude-" in line
 
 
@@ -3513,7 +3665,7 @@ def open_status_screen(args, cancel=None, progress=None):
     if isinstance(days, float) and days.is_integer():
         days = int(days)  # JSON has one kind of number: 7.0 is 7
     if isinstance(days, bool) or not isinstance(days, int) or days not in STATUS_DAYS:
-        raise BridgeError("days must be one of " + ", ".join(map(str, STATUS_DAYS)) + " (0: everything logged).")
+        raise BridgeError("days must be one of " + ", ".join(map(str, STATUS_DAYS)) + " (0: every event the kept logs hold).")
     home = os.path.expanduser("~")  # not a project folder: an open window would keep it from being renamed
     how = open_window(home, [sys.executable, "-I", os.path.abspath(__file__), "top", "--days", str(days or 0)],
                       "nouez status")
@@ -3789,7 +3941,8 @@ def running_on(thread, prefix=""):
 
 
 PATCH_FOLDER = "patches"           # in nouez's cache folder: the diffs a revision line names
-PATCH_KEEP_DAYS = 14               # a saved diff older than this is removed when another is saved
+PATCH_KEEP_DAYS = 14               # a saved diff older than this is removed (at start, and on a save)
+PATCH_NAME = re.compile(r"[0-9a-f]{16}\.patch|tmp[^.]*\.tmp")  # its own names: a diff, or a save's leftover
 PATCH_FILE_BYTES = 256 * 1024      # an untracked file larger than this is named, not put in the diff
 PATCH_UNTRACKED_FILES = 200        # untracked files put in the diff, at most
 PATCH_TOTAL_BYTES = 8 * 1024 * 1024  # a larger diff isn't taken at all, nor a larger git status
@@ -3809,6 +3962,30 @@ DIFF_NAME = re.compile(rb"^(?:rename to |copy to |\+\+\+ b/|--- a/)(.+?)\t?$", r
 # or fsmonitor commands while nouez takes a diff.
 REVISION_GIT = ["git", "--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                 "-c", "core.quotepath=off"]
+
+
+def git_bytes(argv, timeout=20, limit=None, env=None):
+    """run_bytes for git, which then never fetches an object missing from a partial clone (git 2.45
+    or later; earlier ones ignore it, and revision takes no diff of a partial clone with them):
+    saving a diff mustn't reach the network."""
+    return run_bytes(argv, timeout, limit, dict(env or os.environ, GIT_NO_LAZY_FETCH="1"))
+
+
+def may_fetch(git):
+    """Whether git may fetch missing objects in this repository: a partial clone
+    (extensions.partialClone) or a remote.<name>.promisor set to anything, or settings that
+    can't be read, which count as one."""
+    found, _ = git_bytes(git + ["config", "--list", "-z"], 10, 1 << 20)
+    if found is None:
+        return True
+    for item in found.split(b"\0"):
+        key, _, value = item.partition(b"\n")
+        key = key.lower()
+        if key == b"extensions.partialclone" and value.strip():
+            return True
+        if key.startswith(b"remote.") and key.endswith(b".promisor"):
+            return True  # whatever its value: git reads many spellings of true
+    return False
 
 
 def run_bytes(argv, timeout=20, limit=None, env=None):
@@ -3887,7 +4064,7 @@ def take_diff(git, top, commit, left_out):
     """The uncommitted changes of the repo at top against commit, untracked files included, as git
     writes them: (diff, ""), or (None, why not). The untracked files are added as intent-to-add to a
     copy of git's index, so nothing in the repo is written; the files left out go in left_out."""
-    names, why = run_bytes(git + ["ls-files", "--others", "--exclude-standard", "-z"], 20, PATCH_TOTAL_BYTES)
+    names, why = git_bytes(git + ["ls-files", "--others", "--exclude-standard", "-z"], 20, PATCH_TOTAL_BYTES)
     if names is None:
         return None, "too many untracked files" if why == "too large" else "git ls-files failed"
     added = []
@@ -3906,7 +4083,7 @@ def take_diff(git, top, commit, left_out):
             left_out.add(shown, why)
         else:
             added.append(rel)
-    found, _ = run_bytes(git + ["rev-parse", "--git-path", "index"], 10)
+    found, _ = git_bytes(git + ["rev-parse", "--git-path", "index"], 10)
     if not found:
         return None, "git rev-parse failed"
     try:
@@ -3918,11 +4095,11 @@ def take_diff(git, top, commit, left_out):
                 paths = os.path.join(tmp, "paths")
                 with open(paths, "wb") as f:
                     f.write(b"\0".join(added) + b"\0")
-                _, why = run_bytes(git + ["--literal-pathspecs", "add", "--intent-to-add",
+                _, why = git_bytes(git + ["--literal-pathspecs", "add", "--intent-to-add",
                                           f"--pathspec-from-file={paths}", "--pathspec-file-nul"], 30, env=env)
                 if why:
                     return None, "git add --intent-to-add failed"
-            patch, why = run_bytes(git + ["diff", commit, "--no-color", "--no-ext-diff", "--no-textconv",
+            patch, why = git_bytes(git + ["diff", commit, "--no-color", "--no-ext-diff", "--no-textconv",
                                           "--no-relative", "--src-prefix=a/", "--dst-prefix=b/",
                                           "--submodule=short", "--ignore-submodules=none"],
                                    60, PATCH_TOTAL_BYTES, env)
@@ -3943,16 +4120,20 @@ def take_diff(git, top, commit, left_out):
 
 def save_patch(patch, digest, now=None):
     """Save a diff in nouez's cache folder under its digest, remove old ones, and return its path."""
-    folder = os.path.join(nouez_cache_dir(), PATCH_FOLDER)
-    os.makedirs(folder, exist_ok=True)
+    folder = cache_folder(PATCH_FOLDER, create=True)
     path = os.path.join(folder, f"{digest}.patch")
     try:
-        with open(path, "rb") as f:
-            same = f.read(len(patch) + 1) == patch
+        same = regular_file(path)  # a link there is replaced, never read or touched
+        if same:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+            with os.fdopen(fd, "rb") as f:
+                same = f.read(len(patch) + 1) == patch
     except OSError:
         same = False
-    if not same:
-        fd, tmp = tempfile.mkstemp(dir=folder, suffix=".tmp")
+    if same:
+        os.utime(path, None)
+    else:
+        fd, tmp = tempfile.mkstemp(dir=folder, suffix=".tmp")  # private (0600)
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(patch)
@@ -3961,15 +4142,17 @@ def save_patch(patch, digest, now=None):
             with contextlib.suppress(OSError):
                 os.remove(tmp)
             raise
-    os.utime(path, None)
-    cutoff = (now or time.time()) - PATCH_KEEP_DAYS * 86400
-    for old in glob.glob(os.path.join(folder, "*.patch")) + glob.glob(os.path.join(folder, "*.tmp")):
-        try:
-            if os.path.getmtime(old) < cutoff:
-                os.remove(old)
-        except OSError:
-            pass
+    prune_patches(now)
     return path
+
+
+def prune_patches(now=None):
+    """Delete saved diffs (and temporary files left by a failed save) older than PATCH_KEEP_DAYS.
+    Best effort; run when the server starts and after each save."""
+    try:
+        prune_files(cache_folder(PATCH_FOLDER), PATCH_NAME, (now or time.time()) - PATCH_KEEP_DAYS * 86400)
+    except OSError:
+        pass
 
 
 def revision(cwd, take=True, inline_limit=None):
@@ -3982,17 +4165,26 @@ def revision(cwd, take=True, inline_limit=None):
     b"" and the digest "" when the line names none. Writes nothing in the repo."""
     if not cwd or not os.path.isdir(cwd):
         return "", b"", ""
-    found, _ = run_bytes(REVISION_GIT + ["-C", cwd, "rev-parse", "--show-toplevel", "HEAD"], 10)
+    found, _ = git_bytes(REVISION_GIT + ["-C", cwd, "rev-parse", "--show-toplevel", "HEAD"], 10)
     top, _, commit = (found or b"").rstrip(b"\n").rpartition(b"\n")
     if not top or not re.fullmatch(rb"[0-9a-f]{40,64}", commit):
         return "[Revision: not a git repository, or no commits yet]\n", b"", ""
     top, commit = os.fsdecode(top), commit.decode()
     git = REVISION_GIT + ["-C", top]
-    short = (run_bytes(git + ["rev-parse", "--short", commit], 10)[0] or commit[:7].encode()).decode().strip()
-    branch = (run_bytes(git + ["branch", "--show-current"], 10)[0] or b"").decode("utf-8", "replace").strip()
+    # A partial clone fetches missing objects when a diff needs them: git 2.45 or later can be told
+    # not to (GIT_NO_LAZY_FETCH alone is ignored by older ones), so nouez always asks for that, and
+    # with an older git takes no diff of a repository that may fetch, or whose settings it can't read.
+    if git_bytes(git + ["--no-lazy-fetch", "rev-parse", "HEAD"], 10)[0] is not None:
+        git = git + ["--no-lazy-fetch"]
+    elif may_fetch(git):
+        return (f"[Revision: commit {commit[:7]}; a partial clone, and this git (before 2.45) can't take a "
+                "diff without fetching, so review the working tree. Name this revision in your answer.]\n",
+                b"", "")
+    short = (git_bytes(git + ["rev-parse", "--short", commit], 10)[0] or commit[:7].encode()).decode().strip()
+    branch = (git_bytes(git + ["branch", "--show-current"], 10)[0] or b"").decode("utf-8", "replace").strip()
     line = f"[Revision: commit {short}" + (f" on {branch}" if branch else "")
     ask = ". Name this revision in your answer.]\n"
-    status, why = run_bytes(git + ["status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"],
+    status, why = git_bytes(git + ["status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"],
                             20, PATCH_TOTAL_BYTES)
     if status is None:
         return line + "; git status failed, so nouez doesn't know what is uncommitted" + ask, b"", ""
@@ -4459,6 +4651,11 @@ def valid_window(w):
     return isinstance(w, dict) and number(w.get("used_percentage")) is not None and number(w.get("resets_at")) is not None
 
 
+def window_fields(w):
+    """The parts of a usage window nouez uses."""
+    return {"used_percentage": w["used_percentage"], "resets_at": w["resets_at"]}
+
+
 def merge_claude_usage(old, limits, now):
     """The usage file to save: the windows in `limits` (just received), each marked with when it
     was seen, except where `old` (the file as it was) holds a better reading of a window that
@@ -4467,21 +4664,21 @@ def merge_claude_usage(old, limits, now):
     an old number never looks fresh."""
     old_limits = old.get("rate_limits") if isinstance(old, dict) and isinstance(old.get("rate_limits"), dict) else {}
     old_saved = number(old.get("saved")) if isinstance(old, dict) else None
-    merged = {k: v for k, v in limits.items() if k not in dict(CLAUDE_WINDOWS)}
+    merged = {}  # only the windows nouez shows: nothing else Claude Code sends the status line is kept
     for key, _ in CLAUDE_WINDOWS:
         new, prev = limits.get(key), old_limits.get(key)
         if valid_window(new) and number(new["resets_at"]) > now:
-            new = {**new, "observed": now}
+            new = {**window_fields(new), "observed": now}
         else:
             new = None
         if valid_window(prev) and number(prev["resets_at"]) > now:
-            prev = {**prev, "observed": number(prev.get("observed")) or old_saved or now}
+            prev = {**window_fields(prev), "observed": number(prev.get("observed")) or old_saved or now}
             gap = number(prev["resets_at"]) - number(new["resets_at"]) if new else None
             if new is None or gap > 600 or (abs(gap) <= 600 and number(prev["used_percentage"]) > number(new["used_percentage"])):
                 new = prev
         if new:
             merged[key] = new
-    seen = [w["observed"] for k, w in merged.items() if k in dict(CLAUDE_WINDOWS)]
+    seen = [w["observed"] for w in merged.values()]
     return {"saved": round(min(seen) if seen else now, 3), "rate_limits": merged}
 
 
@@ -4593,10 +4790,8 @@ def fetch_aa_models(key):
     """(index version, models) from Artificial Analysis's free models list, all pages."""
     models, version = [], None
     for page in range(1, AA_MAX_PAGES + 1):
-        req = urllib.request.Request(f"{AA_MODELS_URL}?page={page}", headers={
-            "x-api-key": key, "Accept": "application/json", "User-Agent": f"nouez/{SERVER_VERSION}"})
-        with urllib.request.urlopen(req, timeout=AA_TIMEOUT) as r:
-            data = json.loads(r.read(AA_PAGE_BYTES).decode("utf-8"))
+        data = fetch_json(f"{AA_MODELS_URL}?page={page}", {"x-api-key": key, "Accept": "application/json"},
+                          AA_TIMEOUT, AA_PAGE_BYTES)
         if not isinstance(data, dict) or not isinstance(data.get("data"), list):
             raise BridgeError("Artificial Analysis sent an unexpected answer")
         version = number(data.get("intelligence_index_version")) or version
@@ -4737,6 +4932,10 @@ def consultant_budget(args, cancel=None, progress=None):
 
 USAGE_LOG_FILE = "usage-log.jsonl"
 USAGE_LOG_BYTES = 20 * 1024 * 1024  # past this the log is renamed with its date and a new one begun
+USAGE_LOG_MONTH = 30 * 86400        # and when its first event is older than this: one file a month
+USAGE_LOG_KEEP_DAYS = 365           # a renamed log not changed for this long is deleted
+USAGE_LOG_KEEP_BYTES = 100 * 1024 * 1024  # and the oldest go while the renamed ones add up to more
+USAGE_LOG_WAIT = 2                  # seconds a write waits for another server's; then the event is skipped
 CONSULT_KINDS = ("quick-check", "re-check", "review", "bug-hunt", "plan-critique", "research",
                  "fact-check", "other")
 REASON_CHARS = 300
@@ -4758,18 +4957,109 @@ def record_usage(event, path=None, now=None):
     try:
         path = path or usage_log_file()
         line = json.dumps({"ts": round(now or time.time(), 3), **event}, ensure_ascii=False) + "\n"
-        with _usage_log_lock:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            try:
-                if os.path.getsize(path) > USAGE_LOG_BYTES:
-                    stem = path[:-len(".jsonl")] if path.endswith(".jsonl") else path
-                    os.replace(path, f"{stem}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
-            except OSError:
-                pass  # no log yet, or it can't be rotated now: append to it as it is
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(line)
+        # One lock for every nouez server, held from the rename check to the end of the append, so
+        # no line goes to a file another server is renaming or deleting.
+        with _usage_log_lock, FileLock(path + ".lock", USAGE_LOG_WAIT, "the usage log is busy"):
+            rotate_usage_log(path, now, locked=True)
+            if os.path.lexists(path) and not regular_file(path):  # O_NOFOLLOW below covers macOS and Linux
+                raise OSError(f"{path} is a link or not a regular file; nothing is written to it")
+            flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+            with os.fdopen(os.open(path, flags, 0o600), "wb") as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):  # swapped in after the check
+                    raise OSError(f"{path} isn't a regular file; nothing is written to it")
+                f.write(line.encode("utf-8"))
     except Exception as e:
         log("usage log:", e)
+
+
+def usage_log_due(path, now):
+    """Whether the log should be renamed: past USAGE_LOG_BYTES, or begun over a month ago. Never a
+    link or anything but a regular file (opening a pipe could wait)."""
+    try:
+        if not regular_file(path):
+            return False
+        if os.lstat(path).st_size > USAGE_LOG_BYTES:
+            return True
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_BINARY", 0))
+        with os.fdopen(fd, "rb") as f:
+            first = json.loads(f.readline(64 * 1024).decode("utf-8", "replace"))
+        ts = number(first.get("ts")) if isinstance(first, dict) else None
+        return ts is not None and ts < (now or time.time()) - USAGE_LOG_MONTH
+    except (OSError, ValueError, RecursionError):
+        return False
+
+
+def rotated_usage_logs(path):
+    """The files the log at `path` was renamed into, oldest first."""
+    stem = path[:-len(".jsonl")] if path.endswith(".jsonl") else path
+    folder, base = os.path.split(stem)
+    try:
+        names = os.listdir(folder or ".")
+    except OSError:
+        return []
+    pattern = re.compile(re.escape(base) + r"-\d{8}-\d{6}(?:-\d{1,4})?\.jsonl")
+    return [os.path.join(folder, n) for n in sorted(names, key=lambda n: (n[:len(base) + 16], len(n), n))
+            if pattern.fullmatch(n) and regular_file(os.path.join(folder, n))]
+
+
+def regular_file(path):
+    """Whether path is a file itself: not a link or a junction, a folder or a pipe."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode) and not is_link(path)
+    except OSError:
+        return False
+
+
+def rotate_usage_log(path, now=None, locked=False):
+    """Rename the log with its date when it is due, then delete old renamed logs, under the lock
+    every nouez server takes to write it (`locked`: the caller holds it). Never raises: a log that
+    can't be renamed now is appended to as it is."""
+    if not locked:
+        try:
+            with FileLock(path + ".lock", USAGE_LOG_WAIT, "the usage log is busy"):
+                rotate_usage_log(path, now, locked=True)
+        except (OSError, BridgeError) as e:
+            log("usage log:", e)
+        return
+    if usage_log_due(path, now):
+        stem = path[:-len(".jsonl")] if path.endswith(".jsonl") else path
+        name = f"{stem}-{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}"
+        target, n = name + ".jsonl", 0
+        while os.path.lexists(target) and n < 999:
+            n += 1
+            target = f"{name}-{n}.jsonl"
+        if not os.path.lexists(target):  # never over an earlier one
+            with contextlib.suppress(OSError):
+                os.replace(path, target)
+    prune_usage_logs(path, now)
+
+
+def prune_usage_logs(path=None, now=None):
+    """Delete renamed logs not changed for USAGE_LOG_KEEP_DAYS, then the oldest while the rest add
+    up to more than USAGE_LOG_KEEP_BYTES. Never the current log; never a link. Best effort."""
+    path = path or usage_log_file()
+    cutoff = (now or time.time()) - USAGE_LOG_KEEP_DAYS * 86400
+    kept = []
+    for name in rotated_usage_logs(path):
+        try:
+            st = os.lstat(name)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if st.st_mtime < cutoff:
+                os.remove(name)
+            else:
+                kept.append((name, st.st_size))
+        except OSError:
+            pass
+    total = sum(size for _, size in kept)
+    for name, size in kept:
+        if total <= USAGE_LOG_KEEP_BYTES:
+            break
+        with contextlib.suppress(OSError):
+            os.remove(name)
+            total -= size
 
 
 def kind_and_reason(args):
@@ -5165,14 +5455,7 @@ def read_usage_log(path=None):
     """The usage log's events, oldest first, with the files it was rotated into (named with their
     date, beside it); lines that can't be read are skipped."""
     path = path or usage_log_file()
-    stem = path[:-len(".jsonl")] if path.endswith(".jsonl") else path
-    try:
-        folder, base = os.path.split(stem)
-        rotated = sorted(os.path.join(folder, n) for n in os.listdir(folder or ".")
-                         if re.fullmatch(re.escape(base) + r"-\d{8}-\d{6}\.jsonl", n))
-    except OSError:
-        rotated = []
-    return [e for name in [*rotated, path] for e in json_lines(name, lambda e: number(e.get("ts")) is not None)]
+    return [e for name in [*rotated_usage_logs(path), *[path][:regular_file(path)]] for e in json_lines(name, lambda e: number(e.get("ts")) is not None)]
 
 
 def median(values):
@@ -5622,6 +5905,8 @@ def read_agy_usage():
 
 AGY_PREFIX = "agy-"
 AGY_DIR = "agy"
+AGY_TURN_KEEP_DAYS = 90       # a stopped consultant's turn files are deleted this long after the stop
+AGY_TURN_FILE = re.compile(r"[0-9a-f-]{36}\.(?:in|json|jsonl|err|[^.\\/]+\.tmp)")  # a turn's files, a save's leftover
 AGY_MODEL = "gemini-4-neon"   # the model family a new Antigravity consultant starts on
 AGY_EFFORT = "high"           # and its level
 AGY_LEVELS = ("low", "medium", "high", "xhigh", "max")
@@ -5697,7 +5982,10 @@ class FileLock:
 
     def __enter__(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+        if is_link(self.path):  # O_NOFOLLOW covers macOS and Linux; Windows has none
+            raise OSError(f"{self.path} is a link; nouez doesn't lock through it")
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                          | getattr(os, "O_BINARY", 0), 0o600)
         deadline = time.monotonic() + self.seconds
         while True:
             try:
@@ -5726,7 +6014,7 @@ class agy_lock(FileLock):
         self.cid = cid  # None: the lock for all Antigravity consultants, taken while a name is chosen
 
     def __enter__(self):
-        folder = agy_folder(self.cid) if self.cid else agy_root()
+        folder = checked_folder(agy_root(), *([self.cid] if self.cid else []), create=True)
         FileLock.__init__(self, os.path.join(folder, "lock"), AGY_LOCK_SECONDS,
                           ("Another Claude Code session is sending to or stopping this consultant"
                            if self.cid else "Another Claude Code session is starting an Antigravity "
@@ -6033,7 +6321,7 @@ def agy_detach_flags():
 def agy_spawn(argv, cwd, stdin_path, out_path, err_path):
     """Start agy detached from this process, its output going to files. On Windows, also outside
     Claude Code's job object when the job allows it, so the turn survives a reconnect."""
-    with open(stdin_path, "rb") as fin, open(out_path, "wb") as fout, open(err_path, "wb") as ferr:
+    with open(stdin_path, "rb") as fin, new_private_file(out_path) as fout, new_private_file(err_path) as ferr:
         kwargs = dict(cwd=cwd, stdin=fin, stdout=fout, stderr=ferr, **agy_detach_flags())
         if os.name == "nt":
             try:
@@ -6053,12 +6341,14 @@ def agy_start_turn(rec, text, model, conversation, shown):
         raise BridgeError(f"{rec.get('name')} has no valid model ({model!r}); pass `model` to set one.")
     if not text.endswith(shown):
         raise BridgeError("internal: the message shown must end the text sent")
-    folder = os.path.join(agy_folder(rec["id"]), "turns")
-    os.makedirs(folder, exist_ok=True)
     turn_id = str(uuid.uuid4())
-    base = os.path.join(folder, turn_id)
-    with open(base + ".in", "w", encoding="utf-8", newline="\n") as f:
-        f.write(json.dumps({"event": "user", "message": {"content": text}}, ensure_ascii=False) + "\n")
+    try:  # private and not a link, like the rest of nouez's folder: a turn holds the message and the reply
+        folder = checked_folder(agy_root(), rec["id"], "turns", create=True)
+        base = os.path.join(folder, turn_id)
+        with new_private_file(base + ".in") as f:
+            f.write((json.dumps({"event": "user", "message": {"content": text}}, ensure_ascii=False) + "\n").encode())
+    except OSError as e:
+        raise BridgeError(f"Could not write the turn's files for {rec.get('name')}: {e}. Nothing was sent.") from None
     # The message isn't copied here: history reads it from .in, from shown_from on.
     meta = {"id": turn_id, "started": round(time.time(), 3), "model": model, "shown_from": len(text) - len(shown)}
     if not write_json_atomic(base + ".json", meta):
@@ -6205,7 +6495,10 @@ def start_agy_consultant(args, cwd):
         taken = {r.get("name") for r in agy_consultants(include_stopped=True)}
         rec = {"id": cid, "name": agy_name(cwd, cid, taken), "cwd": cwd, "model": model,
                "created": round(time.time(), 3), "instructions": instructions or None, "title": title}
-        os.makedirs(agy_folder(cid), exist_ok=True)
+        try:
+            checked_folder(agy_root(), cid, create=True)
+        except OSError as e:
+            raise BridgeError(f"Could not make {agy_folder(cid)}: {e}") from None
         agy_save(rec)
     record_usage({"event": "start", "consultant": rec["name"], "thread": cid, "new": True, "provider": "antigravity",
                   "project": os.path.basename(os.path.normpath(cwd)) or None, "model": model})
@@ -6413,10 +6706,40 @@ def stop_agy_consultant(rec):
                 "was stopped. Try StopConsultant again; if it still runs, end it yourself (Task Manager), "
                 f"or let it end at agy's {AGY_TURN_LIMIT} limit.")
         conv = agy_conversation(rec["id"])
-        agy_save({**rec, "stopped": round(time.time(), 3)})
+        # The conversation id is kept here too: the turn files it is read from go AGY_TURN_KEEP_DAYS later.
+        agy_save({**rec, "stopped": round(time.time(), 3), "conversation": conv})
     return (f"Stopped {rec['name']}." + (" Ended its running turn." if ended else "")
             + (f" Its conversation stays in Antigravity: to pick it up yourself, run "
                f"{agy_shown()} --conversation {conv} in {rec.get('cwd')}." if conv else ""))
+
+
+def prune_agy_turns(now=None):
+    """Delete the turn files (each message, reply and error output) of Antigravity consultants
+    stopped more than AGY_TURN_KEEP_DAYS ago. Each consultant.json stays, with its agy conversation
+    id; Antigravity's own copy of the conversation is agy's and isn't touched. Best effort."""
+    cutoff = (now or time.time()) - AGY_TURN_KEEP_DAYS * 86400
+
+    def due(rec):
+        stopped = number((rec or {}).get("stopped"))
+        return bool(stopped) and stopped < cutoff and not rec.get("turns_removed")
+    for rec in agy_consultants(include_stopped=True):
+        if not due(rec):
+            continue
+        try:
+            with agy_lock(rec["id"]):
+                cid = rec["id"]
+                rec = read_json_file(os.path.join(checked_folder(agy_root(), cid), "consultant.json"))
+                if not due(rec) or rec.get("id") != cid:  # started again, or done by another server, meanwhile
+                    continue
+                if "conversation" not in rec:  # stopped by nouez before 0.22.0: saved before its events go
+                    rec = {**rec, "conversation": agy_conversation(cid)}
+                    agy_save(rec)
+                if prune_files(checked_folder(agy_root(), cid, "turns"), AGY_TURN_FILE, float("inf")):
+                    agy_save({**rec, "turns_removed": round(now or time.time(), 3)})
+                else:  # tried again at the next start
+                    log(f"agy: some old turn files of {rec.get('name')} couldn't be removed")
+        except (OSError, BridgeError) as e:
+            log(f"agy: couldn't remove the old turns of {rec.get('name')}: {e}")
 
 
 def agy_activity(cid, turn_id):
@@ -6529,7 +6852,7 @@ def columns(blocks, widths):
 
 
 def consultation_rows(scr, summary, days, compact=False, table=True):
-    period = f"last {days} day{'s' if days != 1 else ''}" if days else "all logged"
+    period = period_text(days)
     if not summary["sends"] and not summary["other_replies"]:
         return [scr.dim(f"  No consultations logged ({period}). nouez logs them from 0.14.0 on; "
                         "the consult skill adds each one's kind and reason.")]
@@ -6666,7 +6989,7 @@ def side_by_side(left, width, right):
 
 
 def period_text(days):
-    return f"last {days} day{'s' if days != 1 else ''}" if days else "all logged"
+    return f"last {days} day{'s' if days != 1 else ''}" if days else "all kept"
 
 
 def login_badge(scr, now):
@@ -7031,7 +7354,7 @@ def run_top(argv):
             if len(since) != 2:
                 raise ValueError
     except (IndexError, ValueError):
-        print("usage: server.py top [--once] [--days N]  (N from 0, everything logged, to 65535)")
+        print("usage: server.py top [--once] [--days N]  (N from 0, everything kept, to 65535)")
         return 2
     state_path = os.path.join(nouez_cache_dir(), SCAN_STATE_FILE)
     state = read_scan_state(state_path)
@@ -7371,7 +7694,7 @@ TOOLS = [
             "properties": {
                 "cwd": {"type": "string", "description": "Absolute path of the project folder the session works in."},
                 "create": {"type": "boolean", "description": "Create the folder if it doesn't exist (its parent must exist). Use when the user asks for a session in a new folder."},
-                "trust": {"type": "boolean", "description": "true: the user has seen this folder's report and said, in this conversation, that they trust it; record that in Claude Code's settings before opening, as its trust dialog would. Never set it on your own judgment or on the first call. Default false."},
+                "trust": {"type": "boolean", "description": "true: the user has seen this folder's report and said, in this conversation, that they trust it; record that in Claude Code's settings before opening, as its trust dialog would. Never set it on your own judgment or on the first call. Refused for a folder not already trusted on its own when the user set NOUEZ_NO_TRUST_WRITE=1. Default false."},
                 "open_untrusted": {"type": "boolean", "description": "Open the window even though Claude Code hasn't been trusted in the folder, so the user can answer the trust question on the computer. Default false. Set it only when the user asks for that."},
                 "model": {"type": "string", "description": "Claude Code model alias or full name. Default: opus (the latest Opus). Set it only when the user asks for another model."},
                 "effort": {"type": "string", "enum": list(CLAUDE_EFFORTS), "description": "Effort level. Default: medium. Set it only when the user asks for another."},
@@ -7423,7 +7746,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "days": {"type": "integer", "enum": list(STATUS_DAYS), "description": "The period the consultation counts cover, in days; 0 for everything logged. Default 7."},
+                "days": {"type": "integer", "enum": list(STATUS_DAYS), "description": "The period the consultation counts cover, in days; 0 for every event the kept logs hold. Default 7."},
             },
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
@@ -7855,10 +8178,20 @@ def run_doctor():
     return 1 if problems else 0
 
 
+def tidy():
+    """Delete what nouez keeps past its time (README, Files): saved replies and diffs, the turn
+    files of long-stopped Antigravity consultants, and old usage logs. Run when a server starts."""
+    for step in (prune_replies, prune_patches, prune_agy_turns, lambda: rotate_usage_log(usage_log_file())):
+        try:
+            step()
+        except Exception as e:  # one failing step mustn't stop the others, or the server
+            log("tidy:", e)
+
+
 def main():
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
-    threading.Thread(target=prune_replies, daemon=True).start()  # old replies go even with no new one
+    threading.Thread(target=tidy, daemon=True).start()  # old files go even when nothing new is saved
     for line in sys.stdin:
         line = line.strip()
         if not line:

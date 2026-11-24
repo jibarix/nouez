@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.21.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.22.0\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -813,7 +813,10 @@ A notice that a newer nouez is out comes before the Codex one. When Claude Code 
 call waits for it. The thread first reads \code{nouez/latest-release.json} in the user's cache
 folder (\code{\%LOCALAPPDATA\%} on Windows, \code{\$XDG\_CACHE\_HOME} or
 \code{\textasciitilde/.cache} elsewhere). An answer less than a day old is used as it is, and so
-is a failed attempt less than an hour old, which gives no notice. Otherwise nouez asks GitHub,
+is a failed attempt less than an hour old, which gives no notice. Otherwise nouez asks GitHub through \code{fetch\_json}, the one function that makes nouez's
+web requests (it starts only at \code{RELEASES\_URL} and \code{AA\_MODELS\_URL}, refuses a redirect
+to another scheme, host or port, so the Artificial Analysis key can't follow one, and reads at
+most a set size),
 with no credentials and a 3-second timeout on each network step (not a deadline for the whole
 request: name lookup and several slow reads can take longer), and saves the result, a failure
 included, through a temporary file of its own (\code{mkstemp}) and \code{os.replace}, so servers
@@ -971,7 +974,12 @@ to review the working tree instead. The diff is saved as
 digits of its SHA-256; the line names the file and the digest and asks the consultant to review
 that diff rather than the working tree, which may change while it reads, and to name the digest
 in its answer. The same changes give the same digest, so two consultants' verdicts can be checked
-to be about the same input. Saved diffs older than 14 days are removed when another is saved. The
+to be about the same input. Saved diffs older than 14 days are removed when another is saved and when a server starts.
+git runs with \code{GIT\_NO\_LAZY\_FETCH=1} and \code{-{}-no-lazy-fetch}, so a partial clone's
+missing objects aren't fetched. A git older than 2.45 refuses that option; with one, nouez takes no
+diff of a repository with \code{extensions.partialClone} or a \code{remote.}\textit{name}\code{.promisor}
+set, or whose settings \code{git config -{}-list} can't read: the line asks the consultant to review
+the working tree. Clean filters the repository configures still run. The
 usage log records only the digest (\code{patch}). A Codex consultant reads the file itself, and
 nouez takes the diff only after checking that the session is one it may message. An Antigravity
 consultant runs no commands and may not be allowed to read nouez's folder, so with
@@ -1403,9 +1411,16 @@ Usage counts against the user's subscriptions. Choose by the user's own routing 
 \subsection{Usage log and status screen}
 \label{sec:usage}
 
-nouez appends one JSON line per event to \code{usage-log.jsonl} in its cache folder, under a lock,
-and never lets a failure there fail the tool call (it is written to stderr instead). The file is
-renamed \code{usage-log-}\textit{date}\code{.jsonl} once it passes 20\,MB.
+nouez appends one JSON line per event to \code{usage-log.jsonl} in its cache folder and never lets
+a failure there fail the tool call (it is written to stderr instead). Every server takes
+\code{usage-log.jsonl.lock} from the rename check to the end of the append, so no line goes to a
+file another server is renaming or deleting; an event that waits more than 2 seconds for it is
+skipped, and so is one for a log that isn't a regular file (checked before and after the open,
+which doesn't wait on a pipe). The file is renamed \code{usage-log-}\textit{date}\code{.jsonl} once it passes 20\,MB or
+its first event is 30 days old, with a unique name (none, and no rename, if all are taken).
+Renamed logs not changed for 365 days are deleted, then the oldest while the rest add up to more
+than 100\,MB, under the same lock, when a server starts and on each write. Nothing is read,
+written, renamed or locked through a link.
 \code{NOUEZ\_NO\_USAGE\_LOG=1} turns it off; the unit tests and the live checks set it.
 
 \begin{itemize}
@@ -1547,7 +1562,12 @@ Windows, in its installer's folder \code{\%LOCALAPPDATA\%\textbackslash agy\text
 folder, model, title and standing instructions. \code{turns/}\textit{turn}\code{.json} holds a
 turn's process id, start time and program, its model, and where in \code{.in} the message as
 shown in history starts, beside its \code{.in}, \code{.jsonl} and \code{.err} files. The id is a
-UUID nouez makes; agy's own conversation id comes from the first turn's events. Names are
+UUID nouez makes; agy's own conversation id comes from the first turn's events, and a stop
+saves it in \code{consultant.json}. Ninety days after a stop the turn files are deleted, at a
+server's start, under the consultant's lock: the record is read again there, its conversation id
+saved first, and it is marked done only once every file went, so a file that couldn't be deleted
+is tried at the next start. The record stays. Folders and turn files are made
+without following links (\code{checked\_folder}, \code{new\_private\_file}), 0600 on macOS and Linux. Names are
 \code{agy-}\textit{folder}\code{-}\textit{last 6 of the id}, with more of the id when another
 consultant has that name, chosen under a lock for all Antigravity consultants; a name two
 consultants share is refused. The other tools try these
@@ -1711,8 +1731,11 @@ type and URL, and the names (not values) of its \code{env} and \code{headers}. E
 160 characters and each list at 20, and then the report says it is a summary. Characters that don't
 print, in values and in paths, become \code{\textbackslash{}uXXXX}. What looks like a credential (user and password in a
 URL, a query value, the value after a flag or a \code{NAME=} whose name has token, secret,
-password, key, auth or cred in it) shows as \code{***}, and the report says so. A file that can't be
-read or parsed (or isn't a regular file) is named with the reason and ``look at it on the computer
+password, key, auth or cred in it, or after an \code{Authorization:} or similar header name, in
+permission rules, prompt hooks and fields nouez doesn't know too) shows as \code{***}, and the
+report says so. A file that can't be read or parsed (or isn't a regular file, or is a link, or is
+reached through a linked folder: nouez follows none; or isn't the file the path names once read,
+as when it is swapped meanwhile) is named with the reason and ``look at it on the computer
 before trusting'', never left out.
 
 nouez keeps, per server process, a fingerprint of each report it gave, by trust folder: the
@@ -2062,6 +2085,8 @@ other files would still be taken for a checkout, as \code{git worktree list} tak
 submodule is its own repository. So a trusted \code{C:/Users/me/Projects} covers \code{Projects/notes} but not the repository \code{Projects/nouez}. A state file that is
 missing or can't be parsed also means nouez doesn't know.
 
+\code{NOUEZ\_NO\_TRUST\_WRITE=1} refuses \code{trust: true} for a folder not already trusted on its
+own before anything is written, even the folder \code{create: true} would make.
 With \code{trust: true} nouez sets that one value, for the folder above, and nothing else. It
 refuses the home folder, a drive's root and Claude Code's own folder (where Claude Code doesn't keep
 trust), and a key it can't place. It reads the file and parses it, adding a \code{projects} table if there is none; a file it
@@ -2070,7 +2095,8 @@ left alone. It checks that the changed JSON reads back equal to what it means to
 too big for a float, or text that can't be written as UTF-8, means it leaves the file alone), then copies the file as
 read to a new dated backup in its own folder (\code{\%LOCALAPPDATA\%\textbackslash
 nouez\textbackslash claude-json-backups} on Windows, \code{\$XDG\_STATE\_HOME} or
-\code{\textasciitilde/.local/state} elsewhere; a relative one is ignored; created private), reads the copy back, and keeps
+\code{\textasciitilde/.local/state} elsewhere; a relative one is ignored; created private, and
+on macOS and Linux a folder that isn't private, or is a link, stops the change), reads the copy back, and keeps
 the newest 20. Just before replacing the file it reads it again: if a session has written it in
 the meantime, it starts over from that version (three tries). The new text goes to a temporary
 file of its own beside the state file and is moved into place in one step; half a second later

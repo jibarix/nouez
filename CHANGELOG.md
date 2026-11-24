@@ -6,6 +6,32 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-24
+
+Security hardening, and a [SECURITY.md](SECURITY.md) that says how to report a vulnerability privately and what nouez sends where, keeps and for how long. nouez now deletes the files it keeps after a set time, refuses links where it writes, and no longer lets the Artificial Analysis key follow a redirect. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version.
+
+### Added
+
+- **SECURITY.md.** Report a vulnerability through GitHub's private reporting (the repository's Security tab → Advisories → Report a vulnerability). It also lists every contact nouez makes or causes (its two web requests, and what goes through Codex, Antigravity, Claude Code and git), what it does with credential files (looks at one's time, never opens one), each tool's permissions, what trust can and can't prove, and a retention table. The README's security note is now a summary that links to it.
+- **`NOUEZ_NO_TRUST_WRITE=1`** turns trust writing off: `OpenClaudeSession` refuses `trust: true` for a folder not already trusted, before it makes or writes anything (even the folder `create: true` would make), and never writes `~/.claude.json`, so an untrusted folder is answered at Claude Code's own prompt on the computer. nouez can prove Claude received a folder's report, not that you read it; this is for when you want that proof.
+- **The verify script checks SECURITY.md's lines in `server.py`'s code** on every run, in CI too: no network module, every web request through `fetch_json` to `RELEASES_URL` or `AA_MODELS_URL`, each pinned to its address, credential files named only to read a time, no permission-bypass word and no `curl`, `wget` or `Invoke-WebRequest`, Codex consultants read-only with approvals `never`, and all of Antigravity's deny rules. These catch a plain change, not every way around them. `tests/test_verify.py` covers each rule.
+
+### Changed
+
+- **The usage log is renamed each month** (or sooner past 20 MB, as before), and renamed logs are deleted a year after their last event, the oldest first while they add up to more than 100 MB. Before, a renamed log was kept forever. The status screen's "all" period now says "all kept". Two servers writing and renaming at once can't lose a line: each holds a lock (`usage-log.jsonl.lock`) from the rename check to the end of its append, and a rename takes a unique name. An event that waits over 2 seconds for the lock is skipped, never the tool call, and nothing is written to a log that isn't a regular file.
+- **An Antigravity consultant's turn files are deleted 90 days after you stop it.** They hold each message (with an attached diff) and agy's output, and were kept forever. Its `consultant.json` stays, now with its agy conversation id, so `agy --conversation <id>` still opens it. A file that can't be deleted is tried again at the next start.
+- Old files (long replies, saved diffs, Antigravity turns, usage logs) are removed in the background when a server starts, not only when a new one is saved.
+
+### Fixed
+
+- **The Artificial Analysis key could follow a redirect to another site.** Python's default redirect handling sends custom headers on, so a redirect from `artificialanalysis.ai` would have taken the key with it. Both of nouez's web requests now go through one function that starts only at those two addresses, refuses a redirect to another scheme, host or port, and reads at most a set size.
+- **The folder report no longer shows permission rules unmasked,** and masks header-style secrets (`Authorization: Bearer …`, `X-Api-Token: …`, with or without a space after the colon) everywhere it masks, prompt hooks and fields it doesn't know included.
+- **A linked settings file or folder in a project is reported as unread, not followed.** A project could link `.claude/settings.json` to a file elsewhere, and the report showed that file's content as the project's; trust then can't be recorded from the phone, as for any file nouez can't read. So is a file swapped for another while nouez reads it.
+- **nouez refuses links where it writes and deletes:** Antigravity's folders and turn files, saved diffs, long replies, the usage log, the JSON caches, the pane key, lock files and the `~/.claude.json` backups. nouez trusts its cache folder itself and checks every folder below it. A link there could have made it write or delete elsewhere. Antigravity's turn files and the usage log are created readable by you only (macOS and Linux), and a backup folder that isn't private stops the trust change before anything is written.
+- Taking a diff (`revision: true`) no longer lets git fetch objects missing from a partial clone: nouez passes `--no-lazy-fetch` (git 2.45 or later), and with an older git takes no diff of a partial clone or a repository with a promisor remote, and asks for a review of the working tree.
+- The status line file (`claude-usage.json`) keeps only each window's percentage and reset time. It used to keep whatever else Claude Code put under `rate_limits`.
+- On Windows, telling whether a process is nouez's own helper reads its command line directly instead of starting PowerShell.
+
 ## [0.21.0] - 2026-11-24
 
 Reviewers get one diff, named by its SHA-256, the status screen counts a forked subagent's copied replies once, and a review that couldn't read its input is no longer counted as an approval. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version. A running status screen restarts on it by itself and counts its numbers again once.
@@ -552,7 +578,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/jibarix/nouez/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/jibarix/nouez/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/jibarix/nouez/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/jibarix/nouez/compare/v0.19.0...v0.19.1

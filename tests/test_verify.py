@@ -176,5 +176,76 @@ class UnusedNamesTest(unittest.TestCase):
         self.assertEqual(unused("Base = int\nclass C:\n    Base = str\n    def f[T: Base](self): pass\nC()\n"), [])
 
 
+def crossings(source):
+    return [problem for _, problem in verify.boundary_problems(textwrap.dedent(source))]
+
+
+class BoundaryTest(unittest.TestCase):
+    """0.22.0: the lines SECURITY.md draws, checked in server.py's code."""
+
+    def test_nouez_itself_stays_inside(self):
+        with open(os.path.join(HERE, "..", "server.py"), encoding="utf-8") as f:
+            self.assertEqual(verify.boundary_problems(f.read()), [])
+
+    def test_web_requests_go_through_fetch_json_to_known_urls(self):
+        ok = """
+            import urllib.request
+            RELEASES_URL = "https://api.github.com/repos/jibarix/nouez/releases/latest"
+            AA_MODELS_URL = "https://artificialanalysis.ai/api/v2/language/models/free"
+            def web_opener():
+                return urllib.request.build_opener()
+            def fetch_json(url, headers, timeout, limit):
+                return web_opener().open(urllib.request.Request(url))
+            def a():
+                return fetch_json(RELEASES_URL, {}, 1, 1)
+            def b(page):
+                return fetch_json(f"{AA_MODELS_URL}?page={page}", {}, 1, 1)
+            def c(p):
+                return urllib.request.url2pathname(p)
+        """
+        self.assertEqual(crossings(ok), [])
+        for bad, says in (("def f():\n    return urllib.request.urlopen('https://x')\n", "outside fetch_json"),
+                          ("def f(url):\n    return fetch_json(url, {}, 1, 1)\n", "fetch_json to a URL"),
+                          ("def f():\n    return fetch_json('https://evil', {}, 1, 1)\n", "fetch_json to a URL"),
+                          ("def f():\n    return web_opener()\n", "web_opener called outside"),
+                          ("from urllib.request import urlopen\n", "imports from urllib.request"),
+                          ("import socket\n", "imports socket"),
+                          ("def f():\n    import http.client\n", "imports http.client"),
+                          ("import importlib\n", "imports importlib"),
+                          ('AA_MODELS_URL = "https://evil/free"\n', "AA_MODELS_URL isn't"),
+                          ('def f():\n    global RELEASES_URL\n    RELEASES_URL = "x"\n', "RELEASES_URL isn't"),
+                          ('CMD = ["curl", "https://x"]\n', "the command 'curl'"),
+                          ('S = "run Invoke-WebRequest -Uri x"\n', "the command 'Invoke-WebRequest'")):
+            with self.subTest(bad=bad):
+                self.assertTrue(any(says in p for p in crossings(bad)), crossings(bad))
+
+    def test_credential_files_are_only_timed(self):
+        ok = """
+            import os
+            def credentials_stamp():
+                '''Reads auth.json? Never: a docstring may say so.'''
+                return os.path.getmtime(os.path.join("d", ".credentials.json"))
+        """
+        self.assertEqual(crossings(ok), [])
+        self.assertTrue(crossings("def f():\n    return open('~/.codex/auth.json')\n"))
+        self.assertTrue(crossings("def credentials_stamp():\n    return open('.credentials.json').read()\n"))
+
+    def test_consultants_stay_read_only(self):
+        self.assertEqual(crossings("""
+            SANDBOX = "read-only"
+            AGY_READ_ONLY = {"permissions": {"deny": ["write_file(*)", "command(*)", "mcp(*)", "execute_url(*)"]}}
+            P = {"sandbox": SANDBOX, "approvalPolicy": "never", "sandboxPolicy": {"type": "readOnly"}}
+        """), [])
+        for bad in ('SANDBOX = "workspace-write"\n', 'P = {"approvalPolicy": "on-request"}\n',
+                    'P = {"sandbox": "danger-full-access"}\n', 'P = {"sandboxPolicy": {"type": "workspaceWrite"}}\n',
+                    'ARGS = ["claude", "--dangerously-skip-permissions"]\n', 'MODE = "bypassPermissions"\n',
+                    'MODE = "--yolo"\n',
+                    'AGY_READ_ONLY = {"permissions": {"deny": ["write_file(*)", "command(*)", "mcp(*)"]}}\n',
+                    'AGY_READ_ONLY = {}\n'):
+            with self.subTest(bad=bad):
+                self.assertTrue(crossings(bad))
+        self.assertEqual(crossings('S = "a curly brace, wgetter, curl-free"\n'), [])  # whole words only
+
+
 if __name__ == "__main__":
     unittest.main()
