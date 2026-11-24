@@ -44,6 +44,22 @@ server.agy_root = lambda: os.path.join(_AGY_EMPTY, "agy")
 
 server.CONNECT_SECONDS = 0  # OpenClaudeSession tests look for the new session once, not for 15 s
 
+# Tests never open a real terminal window: one that reaches a launcher without mocking Popen fails.
+_REAL_POPEN = subprocess.Popen
+
+
+def _no_real_window(real):
+    def guarded(argv, *args, **kwargs):
+        stub = isinstance(argv, list) and argv[:2] == [sys.executable, "-c"]  # a test's own stand-in
+        if server.subprocess.Popen is _REAL_POPEN and not stub:
+            raise AssertionError(f"a test would open a real window: {argv!r}")
+        return real(argv, *args, **kwargs)
+    return guarded
+
+
+server.launch = _no_real_window(server.launch)
+server.launch_console = _no_real_window(server.launch_console)
+
 
 class Server:
     """server.py in a subprocess, spoken to one JSON-RPC line at a time."""
@@ -4627,9 +4643,11 @@ class TrustReportFirstTest(unittest.TestCase):
         plain = tempfile.mkdtemp(prefix="nouez-test-plain-")
         self.addCleanup(shutil.rmtree, plain, True)
         new = os.path.join(plain, "fresh")
-        with mock.patch.object(server, "trust_folder", return_value=(new, None)) as trust:
+        with mock.patch.object(server, "trust_folder", return_value=(new, None)) as trust, \
+                mock.patch.object(server, "open_window") as window:
             server.open_claude_session({"cwd": new, "create": True, "trust": True})
         trust.assert_called_once()
+        window.assert_not_called()  # folder_trusted still says no in this test
 
     def test_a_folder_made_inside_a_repository_still_needs_the_report(self):
         new = os.path.join(self.dir, "fresh")
