@@ -2573,7 +2573,8 @@ class AdditionsTest(HandlerTest):
         text = daemon.started["input"][0]["text"]
         self.assertIn("The user's own words, as they typed them:\n<<<\nship it today\n>>>", text)
         self.assertIn("The rest of this message is lead's.\n\nhi", text)
-        self.assertRegex(text, r"\[Revision: commit [0-9a-f]+ .*uncommitted path\(s\)")
+        # " on <branch>" only when a branch is checked out: CI checks a tag out detached
+        self.assertRegex(text, r"\[Revision: commit [0-9a-f]+( on \S+)?, \d+ uncommitted path\(s\)")
         with self.assertRaises(server.BridgeError):
             server.send_consultant_message({"to": thread["id"], "message": "hi", "owner_words": 5})
 

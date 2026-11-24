@@ -6,15 +6,6 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
-### Fixed
-
-- `server.py top` no longer stops with an error when the usage log has a line that isn't valid UTF-8; it skips that line, as it skips one that isn't JSON. A failure to save the usage scan's cache is now logged; before, the message for it could never show.
-
-### Changed
-
-- Cleanup, with no other change in behaviour: four functions only the tests called are gone (the tests check the code nouez runs instead), along with code that repeated `remove_file`. Each Codex connection is closed by `contextlib.closing`. Codex and Antigravity now share their reply, waiter and JSON-lines code, and opening a Linux terminal window is written once. The README no longer lists the "open in another app" pane problem, fixed in 0.19.0.
-- The verify script's static checks also report a top-level function, class or constant that nothing else in its file uses. It follows Python's scopes, so a local, parameter, class attribute or comprehension variable with the same name doesn't count as a use; `tests/test_verify.py` covers it, and CI runs it.
-
 ## [0.20.0] - 2026-11-23
 
 The waiter now says when a consultant may be stuck, and a message sent twice to a busy Codex consultant reaches it once. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version.
@@ -27,6 +18,13 @@ The waiter now says when a consultant may be stuck, and a message sent twice to 
 ### Changed
 
 - **A message nouez already delivered to the running Codex turn isn't sent again.** Sent twice, as once Claude's context was summarised, it used to be steered into the turn a second time. The result now says it was already there and gives the turn's id; with `model` or `effort`, it says the running turn keeps them rather than refusing. A message sent again after the turn ended still starts a new turn.
+- Cleanup, with no other change in behaviour: four functions only the tests called are gone (the tests check the code nouez runs instead), along with code that repeated `remove_file`. Each Codex connection is closed by `contextlib.closing`. Codex and Antigravity now share their reply, waiter and JSON-lines code, and opening a Linux terminal window is written once. The README no longer lists the "open in another app" pane problem, fixed in 0.19.0.
+- The verify script's static checks also report a top-level function, class or constant that nothing else in its file uses. It follows Python's scopes, so a local, parameter, class attribute or comprehension variable with the same name doesn't count as a use; `tests/test_verify.py` covers it, and CI runs it.
+
+### Fixed
+
+- `server.py top` no longer stops with an error when the usage log has a line that isn't valid UTF-8; it skips that line, as it skips one that isn't JSON. A failure to save the usage scan's cache is now logged; before, the message for it could never show.
+- The unit tests pass on a tag's detached checkout and no longer race Windows' clock, and a test can no longer open a real terminal window.
 
 ## [0.19.1] - 2026-11-23
 
