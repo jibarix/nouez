@@ -11,8 +11,9 @@ Never weaken a check, skip a test or add a retry to make a step pass.
 
 1. **Static checks** (seconds):
    `python -I .claude/skills/verify/verify.py static`
-   These catch a top-level name defined twice, `--` inside `\code{}` in TeX, a TeX change without
-   a rebuilt PDF, and version numbers or CHANGELOG links that disagree. The PDF check only sees that
+   These catch a top-level name defined twice, a top-level function, class or constant nothing
+   else in its file uses (dead, or kept only for the tests), `--` inside `\code{}` in TeX, a TeX
+   change without a rebuilt PDF, and version numbers or CHANGELOG links that disagree. The PDF check only sees that
    the file changed and is newer; look at the changed pages yourself.
 
 2. **Checklist:** read `REVIEW.md` as it is on GitHub's `main` (`git fetch origin` then

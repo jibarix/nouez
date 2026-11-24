@@ -1751,6 +1751,14 @@ class HandlerTest(unittest.TestCase):
         self.assertIn("Turn turn-1 was interrupted and Codex carried it on as turn turn-2", out)
         self.assertIn("carried-on answer", out)
 
+    def test_an_offset_past_a_continuations_end_says_only_that(self):
+        thread, _ = self.restarted("cont13")
+        out = server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-1", "offset": 10 ** 6})
+        self.assertIn("past its end", out)
+        self.assertNotIn("carried it on", out)  # no reply is shown, so there's nothing to introduce
+        out = server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-1", "offset": 1})
+        self.assertTrue(out.startswith("(Turn turn-1 was interrupted and Codex carried it on as turn turn-2"), out)
+
     def test_reply_finds_a_continuation_among_older_turns(self):
         thread, daemon = self.restarted("cont13")
         newer = [{"id": f"turn-n{n}", "status": "completed", "items": [user("x"), agent("x", "final_answer")]} for n in range(12)]
@@ -1923,7 +1931,7 @@ class LaunchTest(unittest.TestCase):
                 raise server.BridgeError(f"{how} didn't open (exit code 1)")
             return how
         cwd = tempfile.gettempdir()
-        with mock.patch.object(server.sys, "platform", "linux"), mock.patch.object(server.os, "name", "posix"),              mock.patch.object(server, "launch", fake_launch), mock.patch.dict(server.os.environ, {"TMUX": "", "DISPLAY": ":0"}),              mock.patch.object(server, "pane_resume", lambda codex, tid, cwd, remote: ["codex", "resume", tid]):
+        with mock.patch.object(server.sys, "platform", "linux"), mock.patch.object(server.os, "name", "posix"),              mock.patch.object(server, "launch", fake_launch), mock.patch.dict(server.os.environ, {"TMUX": "", "DISPLAY": ":0"}),              mock.patch.object(server, "pane_resume", lambda codex, tid, remote: ["codex", "resume", tid]):
             with mock.patch.object(server, "which", lambda name, env=None: {"wezterm": "/usr/bin/wezterm"}.get(name)):
                 self.assertEqual(server.open_terminal(cwd, "t-1"), "wezterm")
                 self.assertEqual(calls[-1], ["/usr/bin/wezterm", "start", "--", "codex", "resume", "t-1"])
@@ -2903,6 +2911,11 @@ class UsageLogTest(HandlerTest):
     def events(self):
         return server.read_usage_log(self.log)
 
+    def test_a_usage_log_line_that_isnt_utf8_is_skipped(self):
+        with open(self.log, "wb") as f:
+            f.write(b'{"ts": 1, "event": "send", "reason": "bad \xff byte"}\n{"ts": 2, "event": "send"}\n')
+        self.assertEqual([e["ts"] for e in self.events()], [2])  # the next line is still read
+
     def test_verdicts(self):
         for text, want in (("Verdict: yes", "yes"), ("**Verdict:** CHANGES - two fixes", "changes"),
                            ("No changes needed, ready.", "yes"), ("GO", "yes"), ("NO-GO: tests fail", "no"),
@@ -3053,18 +3066,21 @@ class UsageLogTest(HandlerTest):
 
     def test_window_rows_fit_and_use_the_sample_time(self):
         scr, now = server.Screen(False), self.NOW
+
+        def window_row(owner, label, used, resets_at, length, now, sampled=None):
+            return server.full_row(scr, owner, label, server.window_state(used, resets_at, length, now, sampled), now)
         self.assertEqual(server.window_pace(100, now + 3600, 7 * 86400, now - 86400 * 30), ("used up", None))
-        row = server.window_row(scr, "Codex prolite", "weekly", 0.2, now + 3.5 * 86400, 7 * 86400, now)
+        row = window_row("Codex prolite", "weekly", 0.2, now + 3.5 * 86400, 7 * 86400, now)
         self.assertIn(" <1%", row)
         self.assertLessEqual(len(row), 100)
         # saved at half the window with 50% used: ~100% by the reset, whatever the clock says now
-        fresh = server.window_row(scr, "Claude Code", "weekly", 40, now + 3 * 86400, 7 * 86400, now, now - 60)
+        fresh = window_row("Claude Code", "weekly", 40, now + 3 * 86400, 7 * 86400, now, now - 60)
         self.assertIn("pace: ~", fresh)
-        old = server.window_row(scr, "Claude Code", "weekly", 40, now + 3 * 86400, 7 * 86400, now, now - 7200)
+        old = window_row("Claude Code", "weekly", 40, now + 3 * 86400, 7 * 86400, now, now - 7200)
         self.assertIn("pace not known: an old reading", old)
-        old = server.window_row(scr, "Claude Code", "weekly", 100, now + 3 * 86400, 7 * 86400, now, now - 7200)
+        old = window_row("Claude Code", "weekly", 100, now + 3 * 86400, 7 * 86400, now, now - 7200)
         self.assertIn("used up at the last reading", old)
-        fast = server.window_row(scr, "Codex", "weekly", 90, now + 3 * 86400, 7 * 86400, now)
+        fast = window_row("Codex", "weekly", 90, now + 3 * 86400, 7 * 86400, now)
         self.assertRegex(fast, r"runs out in ~\d")
 
     def write(self, path, lines, mode="w"):
@@ -3139,7 +3155,6 @@ class UsageLogTest(HandlerTest):
         checking = server.top_frame(server.Screen(False), now, 7, live, {}, [], True, 100, {"checking": True})
         self.assertTrue(any("Antigravity" in x and "checking" in x for x in checking))
         # a short screen drops the optional lists first and keeps the latest week
-        week = server.week_of(now)
         scan = {}
         ev = [{"ts": now, "event": "send", "turn": str(i), "thread": "A", "reason": f"r{i}", "kind": "review",
                "model": "m"} for i in range(5)]
@@ -3185,9 +3200,12 @@ class UsageLogTest(HandlerTest):
     def test_antigravity_rows(self):
         now = time.time()
         scr = server.Screen(False)
-        self.assertEqual(server.agy_rows(scr, now, None), [])  # agy not installed: no rows at all
-        self.assertIn("usage not known: agy: not signed in",
-                      server.agy_rows(scr, now, {"error": "agy: not signed in"})[0])
+
+        def agy_rows(live):
+            return server.group_rows(scr, now, server.agy_group(now, live))
+        groups = server.subscription_groups(now, None, None, agy_live=None)
+        self.assertNotIn("Antigravity", [g["title"] for g in groups])  # agy not installed: no rows at all
+        self.assertIn("usage not known: agy: not signed in", agy_rows({"error": "agy: not signed in"})[0])
 
         def reset(secs):
             return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + secs))
@@ -3200,7 +3218,7 @@ class UsageLogTest(HandlerTest):
                 {"window": "weekly", "remaining_fraction": 0.9, "reset_time": reset(-60)}]},  # past reset: left out
             {"name": "New group", "buckets": [
                 {"window": "daily", "remaining_fraction": 0.5, "reset_time": reset(600)}]}]}
-        text = "\n".join(server.agy_rows(scr, now, live))
+        text = "\n".join(agy_rows(live))
         self.assertRegex(text, r"^  Antigravity +\(Google's quota")
         self.assertRegex(text, r"\n    Gemini +weekly .* 75%")
         self.assertRegex(text, r"pace: ~8[78]% by the reset")  # 75% used in 6 of 7 days
@@ -3873,16 +3891,14 @@ class PaneTest(unittest.TestCase):
 
     def test_pane_line_matches_open_terminal(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for folder in (tmp, os.path.join(tmp, "a b")):
-                os.makedirs(folder, exist_ok=True)
-                resume = server.pane_resume("C:\\Program Files\\c\\codex.exe", self.TID, folder)
-                # the daemon's app server, not one of its own in the pane, which the thread's lock keeps out
-                self.assertEqual(resume[5:], ["--remote", "unix://", "-c", "check_for_update_on_startup=false"])
-                line = f'C:\\WINDOWS\\system32\\cmd.exe /d /s /k "{subprocess.list2cmdline(resume)}"'
-                self.assertTrue(server.is_nouez_pane(line, self.TID), line)
-                self.assertFalse(server.is_nouez_pane(line, self.TID[:-1] + "e"))
+            resume = server.pane_resume("C:\\Program Files\\c\\codex.exe", self.TID)
+            # the daemon's app server, not one of its own in the pane, which the thread's lock keeps out
+            self.assertEqual(resume[5:], ["--remote", "unix://", "-c", "check_for_update_on_startup=false"])
+            line = f'C:\\WINDOWS\\system32\\cmd.exe /d /s /k "{subprocess.list2cmdline(resume)}"'
+            self.assertTrue(server.is_nouez_pane(line, self.TID), line)
+            self.assertFalse(server.is_nouez_pane(line, self.TID[:-1] + "e"))
             sock = os.path.join(tmp, "a b", "x.sock")
-            resume = server.pane_resume("codex", self.TID, tmp, "unix://" + sock)
+            resume = server.pane_resume("codex", self.TID, "unix://" + sock)
             self.assertEqual(resume[5:7], ["--remote", "unix://" + sock])
             line = f'C:\WINDOWS\system32\cmd.exe /d /s /k "{subprocess.list2cmdline(resume)}"'
             self.assertTrue(server.is_nouez_pane(line, self.TID), line)
@@ -4486,7 +4502,7 @@ class ConfigReportTest(unittest.TestCase):
                                   "permissions": {"allow": ["Bash(*)"], "defaultMode": "bypassPermissions"},
                                   "enableAllProjectMcpServers": True, "brandNewKey": 1, "model": "opus"},
                         mcp={"mcpServers": {"tools": {"command": "node", "args": ["srv.js"]}}})
-        report = server.config_report([d])
+        report = server.config_review([d])[0]
         for part in ("SessionStart: sh go.sh", "statusLine runs: status.sh", "apiKeyHelper runs: key.sh",
                      "env sets (1, values not shown): PATH", "pre-approves: Bash(*)", "bypassPermissions",
                      "enableAllProjectMcpServers", "other settings: brandNewKey", "tools: runs node srv.js"):
@@ -4523,7 +4539,7 @@ class ConfigReportTest(unittest.TestCase):
                                                    "env": {"DB_PASSWORD": "hunter2"}},
                                             "web": {"type": "http", "url": "https://u:pw@x.test/mcp?key=k1",
                                                     "headers": {"Authorization": "Bearer t"}}}})
-        report = server.config_report([d])
+        report = server.config_review([d])[0]
         for part in ("PreToolUse [Bash]: check.sh --token ***", "good@market (on)", "bad@market (off)",
                      "market from", "o/r", "db: runs npx db --api-key ***", "env DB_PASSWORD (values not shown)",
                      "web: http https://***@x.test/mcp?key=***", "headers Authorization", "\\u001b", "\\u202e",
@@ -4534,10 +4550,10 @@ class ConfigReportTest(unittest.TestCase):
 
     def test_a_long_report_says_it_is_a_summary(self):
         d = self.folder(settings={"permissions": {"allow": [f"Bash(cmd{i})" for i in range(30)]}})
-        report = server.config_report([d])
+        report = server.config_review([d])[0]
         self.assertIn("and 10 more", report)
         self.assertIn("This is a summary", report)
-        self.assertNotIn("summary", server.config_report([self.folder(settings={"apiKeyHelper": "a.sh"})]))
+        self.assertNotIn("summary", server.config_review([self.folder(settings={"apiKeyHelper": "a.sh"})])[0])
 
     def test_the_fingerprint_sees_what_the_report_doesnt(self):
         d = self.folder(settings={"env": {"A": "1"}})
@@ -4551,11 +4567,11 @@ class ConfigReportTest(unittest.TestCase):
     def test_no_settings(self):
         d = tempfile.mkdtemp(prefix="nouez-test-config-")
         self.addCleanup(shutil.rmtree, d, True)
-        self.assertIn("No project settings", server.config_report([d]))
+        self.assertIn("No project settings", server.config_review([d])[0])
 
     def test_both_folders_once(self):
         a, b = self.folder(settings={"apiKeyHelper": "a.sh"}), self.folder(settings={"apiKeyHelper": "b.sh"})
-        report = server.config_report([a, b, a])
+        report = server.config_review([a, b, a])[0]
         self.assertIn("a.sh", report)
         self.assertIn("b.sh", report)
         self.assertEqual(report.count("a.sh"), 1)
@@ -4689,7 +4705,7 @@ class TrustReportFirstTest(unittest.TestCase):
         os.makedirs(os.path.join(odd, ".claude"))
         with open(os.path.join(odd, ".claude", "settings.json"), "w") as f:
             json.dump({"env": {"A": "1"}}, f)
-        report = server.config_report([odd])
+        report = server.config_review([odd])[0]
         self.assertIn("a\\u202eb", report)
         self.assertNotIn("\u202e", report)
 

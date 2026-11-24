@@ -93,6 +93,102 @@ def check_shadowing(files):
     report(not bad, "no top-level name defined twice", "; ".join(bad))
 
 
+FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def own_scope(nodes):
+    """Every node in `nodes` and below that is in their own scope: not inside a nested function or
+    class body, or a comprehension's loop variables, which have scopes of their own."""
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (*FUNCTION_NODES, ast.ClassDef)):
+            continue  # its name is bound here; what it binds inside is its own
+        stack += [c for c in ast.iter_child_nodes(node)
+                  if not (isinstance(node, ast.comprehension) and c is node.target)]
+
+
+def local_names(fn):
+    """The names a function makes local: its parameters and what its own body assigns (not what a
+    nested function assigns), less what it declares global."""
+    a = fn.args
+    params = [*a.posonlyargs, *a.args, *a.kwonlyargs, *filter(None, [a.vararg, a.kwarg])]
+    names = {p.arg for p in params}
+    body = fn.body if isinstance(fn.body, list) else [fn.body]
+    declared = set()
+    for node in own_scope(body):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names |= {(x.asname or x.name).split(".")[0] for x in node.names}
+        elif isinstance(node, ast.Global):
+            declared |= set(node.names)
+    return names - declared
+
+
+def module_reads(node, local=frozenset(), own=None, found=None):
+    """The module-level names `node` reads: a load of a name a function made local doesn't count,
+    nor `own`, a function's call to itself."""
+    found = set() if found is None else found
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, FUNCTION_NODES):
+            a = child.args
+            # decorators, defaults and annotations are read where the function is defined, its body
+            # in its own scope
+            params = [*a.posonlyargs, *a.args, *a.kwonlyargs, *filter(None, [a.vararg, a.kwarg])]
+            for outer in [*getattr(child, "decorator_list", []), *a.defaults, *filter(None, a.kw_defaults),
+                          *filter(None, [p.annotation for p in params] + [getattr(child, "returns", None)])]:
+                module_reads(ast.Expression(outer), local, own, found)
+            body = child.body if isinstance(child.body, list) else [child.body]
+            globals_ = {g for n in own_scope(body) if isinstance(n, ast.Global) for g in n.names}
+            inner = (local - globals_) | local_names(child)  # `global X` reads the module's X again
+            for b in child.body if isinstance(child.body, list) else [child.body]:
+                module_reads(ast.Module([b], []) if isinstance(b, ast.stmt) else ast.Expression(b), inner, own, found)
+        elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+            if child.id not in local and child.id != own:
+                found.add(child.id)
+        else:
+            # X += 1 reads X, though its target is marked as a store
+            if isinstance(child, ast.AugAssign) and isinstance(child.target, ast.Name) and child.target.id not in local:
+                found.add(child.target.id)
+            module_reads(child, local, own, found)
+    return found
+
+
+def check_unused(files):
+    """A top-level function, class or constant that nothing else in its own file uses: dead, or
+    kept only for the tests, which should then test what the code really calls. Code that reads a
+    name only through globals() or a string isn't seen. A read inside a class body or comprehension
+    counts as a module read even where a local of theirs hides the module's name, so such a name
+    can be missed; nothing in use is reported."""
+    bad = []
+    for name in files:
+        if not name.endswith(".py") or name.startswith("tests/"):
+            continue
+        try:
+            tree = ast.parse(read(name))
+        except SyntaxError:
+            continue  # check_shadowing reports it
+        defined = {}
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.setdefault(node.name, node.lineno)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                    for n in ast.walk(target):  # A, B = 1, 2 defines both
+                        if isinstance(n, ast.Name):
+                            defined.setdefault(n.id, node.lineno)
+        used = set()
+        for node in tree.body:
+            module_reads(ast.Module([node], []), own=getattr(node, "name", None), found=used)
+        bad += [f"{name}:{line} {n}" for n, line in sorted(defined.items(), key=lambda x: x[1])
+                if n not in used and not (n.startswith("__") and n.endswith("__"))]
+    report(not bad, "no top-level name left unused", "; ".join(bad))
+
+
 def strip_comments(text):
     """The text as TeX reads it: from an unescaped % to the end of the line dropped, lines kept."""
     out, i = [], 0
@@ -180,6 +276,7 @@ def static():
     files = changed_files()
     print(f"{len(files)} changed file(s){' in ' + RANGE if RANGE else ''}: {', '.join(files) or 'none'}")
     check_shadowing(files)
+    check_unused(files)
     check_tex(files)
     check_versions(files)
 
@@ -612,21 +709,28 @@ def check_setup(label, codex, agy):
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def installed_here(name):
+    """Whether a CLI is installed, found without server.py's lookup, so a regression there makes a
+    setup check fail rather than skip it: an executable on PATH, or agy where its installer puts it
+    on Windows."""
+    exts = PROGRAM_EXTS if os.name == "nt" else ("",)
+    if any(os.path.isfile(f) and (os.name == "nt" or os.access(f, os.X_OK))
+           for d in path_folders(os.environ.get("PATH")) for f in (os.path.join(d, name + e) for e in exts)):
+        return True
+    local = os.environ.get("LOCALAPPDATA") or ""
+    return (name == "agy" and os.name == "nt" and os.path.isabs(local)
+            and os.path.isfile(os.path.join(local, "agy", "bin", "agy.exe")))
+
+
 def check_setups():
     """Each newcomer setup: Codex only, Antigravity only, both, neither."""
-    have_codex = bool(program_files_on_path("codex"))
-    have_agy = bool(program_files_on_path("agy")) or os.path.isfile(
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "agy", "bin", "agy.exe"))
+    have_codex, have_agy = installed_here("codex"), installed_here("agy")
     for label, codex, agy in (("Codex only", True, False), ("Antigravity only", False, True),
                               ("both", True, True), ("neither", False, False)):
         if (codex and not have_codex) or (agy and not have_agy):
             print(f"\n--- {label}: skipped, " + ("Codex" if codex and not have_codex else "agy") + " isn't installed here")
             continue
         check_setup(label, codex, agy)
-
-
-def program_files_on_path(name):
-    return [f for d in path_folders(os.environ.get("PATH")) for f in program_files(d, name)]
 
 
 if __name__ == "__main__":

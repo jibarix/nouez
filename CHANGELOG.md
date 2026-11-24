@@ -6,6 +6,15 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `server.py top` no longer stops with an error when the usage log has a line that isn't valid UTF-8; it skips that line, as it skips one that isn't JSON. A failure to save the usage scan's cache is now logged; before, the message for it could never show.
+
+### Changed
+
+- Cleanup, with no other change in behaviour: four functions only the tests called are gone (the tests check the code nouez runs instead), along with code that repeated `remove_file`. Each Codex connection is closed by `contextlib.closing`. Codex and Antigravity now share their reply, waiter and JSON-lines code, and opening a Linux terminal window is written once. The README no longer lists the "open in another app" pane problem, fixed in 0.19.0.
+- The verify script's static checks also report a top-level function, class or constant that nothing else in its file uses.
+
 ## [0.20.0] - 2026-11-23
 
 The waiter now says when a consultant may be stuck, and a message sent twice to a busy Codex consultant reaches it once. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version.

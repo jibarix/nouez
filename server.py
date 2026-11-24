@@ -31,6 +31,7 @@ message, with deny rules that keep it read-only. Standard library only.
 """
 
 import base64
+import contextlib
 import collections
 import datetime
 import glob
@@ -579,16 +580,6 @@ def user_texts(turn):
             for c in (i.get("content") or [])]
 
 
-def bridge_started(client, thread_id, turn):
-    """Whether nouez started this turn, or the turn it carries on: then it runs read-only and a
-    message may steer it. A turn typed in the watch pane may run with whatever permissions the
-    user set there, so it is never steered."""
-    # Only nouez's own record of the exact turn counts: a turn's text proves nothing, since a
-    # message typed in the pane can start with the same header, and a root only shows shared
-    # ancestry. After a restart the record is empty, so nothing is steered until a new turn starts.
-    return turn.get("id") in _bridge_turns
-
-
 def continued_from(turn):
     """The first turn of the chain of work this turn belongs to (its rootTurnId), or None if it
     starts its own chain. A restarted daemon that carries on a turn the restart cut off names that
@@ -761,10 +752,7 @@ def cap_reply(turn_id, reply, limit=MAX_REPLY_CHARS):
                 f.write(reply)
             os.replace(tmp, path)
         except BaseException:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+            remove_file(tmp)
             raise
         where = f"The full reply is saved in {path}."
     except OSError as e:
@@ -1245,10 +1233,7 @@ def write_json_atomic(path, value):
         return False
     finally:
         if tmp:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+            remove_file(tmp)
 
 
 def save_release_cache(path, now, latest):
@@ -1632,7 +1617,6 @@ def handle_start(handle):
     """Windows: the creation time (100 ns units since 1601) of a process that is still running, or None."""
     ctypes, wintypes, kernel32 = _kernel32()
     times = [wintypes.FILETIME() for _ in range(4)]
-    code = wintypes.DWORD()
     if not kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
         return None
     if handle_exited(handle):
@@ -1726,7 +1710,7 @@ def _same_title(a, b):
     return strip(a) == strip(b)
 
 
-def _activate_window(ctypes, user32, kernel32, hwnd):
+def _activate_window(user32, kernel32, hwnd):
     """Bring a window to the foreground, even from this background process. Returns whether it is."""
     foreground = user32.GetForegroundWindow()
     if foreground == hwnd:
@@ -1768,7 +1752,7 @@ def run_in_host_window(wt, cwd, command):
     host = wt_host_window()
     ctypes, user32, kernel32 = _wt_user32()
     previous = user32.GetForegroundWindow()
-    if not host or not _activate_window(ctypes, user32, kernel32, host[0]):
+    if not host or not _activate_window(user32, kernel32, host[0]):
         # Opening it in another session's window is worse than a window of its own.
         why = "couldn't be brought to the front" if host else "couldn't be found"
         return launch([wt, "-w", "new", *command], f"a new Windows Terminal window (Claude Code's window {why})",
@@ -1792,7 +1776,7 @@ def run_in_host_window(wt, cwd, command):
         pass
     finally:
         if previous and previous != hwnd and user32.IsWindow(previous):
-            _activate_window(ctypes, user32, kernel32, previous)
+            _activate_window(user32, kernel32, previous)
     return how
 
 
@@ -1864,13 +1848,16 @@ def pane_token(thread_id):
     return "p" + hmac.new(pane_key(), thread_id.encode(), hashlib.sha256).hexdigest()[:32]
 
 
-def pane_resume(codex, thread_id, cwd, remote="unix://"):
-    """The `codex resume` command a pane runs: the pane token first, then `--remote <remote>` and
-    viewer_options. `--remote` attaches the pane to the Codex daemon nouez talks to: given -c
-    options, codex resume otherwise starts an app server of its own inside the pane, which can't
-    take the thread from the daemon and shows "This conversation is open in another app"."""
+def pane_resume(codex, thread_id, remote="unix://"):
+    """The `codex resume` command a pane runs: the pane token first, then `--remote <remote>` and no
+    update check. `--remote` attaches the pane to the Codex daemon nouez talks to: given -c options,
+    codex resume otherwise starts an app server of its own inside the pane, which can't take the
+    thread from the daemon and shows "This conversation is open in another app". Trust for the
+    folder can't be given for one run: the attached pane asks the daemon, so in a folder Codex
+    hasn't trusted it asks "Trust this folder?" and saves the answer. The consultant works on
+    meanwhile."""
     return [codex, "resume", thread_id, "-c", f"nouez_pane={pane_token(thread_id)}", "--remote", remote,
-            *viewer_options()]
+            "-c", "check_for_update_on_startup=false"]
 
 
 def daemon_socket(info):
@@ -1885,14 +1872,6 @@ def daemon_socket(info):
         if not (os.name == "nt" and set(path) & CMD_SPECIAL) and os.path.exists(path):
             return "unix://" + path
     return "unix://"
-
-
-def viewer_options():
-    """Options for the viewer's `codex resume`: no update check. Trust for the folder can't be given
-    for one run: a pane attached to the daemon asks the daemon whether the folder is trusted and
-    takes no override, so in a folder Codex hasn't trusted it asks "Trust this folder?" and saves
-    the user's answer, as Codex does. The consultant works on meanwhile."""
-    return ["-c", "check_for_update_on_startup=false"]
 
 
 # Linux terminal emulators nouez can open a window in, in the order tried, with the arguments
@@ -1910,6 +1889,18 @@ def terminal_emulator():
         if exe:
             return exe, lead
     return None, None
+
+
+def linux_terminal(command, yourself=""):
+    """(argv, name) that run `command` in a new window of the first Linux terminal emulator found.
+    Raises BridgeError, ending in `yourself`, when none is installed or there is no display."""
+    term, lead = terminal_emulator()
+    if not term:
+        raise BridgeError("No terminal emulator found (" + ", ".join(n for n, _ in TERMINALS) + ")." + yourself)
+    why = no_display()
+    if why:
+        raise BridgeError(f"Can't open a terminal window: {why}.{yourself}")
+    return [term, *lead, *command], os.path.basename(term)
 
 
 def no_display():
@@ -1968,7 +1959,7 @@ def open_terminal(cwd, thread_id, codex="codex", remote="unix://"):
     if not re.fullmatch(r"[0-9A-Za-z-]+", thread_id):
         raise BridgeError(f"Refusing to open a terminal for an unexpected thread id: {thread_id!r}")
     cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
-    resume = pane_resume(codex, thread_id, cwd, remote)
+    resume = pane_resume(codex, thread_id, remote)
     kwargs = {"cwd": cwd, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     tmux = which("tmux") if os.environ.get("TMUX") else None
     yourself = f" Pass watch=false to start without a pane, or run this yourself: {shlex.join(resume)}"
@@ -2008,13 +1999,7 @@ def open_terminal(cwd, thread_id, codex="codex", remote="unix://"):
         if sys.platform == "darwin":
             argv, how = apple_terminal(f"cd {shlex.quote(cwd)} && {shlex.join(resume)}"), "Terminal"
         else:
-            term, lead = terminal_emulator()
-            if not term:
-                raise BridgeError("No terminal emulator found (" + ", ".join(n for n, _ in TERMINALS)
-                                  + ")." + yourself)
-            if no_display():
-                raise BridgeError(f"Can't open a terminal window: {no_display()}.{yourself}")
-            argv, how = [term, *lead, *resume], os.path.basename(term)
+            argv, how = linux_terminal(resume, yourself)
         try:
             return launch(argv, how, start_new_session=True, **kwargs)
         except BridgeError as e:
@@ -2135,10 +2120,7 @@ def run_claude(spec_path):
         with open(spec_path, encoding="utf-8") as f:
             spec = json.load(f)
     finally:
-        try:
-            os.remove(spec_path)
-        except OSError:
-            pass
+        remove_file(spec_path)
     env = fresh_claude_env(os.environ)
     exe = find_program("claude", env.get("PATH"))
     if not exe:
@@ -2176,10 +2158,7 @@ def run_claude(spec_path):
     marker = close_marker(child.pid)
     if os.path.exists(marker):
         # CloseClaudeSession ended it. Exit cleanly so the terminal closes this window.
-        try:
-            os.remove(marker)
-        except OSError:
-            pass
+        remove_file(marker)
         return 0
     return code
 
@@ -2196,12 +2175,7 @@ def open_window(cwd, argv, title):
     if sys.platform == "darwin":
         return launch(apple_terminal(f"cd {shlex.quote(cwd)} && {shlex.join(argv)}", activate=False),
                       "a new Terminal window", start_new_session=True, **kwargs)
-    term, lead = terminal_emulator()
-    if not term:
-        raise BridgeError("No terminal emulator found (" + ", ".join(n for n, _ in TERMINALS) + ").")
-    if no_display():
-        raise BridgeError(f"Can't open a terminal window: {no_display()}.")
-    return launch([term, *lead, *argv], os.path.basename(term), start_new_session=True, **kwargs)
+    return launch(*linux_terminal(argv), start_new_session=True, **kwargs)
 
 
 def trust_key(path):
@@ -2416,10 +2390,7 @@ def backup_claude_state(text):
             if f.read() != text:
                 raise OSError("the copy doesn't match")
     except OSError as e:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        remove_file(path)
         raise BridgeError(f"Couldn't back up Claude Code's settings to {folder}: {e}. Nothing was changed.")
     dated = []
     for other in glob.glob(os.path.join(glob.escape(folder), ".claude.json.*.bak")):
@@ -2429,10 +2400,7 @@ def backup_claude_state(text):
             pass  # another nouez server removed it meanwhile
     for _, extra in sorted(dated)[:-TRUST_BACKUPS_KEPT]:
         if extra != path:
-            try:
-                os.remove(extra)
-            except OSError:
-                pass
+            remove_file(extra)
     return path
 
 
@@ -2516,10 +2484,7 @@ def trust_folder(path, expect=None):
             pass
         finally:
             if not replaced:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+                remove_file(tmp)
         if not replaced:
             time.sleep(0.2)
             continue
@@ -3036,11 +3001,6 @@ def config_review(folders):
             fingerprint, complete)
 
 
-def config_report(folders):
-    """config_review's report text alone."""
-    return config_review(folders)[0]
-
-
 def same_folder(a, b):
     try:
         return os.path.normcase(os.path.abspath(a)).rstrip("\\/") == os.path.normcase(os.path.abspath(b)).rstrip("\\/")
@@ -3422,10 +3382,7 @@ def end_session(target):
         close_handle(handle)
         close_handle(helper)
         if not closed and os.path.exists(marker):
-            try:
-                os.remove(marker)
-            except OSError:
-                pass
+            remove_file(marker)
 
 
 def _is_nouez_helper(pid):
@@ -3675,14 +3632,11 @@ def list_consultants(args, cancel=None, progress=None):
                        "session tools still work. `server.py doctor` shows what to install."))
     else:
         try:
-            client = CodexClient()
-            try:
+            with contextlib.closing(CodexClient()) as client:
                 if args.get("cwd"):
                     root, threads = repo_consultants(client, args["cwd"])
                 else:
                     threads = load_consultants(client, include_all)
-            finally:
-                client.close()
         except BridgeError as e:
             if not agy:
                 raise
@@ -3745,8 +3699,7 @@ def start_consultant(args, cancel=None, progress=None):
     watch, new = flag(args, "watch", True), flag(args, "new")
     existing, users, has_turns = [], [], False
     title_note = ""
-    client = CodexClient()
-    try:
+    with contextlib.closing(CodexClient()) as client:
         if not new:
             # Reuse before starting: a consultant already in this repo keeps its context, and a
             # duplicate splits the conversation across sessions. Only our own sessions are reused:
@@ -3768,8 +3721,6 @@ def start_consultant(args, cancel=None, progress=None):
                 except Exception as e:  # the thread exists either way: an error here mustn't lose it
                     title_note = f"Its title couldn't be set ({e}); it works without one."
         notice = "\n".join(n for n in (title_note, safe_nouez_update_notice(), update_notice(client.info)) if n)
-    finally:
-        client.close()
 
     name = short_name(thread)
     record_usage({"event": "start", "consultant": name, "thread": thread["id"], "new": not existing,
@@ -3881,8 +3832,7 @@ def send_consultant_message(args, cancel=None, progress=None):
     if agy:
         return send_agy_message(agy, args, message, sender, owner_words, timeout, kind, reason, cancel, progress)
 
-    client = CodexClient()
-    try:
+    with contextlib.closing(CodexClient()) as client:
         thread = resolve(client, to)
         tid, name = thread["id"], short_name(thread)
         stamp = revision_line(thread.get("cwd")) if want_revision else ""
@@ -3916,7 +3866,12 @@ def send_consultant_message(args, cancel=None, progress=None):
                     f"its {' or '.join(overrides)}. Nothing was sent. Read that turn's reply with "
                     f"GetConsultantReply first, then send again; or send now without "
                     f"{' and '.join(overrides)} to add the message to the running turn.")
-            elif busy and is_bridge(thread) and not bridge_started(client, tid, current):
+            # Steer only a turn nouez started, which runs read-only: one typed in the watch pane may run
+            # with whatever permissions the user set there. Only nouez's own record of the exact turn
+            # counts: a turn's text proves nothing, since a message typed in the pane can start with
+            # the same header, and a root only shows shared ancestry. After a restart the record is
+            # empty, so nothing is steered until a new turn starts.
+            elif busy and is_bridge(thread) and current["id"] not in _bridge_turns:
                 raise BridgeError(
                     f"{name} is working on turn {current['id']}, which this nouez server didn't start "
                     "(it was typed in its terminal, or started before the server restarted), so it may not be "
@@ -3992,8 +3947,6 @@ def send_consultant_message(args, cancel=None, progress=None):
             name, turn_id, turn,
             f"Delivered ({mode}), but no reply within {timeout:.0f}s. Don't send the message again. "
             f"{read_later(tid, turn_id)}")
-    finally:
-        client.close()
 
 
 def carried_note(asked, turn):
@@ -4003,6 +3956,26 @@ def carried_note(asked, turn):
     return f"(Turn {asked} was interrupted and Codex carried it on as turn {turn['id']}, shown here.)\n\n"
 
 
+def still_working_reply(name, thread_id, turn):
+    """GetConsultantReply's answer for a turn that hasn't ended: its output so far and the waiter."""
+    return still_working(name, turn["id"], turn,
+                         f"To be woken when it is ready, run in the background:\n"
+                         f"{waiter_command(thread_id, turn['id'])}\nOr check again later with turn_id "
+                         f"{turn['id']}; pass wait=\"done\" only if the user wants you to wait for it.")
+
+
+def reply_part(name, turn, offset, note=""):
+    """The part of a finished turn's reply from `offset` on, at most MAX_REPLY_CHARS of it, after
+    `note`; an offset past the end gets only a message saying so."""
+    reply = turn_reply(turn)
+    if offset >= len(reply):
+        return f"The reply from {name} (turn {turn['id']}) has {len(reply)} characters; offset {offset} is past its end."
+    end = min(len(reply), offset + MAX_REPLY_CHARS)
+    return note + (f"Reply from {name} (turn {turn['id']}, {turn['status']}), characters {offset}-{end} "
+            f"of {len(reply)}:\n\n{reply[offset:end]}"
+            + (f"\n\n[More: read on with offset {end}.]" if end < len(reply) else ""))
+
+
 def get_consultant_reply(args, cancel=None, progress=None):
     to = target(args)
     timeout = wait_seconds(args, 0)
@@ -4010,8 +3983,7 @@ def get_consultant_reply(args, cancel=None, progress=None):
     agy = agy_resolve(to)
     if agy:
         return get_agy_reply(agy, args, timeout, offset, cancel, progress)
-    client = CodexClient()
-    try:
+    with contextlib.closing(CodexClient()) as client:
         thread = resolve(client, to)
         tid, name = thread["id"], short_name(thread)
         turn_id = args.get("turn_id")
@@ -4030,30 +4002,17 @@ def get_consultant_reply(args, cancel=None, progress=None):
                                               on_poll=progress_reporter(progress, name))
                 turn = last or turn  # the newest snapshot, for the partial output
             if not done:
-                return carried_note(asked, turn) + still_working(
-                    name, turn["id"], turn,
-                    f"To be woken when it is ready, run in the background:\n"
-                    f"{waiter_command(tid, turn['id'])}\nOr check again later with "
-                    f"turn_id {turn['id']}; pass wait=\"done\" only if the user wants "
-                    "you to wait for it.")
+                return carried_note(asked, turn) + still_working_reply(name, tid, turn)
         carried = carried_note(asked, turn)
         record_reply(tid, name, turn)
         if offset:
-            reply = turn_reply(turn)
-            if offset >= len(reply):
-                return f"The reply from {name} (turn {turn['id']}) has {len(reply)} characters; offset {offset} is past its end."
-            end = min(len(reply), offset + MAX_REPLY_CHARS)
-            return carried + (f"Reply from {name} (turn {turn['id']}, {turn['status']}), characters {offset}-{end} "
-                    f"of {len(reply)}:\n\n{reply[offset:end]}"
-                    + (f"\n\n[More: read on with offset {end}.]" if end < len(reply) else ""))
+            return reply_part(name, turn, offset, carried)
         out = carried + format_turn(name, turn)
         latest = latest_turn(client, tid)
         if turn["status"] == "interrupted" and latest and latest["id"] != turn["id"]:
             out += (f"\nA later turn exists ({latest['id']}, {latest['status']}). If your message "
                     "continued there, read it by omitting turn_id.")
         return out
-    finally:
-        client.close()
 
 
 HISTORY_DEFAULT = 20
@@ -4065,12 +4024,9 @@ def get_consultant_history(args, cancel=None, progress=None):
     agy = agy_resolve(to)
     if agy:
         return agy_history(agy, limit)
-    client = CodexClient()
-    try:
+    with contextlib.closing(CodexClient()) as client:
         thread = resolve(client, to)
         turns = list_turns(client, thread["id"], limit)
-    finally:
-        client.close()
     name = short_name(thread)
     if not turns:
         return f"{name} has no messages yet."
@@ -4090,23 +4046,17 @@ def watch_consultant(args, cancel=None, progress=None):
                 "one agy turn in the background. GetConsultantHistory lists its turns."
                 + (f" To open its conversation in agy yourself, run {agy_shown()} --conversation {conv} "
                    f"in {agy.get('cwd')}." if conv else ""))
-    client = CodexClient()
-    try:
+    with contextlib.closing(CodexClient()) as client:
         thread = resolve(client, to)
         has_turns = bool(latest_turn(client, thread["id"]))
         info = client.info
-    finally:
-        client.close()
     tid, name = thread["id"], short_name(thread)
     if not has_turns:
         # Codex can't resume a session before its first message. If a send slipped in
         # between the check above and this flag, open now rather than wait for the next one.
         set_watch(tid)
-        client = CodexClient()
-        try:
+        with contextlib.closing(CodexClient()) as client:
             has_turns = bool(latest_turn(client, tid))
-        finally:
-            client.close()
         if not (has_turns and take_watch(tid)):
             return f"{name} has no messages yet; a terminal window will open when you send the first one."
     return show_viewer(thread, info)
@@ -4117,15 +4067,12 @@ def stop_consultant(args, cancel=None, progress=None):
     agy = agy_resolve(to, exact_only=True)
     if agy:
         return stop_agy_consultant(agy)
-    client = CodexClient()
-    try:
+    with contextlib.closing(CodexClient()) as client:
         thread = resolve(client, to, exact_only=True)
         name = short_name(thread)
         if not is_bridge(thread):
             raise BridgeError(f"{name} was not started by StartConsultant. Close it from its own terminal.")
         client.request("thread/archive", {"threadId": thread["id"]})
-    finally:
-        client.close()
     set_watch(thread["id"], False)
     with _send_locks_guard:
         _unwatched.discard(thread["id"])
@@ -4537,11 +4484,8 @@ def consultant_budget(args, cancel=None, progress=None):
         out.append("Codex: not installed.")
     else:
         try:
-            client = CodexClient()
-            try:
+            with contextlib.closing(CodexClient()) as client:
                 out += codex_budget(client, now)
-            finally:
-                client.close()
         except BridgeError as e:
             out.append(f"Codex: usage unavailable ({e}).")
     out.append("")
@@ -4866,6 +4810,25 @@ def weekly_tokens(state):
     return weeks
 
 
+def json_lines(path, keep, errors="strict"):
+    """The objects on a JSON-lines file's lines that `keep` accepts. A line that isn't JSON, such as a
+    half-written last one, is skipped, and so is a file that can't be read. Each line is decoded on
+    its own, so with errors="strict" a line that isn't UTF-8 is skipped and the next one still read."""
+    found = []
+    try:
+        with open(path, "rb") as f:
+            for line in f:
+                try:
+                    e = json.loads(line.decode("utf-8", errors))
+                except ValueError:  # UnicodeDecodeError too
+                    continue
+                if isinstance(e, dict) and keep(e):
+                    found.append(e)
+    except OSError:
+        pass
+    return found
+
+
 def read_usage_log(path=None):
     """The usage log's events, oldest first, with the files it was rotated into (named with their
     date, beside it); lines that can't be read are skipped."""
@@ -4877,20 +4840,7 @@ def read_usage_log(path=None):
                          if re.fullmatch(re.escape(base) + r"-\d{8}-\d{6}\.jsonl", n))
     except OSError:
         rotated = []
-    events = []
-    for name in [*rotated, path]:
-        try:
-            with open(name, encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        e = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(e, dict) and number(e.get("ts")) is not None:
-                        events.append(e)
-        except OSError:
-            pass
-    return events
+    return [e for name in [*rotated, path] for e in json_lines(name, lambda e: number(e.get("ts")) is not None)]
 
 
 def median(values):
@@ -5002,7 +4952,7 @@ class Screen:
     a dotted marker, which need a current terminal font; without it, characters every console
     font has."""
     def __init__(self, color, fancy=True):
-        self.color, self.fancy = color, fancy
+        self.color = color
         self.box = "╭╮╰╯─│" if fancy else "┌┐└┘─│"
         self.mark = "┊" if fancy else "|"
 
@@ -5140,12 +5090,6 @@ def compact_row(scr, label, state):
     return f"{label[:7]:<8}{window_gauge(scr, state, 10)}  " + scr.dim(f"{state['short'][:11]:<11}") + " " + reset
 
 
-def window_row(scr, owner, label, used, resets_at, length, now, sampled=None):
-    """One subscription window as a line with a bar, or None if its numbers can't be used."""
-    state = window_state(used, resets_at, length, now, sampled)
-    return full_row(scr, owner, label, state, now) if state else None
-
-
 def subscription_groups(now, codex_live, codex_saved, claude_path=None, agy_live=None):
     """Each subscription as a dict: its title; its windows as (quota group, label, state), the group
     naming one of Antigravity's or ""; a note on where the numbers came from, long and short; or
@@ -5210,14 +5154,6 @@ def subscription_groups(now, codex_live, codex_saved, claude_path=None, agy_live
     if agy_live is not None:
         groups.append(agy_group(now, agy_live))
     return groups
-
-
-def subscription_rows(scr, now, codex_live, codex_saved, claude_path=None, agy_live=None):
-    """The subscriptions as full-width lines."""
-    rows = []
-    for group in subscription_groups(now, codex_live, codex_saved, claude_path, agy_live):
-        rows += group_rows(scr, now, group)
-    return rows
 
 
 def group_rows(scr, now, group):
@@ -5296,11 +5232,6 @@ def agy_group(now, agy_live):
             if state:
                 group["entries"].append((sub, window_label(length) if length else "usage", state))
     return {**group, "empty": "no current quota window reported"}
-
-
-def agy_rows(scr, now, agy_live):
-    """Antigravity's quota groups as full-width lines. Nothing at all when agy isn't installed."""
-    return [] if agy_live is None else group_rows(scr, now, agy_group(now, agy_live))
 
 
 # The actions agy can deny: file writes and edits (write_file covers every editing tool), commands,
@@ -5610,7 +5541,7 @@ def agy_identity(meta, access=QUERY | SYNCHRONIZE):
         if not handle:
             return ("gone" if err == 87 else "unknown"), None  # ERROR_INVALID_PARAMETER: no such process
         start, recorded = handle_start(handle), meta.get("pid_start")
-        image, program = meta.get("image"), None
+        image = meta.get("image")
         if start is None:
             # Ended, or its times couldn't be read; only an exit code nouez can read means ended.
             state = "gone" if handle_exited(handle) else "unknown"
@@ -5634,9 +5565,7 @@ def agy_identity(meta, access=QUERY | SYNCHRONIZE):
         return "gone", None
     try:
         os.kill(pid, 0)
-    except PermissionError:
-        return "gone", None  # another user's process: not one nouez started
-    except OSError:
+    except OSError:  # ended, or another user's process (PermissionError): not one nouez started
         return "gone", None
     return "unknown", None
 
@@ -5670,19 +5599,7 @@ def agy_turn_ids(cid):
 
 def agy_events(path):
     """The NDJSON events an agy run has written so far; a half-written last line is skipped."""
-    events = []
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    e = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(e, dict) and isinstance(e.get("event"), str):
-                    events.append(e)
-    except OSError:
-        pass
-    return events
+    return json_lines(path, lambda e: isinstance(e.get("event"), str), errors="replace")
 
 
 def agy_turn(cid, turn_id, now=None):
@@ -5712,11 +5629,8 @@ def agy_turn(cid, turn_id, now=None):
     events = agy_events(os.path.join(folder, turn_id + ".jsonl"))
     result = next((e.get("result") for e in reversed(events) if e["event"] == "result"), None)
     result = result if isinstance(result, dict) else None
-    turn = {"id": turn_id, "provider": "antigravity", "startedAt": int(started), "model": meta.get("model"),
+    turn = {"id": turn_id, "provider": "antigravity", "startedAt": int(started),
             "items": [{"type": "userMessage", "content": [{"type": "text", "text": shown}]}]}
-    conv = next((e.get("conversation_id") for e in events if isinstance(e.get("conversation_id"), str)), None)
-    if conv:
-        turn["conversation"] = conv
     if result:
         text = result.get("response") if isinstance(result.get("response"), str) else ""
         turn["items"].append({"type": "agentMessage", "text": text, "phase": "final_answer"})
@@ -6074,20 +5988,9 @@ def get_agy_reply(rec, args, timeout, offset, cancel, progress):
         if timeout > 0:
             done, turn = agy_wait(cid, turn["id"], timeout, cancel, progress_reporter(progress, name))
         if not done:
-            return still_working(name, turn["id"], turn,
-                                 f"To be woken when it is ready, run in the background:\n"
-                                 f"{waiter_command(cid, turn['id'])}\nOr check again later with turn_id "
-                                 f"{turn['id']}; pass wait=\"done\" only if the user wants you to wait for it.")
+            return still_working_reply(name, cid, turn)
     record_reply(cid, name, turn)
-    if offset:
-        reply = turn_reply(turn)
-        if offset >= len(reply):
-            return f"The reply from {name} (turn {turn['id']}) has {len(reply)} characters; offset {offset} is past its end."
-        end = min(len(reply), offset + MAX_REPLY_CHARS)
-        return (f"Reply from {name} (turn {turn['id']}, {turn['status']}), characters {offset}-{end} "
-                f"of {len(reply)}:\n\n{reply[offset:end]}"
-                + (f"\n\n[More: read on with offset {end}.]" if end < len(reply) else ""))
-    return format_turn(name, turn)
+    return reply_part(name, turn, offset) if offset else format_turn(name, turn)
 
 
 def agy_history(rec, limit):
@@ -6185,6 +6088,21 @@ def agy_activity(cid, turn_id):
         return None
 
 
+def print_unfinished(name, thread_id, turn_id, turn, stall, **advice):
+    """The waiter's last word on a turn still running: stuck, or out of time and how to wait on."""
+    again = waiter_command(thread_id, turn_id)
+    print(still_working(name, turn_id, turn, stall_advice(name, stall.limit, again, **advice) if stall.stalled
+                        else f"Waited {WAITER_SECONDS // 60} minutes. To keep waiting, run the same command "
+                        f"again in the background:\n{again}"))
+
+
+def print_finished(name, thread_id, whose, turn_id, turn):
+    """The waiter's report of an ended turn, reply included; `whose` names the thread for the reader."""
+    record_reply(thread_id, name, turn)
+    print(f"The consultant's turn has ended ({whose}, turn {turn_id}).\n")
+    print(format_turn(name, turn, WAITER_REPLY_CHARS))
+
+
 def run_agy_waiter(rec, turn_id):
     """`server.py wait` for an Antigravity consultant's turn."""
     name, cid = rec["name"], rec["id"]
@@ -6198,14 +6116,9 @@ def run_agy_waiter(rec, turn_id):
         print(f"Stopped waiting for turn {turn_id}: {e}")
         return 1
     if not done:
-        again = waiter_command(cid, turn_id)
-        print(still_working(name, turn_id, turn, stall_advice(name, stall.limit, again, antigravity=True)
-                            if stall.stalled else f"Waited {WAITER_SECONDS // 60} minutes. To keep waiting, "
-                            f"run the same command again in the background:\n{again}"))
+        print_unfinished(name, cid, turn_id, turn, stall, antigravity=True)
         return 0
-    record_reply(cid, name, turn)
-    print(f"The consultant's turn has ended (Antigravity consultant {cid}, turn {turn_id}).\n")
-    print(format_turn(name, turn, WAITER_REPLY_CHARS))
+    print_finished(name, cid, f"Antigravity consultant {cid}", turn_id, turn)
     return 0
 
 
@@ -6259,10 +6172,8 @@ def agy_model_families(ids):
                      for base, levels in families.items())
 
 
-def columns(blocks, widths=26):
-    """Side-by-side lists: each block is (title, [(label, count)...]), each column `widths` wide
-    (one width for all, or one per block)."""
-    widths = [widths] * len(blocks) if isinstance(widths, int) else list(widths)
+def columns(blocks, widths):
+    """Side-by-side lists: each block is (title, [(label, count)...]), with one width per block."""
     height = max((len(items) for _, items in blocks), default=0)
     lines = ["  " + "".join(f"{title:<{w}}" for (title, _), w in zip(blocks, widths))]
     for i in range(height):
@@ -6491,7 +6402,7 @@ def help_rows(scr):
 def top_data(now, days, codex_live, scan, events, agy_live):
     """What the screen shows, read once for every layout tried."""
     everything = log_summary(events)
-    return {"summary": log_summary(events, now - days * 86400 if days else None), "everything": everything,
+    return {"summary": log_summary(events, now - days * 86400) if days else everything, "everything": everything,
             "groups": subscription_groups(now, codex_live, scan.get("codex_limits"), agy_live=agy_live),
             "weeks": weekly_tokens(scan), "first": min((e["ts"] for e in events), default=None),
             "per_day": sends_per_day(events, now, days) if days in (7, 30) else []}
@@ -6560,12 +6471,9 @@ def _top_frame(scr, now, days, data, scanning, width, level, last, view):
 def read_codex_usage():
     """Codex's usage windows from the daemon, or None if it can't be reached."""
     try:
-        client = CodexClient()
-        try:
+        with contextlib.closing(CodexClient()) as client:
             result = client.request("account/rateLimits/read", None)
             return result if isinstance(result, dict) else None
-        finally:
-            client.close()
     except (BridgeError, OSError):
         return None
 
@@ -6772,7 +6680,7 @@ def run_top(argv):
     """`server.py top [--once] [--days N]`: the usage status screen."""
     if "--once" not in argv and "--screen" not in argv:
         return supervise_top(argv)  # it notes the version before the screen's Python reads it
-    once, days, since, quit_code = "--once" in argv, 7, None, TOP_QUIT if "--screen" in argv else 0
+    once, days, since = "--once" in argv, 7, None
     try:
         if "--days" in argv:
             days = int(argv[argv.index("--days") + 1])
@@ -6794,10 +6702,8 @@ def run_top(argv):
 
     def scan_once():
         scan_usage(state, time.time())
-        try:
-            write_json_atomic(state_path, state)
-        except OSError as e:
-            log("usage scan cache:", e)
+        if not write_json_atomic(state_path, state):
+            log("usage scan cache: not saved")
         with guard:
             shared["scan"], shared["scanning"] = json.loads(json.dumps(state)), False
 
@@ -6845,7 +6751,7 @@ def run_top(argv):
     if shared["agy"] is not None:
         threading.Thread(target=antigravity, daemon=True).start()
     source = os.path.abspath(__file__)
-    if os.name != "nt" and "--screen" in argv:  # ended by its supervisor: restore the terminal first
+    if os.name != "nt":  # ended by its supervisor: restore the terminal first
         def ended(signum, frame):
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, ended)
@@ -6878,14 +6784,14 @@ def run_top(argv):
             if key == "?" or (key == "\x1b" and view == "help"):
                 view = "screen" if view == "help" else "help"
             elif key in ("q", "Q", "\x1b", "\x03"):
-                return quit_code
+                return TOP_QUIT
             elif key in TOP_PERIODS:
                 days, view = TOP_PERIODS[key], "screen"
             elif key in ("r", "R"):  # read again in the background; the screen keeps answering keys
                 refresh["codex"].set()
                 refresh["agy"].set()
     except KeyboardInterrupt:
-        return quit_code
+        return TOP_QUIT
     finally:
         stop.set()
         sys.stdout.write("\x1b[?25h\x1b[?1049l")
@@ -7416,8 +7322,7 @@ def run_waiter(thread_id, turn_id):
         turn_id = new_id
     while True:
         try:
-            client = CodexClient()
-            try:
+            with contextlib.closing(CodexClient()) as client:
                 daemon = version_of(((client.info or {}).get("userAgent") or "").split("/", 1)[-1])
                 if daemon and daemon not in daemons:
                     daemons.append(daemon)
@@ -7440,8 +7345,6 @@ def run_waiter(thread_id, turn_id):
                                                         on_poll=stall, on_follow=moved)
                 else:
                     done = True
-            finally:
-                client.close()
         except (BridgeError, OSError) as e:
             failures += 1
             dropped = True
@@ -7453,16 +7356,9 @@ def run_waiter(thread_id, turn_id):
             time.sleep(min(10, left))
             continue
         if not done:
-            again = waiter_command(tid, turn_id)
-            print(still_working(name, turn_id, turn, stall_advice(name, stall.limit, again,
-                                                                  user_session=not is_bridge(thread))
-                                if stall.stalled
-                                else f"Waited {WAITER_SECONDS // 60} minutes. To keep waiting, run the same "
-                                f"command again in the background:\n{again}"))
+            print_unfinished(name, tid, turn_id, turn, stall, user_session=not is_bridge(thread))
             return 0
-        record_reply(tid, name, turn)
-        print(f"The consultant's turn has ended (thread {tid}, turn {turn_id}).\n")
-        print(format_turn(name, turn, WAITER_REPLY_CHARS))
+        print_finished(name, tid, f"thread {tid}", turn_id, turn)
         notes = []
         if turn_id != asked:
             notes.append(f"Turn {asked} was interrupted and Codex carried it on as turn {turn_id}, "
@@ -7572,11 +7468,8 @@ def run_doctor():
             else "Codex isn't signed in" + (f" ({out.strip().splitlines()[-1][:120]})" if out.strip() else "")
             + ": run `codex login`.", cli=True)
         try:
-            client = CodexClient()
-            try:
+            with contextlib.closing(CodexClient()) as client:
                 daemon = version_of((client.info.get("userAgent") or "").split("/", 1)[-1])
-            finally:
-                client.close()
             say(True, f"the Codex app-server daemon answers (version {daemon or 'unknown'})")
             working += signed
             notice = update_notice(client.info)
