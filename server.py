@@ -65,7 +65,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.19.0"
+SERVER_VERSION = "0.19.1"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -3450,6 +3450,10 @@ def list_projects(args, cancel=None, progress=None):
         log("claude_sessions:", repr(e))
         sessions = None
     trusted = trusted_folders()
+    # A folder counts as a link when it resolves somewhere other than its place in the listed
+    # folder as resolved, so a listed folder reached through a link (macOS's /var) or a short
+    # Windows name (RUNNER~1) doesn't make every folder in it look like one.
+    home = os.path.realpath(folder)
     rows, hidden = [], 0
     for name in names:
         path = os.path.join(folder, name)
@@ -3464,7 +3468,7 @@ def list_projects(args, cancel=None, progress=None):
         check_cancel(cancel)
         marks = []
         real = os.path.realpath(path)
-        if not same_folder(real, path):
+        if not same_folder(real, os.path.join(home, name)):
             marks.append(f"a link to {real}")
         is_repo = os.path.exists(os.path.join(path, ".git"))
         if is_repo:

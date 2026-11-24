@@ -6,6 +6,14 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-11-23
+
+`ListProjects` no longer calls every folder a link when the folder it lists is itself reached through one. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version.
+
+### Fixed
+
+- **`ListProjects` marked every folder "a link to …" when the listed folder was reached through a link or a short Windows name** (on macOS, anything under `/var` or `/tmp`; on Windows, a path such as `C:\Users\RUNNER~1`). A folder now counts as a link only when it resolves somewhere other than its own place in the listed folder, resolved the same way.
+
 ## [0.19.0] - 2026-11-23
 
 Trusting a folder from the phone now starts from a report nouez writes of everything the folder would run, a session can list your projects, and nouez warns a week ahead when Claude Code's sign-in on the computer is about to end. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version. A running status screen restarts on it by itself.
@@ -511,7 +519,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.19.1...HEAD
+[0.19.1]: https://github.com/jibarix/nouez/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/jibarix/nouez/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/jibarix/nouez/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/jibarix/nouez/compare/v0.17.0...v0.18.0

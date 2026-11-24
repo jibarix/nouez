@@ -4576,6 +4576,26 @@ class ListProjectsTest(unittest.TestCase):
         self.assertNotIn("notes.txt", out)
         self.assertNotIn(".hidden", out)
 
+    def test_a_folder_reached_through_a_link_doesnt_make_links_of_its_folders(self):
+        # macOS's temp folder is under /var, a link to /private/var; CI's Windows temp is RUNNER~1
+        outer = tempfile.mkdtemp(prefix="nouez-test-via-")
+        self.addCleanup(shutil.rmtree, outer, True)
+        via = os.path.join(outer, "via")
+        try:
+            if os.name == "nt":
+                import _winapi
+                _winapi.CreateJunction(self.root, via)
+            else:
+                os.symlink(self.root, via)
+        except OSError as e:
+            self.skipTest(f"can't make a link here: {e}")
+        out = server.list_projects({"folder": via})
+        self.assertIn("- beta [", out)
+        self.assertNotIn("a link to", out)
+        if os.name != "nt":  # a folder that is a link is still marked
+            os.symlink(outer, os.path.join(self.root, "gamma"))
+            self.assertIn(f"- gamma [a link to {os.path.realpath(outer)}", server.list_projects({"folder": via}))
+
     def test_folders_windows_marks_hidden_are_left_out(self):
         with mock.patch.object(server, "hidden_on_windows", side_effect=lambda p: p.endswith("beta")):
             out = server.list_projects({})
