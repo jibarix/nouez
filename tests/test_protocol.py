@@ -421,8 +421,10 @@ class ReplyTest(unittest.TestCase):
 
 class DaemonStartTest(unittest.TestCase):
     def connect(self, failures):
-        """A CodexClient whose first `failures` connections find no daemon; returns start_daemon's mock."""
-        attempts = iter([server.DaemonDown("down")] * failures)
+        """A CodexClient whose first `failures` connections find no daemon (None: none ever does);
+        returns start_daemon's mock."""
+        attempts = (iter(lambda: server.DaemonDown("down"), None) if failures is None
+                    else iter([server.DaemonDown("down")] * failures))
 
         def fake_connect(client, exe):
             client.proc = mock.Mock()
@@ -454,7 +456,9 @@ class DaemonStartTest(unittest.TestCase):
         start.assert_called_once_with("codex")
 
     def test_gives_up_when_the_daemon_never_comes_up(self):
-        start = self.connect(1000)
+        # Never up, not a large count: Windows' clock moves in ~15 ms steps, so a fast machine
+        # could use up any count before the deadline passes and then connect.
+        start = self.connect(None)
         with self.assertRaises(server.DaemonDown):
             server.CodexClient()
         start.assert_called_once_with("codex")
