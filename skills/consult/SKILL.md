@@ -89,5 +89,10 @@ scores and your own experience decide which.
 - Ask for every finding in the first round ("list everything you would block on now").
 - Later rounds that only check named fixes are re-checks: use the re-check row.
 - After three rounds of changes on the same work, stop and show the user the open points.
+- When you and the consultant still disagree about a finding, and Codex and Antigravity are both
+  installed, ask the other one: start a new consultant there (`StartConsultant` with its `provider`
+  and `new: true`) and send it the original brief, the finding and both sides' reasons. It
+  hasn't seen the earlier rounds, so its view is independent. Keep the first
+  consultant for questions about what it meant.
 - When a reply was poor, find out why first: missing information → fix the brief; steps rushed →
   one effort level up; tried properly and still wrong → a stronger model.

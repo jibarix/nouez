@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.19.1\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.20.0\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -964,6 +964,18 @@ when nouez sees the session busy, a send with either is refused and nothing is s
 steering the turn with them silently dropped. Like the choice between start and steer, this check
 is not atomic: a turn another client starts between it and \code{turn/start} is not seen.
 
+Before either check, a message this server already delivered to the running turn is not sent
+again: the result says it was already in the running turn and gives that turn's id, and with
+\code{model} or \code{effort} that the running turn keeps them, after a quick reply too. This is
+what Claude meets when it sends again after its context was summarised and it lost track of a
+send. Only nouez's own record counts (\code{\_delivered}: each turn's texts, header included, added
+once \code{turn/start} or \code{turn/steer} returns), as for steering: \code{thread/turns/list}
+gives a summary of a turn's items, its first user message and last agent message, so a steer
+doesn't show there, and the same text typed in the pane is not a message this server delivered. A
+send whose acknowledgement was lost is not in the record, and after a restart the record is empty.
+Nothing goes to the daemon and no \code{send} event is logged. A message sent again after the turn
+ended starts a new turn as usual, since the work under review may have changed.
+
 \begin{wire}[nouez $\rightarrow$ daemon: session idle, sent with \code{"effort": "xhigh"}]
 {"id": 6, "method": "turn/start", "params": {"threadId": "01a1f3c2-...", "input": [...], "effort": "xhigh"}}
 \end{wire}
@@ -1169,7 +1181,21 @@ A continuation followed during the wait is kept across a dropped connection, so 
 reconnects to it even after the turn it started with has left the newest 100.
 Claude Code stops a background command after 30 minutes by default, so at that point the waiter
 exits with code~0 and the \emph{still working} result, including the output so far and the same
-command to run again; Claude starts a new waiter. When the turn ends, the waiter prints
+command to run again; Claude starts a new waiter. It exits the same way, early, when the turn has
+shown nothing new for \code{STALL\_SECONDS} (10 minutes), with \emph{``nouez has seen no change
+from \ldots\ for 10 minutes: it may be stuck, or still thinking or running a long command. Tell the
+user.''}\ in place of the 25-minute note; for a Codex session the user opened, which
+\code{StopConsultant} refuses, it says to stop it from its terminal. \code{StallWatch}, passed as
+the \code{on\_poll} of \code{wait\_for\_turn} or \code{agy\_wait}, compares each snapshot of the
+running turn with the one before. For Codex that is the size of the session's rollout file (the
+thread's \code{path}), with the turn's items: the items alone are the summary above, which commands
+and reasoning leave unchanged, while Codex writes the rollout at least every minute or so during a
+turn (47 seconds at most across a month of turns on one machine). For agy it is the size of the turn's
+\code{.jsonl} file, to which agy adds an event every few seconds while it works (a 3-minute Neon
+turn wrote 431). A single command that runs quietly past the limit looks stuck too, hence the
+wording. The watch is kept across a
+dropped connection, so reconnecting is not taken for progress, and a followed continuation counts
+as a change. When the turn ends, the waiter prints
 \emph{``The consultant's turn has ended (thread \ldots, turn \ldots).''} and the turn formatted as
 \code{GetConsultantReply} would, with the reply cut at \code{WAITER\_REPLY\_CHARS} (20,000)
 characters and the rest saved to a file, and exits with code~0. Its standard output is UTF-8.
@@ -1498,7 +1524,8 @@ Probed against agy 1.5.14: \code{write\_file(*)} blocks every editing tool (\cod
 \code{replace}, \code{multi\_replace}), inside and outside the folder; \code{command(*)} blocks
 \code{run\_command}. Subagents and the browser tools aren't available in \code{-p} mode. The
 \code{schedule} tool has no deny rule or setting; the first message's preamble asks the model not
-to use it, and \code{-{}-print-timeout} bounds a turn that waits on it.
+to use it, \code{-{}-print-timeout} bounds a turn that waits on it, and the waiter says such a
+turn may be stuck after \code{STALL\_SECONDS} without a new event.
 
 Each output line is an event with \code{event} and \code{conversation\_id}, and an object named
 after the event. nouez reads:
@@ -2023,6 +2050,7 @@ Default \code{wait} & 5 s / 0 s & SendConsultantMessage / GetConsultantReply \\
 \code{WAITER\_REPLY\_CHARS} & 20,000 & longest reply the waiter prints \\
 \code{WAITER\_RETRIES} & 3 & failed connections the waiter rides out \\
 \code{WAITER\_SECONDS} & 25 min & one waiter run, under Claude Code's limit \\
+\code{STALL\_SECONDS} & 10 min & no new output, after which the waiter says a turn may be stuck \\
 \code{AA\_REFRESH\_SECONDS} & 7 days & age at which model scores are fetched again \\
 \code{AA\_RETRY\_SECONDS} & 6 h & wait after a failed fetch of model scores \\
 \code{AA\_SHOWN} & 8 & top-scoring models shown per maker \\

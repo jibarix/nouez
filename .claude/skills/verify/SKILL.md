@@ -49,3 +49,11 @@ Never weaken a check, skip a test or add a retry to make a step pass.
 5. **Report** each step as passed, failed or skipped, with the reason for a skip. In the commit
    message, say how the change was verified (for example "Verified: static, checklist, unit tests,
    live --sessions"), or "Verified: none" and why.
+
+6. **Release: CI before main and the tag.** Push the commit to its branch only and wait for the
+   `tests` run on that commit (`gh run watch <id> --exit-status`) to pass on every system. Only then
+   move `main` to it and push the version tag. If CI fails, fix on the branch, bump the version if
+   `server.py` changed, and push again; never tag or move `main` past a red run. A tag that's
+   already pushed is never moved. Why: 0.19.0 was tagged and put on `main` before CI ran, and
+   failed on macOS and Windows (a folder reached through a link, which this machine doesn't
+   have), so it needed 0.19.1.

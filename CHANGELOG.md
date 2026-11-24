@@ -6,6 +6,19 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-23
+
+The waiter now says when a consultant may be stuck, and a message sent twice to a busy Codex consultant reaches it once. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version.
+
+### Added
+
+- **The waiter says when a turn may be stuck.** When nouez sees no change in a running turn for 10 minutes (Codex's session file and agy's event file grow every minute or so while a turn works), the waiter exits early with the output so far, says the consultant may be stuck, thinking at length or running a long command, and gives the same command to keep waiting. Claude tells you then, instead of after the waiter's 25 minutes. An Antigravity turn waiting on agy's `schedule` tool, which nouez can't deny, is the known case.
+- The consult skill's review loops: when Claude and the consultant still disagree about a finding and both Codex and Antigravity are installed, Claude sends the brief, the finding and both sides' reasons to a new consultant on the other one, for a view that hasn't seen the earlier rounds. If you copied the skill to `~/.claude/skills`, copy it again: `/mcp` reloads only the server.
+
+### Changed
+
+- **A message nouez already delivered to the running Codex turn isn't sent again.** Sent twice, as once Claude's context was summarised, it used to be steered into the turn a second time. The result now says it was already there and gives the turn's id; with `model` or `effort`, it says the running turn keeps them rather than refusing. A message sent again after the turn ended still starts a new turn.
+
 ## [0.19.1] - 2026-11-23
 
 `ListProjects` no longer calls every folder a link when the folder it lists is itself reached through one. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version.
@@ -519,7 +532,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.19.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/jibarix/nouez/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/jibarix/nouez/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/jibarix/nouez/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/jibarix/nouez/compare/v0.18.0...v0.18.1

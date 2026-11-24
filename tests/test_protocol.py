@@ -1059,7 +1059,8 @@ class HandlerTest(unittest.TestCase):
         self.panes = []
         # Never open a real terminal from a test.
         fake_viewer = lambda thread, info, quiet=False: self.panes.append(thread["id"]) or "Opened (test)."
-        for attr, value in (("CodexClient", daemon), ("POLL_SECONDS", 0.01), ("show_viewer", fake_viewer)):
+        for attr, value in (("CodexClient", daemon), ("POLL_SECONDS", 0.01), ("show_viewer", fake_viewer),
+                            ("_delivered", {})):  # turn ids repeat across tests
             self.addCleanup(setattr, server, attr, getattr(server, attr))
             setattr(server, attr, value)
         return daemon
@@ -1193,6 +1194,86 @@ class HandlerTest(unittest.TestCase):
         self.assertIn("steered into the running turn", out)
         self.assertNotIn("answer to q", out)
 
+    def test_the_same_message_again_isnt_steered_twice(self):
+        """0.20.0: a repeated send, as after a dropped connection, gets the running turn's receipt."""
+        thread = self.consultant("busy05")
+        running = {"id": "turn-1", "status": "inProgress",
+                   "items": [user("[Message from Claude Code via the consultants bridge]\n\nq")]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        with mock.patch.object(server, "_bridge_turns", {"turn-1"}), mock.patch.object(server, "_delivered", {}):
+            first = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0})
+            running["items"].pop()  # thread/turns/list's summary doesn't show a steer
+            again = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0})
+            tuned = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0, "effort": "high"})
+        self.assertIn("steered into the running turn", first)
+        self.assertEqual(daemon.calls.count("turn/steer"), 1)
+        self.assertNotIn("turn/start", daemon.calls)
+        self.assertIn("already in the running turn, so it wasn't sent again", again)
+        self.assertIn("turn turn-1", again)
+        self.assertIn("the running turn keeps its effort", tuned)  # not refused: nothing new to send
+
+    def test_text_nouez_didnt_deliver_isnt_a_repeat(self):
+        """0.20.0: the same text typed in the pane started a turn nouez didn't, so it is refused as
+        any such turn is, not taken for a message already delivered."""
+        thread = self.consultant("busy06")
+        running = {"id": "turn-1", "status": "inProgress",
+                   "items": [user("[Message from Claude Code via the consultants bridge]\n\nmore")]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        with mock.patch.object(server, "_delivered", {}):
+            with self.assertRaisesRegex(server.BridgeError, "didn't start.*Nothing was sent"):
+                server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0})
+        self.assertNotIn("turn/steer", daemon.calls)
+
+    def test_a_repeat_that_ends_doesnt_claim_new_settings(self):
+        """0.20.0: a repeat with effort whose turn ends within the wait says the turn kept its
+        settings, not that the consultant now runs on new ones."""
+        thread = self.consultant("busy07")
+        text = "[Message from Claude Code via the consultants bridge]\n\nmore"
+        running = {"id": "turn-1", "status": "inProgress", "items": [user(text)]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        plain, lists = daemon.request, []
+
+        def request(method, params):
+            if method == "thread/turns/list":
+                lists.append(1)
+                if len(lists) == 3:
+                    running.update(status="completed", items=[user(text), agent("done", "final_answer")])
+            return plain(method, params)
+        daemon.request = request
+        with mock.patch.object(server, "_bridge_turns", {"turn-1"}), \
+                mock.patch.object(server, "_delivered", {"turn-1": {text}}):
+            out = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 5, "effort": "high"})
+        self.assertIn("done", out)
+        self.assertIn("already in turn turn-1, so it wasn't sent again, and the turn kept its effort", out)
+        self.assertNotIn("now runs on", out)
+        self.assertFalse({"turn/steer", "turn/start"} & set(daemon.calls))
+
+    def test_a_repeat_names_the_turn_it_was_delivered_to(self):
+        """0.20.0: followed to Codex's continuation, a repeat still names the turn nouez's record
+        has it in, not the continuation, which may hold no message at all."""
+        thread = self.consultant("busy08")
+        text = "[Message from Claude Code via the consultants bridge]\n\nmore"
+        running = {"id": "turn-1", "rootTurnId": "turn-1", "status": "inProgress", "items": [user(text)]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        cont = {"id": "turn-2", "rootTurnId": "turn-1", "status": "completed",
+                "items": [agent("carried-on answer", "final_answer")]}
+        plain, lists = daemon.request, []
+
+        def request(method, params):
+            if method == "thread/turns/list":
+                lists.append(1)
+                if len(lists) == 3:
+                    running["status"] = "interrupted"
+                    daemon.turns[thread["id"]].insert(0, cont)
+            return plain(method, params)
+        daemon.request = request
+        with mock.patch.object(server, "_bridge_turns", {"turn-1"}), \
+                mock.patch.object(server, "_delivered", {"turn-1": {text}}):
+            out = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 5})
+        self.assertIn("carried-on answer", out)
+        self.assertIn("already in turn turn-1, so it wasn't sent again", out)
+        self.assertNotIn("already in turn turn-2", out)
+
     def test_only_the_exact_turn_nouez_started_is_steered(self):
         """0.18.0: a turn whose root nouez started may still be one typed in the pane."""
         thread = self.consultant("busy04")
@@ -1325,6 +1406,62 @@ class HandlerTest(unittest.TestCase):
         self.assertIn("still working", out)
         self.assertIn(f"run the same command again in the background:\n", out)
         self.assertIn(f"wait {thread['id']} turn-1", out)
+
+    def test_waiter_says_when_a_turn_shows_nothing_new(self):
+        """0.20.0: a turn that shows nothing new for STALL_SECONDS wakes Claude, rather than the
+        waiter sitting silent for its whole 25 minutes."""
+        thread = self.consultant("wait08")
+        running = {"id": "turn-1", "status": "inProgress", "items": [user("q"), agent("looking", "commentary")]}
+        self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        with mock.patch.object(server, "STALL_SECONDS", 0.05):
+            code, out = self.run_waiter(thread["id"], "turn-1")
+        self.assertEqual(code, 0)
+        self.assertIn("still working on turn turn-1; this is not a reply", out)
+        self.assertIn("seen no change from", out)
+        self.assertIn("for 0 minutes: it may be stuck, or still thinking or running a long command", out)
+        self.assertIn(f"wait {thread['id']} turn-1", out)
+        self.assertIn("StopConsultant stops the consultant", out)
+        self.assertNotIn("schedule", out)
+
+    def test_stall_advice_for_a_users_own_session(self):
+        """0.20.0: StopConsultant refuses a session the user opened, so the advice sends them to its terminal."""
+        mine = {"id": "0199aaaa-0000-0000-0000-000000user09", "cwd": ROOT}
+        running = {"id": "turn-1", "status": "inProgress", "items": [user("q")]}
+        self.use(FakeDaemon([mine], {mine["id"]: [running]}))
+        with mock.patch.object(server, "STALL_SECONDS", 0.05):
+            code, out = self.run_waiter(mine["id"], "turn-1")
+        self.assertIn("seen no change from", out)
+        self.assertIn("user's own Codex session, so they stop it from its terminal", out)
+        self.assertNotIn("StopConsultant", out)
+
+    def test_a_growing_rollout_is_activity(self):
+        """0.20.0: the turn list shows only the first and last messages, so Codex's rollout file is
+        what changes while a turn runs commands."""
+        with tempfile.TemporaryDirectory() as d:
+            rollout = os.path.join(d, "rollout.jsonl")
+            with open(rollout, "w") as f:
+                f.write("{}\n")
+            watch = server.StallWatch(server.codex_activity(rollout), limit=0)
+            turn = {"items": [user("q")]}
+            self.assertFalse(watch("t", turn))
+            with open(rollout, "a") as f:
+                f.write("{}\n")
+            self.assertFalse(watch("t", turn))  # same items, but the rollout grew
+            self.assertTrue(watch("t", turn))
+            gone = server.codex_activity(os.path.join(d, "missing.jsonl"))
+            self.assertEqual(gone("t", turn)[0], None)
+
+    def test_a_turn_that_keeps_changing_isnt_called_stuck(self):
+        marks = iter(range(100))
+        moving = server.StallWatch(lambda tid, turn: next(marks), limit=0)
+        self.assertFalse(any(moving("t", None) for _ in range(5)))
+        still = server.StallWatch(lambda tid, turn: "same", limit=0)
+        self.assertFalse(still("t", None))  # the first look only sets the mark
+        self.assertTrue(still("t", None))
+        self.assertTrue(still.stalled)
+        followed = server.StallWatch(lambda tid, turn: "same", limit=0)
+        followed("t1", None)
+        self.assertFalse(followed("t2", None))  # a continuation is a change
 
     def test_waiter_prints_the_reply(self):
         thread = self.consultant("wait02")
@@ -3463,6 +3600,23 @@ class AgyTest(unittest.TestCase):
         self.assertNotIn("shown", meta)  # the message is read from .in, so the record stays small
         self.assertEqual(turn["items"][0]["content"][0]["text"],
                          "[Message from Claude Code via the consultants bridge]\n\nx")
+
+    def test_waiter_says_when_agy_writes_nothing_new(self):
+        """0.20.0: agy adds an event every few seconds, so a turn file that stops growing may be
+        stuck, as on agy's schedule tool."""
+        _, name = self.start()
+        cid = server.agy_resolve(name)["id"]
+        self.replies = [None]
+        server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+        tid = server.agy_turn_ids(cid)[0]
+        buf = io.StringIO()
+        with mock.patch.object(server, "agy_alive", lambda meta: True), \
+                mock.patch.object(server, "STALL_SECONDS", 0.05), contextlib.redirect_stdout(buf):
+            code = server.run_waiter(cid, tid)
+        self.assertEqual(code, 0)
+        self.assertIn(f"still working on turn {tid}; this is not a reply", buf.getvalue())
+        self.assertIn("agy's schedule tool", buf.getvalue())
+        self.assertIn(f"wait {cid} {tid}", buf.getvalue())
 
     def test_launch_failure_and_bad_model(self):
         _, name = self.start()

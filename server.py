@@ -65,7 +65,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.19.1"
+SERVER_VERSION = "0.20.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -79,6 +79,7 @@ MAX_REPLY_CHARS = 60_000  # longer replies are cut here; the full text is saved 
 WAITER_REPLY_CHARS = 20_000  # the same for the waiter, whose output reaches Claude through a shell tool
 WAITER_RETRIES = 3  # connection failures in a row the waiter rides out (a daemon restart, say)
 WAITER_SECONDS = 25 * 60  # one waiter run; under Claude Code's 30-minute default for background commands
+STALL_SECONDS = 10 * 60  # a running turn that shows nothing new this long may be stuck: the waiter says so
 SEND_WAIT_SECONDS = 5  # SendConsultantMessage's default wait: a quick answer fits, a long one doesn't hold the caller
 PARTIAL_CHARS = 4_000  # how much of a still-running turn's output a timeout shows (the most recent part)
 PROGRESS_SECONDS = 10  # least time between two progress notifications for one call
@@ -98,6 +99,7 @@ _send_locks = {}  # thread id -> lock, so concurrent sends can't both start a tu
 _send_locks_guard = threading.Lock()
 _watch_pending = set()  # consultants to open in a terminal once their first turn starts
 _bridge_turns = set()  # turns this server started (read-only), which a later message may steer
+_delivered = {}  # turn id -> the texts this server delivered to it (started or steered), for repeats
 _unwatched = set()  # StartConsultant sessions started with watch=false: no automatic pane
 _update_noted = set()  # latest Codex versions StartConsultant has already told about
 _nouez_latest = None  # the latest nouez release found this process, e.g. "0.9.0"
@@ -661,7 +663,8 @@ def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None, on_poll=None
     (see next_in_chain); turn_id is then the continuation's id, and on_follow(turn_id) is called.
     While Codex may yet carry an interrupted turn on, it is given up to CONTINUATION_GRACE to do
     so, within `timeout`; then the interrupted turn is returned as done. on_poll(turn_id, turn) is
-    called with each snapshot of a turn still running."""
+    called with each snapshot of a turn still running; if it returns True, the wait ends there as a
+    timeout would."""
     deadline = time.monotonic() + timeout
     grace = None  # when to stop waiting for an interrupted turn's continuation to start
     while True:
@@ -677,8 +680,8 @@ def wait_for_turn(client, tid, turn_id, timeout, cancel, text=None, on_poll=None
                 if on_follow:
                     on_follow(turn_id)
         status = turn.get("status") if turn else None
-        if on_poll and status == "inProgress":
-            on_poll(turn_id, turn)
+        if on_poll and status == "inProgress" and on_poll(turn_id, turn):
+            return False, turn_id, turn
         now = time.monotonic()
         if status == "interrupted":
             grace = grace or now + CONTINUATION_GRACE
@@ -881,6 +884,48 @@ def progress_reporter(progress, name):
         note = f": {latest[0][:150]}" if latest else ""
         progress(f"{name} is working on turn {turn_id} (waited {time.monotonic() - started:.0f}s){note}")
     return report
+
+
+class StallWatch:
+    """An on_poll that returns True, and sets `stalled`, once a running turn has shown nothing new
+    for `limit` seconds. What counts as new is a change in activity(turn_id, turn)."""
+
+    def __init__(self, activity, limit=None):
+        self.activity, self.limit = activity, STALL_SECONDS if limit is None else limit
+        self.seen, self.since, self.stalled = None, time.monotonic(), False
+
+    def __call__(self, turn_id, turn):
+        now, mark = time.monotonic(), (turn_id, self.activity(turn_id, turn))
+        if mark != self.seen:
+            self.seen, self.since = mark, now
+            return False
+        self.stalled = now - self.since >= self.limit
+        return self.stalled
+
+
+def codex_activity(rollout):
+    """An activity for StallWatch on a Codex turn: the size of the session's rollout file (`rollout`,
+    the thread's path), to which Codex adds an event at least every minute or so while a turn works,
+    and the turn's items. The items alone don't do: thread/turns/list shows only the first user
+    message and the last agent message, so commands and reasoning leave them unchanged."""
+    def activity(turn_id, turn):
+        try:
+            size = os.path.getsize(rollout) if rollout else None
+        except OSError:
+            size = None
+        return size, json.dumps((turn or {}).get("items"), sort_keys=True, default=str)
+    return activity
+
+
+def stall_advice(name, limit, command, antigravity=False, user_session=False):
+    """The waiter's words for a turn that has shown nothing new for `limit` seconds."""
+    why = (", for example on agy's schedule tool, which nouez can't deny and which can hold a turn "
+           f"until its {AGY_TURN_LIMIT} limit") if antigravity else ""
+    stop = ("it is the user's own Codex session, so they stop it from its terminal." if user_session
+            else "StopConsultant stops the consultant, this turn included.")
+    return (f"nouez has seen no change from {name} for {int(limit) // 60} minutes: it may be stuck{why}, or "
+            "still thinking or running a long command. Tell the user. To keep waiting, run the same command "
+            f"again in the background:\n{command}\nOnly if the user wants it ended: {stop}")
 
 
 def format_turn(name, turn, limit=MAX_REPLY_CHARS):
@@ -3854,25 +3899,35 @@ def send_consultant_message(args, cancel=None, progress=None):
             check_cancel(cancel)
             ensure_loaded(client, thread)
             current = latest_turn(client, tid)
-            if current and current.get("status") == "inProgress" and overrides:
+            busy = bool(current) and current.get("status") == "inProgress"
+            # Only nouez's own record counts, as for steering: the turn's items may not show a steer
+            # yet (nor at all in the summary thread/turns/list gives), and the same text typed in the
+            # pane is not a message this server delivered.
+            repeat = busy and text in _delivered.get(current["id"], ())
+            if repeat:
+                # The same message again, as after a dropped connection: the running turn has it already.
+                turn_id, mode = current["id"], "it was already in the running turn, so it wasn't sent again"
+                if overrides:
+                    mode += f", and the running turn keeps its {' and '.join(overrides)}"
+            elif busy and overrides:
                 # A running turn keeps the model and effort it started with; steering can't change them.
                 raise BridgeError(
                     f"{name} is still working on turn {current['id']}, and a running turn can't change "
                     f"its {' or '.join(overrides)}. Nothing was sent. Read that turn's reply with "
                     f"GetConsultantReply first, then send again; or send now without "
                     f"{' and '.join(overrides)} to add the message to the running turn.")
-            if current and current.get("status") == "inProgress" and is_bridge(thread) \
-                    and not bridge_started(client, tid, current):
+            elif busy and is_bridge(thread) and not bridge_started(client, tid, current):
                 raise BridgeError(
                     f"{name} is working on turn {current['id']}, which this nouez server didn't start "
                     "(it was typed in its terminal, or started before the server restarted), so it may not be "
                     "read-only. Nothing was sent. Wait for that turn to end "
                     f"(GetConsultantReply with turn_id {current['id']}), then send again: a new turn runs "
                     "read-only.")
-            if current and current.get("status") == "inProgress":
+            elif busy:
                 # Session is mid-turn: steer the running turn instead of queueing a new one.
                 client.request("turn/steer", {"threadId": tid, "expectedTurnId": current["id"], "input": [{"type": "text", "text": text}]})
                 turn_id, mode = current["id"], "steered into the running turn"
+                _delivered.setdefault(turn_id, set()).add(text)
             else:
                 # Codex keeps a turn's model and effort for the session's later turns too.
                 # A consultant is read-only on every turn, even if its permissions were changed in the
@@ -3882,6 +3937,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                                                         **overrides, **policy})
                 turn_id, mode = started["turn"]["id"], "started a new turn"
                 _bridge_turns.add(turn_id)
+                _delivered.setdefault(turn_id, set()).add(text)
                 if overrides:
                     mode += f" on {settings}, which the consultant keeps for later messages until changed"
                 else:
@@ -3904,7 +3960,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                     watching = f" {shown}" if shown else ""
                 except (BridgeError, OSError) as e:
                     watching = f" Could not open a terminal: {e}"
-        if not usage_log_off():  # the snapshot asks the daemon, so only when it will be kept
+        if not repeat and not usage_log_off():  # the snapshot asks the daemon, so only when it will be kept
             was = {"model": thread.get("model"), "effort": thread.get("reasoningEffort")}
             record_usage({
                 "event": "send", "consultant": name, "thread": tid, "turn": turn_id,
@@ -3927,7 +3983,9 @@ def send_consultant_message(args, cancel=None, progress=None):
         if done:
             record_reply(tid, name, turn)
             now_on = running_on(thread)
-            changed = (f"\n\n({name} now runs on {settings} until changed.)" if overrides
+            changed = (f"\n\n(This message was already in turn {current['id']}, so it wasn't sent again"
+                       + (f", and the turn kept its {' and '.join(overrides)}" if overrides else "") + ".)"
+                       if repeat else f"\n\n({name} now runs on {settings} until changed.)" if overrides
                        else f"\n\n({name} runs on {now_on}.)" if now_on else "")
             return format_turn(name, turn) + changed + (f"\n\n({watching.strip()})" if watching else "")
         return still_working(
@@ -5818,7 +5876,8 @@ def agy_end_unsaved(proc):
 
 
 def agy_wait(cid, turn_id, timeout, cancel, on_poll=None):
-    """Poll until the turn ends. Returns (done, turn)."""
+    """Poll until the turn ends. Returns (done, turn). If on_poll(turn_id, turn) returns True, the
+    wait ends there as a timeout would."""
     deadline = time.monotonic() + timeout
     while True:
         turn = agy_turn(cid, turn_id)
@@ -5826,8 +5885,8 @@ def agy_wait(cid, turn_id, timeout, cancel, on_poll=None):
             raise BridgeError(f"The turn {turn_id} has gone: its files were removed.")
         if turn["status"] != "inProgress":
             return True, turn
-        if on_poll:
-            on_poll(turn_id, turn)
+        if on_poll and on_poll(turn_id, turn):
+            return False, turn
         now = time.monotonic()
         if now >= deadline:
             return False, turn
@@ -6118,20 +6177,31 @@ def stop_agy_consultant(rec):
                f"{agy_shown()} --conversation {conv} in {rec.get('cwd')}." if conv else ""))
 
 
+def agy_activity(cid, turn_id):
+    """How much agy has written for the turn: it adds an event for each step, every few seconds."""
+    try:
+        return os.path.getsize(os.path.join(agy_folder(cid), "turns", turn_id + ".jsonl"))
+    except OSError:
+        return None
+
+
 def run_agy_waiter(rec, turn_id):
     """`server.py wait` for an Antigravity consultant's turn."""
     name, cid = rec["name"], rec["id"]
     if not FULL_ID.fullmatch(turn_id) or not agy_turn(cid, turn_id):
         print(f"{name} has no turn {turn_id}.")
         return 1
+    stall = StallWatch(lambda tid, turn: agy_activity(cid, tid))
     try:
-        done, turn = agy_wait(cid, turn_id, WAITER_SECONDS, None)
+        done, turn = agy_wait(cid, turn_id, WAITER_SECONDS, None, on_poll=stall)
     except BridgeError as e:
         print(f"Stopped waiting for turn {turn_id}: {e}")
         return 1
     if not done:
-        print(still_working(name, turn_id, turn, f"Waited {WAITER_SECONDS // 60} minutes. To keep waiting, "
-                            f"run the same command again in the background:\n{waiter_command(cid, turn_id)}"))
+        again = waiter_command(cid, turn_id)
+        print(still_working(name, turn_id, turn, stall_advice(name, stall.limit, again, antigravity=True)
+                            if stall.stalled else f"Waited {WAITER_SECONDS // 60} minutes. To keep waiting, "
+                            f"run the same command again in the background:\n{again}"))
         return 0
     record_reply(cid, name, turn)
     print(f"The consultant's turn has ended (Antigravity consultant {cid}, turn {turn_id}).\n")
@@ -7339,6 +7409,7 @@ def run_waiter(thread_id, turn_id):
     deadline = time.monotonic() + WAITER_SECONDS
     failures = 0  # in a row: reset by each connection that works
     asked, dropped, daemons = turn_id, False, []  # daemons: the versions seen, in order
+    stall = StallWatch(codex_activity(None))  # kept across reconnections, so a dropped connection isn't progress
 
     def moved(new_id):  # keeps a followed continuation even if the connection then drops
         nonlocal turn_id
@@ -7352,6 +7423,7 @@ def run_waiter(thread_id, turn_id):
                     daemons.append(daemon)
                 thread = resolve(client, thread_id, exact_only=True)
                 tid, name = thread["id"], short_name(thread)
+                stall.activity = codex_activity(thread.get("path"))
                 failures = 0
                 turns = list_turns(client, tid, REPLY_LOOKBACK)
                 turn = next((t for t in turns if t.get("id") == turn_id), None)
@@ -7365,7 +7437,7 @@ def run_waiter(thread_id, turn_id):
                 if turn.get("status") == "inProgress" or may_be_carried_on(turns, turn):
                     done, turn_id, turn = wait_for_turn(client, tid, turn_id,
                                                         max(0, deadline - time.monotonic()), None,
-                                                        on_follow=moved)
+                                                        on_poll=stall, on_follow=moved)
                 else:
                     done = True
             finally:
@@ -7381,9 +7453,12 @@ def run_waiter(thread_id, turn_id):
             time.sleep(min(10, left))
             continue
         if not done:
-            print(still_working(name, turn_id, turn, f"Waited {WAITER_SECONDS // 60} minutes. To keep "
-                                "waiting, run the same command again in the background:\n"
-                                f"{waiter_command(tid, turn_id)}"))
+            again = waiter_command(tid, turn_id)
+            print(still_working(name, turn_id, turn, stall_advice(name, stall.limit, again,
+                                                                  user_session=not is_bridge(thread))
+                                if stall.stalled
+                                else f"Waited {WAITER_SECONDS // 60} minutes. To keep waiting, run the same "
+                                f"command again in the background:\n{again}"))
             return 0
         record_reply(tid, name, turn)
         print(f"The consultant's turn has ended (thread {tid}, turn {turn_id}).\n")
