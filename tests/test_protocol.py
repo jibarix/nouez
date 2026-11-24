@@ -2673,7 +2673,8 @@ class RevisionTest(unittest.TestCase):
         self.put("tab\there.txt" if os.name != "nt" else "q[1].txt", "x\n")
         self.put("art.png", b"\x89PNG\0")
         self.git("add", "art.png")                   # a binary file new to the index
-        self.git("update-index", "--chmod=+x", "app.py")
+        os.chmod(os.path.join(self.repo, "app.py"), 0o755)  # where git reads the mode (core.fileMode)
+        self.git("update-index", "--chmod=+x", "app.py")   # and where it does without it (Windows)
         line, patch, digest = server.revision(self.repo)
         self.assertIn("art.png (binary)", line)
         self.assertIn(b"+a\r\n+b\r\n", patch)
