@@ -6,6 +6,19 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-24
+
+Reviewers get one diff, named by its SHA-256, the status screen counts a forked subagent's copied replies once, and a review that couldn't read its input is no longer counted as an approval. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version. A running status screen restarts on it by itself and counts its numbers again once.
+
+### Added
+
+- **`revision: true` takes the uncommitted diff once and names it by its SHA-256.** The revision line used to give only the commit and the number of uncommitted paths, so a consultant reading the working tree a minute later could review changes made after the message was sent, and two consultants could review different code under the same line. nouez now takes the diff when the message is sent and saves it as `patches/<digest>.patch` in its cache folder for 14 days, and asks the consultant to review that file and name the digest. Git writes the whole diff, untracked files included, from a temporary copy of its index, so nothing in the repo changes. It leaves out binary files, untracked files over 256 KB and untracked files with a part of their path that looks like a secret, and the line names them. An Antigravity consultant can't run `git diff`, so with the new `attach_diff: true` it gets the diff in its message, up to 200,000 bytes; its text then goes to Google. Without it, an Antigravity consultant gets the line as before. nouez runs no git hooks while it takes the diff. The usage log records only the digest. When the diff can't be taken or saved, the line says so instead of naming one.
+
+### Fixed
+
+- **`server.py top` counts a Claude Code reply once when a forked subagent's transcript copies it.** A fork's transcript starts with its parent's history, under the same message ids, and those replies were counted again as the subagent's output; on the machine this was found on, that was about 3% of subagent output. A reply is now counted once across a session's transcripts, in the session's own transcript when it has it; when a transcript is removed or rewritten, its session is read again, so the counts always match a fresh read. The usage cache, `usage-weeks.json`, is read again from the transcripts once after the update, which can take half a minute, and is now larger, about 3 MB for three months of heavy use, since it keeps the message ids each transcript counted. (Codex forks were checked too: their running totals start from zero, so they were already counted once.)
+- **A review that couldn't read its input is no longer logged as an approval.** A first line such as "Incomplete: no findings because the diff could not be read" used to be read as `yes` because it says "no findings". It is now `incomplete`, as is a turn that failed or was interrupted, whatever its text says; the status screen counts replies logged by older versions by the same rule, so an interrupted turn no longer extends a run of CHANGES rounds. A line that starts with "Verdict:" is read from the word after it, so "Verdict: yes. I couldn't run the tests" stays `yes`, "Verdict: yes, with changes" is `changes`, and a "verdict" quoted later in the line doesn't count. The status screen's verdict column is wider to fit the new word, and the README's brief template offers "incomplete" as a verdict.
+
 ## [0.20.0] - 2026-11-23
 
 The waiter now says when a consultant may be stuck, and a message sent twice to a busy Codex consultant reaches it once. Reconnect `consultants` with `/mcp` in each open Claude Code session so it loads the new version.
@@ -539,7 +552,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/jibarix/nouez/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/jibarix/nouez/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/jibarix/nouez/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/jibarix/nouez/compare/v0.18.1...v0.19.0

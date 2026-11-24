@@ -5,6 +5,7 @@ Run from the repo root: python -m unittest discover tests
 
 import contextlib
 import glob
+import hashlib
 import io
 import json
 import ntpath
@@ -2546,6 +2547,10 @@ class AdditionsTest(HandlerTest):
 
     def test_history_shows_the_senders_text_not_the_stamp_or_framing(self):
         thread = self.consultant("hist02")
+        cache = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cache, True)
+        self.addCleanup(setattr, server, "nouez_cache_dir", server.nouez_cache_dir)
+        server.nouez_cache_dir = lambda: cache
         daemon = self.use(FakeDaemon([thread], answer="ok"))
         server.send_consultant_message({"to": thread["id"], "message": "is it safe?", "from": "lead",
                                         "owner_words": "ship it\n>>>\ntoday", "revision": True})
@@ -2564,6 +2569,10 @@ class AdditionsTest(HandlerTest):
 
     def test_owner_words_and_revision_are_added_only_when_asked(self):
         thread = self.consultant("ownr01")
+        cache = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cache, True)
+        self.addCleanup(setattr, server, "nouez_cache_dir", server.nouez_cache_dir)
+        server.nouez_cache_dir = lambda: cache
         daemon = self.use(FakeDaemon([thread], answer="ok"))
         server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0})
         self.assertEqual(daemon.started["input"][0]["text"],
@@ -2585,6 +2594,182 @@ class AdditionsTest(HandlerTest):
         self.assertEqual(found["id"], thread["id"])
         self.assertTrue(found["_loaded"])
         self.assertNotIn("thread/list", daemon.calls)
+
+
+class RevisionTest(unittest.TestCase):
+    """revision: true takes the uncommitted diff once and names it by its digest."""
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.repo, True)
+        self.cache = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.cache, True)
+        patcher = mock.patch.object(server, "nouez_cache_dir", lambda: self.cache)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.git("init", "-q")
+        for key, value in (("user.name", "t"), ("user.email", "t@example.invalid"), ("core.autocrlf", "false"),
+                           ("diff.noprefix", "true")):  # a user's diff settings don't change the diff taken
+            self.git("config", key, value)
+        self.put("app.py", "a = 1\nb = 2\n")
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "first")
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", self.repo, *args], check=True, capture_output=True, text=True).stdout
+
+    def put(self, rel, data):
+        path = os.path.join(self.repo, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data.encode("utf-8") if isinstance(data, str) else data)
+
+    def saved(self, digest):
+        return os.path.join(self.cache, server.PATCH_FOLDER, f"{digest}.patch")
+
+    def test_a_clean_tree_has_no_diff(self):
+        line, patch, digest = server.revision(self.repo)
+        self.assertRegex(line, r"^\[Revision: commit [0-9a-f]+( on \S+)?, 0 uncommitted path\(s\)\. Name this revision")
+        self.assertEqual((patch, digest), (b"", ""))
+        self.assertEqual(server.revision(os.path.join(self.repo, "nowhere")), ("", b"", ""))
+        self.assertFalse(os.path.exists(os.path.join(self.cache, server.PATCH_FOLDER)))
+
+    def test_the_diff_is_taken_once_and_applies(self):
+        self.put("app.py", "a = 1\nb = 3\n")
+        self.put("new/notes.txt", "café\nlast line without a newline")
+        self.put("empty.txt", "")
+        self.put(".env", "TOKEN=hunter2\n")
+        self.put("secrets/config.json", '{"key": "hunter2"}\n')
+        self.put("logo.bin", b"\x89PNG\0\0")
+        before = self.git("status", "--porcelain")
+        line, patch, digest = server.revision(self.repo)
+        self.assertEqual(self.git("status", "--porcelain"), before)  # nothing added to the real index
+        self.assertRegex(digest, r"^[0-9a-f]{16}$")
+        self.assertEqual(digest, hashlib.sha256(patch).hexdigest()[:16])
+        self.assertIn(f"sha256 {digest}, 3 file(s)", line)
+        self.assertIn("left out: .env (may hold secrets), secrets/config.json (may hold secrets), logo.bin (binary)", line)
+        self.assertNotIn(b"hunter2", patch)
+        self.assertIn(b"+b = 3\n", patch)
+        self.assertIn("+café\n+last line without a newline\n\\ No newline at end of file\n".encode(), patch)
+        self.assertTrue(server.REVISION_STAMP.match(line))
+        self.assertIn(self.saved(digest), line)
+        with open(self.saved(digest), "rb") as f:
+            self.assertEqual(f.read(), patch)
+        # the same tree, the same diff, from a subfolder too; a change, another
+        self.assertEqual(server.revision(self.repo)[2], digest)
+        self.assertEqual(server.revision(os.path.join(self.repo, "new"))[2], digest)
+        self.put("app.py", "a = 1\nb = 4\n")
+        self.assertNotEqual(server.revision(self.repo)[2], digest)
+        # the saved diff is what was reviewed: it applies to the commit it names
+        self.git("stash", "-u", "-q")
+        self.git("apply", "--check", self.saved(digest))
+        self.git("apply", self.saved(digest))
+        with open(os.path.join(self.repo, "new", "notes.txt"), "rb") as f:
+            self.assertEqual(f.read(), "café\nlast line without a newline".encode("utf-8"))
+
+    def test_bytes_names_and_modes_are_kept(self):
+        self.put("my notes.txt", "a\r\nb\r\n")
+        self.put("latin.txt", b"caf\xe9\r\n")      # not UTF-8: in the diff as it is
+        self.put("tab\there.txt" if os.name != "nt" else "q[1].txt", "x\n")
+        self.put("art.png", b"\x89PNG\0")
+        self.git("add", "art.png")                   # a binary file new to the index
+        self.git("update-index", "--chmod=+x", "app.py")
+        line, patch, digest = server.revision(self.repo)
+        self.assertIn("art.png (binary)", line)
+        self.assertIn(b"+a\r\n+b\r\n", patch)
+        self.assertIn(b"+caf\xe9\r\n", patch)
+        self.assertIn(b"new mode 100755", patch)
+        line, inline, _ = server.revision(self.repo, inline_limit=100_000)
+        self.assertIn("has bytes that aren't UTF-8", line)  # not attached with them replaced
+        self.assertEqual(inline, b"")
+        self.git("stash", "-u", "-q")
+        self.git("apply", "--check", self.saved(digest))
+        out = subprocess.run(["git", "-C", self.repo, "apply", "--numstat", self.saved(digest)],
+                             capture_output=True, check=True).stdout
+        self.assertIn(b"latin.txt", out)
+        self.assertNotIn(b"art.png", out)            # a binary's change isn't in the diff
+
+    def test_left_out_names_are_counted_not_kept(self):
+        left_out = server.LeftOut()
+        for n in range(1000):
+            left_out.add(f"f{n}", "too large")
+        self.assertEqual(len(left_out.names), server.PATCH_NAMES_SHOWN)
+        self.assertTrue(str(left_out).endswith("f4 (too large), 995 more"))
+        self.assertEqual(str(server.LeftOut()), "")
+
+    def test_a_branch_or_path_with_a_bracket_is_still_stripped(self):
+        self.git("checkout", "-q", "-b", "a]b")
+        self.put("app.py", "changed\n")
+        line, _, _ = server.revision(self.repo)
+        self.assertIn(" on a]b, 1 uncommitted path(s)", line)
+        self.assertEqual(server.REVISION_STAMP.sub("", line + "hi"), "hi")
+        self.assertEqual(server.REVISION_STAMP.sub("", "[Revision: not a git repository, or no commits yet]\nhi"), "hi")
+
+    def test_a_large_diff_is_described_not_attached(self):
+        self.put("app.py", "x = 1\n" * 1000)
+        line, patch, digest = server.revision(self.repo, inline_limit=1000)
+        self.assertEqual((patch, digest), (b"", ""))
+        self.assertIn("is too large to put in this message, so review the working tree", line)
+        self.assertNotIn("Review that diff", line)
+        self.assertNotIn("sha256", line)                 # no digest the consultant can't check
+        self.assertEqual(server.revision(self.repo, take=False)[1:], (b"", ""))
+        line, patch, digest = server.revision(self.repo, inline_limit=100_000)
+        self.assertIn("is in this message, above the bridge header", line)
+        self.assertTrue(patch)
+
+    def test_a_failure_is_not_taken_for_no_changes(self):
+        self.put("app.py", "changed\n")
+        real = server.run_bytes
+        failing = lambda argv, *a, **k: (None, "failed") if "diff" in argv else real(argv, *a, **k)
+        with mock.patch.object(server, "run_bytes", failing):
+            line, patch, digest = server.revision(self.repo)
+        self.assertIn("couldn't take their diff (git diff failed), so review the working tree", line)
+        self.assertEqual((patch, digest), (b"", ""))
+        with mock.patch.object(server, "save_patch", side_effect=PermissionError("locked")):
+            line, patch, digest = server.revision(self.repo)
+        self.assertIn("couldn't save their diff (1 file(s), ", line)
+        self.assertNotIn("sha256", line)
+        self.assertEqual((patch, digest), (b"", ""))
+        with mock.patch.object(server, "save_patch", side_effect=PermissionError("locked")):
+            self.assertEqual(server.revision(self.repo, inline_limit=100_000)[1:], (b"", ""))
+        with mock.patch.object(server.tempfile, "TemporaryDirectory", side_effect=OSError("disk full")):
+            line, patch, digest = server.revision(self.repo)
+        self.assertIn("couldn't take their diff (couldn't copy git's index to a temporary folder)", line)
+        out, why = server.run_bytes([sys.executable, "-c", "print('x' * 100)"], limit=10)
+        self.assertEqual((out, why), (None, "too large"))
+        self.assertEqual(server.run_bytes([sys.executable, "-c", "import sys; sys.exit(3)"]), (None, "failed"))
+
+    def test_settings_and_hooks_of_the_repo_are_not_used(self):
+        self.git("config", "status.showUntrackedFiles", "no")
+        hooks = os.path.join(self.repo, ".git", "hooks")
+        os.makedirs(hooks, exist_ok=True)
+        ran = os.path.join(self.cache, "hook-ran")
+        for hook in ("post-index-change", "post-index-change.bat"):
+            with open(os.path.join(hooks, hook), "w") as f:
+                f.write(f"#!/bin/sh\necho x > '{ran}'\n")
+            os.chmod(os.path.join(hooks, hook), 0o755)
+        self.put("notes.md", "Subproject commit 0123abc-dirty\n")  # text that only looks like a submodule
+        line, patch, digest = server.revision(self.repo)
+        self.assertIn(", 1 uncommitted path(s)", line)
+        self.assertIn(b"+Subproject commit 0123abc-dirty\n", patch)
+        self.assertFalse(os.path.exists(ran))
+
+    def test_old_diffs_are_removed(self):
+        folder = os.path.join(self.cache, server.PATCH_FOLDER)
+        os.makedirs(folder)
+        old = os.path.join(folder, "0123456789abcdef.patch")
+        with open(old, "w") as f:
+            f.write("x")
+        os.utime(old, (time.time() - (server.PATCH_KEEP_DAYS + 1) * 86400,) * 2)
+        self.put("app.py", "changed\n")
+        _, patch, digest = server.revision(self.repo)
+        self.assertFalse(os.path.exists(old))
+        self.assertEqual(os.listdir(folder), [f"{digest}.patch"])
+        with open(self.saved(digest), "wb") as f:
+            f.write(b"something else")               # a damaged copy isn't trusted
+        server.revision(self.repo)
+        with open(self.saved(digest), "rb") as f:
+            self.assertEqual(f.read(), patch)
 
 
 class OpenedSessionCheckTest(unittest.TestCase):
@@ -2945,9 +3130,32 @@ class UsageLogTest(HandlerTest):
                            ("I made changes to the plan", None), ("", None), (None, None),
                            ("Looks fine.\nVerdict: no", None),  # only the first line counts
                            ("Not approved: see 1", "no"), ("not ok yet", "no"), ("OK.", "yes"),
-                           ("Okay, ship it", "yes"), ("OK, I will inspect the patch", None)):
+                           ("Okay, ship it", "yes"), ("OK, I will inspect the patch", None),
+                           # a review that couldn't read its input approves nothing
+                           ("Incomplete: no findings because the diff could not be read.", "incomplete"),
+                           ("No findings: I can't read the diff.", "incomplete"),
+                           ("No findings because I couldn’t read the full diff.", "incomplete"),
+                           ("Not reviewed: server.py", "incomplete"), ("I couldn't find any issues; LGTM", "yes"),
+                           # "incomplete" about the code under review isn't the review's own verdict
+                           ("LGTM - the fix correctly rejects incomplete files.", "yes"),
+                           # an explicit verdict is read from the word after its label
+                           ("Verdict: CHANGES because the implementation is incomplete.", "changes"),
+                           ("Verdict: yes. I couldn't read the tests", "yes"), ("Verdict: no changes needed", "yes"),
+                           ("Verdict: yes, with changes.", "changes"), ("Verdict: yes (with changes).", "changes"),
+                           ("Verdict: approved with no changes.", "yes"),
+                           ("Verdict: yes. But the changes still need to be deployed.", "yes"),
+                           ("No findings: I couldn't find the diff.", "incomplete"),
+                           ("I couldn't find any changes that break callers; LGTM", "yes"),
+                           ("Verdict — incomplete — couldn't open the patch", "incomplete"),
+                           ("Verdict: NO-GO", "no"), ("Verdict: approve with nits", "yes"),
+                           ("1. **Final verdict:** no-go", "no"), ("My verdict: yes", "yes"),
+                           # only at the start of the line: quoted words don't override the reviewer
+                           ("CHANGES: the parser reports 'Verdict: yes' for failures.", "changes"),
+                           ("The verdict depends on the schema", None)):
             with self.subTest(text=text):
                 self.assertEqual(server.verdict_of(text), want)
+        for status in ("interrupted", "failed"):  # a turn that didn't finish concluded nothing
+            self.assertEqual(server.verdict_of("Verdict: yes", status), "incomplete")
 
     def test_kind_and_reason_are_checked(self):
         self.assertEqual(server.kind_and_reason({}), (None, None))
@@ -3060,10 +3268,11 @@ class UsageLogTest(HandlerTest):
               send(17, "4", model="claude-x", effort="", provider="antigravity")]
         s = server.log_summary(ev, since=t + 10)
         self.assertEqual((s["sends"], s["replies"], s["other_replies"]), (6, 2, 1))
-        self.assertEqual(dict(s["verdicts"]), {"changes": 2})
+        # turn 2 was interrupted: logged as "changes" by an older version, it counts as incomplete
+        self.assertEqual(dict(s["verdicts"]), {"changes": 1, "incomplete": 1})
         self.assertEqual(s["statuses"]["interrupted"], 1)
         self.assertEqual(s["loops"][0]["rounds"], 4)  # turns 1, 2, 3, 4: the steers are turn 1
-        self.assertEqual(s["loops"][0]["changes_streak"], 2)
+        self.assertEqual(s["loops"][0]["changes_streak"], 1)
         self.assertEqual(list(s["reasons"]), ["new", "old"])
         self.assertEqual(s["models"]["gemini-4-neon low"], 1)
         self.assertEqual(s["models"]["claude-x (AG)"], 1)
@@ -3152,6 +3361,70 @@ class UsageLogTest(HandlerTest):
         os.remove(ours)
         state = server.scan_usage(state, time.time(), claude, codex)
         self.assertEqual(server.weekly_tokens(state)[server.week_of(time.time() - 60)]["consultants"], 0)
+
+    def test_a_reply_copied_into_another_transcript_counts_once(self):
+        """A forked subagent's transcript starts with its parent's history: those replies count once,
+        in the first of the session's transcripts that has them, and a copy in another session's isn't
+        one. Whatever changes between scans, the counts are those of a fresh scan."""
+        claude, codex = os.path.join(self.dir, "claude"), os.path.join(self.dir, "codex")
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 60))
+
+        def reply(mid, out, **kw):
+            return json.dumps({"type": "assistant", "timestamp": stamp, **kw,
+                               "message": {"id": mid, "model": "m", "usage": {"output_tokens": out}}}) + "\n"
+
+        def scan(state):
+            state = server.scan_usage(state, time.time(), claude, codex)
+            (week,) = server.weekly_tokens(state).values() or [{"claude": 0, "subagents": 0}]
+            (anew,) = server.weekly_tokens(server.scan_usage({}, time.time(), claude, codex)).values() \
+                or [{"claude": 0, "subagents": 0}]
+            self.assertEqual((week["claude"], week["subagents"]), (anew["claude"], anew["subagents"]))
+            return state, (week["claude"], week["subagents"])
+        main = os.path.join(claude, "proj", "s1.jsonl")
+        fork = os.path.join(claude, "proj", "s1", "subagents", "agent-f.jsonl")
+        again = os.path.join(claude, "proj", "s1", "subagents", "agent-g.jsonl")
+        self.write(fork, ['{"type":"fork-context-ref"}\n', reply("msg_parent0001", 30, isSidechain=True),
+                          reply("msg_own0000001", 5, isSidechain=True)])
+        self.write(main, [reply("msg_parent0001", 30), reply("msg_parent0002", 40)])
+        # a reply with no time counts nowhere, and so doesn't keep its copy from counting
+        self.write(again, [reply("msg_own0000001", 5), reply("msg_parent0002", 40), reply("msg_own0000002", 2),
+                           reply("x_123456789abc", 3)])
+        self.write(os.path.join(claude, "proj", "s1", "subagents", "agent-h.jsonl"),
+                   [json.dumps({"type": "assistant", "message": {"id": "msg_own0000003", "usage": {"output_tokens": 9}}}) + "\n",
+                    reply("y_123456789abc", 4)])  # ids that end alike are different replies
+        self.write(os.path.join(claude, "other", "s2.jsonl"), [reply("msg_parent0001", 30)])  # not a copy
+        state, counts = scan({})
+        self.assertEqual(counts, (100, 14))  # 30 + 40 + 30; 5 + 2 + 3 + 4
+        # read on: a copy added later isn't counted either
+        self.write(fork, [reply("msg_parent0002", 40, isSidechain=True)], "a")
+        state, counts = scan(state)
+        self.assertEqual(counts, (100, 14))
+        # the session's own transcript rewritten shorter: parent0002 now counts in the first fork that has it
+        self.write(main, [reply("msg_parent0001", 30)])
+        state, counts = scan(state)
+        self.assertEqual(counts, (60, 54))
+        # gone: its replies count in the forks
+        os.remove(main)
+        state, counts = scan(state)
+        self.assertEqual(counts, (30, 84))
+        # back, after its forks were read: its replies count in it again, not in the forks
+        self.write(main, [reply("msg_parent0001", 30), reply("msg_parent0002", 40)])
+        state, counts = scan(state)
+        self.assertEqual(counts, (100, 14))
+        # a transcript that can't be read: its session keeps the last scan's counts until it can
+        self.write(fork, [reply("msg_own0000004", 6, isSidechain=True)], "a")
+        lines = server.new_lines
+
+        def unreadable(path, entry):
+            if path == fork:
+                raise PermissionError(path)
+            return lines(path, entry)
+        with mock.patch.object(server, "new_lines", unreadable):
+            state = server.scan_usage(state, time.time(), claude, codex)
+        (week,) = server.weekly_tokens(state).values()
+        self.assertEqual((week["claude"], week["subagents"]), (100, 14))
+        state, counts = scan(state)
+        self.assertEqual(counts, (100, 20))
 
     def test_frame_and_once(self):
         scr = server.Screen(True)
@@ -3362,7 +3635,8 @@ class AgyTest(unittest.TestCase):
         for name, value in (("nouez_cache_dir", lambda: self.dir), ("agy_root", lambda: os.path.join(self.dir, "agy")),
                             ("agy_command", lambda env=None: "agy"), ("agy_models", lambda env=None, now=None: self.MODELS),
                             ("agy_spawn", self.spawn), ("POLL_SECONDS", 0.01), ("CodexClient", FakeDaemon([])), ("read_agy_usage", lambda: None),
-                            ("revision_line", lambda cwd: "[Revision: commit abc]\n")):
+                            ("revision", lambda cwd, take=True, inline_limit=None: ("[Revision: commit abc. Name this revision in your answer.]\n",
+                                                                       b"--- a/x\n+++ b/x\n" if take else b"", "d1g3st" if take else ""))):
             patcher = mock.patch.object(server, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -3478,7 +3752,7 @@ class AgyTest(unittest.TestCase):
         _, name = self.start(instructions="Answer in French.")
         self.replies = [[{"event": "step_update", "step_update": {"text_delta": "pomme"}}, agy_result("pomme\n")]]
         out = server.send_consultant_message({"to": name, "message": "Which fruit?", "wait": 5, "kind": "quick-check",
-                                              "owner_words": "fruit?", "revision": True})
+                                              "owner_words": "fruit?", "revision": True, "attach_diff": True})
         self.assertIn(f"Reply from {name}:\n\npomme", out)
         argv, cwd, sent = self.runs[0]
         self.assertEqual(cwd, self.work)
@@ -3492,7 +3766,8 @@ class AgyTest(unittest.TestCase):
         self.assertEqual(json.loads(sent)["event"], "user")
         self.assertTrue(content.startswith(server.AGY_PREAMBLE))
         self.assertIn("<<<\nAnswer in French.\n>>>", content)
-        self.assertIn("[Message from Claude Code via the consultants bridge]\n[Revision: commit abc]", content)
+        self.assertIn("The diff named in the revision line below (sha256 d1g3st), as nouez took it:\n<<<\n--- a/x\n"
+                      "+++ b/x\n>>>\n\n[Message from Claude Code via the consultants bridge]\n[Revision: commit abc. Name", content)
         self.assertIn("The user's own words, as they typed them:\n<<<\nfruit?\n>>>", content)
 
         # The next turn continues the conversation, on a new level, without the preamble; it runs on.

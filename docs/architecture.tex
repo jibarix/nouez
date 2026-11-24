@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.20.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.21.0\\[0.3em]\large Architecture and message reference}
 \date{November 7, 2026}
 \author{}
 
@@ -947,9 +947,43 @@ the consultant can tell the request from Claude's reading of it. \code{revision:
 after the header with the git commit, branch and number of uncommitted paths in the consultant's
 folder (from \code{git rev-parse} and \code{git status -{}-porcelain}, run by nouez with a timeout)
 and asks the consultant to name that revision in its answer. Outside git the line says so.
+History finds the line by its fixed start and end, so a branch name or path with \code{]} in it
+doesn't stop it being hidden.
+
+With uncommitted changes, nouez also takes their diff then, from the top of the repo even when the
+consultant's folder is a subfolder. Git writes all of it, so names, file modes, line endings and
+bytes that aren't UTF-8 come out as \code{git apply} expects: nouez copies git's index to a temporary
+folder, adds the untracked files that \code{git ls-files -{}-others -{}-exclude-standard} lists to
+the copy as intent-to-add (\code{git add -N}), and runs \code{git diff} against the commit the line
+names, with that copy as \code{GIT\_INDEX\_FILE}, so nothing in the repo is written. Every git
+command runs with \code{-{}-no-optional-locks}, no hooks (\code{core.hooksPath=/dev/null}) and no
+fsmonitor, and \code{git status} and \code{git diff} with options that override the user's settings
+that would hide untracked files, change the names' prefixes or summarise submodules. It leaves out an untracked file with a part
+of its path that looks like a secret (\code{.env}, \code{.netrc}, \code{id\_rsa}, \code{*.pem},
+\code{*.key}, \code{settings.local.json}, or a name with \code{secret}, \code{credential},
+\code{token} or \code{password}), one over 256\,KB, a repository inside this one, and any past the
+first 200; from git's diff, it leaves out binary files and submodules with changes inside, and
+names up to five of these in the line and counts the rest. A diff, or \code{git status} or
+\code{ls-files} output, over 8\,MB isn't taken. When a git command fails,
+times out or the diff can't be saved, the line says so, names no digest and asks the consultant
+to review the working tree instead. The diff is saved as
+\code{patches/<digest>.patch} in nouez's cache folder, where \textit{digest} is the first 16 hex
+digits of its SHA-256; the line names the file and the digest and asks the consultant to review
+that diff rather than the working tree, which may change while it reads, and to name the digest
+in its answer. The same changes give the same digest, so two consultants' verdicts can be checked
+to be about the same input. Saved diffs older than 14 days are removed when another is saved. The
+usage log records only the digest (\code{patch}). A Codex consultant reads the file itself, and
+nouez takes the diff only after checking that the session is one it may message. An Antigravity
+consultant runs no commands and may not be allowed to read nouez's folder, so with
+\code{attach\_diff} its message carries the diff, before the bridge header, where
+\code{GetConsultantHistory} doesn't show it; the message stays in the consultant's records like any
+other, and goes to Google. Without \code{attach\_diff} nouez takes no diff for it, and the line
+gives only the commit, branch and count. A diff over 200{,}000 bytes, or with bytes that aren't
+UTF-8 (which the message couldn't carry unchanged), isn't attached: the line gives its size and asks
+for a review of the working tree.
 
 \begin{wire}[turn/start text with \code{"from": "lead"}, \code{owner\_words} and \code{"revision": true}]
-"[Message from lead via the consultants bridge]\n[Revision: commit 35729af on main, 2 uncommitted path(s). Name this revision in your answer.]\n
+"[Message from lead via the consultants bridge]\n[Revision: commit 35729af on main, 2 uncommitted path(s); their diff against it, taken when this message was sent, is saved as C:\\Users\\me\\AppData\\Local\\nouez\\patches\\5d0c3e8a91f2b7c4.patch (sha256 5d0c3e8a91f2b7c4, 2 file(s), 3 KB). Review that diff rather than the working tree, which may have changed since, and name this revision and that sha256 in your answer.]\n
 The user's own words, as they typed them:\n<<<\nmake sure the new flag can't break old callers\n>>>\n\n
 The rest of this message is lead's.\n\nReview this diff for bugs: ..."
 \end{wire}
@@ -1380,7 +1414,8 @@ renamed \code{usage-log-}\textit{date}\code{.jsonl} once it passes 20\,MB.
 \item \code{send}: \code{consultant}, \code{thread}, \code{turn}, \code{project}, \code{mode}
   (\code{new} or \code{steer}), \code{model} and \code{effort} in effect, \code{changed} (those of
   the two the message changed), \code{kind}, \code{reason}, \code{chars}, \code{owner\_words},
-  \code{user\_session}, and \code{usage}: each window's percentage used on Codex (from
+  \code{patch} (the digest of the diff that \code{revision} took), \code{user\_session}, and
+  \code{usage}: each window's percentage used on Codex (from
   \code{account/rateLimits/read}) and Claude Code (from \code{claude-usage.json}).
 \item \code{reply}: \code{consultant}, \code{thread}, \code{turn}, \code{status}, \code{ms},
   \code{chars} and \code{verdict}. It is written when a waiting send, the waiter or
@@ -1390,11 +1425,22 @@ renamed \code{usage-log-}\textit{date}\code{.jsonl} once it passes 20\,MB.
 
 Every line also has \code{ts} (Unix seconds). No line holds the text of a message or reply.
 \code{kind} and \code{reason} are \code{SendConsultantMessage} arguments; an unknown \code{kind}
-is refused before anything is sent. The verdict is read from the first line of the reply that
-isn't blank: ``no changes'' or ``no blockers'' is \code{yes}; then \code{CHANGES}, ``changes
-needed'' and the like are \code{changes}; then ``no-go'', ``not approved'', ``not ok'',
-``blocked'', ``reject'' or a leading ``no'' are \code{no}; then ``go'', ``ready'', ``approved'',
-``LGTM'', a leading ``yes'' or a line that is just ``OK'' are \code{yes}. Anything else has no verdict.
+is refused before anything is sent. A turn that failed or was interrupted has the verdict
+\code{incomplete}; the status screen applies that rule to replies logged by older versions too.
+Otherwise the verdict is read from the first line of the reply that isn't blank. A line that starts
+with a verdict label (``Verdict:'', ``**Final verdict** -'', after any numbering or formatting) is
+read from the word after it: ``yes, with changes'' and the like are \code{changes}; ``no changes''
+or ``no blockers'' is \code{yes}; ``incomplete'', ``inconclusive'' or ``not reviewed'' is
+\code{incomplete}; ``changes'' is \code{changes}; ``no'', ``no-go'', ``not approved'', ``reject''
+or ``blocked'' is \code{no}; ``yes'', ``go'', ``approved'', ``LGTM'', ``ready'' or ``OK'' is
+\code{yes}. So a caveat later in the line doesn't change it, and a ``verdict'' quoted later doesn't
+count. Any other line is read whole, in order: one that starts with ``incomplete'',
+``inconclusive'' or ``not reviewed'', or says the diff, patch, files or code couldn't be read,
+opened or found, is \code{incomplete}; then ``no changes'' or ``no blockers'' is \code{yes}; then
+\code{CHANGES}, ``changes needed'' and the like are \code{changes}; then ``no-go'', ``not
+approved'', ``not ok'', ``blocked'', ``reject'' or a leading ``no'' are \code{no}; then ``go'',
+``ready'', ``approved'', ``LGTM'', a leading ``yes'' or a line that is just ``OK'' are \code{yes}.
+Anything else has no verdict.
 
 \code{server.py top} draws a status screen from that log and from files already on the computer,
 with ANSI colours and the terminal's alternate screen: a top bar with each subscription's most
@@ -1462,18 +1508,31 @@ Token counts per week (weeks start on Monday, local time):
 \item \textbf{Claude Code:} \code{\textasciitilde/.claude/projects/**/*.jsonl}, the
   \code{message.usage.output\_tokens} of each \code{assistant} line, counted once per
   \code{message.id} (Claude Code writes one message over several lines). Files under a
-  \code{subagents} folder count as subagents.
+  \code{subagents} folder count as subagents. A reply is also counted once across a session's
+  transcripts: its own (\code{<project>/<id>.jsonl}) and its subagents'
+  (\code{<project>/<id>/subagents/*.jsonl}). A forked subagent's transcript starts with a copy of
+  its parent's history, with the same message ids, so a reply already counted in another transcript
+  of the session isn't counted again: a reply counts in the first of the session's transcripts, in
+  path order, that has it. Path order puts a session's own transcript before its subagents', so the
+  copy is the one left out.
 \item \textbf{Codex:} \code{rollout-*.jsonl} under \code{\textasciitilde/.codex/sessions} and
   \code{archived\_sessions}. \code{token\_count} events carry running totals
-  (\code{info.total\_token\_usage}); nouez counts the growth since the last one. A file whose
+  (\code{info.total\_token\_usage}); nouez counts the growth since the last one. A forked session's
+  totals start from zero, so a fork counts only its own turns. A file whose
   \code{session\_meta} has \code{thread\_source: "nouez"} is a consultant's. The latest
   \code{rate\_limits} seen stand in for the daemon when it can't be reached.
 \end{itemize}
 
 Only files changed in the last 13 weeks are read. For each, \code{usage-weeks.json} keeps the byte
-offset read to (only whole lines count), the last 20 message ids, and its counts per week, so a
-later scan reads only what was added. A file that got shorter is read again from the start; a file
-that's gone drops out.
+offset read to (only whole lines count), its counts per week and, for a Claude Code transcript,
+the message id of each reply it counted, so a later scan reads only what was added. A Codex file
+that got shorter is read again from the start; a file that's gone drops out. A Claude Code session
+is read again from the start, all its transcripts, when reading on could count differently from a
+fresh scan: one of its transcripts got shorter, is gone or aged out (its replies may now count in
+another), or a reply turns up in a transcript that comes before the one that counted it. So the
+counts are always those of a fresh scan. A session with a transcript that can't be read keeps the
+counts of the last scan until a later one can read it. A cache written by an older version is dropped and the
+transcripts are read again.
 
 \subsection{Antigravity consultants}
 \label{sec:agy}

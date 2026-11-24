@@ -66,7 +66,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.20.0"
+SERVER_VERSION = "0.21.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -944,7 +944,8 @@ def format_turn(name, turn, limit=MAX_REPLY_CHARS):
 BRIDGE_HEADER = re.compile(r"\[Message from (.{1,200}?) via the consultants bridge\]")
 
 
-REVISION_STAMP = re.compile(r"\A\s*\[Revision: [^\]\n]*\]\n")
+# Ends where nouez's own wording ends: a branch name or a path in the line may hold "]".
+REVISION_STAMP = re.compile(r"\A\s*\[Revision: (?:[^\n]*? in your answer\.|not a git repository, or no commits yet)\]\n")
 OWNER_BLOCK = re.compile(r"\A\s*The user's own words, as they typed them:\n<<<\n.*?\n>>>\n\n"
                          r"The rest of this message is [^\n]*'s\.\n\n", re.S)
 
@@ -3787,19 +3788,245 @@ def running_on(thread, prefix=""):
     return prefix + ", ".join(parts) if parts else ""
 
 
-def revision_line(cwd):
-    """A line naming the commit and the number of uncommitted paths of the repo at cwd, so a
-    review can say which version it read. Read-only git commands; "" if git has nothing to say."""
+PATCH_FOLDER = "patches"           # in nouez's cache folder: the diffs a revision line names
+PATCH_KEEP_DAYS = 14               # a saved diff older than this is removed when another is saved
+PATCH_FILE_BYTES = 256 * 1024      # an untracked file larger than this is named, not put in the diff
+PATCH_UNTRACKED_FILES = 200        # untracked files put in the diff, at most
+PATCH_TOTAL_BYTES = 8 * 1024 * 1024  # a larger diff isn't taken at all, nor a larger git status
+PATCH_NAMES_SHOWN = 5              # left-out files named in the revision line
+AGY_PATCH_BYTES = 200_000          # a larger diff isn't put in an Antigravity consultant's message
+# An untracked file with a part of its path like these may hold secrets: named in the revision
+# line, never put in the diff.
+SECRET_NAME = re.compile(r"\.env(\..*)?|\.netrc|\.npmrc|\.pypirc|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|"
+                         r".*(secret|credential|token|password).*|.*\.(pem|key|p12|pfx|jks|keystore)|"
+                         r"settings\.local\.json", re.I)
+DIFF_BLOCK = re.compile(rb"^diff --git ", re.M)
+BINARY_DIFF = re.compile(rb"^Binary files .* differ$", re.M)
+GITLINK = re.compile(rb"^(?:index \S+ |new file mode |deleted file mode |old mode |new mode )160000$", re.M)
+DIRTY_SUBMODULE = re.compile(rb"^\+Subproject commit [0-9a-f]+-dirty$", re.M)
+DIFF_NAME = re.compile(rb"^(?:rename to |copy to |\+\+\+ b/|--- a/)(.+?)\t?$", re.M)
+# Git reads the user's settings: these keep its output the same for every user, and run no hooks
+# or fsmonitor commands while nouez takes a diff.
+REVISION_GIT = ["git", "--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                "-c", "core.quotepath=off"]
+
+
+def run_bytes(argv, timeout=20, limit=None, env=None):
+    """A command's stdout as bytes and "", or None and why not: "failed" when it couldn't start,
+    exited with an error or timed out, "too large" when it wrote more than `limit` bytes. Can't
+    hang, for the reason run_text gives, and holds no more than `limit` bytes."""
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, env=env)
+    except OSError:
+        return None, "failed"
+    chunks, size = [], [0]
+
+    def read():
+        for chunk in iter(lambda: proc.stdout.read(65536), b""):
+            size[0] += len(chunk)
+            if limit is not None and size[0] > limit:
+                return
+            chunks.append(chunk)
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    reader.join(timeout)
+    over = limit is not None and size[0] > limit
+    if reader.is_alive() or over:
+        kill_tree(proc)  # abandon a reader still blocked rather than wait on it
+        if not reader.is_alive():
+            proc.stdout.close()
+        return None, "too large" if over else "failed"
+    proc.stdout.close()
+    try:
+        code = proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        return None, "failed"
+    return (b"".join(chunks), "") if code == 0 else (None, "failed")
+
+
+def secret_path(rel):
+    return any(SECRET_NAME.fullmatch(part) for part in rel.split("/"))
+
+
+def diff_blocks(patch):
+    """A diff split into its files' parts."""
+    starts = [m.start() for m in DIFF_BLOCK.finditer(patch)]
+    return [patch[a:b] for a, b in zip(starts, starts[1:] + [len(patch)])]
+
+
+def block_name(block):
+    """The file a part of a diff is about, as git wrote it."""
+    head = block.split(b"\n", 1)[0][len(b"diff --git "):].decode("utf-8", "replace")
+    half = (len(head) - 5) // 2  # "a/X b/X"
+    if head.startswith("a/") and head[2 + half:] == " b/" + head[2:2 + half]:
+        return head[2:2 + half]
+    found = DIFF_NAME.search(block)
+    return found.group(1).decode("utf-8", "replace") if found else head
+
+
+class LeftOut:
+    """The files left out of a diff: how many, and the first few names with why."""
+
+    def __init__(self):
+        self.count, self.names = 0, []
+
+    def add(self, name, why):
+        self.count += 1
+        if len(self.names) < PATCH_NAMES_SHOWN:
+            self.names.append(" ".join(f"{name} ({why})".split()))
+
+    def __str__(self):
+        more = [f"{self.count - len(self.names)} more"] if self.count > len(self.names) else []
+        return f"; left out: {', '.join(self.names + more)}" if self.count else ""
+
+
+def take_diff(git, top, commit, left_out):
+    """The uncommitted changes of the repo at top against commit, untracked files included, as git
+    writes them: (diff, ""), or (None, why not). The untracked files are added as intent-to-add to a
+    copy of git's index, so nothing in the repo is written; the files left out go in left_out."""
+    names, why = run_bytes(git + ["ls-files", "--others", "--exclude-standard", "-z"], 20, PATCH_TOTAL_BYTES)
+    if names is None:
+        return None, "too many untracked files" if why == "too large" else "git ls-files failed"
+    added = []
+    for rel in sorted(n for n in names.split(b"\0") if n):
+        shown = rel.decode("utf-8", "replace")
+        why = ("may hold secrets" if secret_path(shown) else
+               "a repository inside this one" if rel.endswith(b"/") else
+               f"over {PATCH_UNTRACKED_FILES} untracked files" if len(added) >= PATCH_UNTRACKED_FILES else "")
+        if not why:
+            try:
+                if os.lstat(os.path.join(top, os.fsdecode(rel))).st_size > PATCH_FILE_BYTES:
+                    why = "too large"
+            except OSError:
+                why = "unreadable"
+        if why:
+            left_out.add(shown, why)
+        else:
+            added.append(rel)
+    found, _ = run_bytes(git + ["rev-parse", "--git-path", "index"], 10)
+    if not found:
+        return None, "git rev-parse failed"
+    try:
+        with tempfile.TemporaryDirectory(prefix="nouez-diff-") as tmp:
+            index = os.path.join(tmp, "index")
+            shutil.copyfile(os.path.join(top, os.fsdecode(found.rstrip(b"\n"))), index)
+            env = dict(os.environ, GIT_INDEX_FILE=index)
+            if added:
+                paths = os.path.join(tmp, "paths")
+                with open(paths, "wb") as f:
+                    f.write(b"\0".join(added) + b"\0")
+                _, why = run_bytes(git + ["--literal-pathspecs", "add", "--intent-to-add",
+                                          f"--pathspec-from-file={paths}", "--pathspec-file-nul"], 30, env=env)
+                if why:
+                    return None, "git add --intent-to-add failed"
+            patch, why = run_bytes(git + ["diff", commit, "--no-color", "--no-ext-diff", "--no-textconv",
+                                          "--no-relative", "--src-prefix=a/", "--dst-prefix=b/",
+                                          "--submodule=short", "--ignore-submodules=none"],
+                                   60, PATCH_TOTAL_BYTES, env)
+    except OSError:
+        return None, "couldn't copy git's index to a temporary folder"
+    if patch is None:
+        return None, f"over {PATCH_TOTAL_BYTES // (1024 * 1024)} MB" if why == "too large" else "git diff failed"
+    kept = []
+    for block in diff_blocks(patch):
+        why = ("binary" if BINARY_DIFF.search(block) else
+               "a submodule with changes inside" if GITLINK.search(block) and DIRTY_SUBMODULE.search(block) else "")
+        if why:
+            left_out.add(block_name(block), why)
+        else:
+            kept.append(block)
+    return b"".join(kept), ""
+
+
+def save_patch(patch, digest, now=None):
+    """Save a diff in nouez's cache folder under its digest, remove old ones, and return its path."""
+    folder = os.path.join(nouez_cache_dir(), PATCH_FOLDER)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{digest}.patch")
+    try:
+        with open(path, "rb") as f:
+            same = f.read(len(patch) + 1) == patch
+    except OSError:
+        same = False
+    if not same:
+        fd, tmp = tempfile.mkstemp(dir=folder, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(patch)
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
+    os.utime(path, None)
+    cutoff = (now or time.time()) - PATCH_KEEP_DAYS * 86400
+    for old in glob.glob(os.path.join(folder, "*.patch")) + glob.glob(os.path.join(folder, "*.tmp")):
+        try:
+            if os.path.getmtime(old) < cutoff:
+                os.remove(old)
+        except OSError:
+            pass
+    return path
+
+
+def revision(cwd, take=True, inline_limit=None):
+    """The revision line for a message: the commit, branch and number of uncommitted paths of the
+    repo at cwd, so a review can say which version it read. With take, when there are uncommitted
+    changes, nouez takes their diff once, saves it under its digest and names it, so every reviewer
+    reads the same input even if the working tree changes meanwhile. With inline_limit, the diff
+    goes in the message instead (the line says so); one larger than that many bytes, or not UTF-8,
+    is only described. Returns (line, diff, digest); the line is "" when cwd isn't a folder, the diff
+    b"" and the digest "" when the line names none. Writes nothing in the repo."""
     if not cwd or not os.path.isdir(cwd):
-        return ""
-    head = run_text(["git", "-C", cwd, "rev-parse", "--short", "HEAD"], timeout=10).strip()
-    if not head:
-        return "[Revision: not a git repository, or no commits yet]\n"
-    branch = run_text(["git", "-C", cwd, "branch", "--show-current"], timeout=10).strip()
-    status = run_text(["git", "-C", cwd, "status", "--porcelain"], timeout=20)
-    dirty = sum(1 for line in status.splitlines() if line.strip())
-    return (f"[Revision: commit {head}" + (f" on {branch}" if branch else "")
-            + f", {dirty} uncommitted path(s). Name this revision in your answer.]\n")
+        return "", b"", ""
+    found, _ = run_bytes(REVISION_GIT + ["-C", cwd, "rev-parse", "--show-toplevel", "HEAD"], 10)
+    top, _, commit = (found or b"").rstrip(b"\n").rpartition(b"\n")
+    if not top or not re.fullmatch(rb"[0-9a-f]{40,64}", commit):
+        return "[Revision: not a git repository, or no commits yet]\n", b"", ""
+    top, commit = os.fsdecode(top), commit.decode()
+    git = REVISION_GIT + ["-C", top]
+    short = (run_bytes(git + ["rev-parse", "--short", commit], 10)[0] or commit[:7].encode()).decode().strip()
+    branch = (run_bytes(git + ["branch", "--show-current"], 10)[0] or b"").decode("utf-8", "replace").strip()
+    line = f"[Revision: commit {short}" + (f" on {branch}" if branch else "")
+    ask = ". Name this revision in your answer.]\n"
+    status, why = run_bytes(git + ["status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"],
+                            20, PATCH_TOTAL_BYTES)
+    if status is None:
+        return line + "; git status failed, so nouez doesn't know what is uncommitted" + ask, b"", ""
+    dirty = sum(1 for row in status.splitlines() if row.strip())
+    line += f", {dirty} uncommitted path(s)"
+    if not dirty or not take:
+        return line + ask, b"", ""
+    left_out = LeftOut()
+    patch, why = take_diff(git, top, commit, left_out)
+    if patch is None:
+        return line + f"; nouez couldn't take their diff ({why}), so review the working tree" + ask, b"", ""
+    if not patch:
+        return line + f"{left_out}" + ask, b"", ""
+    size = f"{len(diff_blocks(patch))} file(s), {max(1, round(len(patch) / 1024))} KB{left_out}"
+    if inline_limit is not None:
+        try:
+            patch.decode("utf-8")
+            why = "is too large to put in this message" if len(patch) > inline_limit else ""
+        except UnicodeDecodeError:
+            why = "has bytes that aren't UTF-8, so it can't be put in this message as they are"
+        if why:
+            return (line + f"; their diff ({size}) {why}, so review the working tree, which may have changed "
+                    "since this message was sent" + ask), b"", ""
+    digest = hashlib.sha256(patch).hexdigest()[:16]
+    try:
+        path = save_patch(patch, digest)
+    except OSError:
+        path = ""
+    if not path or "\n" in path:
+        return line + f"; nouez couldn't save their diff ({size}), so review the working tree" + ask, b"", ""
+    where = "is in this message, above the bridge header" if inline_limit is not None else f"is saved as {path}"
+    return (line + f"; their diff against it, taken when this message was sent, {where} (sha256 {digest}, "
+            f"{size}). Review that diff rather than the working tree, which may have changed since, and name "
+            "this revision and that sha256 in your answer.]\n"), patch, digest
 
 
 def send_consultant_message(args, cancel=None, progress=None):
@@ -3835,8 +4062,6 @@ def send_consultant_message(args, cancel=None, progress=None):
     with contextlib.closing(CodexClient()) as client:
         thread = resolve(client, to)
         tid, name = thread["id"], short_name(thread)
-        stamp = revision_line(thread.get("cwd")) if want_revision else ""
-        text = f"[Message from {sender} via the consultants bridge]\n{stamp}\n{message}"
         if not (is_bridge(thread) or allow_user):
             # Our consultants are read-only; a session the user opened has the user's permissions.
             raise BridgeError(
@@ -3844,6 +4069,8 @@ def send_consultant_message(args, cancel=None, progress=None):
                 "user's own permissions and may be able to edit files. Nothing was sent. Only if the "
                 "user asked you to message this session, send again with allow_user_session=true; "
                 "otherwise use StartConsultant.")
+        stamp, _, digest = revision(thread.get("cwd")) if want_revision else ("", b"", "")
+        text = f"[Message from {sender} via the consultants bridge]\n{stamp}\n{message}"
         with send_lock(tid):
             # Last point a cancellation can still stop the message from being delivered.
             check_cancel(cancel)
@@ -3924,7 +4151,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                 "model": overrides.get("model") or was["model"], "effort": overrides.get("effort") or was["effort"],
                 "changed": sorted(k for k, v in overrides.items() if v != was[k]) or None,
                 "kind": kind, "reason": reason, "chars": len(message), "owner_words": bool(owner_words) or None,
-                "user_session": not is_bridge(thread) or None, "usage": usage_snapshot(client)})
+                "patch": digest or None, "user_session": not is_bridge(thread) or None, "usage": usage_snapshot(client)})
         if not timeout:
             return f"Delivered to {name} ({mode}, turn {turn_id}).{watching} {read_later(tid, turn_id)}"
         try:
@@ -4586,24 +4813,62 @@ def usage_snapshot(client):
     return snap
 
 
-VERDICTS = (  # read from a reply's first non-empty line; the first match wins
+CANNOT = r"(could ?n[o'’]t|could not|can['’]t|can ?not|unable to|(was|were) ?n['’]t able to|(was|were) not able to)"
+INPUT = r"(diff|patch|files?|changes|code|repo|commit|branch|input)"
+# An explicit verdict: a line that starts with "Verdict:" (or "**Final verdict** -" and the like),
+# read from the word after it; the first match wins.
+VERDICT_LABEL = re.compile(r"^[^A-Za-z]*((my|final|overall|the) )?verdict\b[^A-Za-z]*", re.I)
+EXPLICIT_VERDICTS = tuple((name, re.compile(pattern, re.I)) for name, pattern in (
+    # in the same clause: "yes. But the changes..." is a yes, "approved with no changes" too
+    ("changes", r"(yes|go|approved?|ok(ay)?|lgtm)[\s,(\[\-–—]+(with|but|pending|after)\s+"
+                r"((?!no\b|without\b)\w+\s+)?(changes|fixes|edits)\b"),
+    ("yes", r"no\W+(further |more |other )?(changes|blockers?|issues|findings)\b"),
+    ("incomplete", r"(incomplete|inconclusive|unknown|not (yet )?reviewed)\b"),
+    ("changes", r"(changes|request changes|needs? (some )?changes)\b"),
+    ("no", r"(no[- ]go|no|not (approved?|ok(ay)?|ready)|reject(ed)?|blocked|block)\b"),
+    ("yes", r"(yes|go|approved?|lgtm|ready|ok(ay)?|ship it)\b")))
+VERDICTS = (  # read from a whole first line without an explicit verdict; the first match wins
+    # A review that couldn't read what it was given approves nothing, whatever else the line says;
+    # "incomplete" only at the start, so a line about incomplete code isn't taken for one.
+    ("incomplete", re.compile(r"^[^A-Za-z]*(incomplete|inconclusive|not (yet )?(reviewed|checked))\b|"
+                              rf"\b{CANNOT} (read|open|access|fetch|load|inspect|review) (\w+ ){{0,2}}?{INPUT}\b|"
+                              # "couldn't find any changes that break X" is a finding, not a gap
+                              rf"\b{CANNOT} find (the |your |this |that )?(diff|patch|files?|repo|commit|branch|input)\b|"
+                              rf"\b{INPUT} {CANNOT} be (read|opened|accessed|fetched|loaded|found)\b", re.I)),
     ("yes", re.compile(r"\bno (further |more |other )?(changes|blockers?|issues|findings)\b", re.I)),
     ("changes", re.compile(r"\bCHANGES\b")),  # the word in capitals, as many briefs ask for it
     ("changes", re.compile(r"\b(with changes|changes (requested|needed|required)|needs? (some )?changes|"
                            r"request changes)\b", re.I)),
     ("no", re.compile(r"\b(no[- ]go|not (ready|approved?|ok(ay)?)|blocked|block|reject(ed)?|"
-                      r"do not (merge|ship|commit))\b|\bverdict\W*no\b|^\W*no\b", re.I)),
-    ("yes", re.compile(r"\b(go|ready|approved?|lgtm|ship it)\b|\bverdict\W*yes\b|^\W*yes\b|^\W*ok(ay)?\W*$", re.I)),
+                      r"do not (merge|ship|commit))\b|^\W*no\b", re.I)),
+    ("yes", re.compile(r"\b(go|ready|approved?|lgtm|ship it)\b|^\W*yes\b|^\W*ok(ay)?\W*$", re.I)),
 )
+UNFINISHED = ("failed", "interrupted")
 
 
-def verdict_of(reply):
-    """yes, changes or no, from a reply's first non-empty line, or None when it gives no verdict."""
+def verdict_of(reply, status="completed"):
+    """yes, changes, no or incomplete, from a reply's first non-empty line, or None when it gives no
+    verdict. A line starting "Verdict: ..." is read from the word after the label, so a caveat later
+    ("Verdict: yes. I couldn't run the tests") doesn't change it. A turn that failed or was
+    interrupted is incomplete, whatever its text says."""
+    if status in UNFINISHED:
+        return "incomplete"
     first = next((line for line in (reply or "").splitlines() if line.strip()), "")[:300]
+    label = VERDICT_LABEL.match(first)
+    if label:
+        for name, pattern in EXPLICIT_VERDICTS:
+            if pattern.match(first, label.end()):
+                return name
     for name, pattern in VERDICTS:
         if pattern.search(first):
             return name
     return None
+
+
+def logged_verdict(reply):
+    """A logged reply's verdict, by the rule of this version for one whose turn didn't finish, so
+    replies logged by an older version count the same."""
+    return "incomplete" if reply.get("status") in UNFINISHED else reply.get("verdict")
 
 
 def record_reply(thread_id, name, turn, path=None):
@@ -4613,7 +4878,7 @@ def record_reply(thread_id, name, turn, path=None):
     reply = turn_reply(turn)
     record_usage({"event": "reply", "consultant": name, "thread": thread_id, "turn": turn.get("id"),
                   "status": turn.get("status"), "ms": number(turn.get("durationMs")),
-                  "chars": len(reply), "verdict": verdict_of(reply),
+                  "chars": len(reply), "verdict": verdict_of(reply, turn.get("status")),
                   **({"provider": turn["provider"]} if turn.get("provider") else {}),
                   **({"tokens": turn["usage"]} if isinstance(turn.get("usage"), dict) else {})}, path)
 
@@ -4629,8 +4894,7 @@ TOP_SCAN_SECONDS = 300    # between transcript scans
 TOP_WEEKS = 8             # weeks shown in the offload table
 SCAN_WEEKS = 13           # transcripts last changed longer ago than this aren't read
 SCAN_STATE_FILE = "usage-weeks.json"
-SCAN_STATE_VERSION = 1
-SCAN_IDS_KEPT = 20        # message ids kept per transcript, to skip a reply split across a scan
+SCAN_STATE_VERSION = 2     # 2: a reply copied into another transcript of its session counts once
 TOP_PERIODS = {"1": 1, "7": 7, "3": 30, "a": None}  # key: days the consultation counts cover
 
 
@@ -4676,12 +4940,18 @@ def new_lines(path, entry):
     entry["offset"] = offset
 
 
-def scan_claude_file(path, entry):
+def scan_claude_file(path, entry, owners=None):
     """Add a Claude Code transcript's new replies to entry["weeks"]: output tokens of the main
-    conversation and of subagents, and output by model."""
+    conversation and of subagents, and output by model. entry["keys"] holds the message ids of the
+    replies this file counted. `owners` maps the ids counted by the session's other transcripts to
+    their paths: a forked subagent's transcript starts with a copy of its parent's history, and a
+    reply is counted only in the first transcript, in path order, that has it. Returns False if a
+    reply here was counted by a transcript that comes after this one, so the session must be read
+    again from the start to count it here instead."""
+    owners = owners or {}
     weeks = entry.setdefault("weeks", {})
-    ids = entry.get("ids") or []
-    seen = set(ids)
+    keys = entry.get("keys", "").split()
+    seen = set(keys)
     in_subagent = f"{os.sep}subagents{os.sep}" in path or "/subagents/" in path
     for line in new_lines(path, entry):
         if b'"assistant"' not in line or b'"usage"' not in line:
@@ -4693,22 +4963,27 @@ def scan_claude_file(path, entry):
         m = o.get("message") if isinstance(o, dict) else None
         if o.get("type") != "assistant" or not isinstance(m, dict) or not isinstance(m.get("usage"), dict):
             continue
-        mid = m.get("id")
-        if mid in seen:
-            continue  # one reply is written as several lines, each with its usage
-        if mid:
-            seen.add(mid)
-            ids.append(mid)
-        out = number(m["usage"].get("output_tokens")) or 0
         ts = iso_seconds(o.get("timestamp"))
         if ts is None:
             continue
+        key = "".join(m["id"].split()) if isinstance(m.get("id"), str) else ""
+        if key in seen:
+            continue  # one reply is written as several lines, each with its usage
+        if key in owners:
+            if owners[key] < path:
+                continue  # a copy of a reply counted in an earlier transcript of the session
+            return False
+        if key:
+            seen.add(key)
+            keys.append(key)
+        out = number(m["usage"].get("output_tokens")) or 0
         w = weeks.setdefault(week_of(ts), {"main": 0, "sub": 0, "calls": 0, "models": {}})
         w["sub" if in_subagent or o.get("isSidechain") else "main"] += out
         w["calls"] += 1
         model = m.get("model") if isinstance(m.get("model"), str) else "?"
         w["models"][model] = w["models"].get(model, 0) + out
-    entry["ids"] = ids[-SCAN_IDS_KEPT:]
+    entry["keys"] = " ".join(keys)
+    return True
 
 
 def scan_codex_file(path, entry, state):
@@ -4750,6 +5025,52 @@ def codex_home(env=None):
     return env.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
 
 
+def transcript_session(path, claude_root):
+    """The Claude Code session a transcript belongs to: "<project>/<session id>" for both the
+    session's own file (<project>/<id>.jsonl) and its subagents' (<project>/<id>/subagents/...)."""
+    parts = os.path.relpath(path, claude_root).split(os.sep)
+    if len(parts) < 2:
+        return path
+    return parts[0] + "/" + (parts[1][:-len(".jsonl")] if len(parts) == 2 else parts[1])
+
+
+def scan_claude_session(paths, files, cached):
+    """Bring a Claude Code session's transcripts (paths, in path order; cached, those the last scan
+    kept) up to date. Only new lines are read, unless that could count a reply differently from
+    reading everything again: a transcript of the session was removed, aged out or got shorter, or
+    a reply turns up in a transcript before the one that counted it. Then all of the session's
+    transcripts are read again from the start, so the counts are always those of a fresh scan.
+    If a transcript can't be read, the session keeps the counts of the last scan, to be brought up
+    to date by the next one, and OSError is raised."""
+    sizes = {path: os.path.getsize(path) for path in paths}
+    if set(cached) == set(paths) and all(sizes[path] == files[path].get("offset", 0) for path in paths):
+        return  # nothing new
+    kept = {path: files[path] for path in cached}
+    for path in paths:  # work on copies of the entries, so a failure leaves the last scan's counts
+        files[path] = json.loads(json.dumps(files.get(path, {"kind": "claude"})))
+    try:
+        def owners_except(path):
+            return {key: other for other in paths if other != path for key in files[other].get("keys", "").split()}
+        fresh = set(cached) <= set(paths) and all(sizes[path] >= files[path].get("offset", 0) for path in paths)
+        if fresh:
+            for path in paths:
+                entry = files[path]
+                if sizes[path] != entry.get("offset", 0) and not scan_claude_file(path, entry, owners_except(path)):
+                    fresh = False
+                    break
+        if not fresh:
+            owners = {}
+            for path in paths:
+                entry = files[path] = {"kind": "claude"}
+                scan_claude_file(path, entry, owners)
+                owners.update(dict.fromkeys(entry["keys"].split(), path))
+    except OSError:
+        for path in paths:
+            files.pop(path, None)
+        files.update(kept)
+        raise
+
+
 def scan_usage(state, now, claude_root=None, codex_root=None):
     """Bring the token counts in state up to date with the transcripts changed in the last
     SCAN_WEEKS weeks. Files are read from where the last scan stopped."""
@@ -4761,21 +5082,32 @@ def scan_usage(state, now, claude_root=None, codex_root=None):
     for folder in ("sessions", "archived_sessions"):
         found += [("codex", p) for p in
                   glob.glob(os.path.join(codex_root, folder, "**", "rollout-*.jsonl"), recursive=True)]
+    found.sort()  # a session's own transcript before its subagents', so a copy is the one not counted
+    sessions = collections.defaultdict(list)  # a Claude Code session: its transcripts, in path order
     seen = set()
     for kind, path in found:
         try:
             if os.path.getmtime(path) < since:
                 continue
             seen.add(path)
+            if kind == "claude":
+                sessions[transcript_session(path, claude_root)].append(path)
+                continue
             entry = files.get(path)
             if entry is None or os.path.getsize(path) < entry.get("offset", 0):
                 entry = files[path] = {"kind": kind}  # new, or rewritten shorter: read from the start
-            if kind == "claude":
-                scan_claude_file(path, entry)
-            else:
-                scan_codex_file(path, entry, state)
+            scan_codex_file(path, entry, state)
         except OSError:
             continue
+    cached = collections.defaultdict(list)  # each session's transcripts as of the last scan
+    for path, entry in files.items():
+        if entry.get("kind") == "claude":
+            cached[transcript_session(path, claude_root)].append(path)
+    for session, paths in sessions.items():
+        try:
+            scan_claude_session(paths, files, cached.get(session, ()))
+        except OSError:
+            seen.update(cached.get(session, ()))  # kept as the last scan left them
     for path in [p for p in files if p not in seen]:
         del files[path]  # gone, or too old to show
     state["scanned"] = now
@@ -4874,7 +5206,7 @@ def log_summary(events, since=None):
     for e in sends:
         if e.get("turn") not in by_thread[e.get("thread")]:  # a message steered into a turn isn't a round
             by_thread[e.get("thread")].append(e.get("turn"))
-    verdict_by_turn = {r["turn"]: r.get("verdict") for r in replies}
+    verdict_by_turn = {r["turn"]: logged_verdict(r) for r in replies}
     last = {e.get("thread"): e for e in sends}
     loops = []
     for tid, items in by_thread.items():
@@ -4909,7 +5241,7 @@ def log_summary(events, since=None):
         "kinds": count(e.get("kind") or "not given" for e in sends),
         "reasons": count(e["reason"] for e in reversed(sends) if e.get("reason")),  # ties: latest first
         "projects": count(e.get("project") or "?" for e in sends),
-        "verdicts": count(r.get("verdict") or "none" for r in replies),
+        "verdicts": count(logged_verdict(r) or "none" for r in replies),
         "statuses": count(r.get("status") or "?" for r in replies),
         "loops": sorted(loops, key=lambda x: -x["rounds"]),
         "reply_seconds": (median(times), sorted(times)[int(len(times) * 0.9)] if times else None),
@@ -5892,8 +6224,14 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
     cid, name = rec["id"], rec["name"]
     override = args.get("model") or args.get("effort")
     known = agy_models() if override else None  # can take seconds, so read before taking the lock
-    stamp = revision_line(rec.get("cwd")) if flag(args, "revision") else ""
+    stamp, patch, digest = (revision(rec.get("cwd"), take=flag(args, "attach_diff"), inline_limit=AGY_PATCH_BYTES)
+                            if flag(args, "revision") else ("", b"", ""))
     shown = f"[Message from {sender} via the consultants bridge]\n{stamp}\n{message}"
+    # An Antigravity consultant runs no commands and may not be able to read nouez's folder, so the
+    # diff the revision line names goes in the message, before the part history shows.
+    # revision gives a diff here only when it is UTF-8.
+    attached = (f"The diff named in the revision line below (sha256 {digest}), as nouez took it:\n<<<\n"
+                f"{patch.decode('utf-8')}>>>\n\n" if patch else "")
     with send_lock(cid), agy_lock(cid):
         check_cancel(cancel)
         # Read the consultant again under the lock: another session may have stopped it or changed its model.
@@ -5910,11 +6248,11 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
                 f"message while it runs; nothing was sent. Read that turn's reply first (GetConsultantReply "
                 f"with turn_id {current[0]['id']}, or its waiter), then send again.")
         conversation = agy_conversation(cid)
-        text = shown
+        text = attached + shown
         if not conversation:
             standing = (f"Standing instructions for this consultation:\n<<<\n{rec['instructions']}\n>>>\n\n"
                         if rec.get("instructions") else "")
-            text = f"{AGY_PREAMBLE}\n\n{standing}{shown}"
+            text = f"{AGY_PREAMBLE}\n\n{standing}{attached}{shown}"
         turn_id = agy_start_turn(rec, text, model, conversation, shown)
         rec_before = rec
         changed, kept = model != rec.get("model"), True
@@ -5933,7 +6271,8 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
                  "model": model, "effort": agy_level(model),
                  "changed": [k for k, f in (("model", agy_base), ("effort", agy_level))
                              if f(model) != f(rec_before.get("model") or "")] or None if changed else None,
-                 "kind": kind, "reason": reason, "chars": len(message), "owner_words": bool(owner_words) or None}
+                 "kind": kind, "reason": reason, "chars": len(message), "owner_words": bool(owner_words) or None,
+                 "patch": digest or None}
         sent_at = time.time()
 
         def log_send():  # agy's quota takes a few seconds to read: don't hold the reply for it
@@ -6208,7 +6547,7 @@ def consultation_rows(scr, summary, days, compact=False, table=True):
     rows += [] if not table else columns([("by model and effort", s["models"].most_common(top)),
                      ("by kind", s["kinds"].most_common(top)),
                      ("verdicts", s["verdicts"].most_common(top)),
-                     ("by project", s["projects"].most_common(top))], (30, 18, 14, 28))
+                     ("by project", s["projects"].most_common(top))], (30, 18, 18, 24))
     if not compact:
         rows += ["", "  which kind went where"]
         rows += [f"  {n:>4}  {kind} → {model}" for (kind, model), n in s["routes"].most_common(4)]
@@ -6930,7 +7269,8 @@ TOOLS = [
                 "message": {"type": "string", "description": "The message to send."},
                 "from": {"type": "string", "description": "Sender label shown to the consultant, e.g. your session name. Default 'Claude Code'."},
                 "owner_words": {"type": "string", "description": "Optional: text the user typed, quoted exactly as they wrote it (never a summary). The consultant sees it in its own block, marked as the user's words, apart from your message."},
-                "revision": {"type": "boolean", "description": "Optional: add a line with the consultant's repository commit, branch and number of uncommitted paths, and ask it to name that revision in its answer. Default false."},
+                "revision": {"type": "boolean", "description": "Optional: add a line with the consultant's repository commit, branch and number of uncommitted paths, and ask it to name that revision in its answer. With uncommitted changes, nouez also takes their diff (tracked changes and untracked files, leaving out binary files, untracked files over 256 KB and untracked files whose path looks like a secret), saves it in its cache folder under its SHA-256 and asks the consultant to review that diff. An Antigravity consultant gets only the line, unless attach_diff is true. Default false."},
+                "attach_diff": {"type": "boolean", "description": "Optional, Antigravity consultants with revision=true only: put the uncommitted diff nouez takes in the message, so the consultant reviews exactly that. Its text goes to Google, deleted lines and untracked files included. Default false."},
                 "model": {"type": "string", "description": "Model id for this message and later ones: Codex, e.g. gpt-6-astra; Antigravity, e.g. gemini-4-neon. Default: unchanged. Set it when the user asks, or when the user's own rules call for another model."},
                 "effort": {"type": "string", "description": "Reasoning effort (Codex) or model level (Antigravity) for this message and later ones, such as low, medium, high or xhigh; which levels exist depends on the model. Default: unchanged. Set it when the user asks, or when the user's own rules call for more or less effort."},
                 "kind": {"type": "string", "enum": list(CONSULT_KINDS), "description": "Optional: what kind of consultation this is, for the user's usage log (nouez/usage-log.jsonl on this computer). Default: not recorded."},
