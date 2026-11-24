@@ -13,7 +13,7 @@ All notable changes to this project are recorded here. The format follows
 ### Changed
 
 - Cleanup, with no other change in behaviour: four functions only the tests called are gone (the tests check the code nouez runs instead), along with code that repeated `remove_file`. Each Codex connection is closed by `contextlib.closing`. Codex and Antigravity now share their reply, waiter and JSON-lines code, and opening a Linux terminal window is written once. The README no longer lists the "open in another app" pane problem, fixed in 0.19.0.
-- The verify script's static checks also report a top-level function, class or constant that nothing else in its file uses.
+- The verify script's static checks also report a top-level function, class or constant that nothing else in its file uses. It follows Python's scopes, so a local, parameter, class attribute or comprehension variable with the same name doesn't count as a use; `tests/test_verify.py` covers it, and CI runs it.
 
 ## [0.20.0] - 2026-11-23
 

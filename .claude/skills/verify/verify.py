@@ -93,99 +93,212 @@ def check_shadowing(files):
     report(not bad, "no top-level name defined twice", "; ".join(bad))
 
 
-FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+TYPE_ALIASES = tuple(filter(None, [getattr(ast, "TypeAlias", None)]))  # `type X = ...`, Python 3.12+
 
 
-def own_scope(nodes):
-    """Every node in `nodes` and below that is in their own scope: not inside a nested function or
-    class body, or a comprehension's loop variables, which have scopes of their own."""
-    stack = list(nodes)
+def arguments(fn):
+    a = fn.args
+    return [*a.posonlyargs, *a.args, *a.kwonlyargs, *filter(None, [a.vararg, a.kwarg])]
+
+
+def annotations(fn):
+    """A function's parameter and return annotations (a lambda has none)."""
+    if isinstance(fn, ast.Lambda):
+        return []
+    return [*filter(None, [x.annotation for x in arguments(fn)] + [fn.returns])]
+
+
+def mangle(name, cls):
+    """`name` as Python spells it inside class `cls`: a private __name there is _cls__name."""
+    if cls and cls.strip("_") and name.startswith("__") and not name.endswith("__"):
+        return f"_{cls.lstrip('_')}{name}"
+    return name
+
+
+def evaluated_around(node):
+    """The parts of a nested function or class that run in the scope around it: decorators and
+    defaults, or decorators, bases and keywords."""
+    if isinstance(node, FUNCTIONS):
+        a = node.args
+        return [*getattr(node, "decorator_list", []), *a.defaults, *filter(None, a.kw_defaults)]
+    return [*node.decorator_list, *node.bases, *node.keywords]
+
+
+def type_params(node):
+    """A generic function's, class's or type alias's type parameters (Python 3.12+), the scope they
+    make around it, and the bounds and defaults read in that scope."""
+    params = getattr(node, "type_params", None) or []
+    parts = [x for t in params for x in (getattr(t, "bound", None), getattr(t, "default_value", None)) if x]
+    return params, parts
+
+
+def bindings(body, cls=None):
+    """(how, name) for each name the statements `body` bind in their own scope, `how` being "bind",
+    "del", "global" or "nonlocal". What a nested function, class or comprehension binds is its own,
+    but a walrus in a comprehension, a default or a base binds here."""
+    stack = list(body)
     while stack:
         node = stack.pop()
-        yield node
-        if isinstance(node, (*FUNCTION_NODES, ast.ClassDef)):
-            continue  # its name is bound here; what it binds inside is its own
-        stack += [c for c in ast.iter_child_nodes(node)
-                  if not (isinstance(node, ast.comprehension) and c is node.target)]
-
-
-def local_names(fn):
-    """The names a function makes local: its parameters and what its own body assigns (not what a
-    nested function assigns), less what it declares global."""
-    a = fn.args
-    params = [*a.posonlyargs, *a.args, *a.kwonlyargs, *filter(None, [a.vararg, a.kwarg])]
-    names = {p.arg for p in params}
-    body = fn.body if isinstance(fn.body, list) else [fn.body]
-    declared = set()
-    for node in own_scope(body):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield "bind", mangle(node.name, cls)
+        if isinstance(node, (*FUNCTIONS, ast.ClassDef)):
+            stack += evaluated_around(node)
+            continue
+        if isinstance(node, TYPE_ALIASES):
+            yield "bind", mangle(node.name.id, cls)
+            continue
+        if isinstance(node, ast.comprehension):
+            stack += [node.iter, *node.ifs]  # not its target: that is the comprehension's own
+            continue
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            names.add(node.id)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
+            yield ("del" if isinstance(node.ctx, ast.Del) else "bind"), mangle(node.id, cls)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names |= {(x.asname or x.name).split(".")[0] for x in node.names}
-        elif isinstance(node, ast.Global):
-            declared |= set(node.names)
-    return names - declared
+            for x in node.names:
+                yield "bind", mangle((x.asname or x.name).split(".")[0], cls)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for n in node.names:
+                yield type(node).__name__.lower(), mangle(n, cls)
+        elif not isinstance(node, ast.alias):
+            for field in ("name", "rest"):  # except E as x, and the names a match pattern captures
+                if isinstance(getattr(node, field, None), str):
+                    yield "bind", mangle(getattr(node, field), cls)
+        stack += ast.iter_child_nodes(node)
 
 
-def module_reads(node, local=frozenset(), own=None, found=None):
-    """The module-level names `node` reads: a load of a name a function made local doesn't count,
-    nor `own`, a function's call to itself."""
-    found = set() if found is None else found
-    for child in ast.iter_child_nodes(node):
-        if isinstance(child, FUNCTION_NODES):
-            a = child.args
-            # decorators, defaults and annotations are read where the function is defined, its body
-            # in its own scope
-            params = [*a.posonlyargs, *a.args, *a.kwonlyargs, *filter(None, [a.vararg, a.kwarg])]
-            for outer in [*getattr(child, "decorator_list", []), *a.defaults, *filter(None, a.kw_defaults),
-                          *filter(None, [p.annotation for p in params] + [getattr(child, "returns", None)])]:
-                module_reads(ast.Expression(outer), local, own, found)
-            body = child.body if isinstance(child.body, list) else [child.body]
-            globals_ = {g for n in own_scope(body) if isinstance(n, ast.Global) for g in n.names}
-            inner = (local - globals_) | local_names(child)  # `global X` reads the module's X again
-            for b in child.body if isinstance(child.body, list) else [child.body]:
-                module_reads(ast.Module([b], []) if isinstance(b, ast.stmt) else ast.Expression(b), inner, own, found)
-        elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
-            if child.id not in local and child.id != own:
-                found.add(child.id)
-        else:
-            # X += 1 reads X, though its target is marked as a store
-            if isinstance(child, ast.AugAssign) and isinstance(child.target, ast.Name) and child.target.id not in local:
-                found.add(child.target.id)
-            module_reads(child, local, own, found)
-    return found
+def function_scope(body, params, cls):
+    """A function's scope (kind, locals, globals): its parameters and what its body binds, less
+    what it declares global or nonlocal, and the names it declares global."""
+    found = list(bindings(body, cls))
+    declared = {n for how, n in found if how in ("global", "nonlocal")}
+    names = {mangle(p, cls) for p in params} | {n for how, n in found if how in ("bind", "del")}
+    return "function", names - declared, {n for how, n in found if how == "global"}
+
+
+def always_binds(stmt, cls):
+    """The names a class-body statement binds whenever it runs: its targets, its def or class name,
+    or what it imports; not a walrus inside it, which may not run."""
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {mangle(stmt.name, cls)}
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return {mangle((x.asname or x.name).split(".")[0], cls) for x in stmt.names}
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target] \
+        if isinstance(stmt, ast.AugAssign) or isinstance(stmt, ast.AnnAssign) and stmt.value else []
+    return {mangle(n.id, cls) for t in targets for n in ast.walk(t)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+
+
+def reads_module(name, chain):
+    """Whether a load of `name` in the innermost scope of `chain` reads the module's `name`. A class
+    body's names are seen in that body and in the type-parameter scopes directly in it, not in its
+    methods or comprehensions. Code a class runs later, such as a type alias's value, may find the
+    class's name deleted by then and read the module's, so that counts as a module read too."""
+    visible, later = True, False
+    for kind, names, glob in reversed(chain):
+        if kind == "class" and not visible:
+            continue
+        if kind == "module" or name in glob:
+            return True
+        if name in names:
+            return kind == "class" and later
+        visible = visible and kind in ("annotation", "later")
+        later = later or kind == "later"
+    return True
+
+
+def module_reads(node, chain, found, cls=None):
+    """Add to `found` the module-level names that `node`, in the scopes `chain` and inside class
+    `cls`, reads or deletes."""
+    params, parts = type_params(node)
+    typed = chain + [("annotation", {mangle(t.name, cls) for t in params}, set())] if params else chain
+    later = typed + [("later", set(), set())]  # bounds, defaults and an alias's value run when first used
+    if isinstance(node, FUNCTIONS):
+        body = node.body if isinstance(node.body, list) else [node.body]
+        inner = typed + [function_scope(body, [x.arg for x in arguments(node)], cls)]
+        triples = [(x, chain, cls) for x in evaluated_around(node)] + [(x, later, cls) for x in parts] \
+            + [(x, typed, cls) for x in annotations(node)] + [(x, inner, cls) for x in body]
+    elif isinstance(node, ast.ClassDef):
+        triples = [(x, chain, cls) for x in node.decorator_list] + [(x, later, cls) for x in parts] \
+            + [(x, typed, cls) for x in [*node.bases, *node.keywords]]
+        # A class body reads its own name only once a statement has surely bound it. A name it binds,
+        # deletes or declares global anywhere is otherwise looked up in the module, skipping the
+        # functions around the class; one it declares nonlocal is theirs.
+        found_here = list(bindings(node.body, node.name))
+        unsure = {n for how, n in found_here if how != "bind"}
+        to_module = {n for how, n in found_here if how != "nonlocal"} - {n for how, n in found_here if how == "nonlocal"}
+        bound = set()
+        for stmt in node.body:
+            triples.append((stmt, typed + [("class", set(bound), to_module - bound)], node.name))
+            bound |= always_binds(stmt, node.name) - unsure
+    elif isinstance(node, TYPE_ALIASES):
+        triples = [(x, later, cls) for x in [*parts, node.value]]
+    elif isinstance(node, COMPREHENSIONS):
+        gens = node.generators
+        targets = {mangle(n.id, cls) for g in gens for n in ast.walk(g.target)
+                   if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}  # D[i] reads D and i
+        elts = [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+        inner = chain + [("comprehension", targets, set())]  # a walrus binds in the scope around it
+        # the first loop's source is read around the comprehension, the rest inside it
+        triples = [(gens[0].iter, chain, cls)] + [(x, inner, cls) for g in gens for x in [g.target, *g.ifs]] \
+            + [(g.iter, inner, cls) for g in gens[1:]] + [(x, inner, cls) for x in elts]
+    else:
+        # a del needs the name as much as a read; X += 1 reads X, though its target is a store
+        name = node if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Load, ast.Del)) else \
+            node.target if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) else None
+        if name is not None and reads_module(mangle(name.id, cls), chain):
+            found.add(mangle(name.id, cls))
+        triples = [(x, chain, cls) for x in ast.iter_child_nodes(node)]
+    for child, where, inside in triples:
+        module_reads(child, where, found, inside)
+
+
+def unused_names(source):
+    """(line, name) for each top-level function, class or constant in `source` that nothing else in
+    it reads. A top-level function or class that only refers to itself counts as unused, but its
+    decorators, defaults, bases and annotations run before it binds its name, so they read the one
+    before."""
+    tree = ast.parse(source)
+    defined = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined.setdefault(node.name, node.lineno)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, *TYPE_ALIASES)):
+            targets = node.targets if isinstance(node, ast.Assign) else [getattr(node, "target", None) or node.name]
+            for target in targets:
+                for n in ast.walk(target):  # A, B = 1, 2 defines both
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                        defined.setdefault(n.id, node.lineno)
+    module = [("module", set(), set())]
+    used = set()
+    for node in tree.body:
+        found = set()
+        module_reads(node, module, found)
+        if isinstance(node, (*FUNCTIONS, ast.ClassDef)):
+            params, _ = type_params(node)
+            typed = module + [("annotation", {t.name for t in params}, set())] if params else module
+            early = annotations(node) if isinstance(node, FUNCTIONS) else [*node.bases, *node.keywords]
+            before = set()
+            for x, where in [(x, module) for x in evaluated_around(node) if x not in early] + [(x, typed) for x in early]:
+                module_reads(x, where, before)
+            found = found - {node.name} | before
+        used |= found
+    return sorted((line, n) for n, line in defined.items()
+                  if n not in used and not (n.startswith("__") and n.endswith("__")))
 
 
 def check_unused(files):
     """A top-level function, class or constant that nothing else in its own file uses: dead, or
     kept only for the tests, which should then test what the code really calls. Code that reads a
-    name only through globals() or a string isn't seen. A read inside a class body or comprehension
-    counts as a module read even where a local of theirs hides the module's name, so such a name
-    can be missed; nothing in use is reported."""
+    name only through globals() or a string isn't seen."""
     bad = []
     for name in files:
         if not name.endswith(".py") or name.startswith("tests/"):
             continue
         try:
-            tree = ast.parse(read(name))
+            bad += [f"{name}:{line} {n}" for line, n in unused_names(read(name))]
         except SyntaxError:
             continue  # check_shadowing reports it
-        defined = {}
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                defined.setdefault(node.name, node.lineno)
-            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-                for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
-                    for n in ast.walk(target):  # A, B = 1, 2 defines both
-                        if isinstance(n, ast.Name):
-                            defined.setdefault(n.id, node.lineno)
-        used = set()
-        for node in tree.body:
-            module_reads(ast.Module([node], []), own=getattr(node, "name", None), found=used)
-        bad += [f"{name}:{line} {n}" for n, line in sorted(defined.items(), key=lambda x: x[1])
-                if n not in used and not (n.startswith("__") and n.endswith("__"))]
     report(not bad, "no top-level name left unused", "; ".join(bad))
 
 

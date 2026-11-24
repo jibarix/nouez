@@ -23,7 +23,7 @@ Never weaken a check, skip a test or add a retry to make a step pass.
    check and say in one line what you found.
 
 3. **Unit tests** (about 150 s; run in the background):
-   `python -m unittest tests.test_protocol`
+   `python -m unittest tests.test_protocol tests.test_verify`
 
 4. **Live checks:** nouez from this working copy, against the real Codex daemon:
    `python -I .claude/skills/verify/verify.py live`

@@ -50,4 +50,4 @@ jobs:
           fi
           python -I .claude/skills/verify/verify.py static --range "$BASE..HEAD"
       - name: Unit tests
-        run: python -m unittest tests.test_protocol
+        run: python -m unittest tests.test_protocol tests.test_verify
