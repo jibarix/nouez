@@ -104,7 +104,8 @@ _bridge_turns = set()  # turns this server started (read-only), which a later me
 _delivered = {}  # turn id -> the texts this server delivered to it (started or steered), for repeats
 _update_noted = set()  # latest Codex versions StartConsultant has already told about
 _nouez_latest = None  # the latest nouez release found this process, e.g. "0.9.0"
-_nouez_noted = False  # whether StartConsultant has told about it
+_nouez_noted = None  # the nouez release a notice has told about, so each newer one is told once
+_release_check = {"running": False, "started": None}  # the background lookup: one at a time
 _cancel_events = {}  # MCP request id -> Event set by notifications/cancelled
 _cancel_guard = threading.Lock()
 _client_caps = {}  # capabilities Claude Code advertised in initialize
@@ -1383,25 +1384,40 @@ def latest_release(now=None):
 
 def check_for_release():
     global _nouez_latest
-    if update_check_off():
-        return
     try:
-        latest = latest_release()
-    except Exception:  # an optional check: never let it surface anywhere
-        return
-    if latest:
+        if update_check_off():
+            return
+        try:
+            latest = latest_release()
+        except Exception:  # an optional check: never let it surface anywhere
+            return
+        if latest:
+            with _send_locks_guard:
+                _nouez_latest = latest
+    finally:
         with _send_locks_guard:
-            _nouez_latest = latest
+            _release_check["running"] = False
 
 
-def start_release_check():
+def start_release_check(again_after=None):
     """Look up the latest nouez release in the background, so no tool call waits for it. A
-    thread that can't start just means no check: the initialize answer is already sent."""
+    thread that can't start just means no check: the initialize answer is already sent. With
+    `again_after` (seconds), only if the last lookup started that long ago, for a server that runs
+    for days, as the dispatcher's do; latest_release's cache still decides whether GitHub is asked.
+    One lookup at a time."""
     if update_check_off():
         return
+    now = time.monotonic()
+    with _send_locks_guard:
+        last = _release_check["started"]
+        if _release_check["running"] or (again_after is not None and last is not None and now - last < again_after):
+            return
+        _release_check.update(running=True, started=now)
     try:
         threading.Thread(target=check_for_release, daemon=True).start()
     except Exception as e:
+        with _send_locks_guard:
+            _release_check["running"] = False
         log(f"release check not started: {e}")
 
 
@@ -1414,20 +1430,45 @@ def shell_literal(path):
     return f"'{path}'"
 
 
-def nouez_update_notice():
-    """A note for StartConsultant's result when a newer nouez is released, or "" (also once it
-    has been given in this server process)."""
-    global _nouez_noted
+def in_dispatcher(env=None):
+    """Whether this server runs in a session of the phone dispatcher (dispatcher_env marks them)."""
+    return (os.environ if env is None else env).get(DISPATCHER_MARK) == "1"
+
+
+def nouez_update_notice(pending=None):
+    """A note for StartConsultant's result, or in the dispatcher for its tools' results, when a
+    newer nouez is released, or "" (also once that release has been told about in this server
+    process). Counted as told only once the result is sent: with `pending` (dispatch's list of what
+    to keep after the response is written, by default the running tool call's), a cancelled or
+    failed call leaves it for the next. Two calls running at once may both carry it."""
     with _send_locks_guard:
         latest = _nouez_latest
-        if (not latest or _nouez_noted or not RELEASE_VERSION.fullmatch(latest)
+        if (not latest or latest == _nouez_noted or not RELEASE_VERSION.fullmatch(latest)
                 or version_key(latest) <= version_key(SERVER_VERSION)):
             return ""
-        _nouez_noted = True
+
+    def told():
+        global _nouez_noted
+        with _send_locks_guard:
+            _nouez_noted = latest
+    pending = getattr(_on_reply, "pending", None) if pending is None else pending
+    if pending is None:  # called directly, not through dispatch
+        told()
+    else:
+        pending.append(told)
     folder = os.path.dirname(os.path.abspath(__file__))
     page = RELEASE_PAGE.format(latest)
     shown = folder.replace("\\", "/") if os.name == "nt" else folder
     quoted = shell_literal(shown)
+    if in_dispatcher():
+        get = (f"`git -C {quoted} pull --ff-only`" if os.path.exists(os.path.join(folder, ".git")) and quoted
+               else f"a git pull in {json.dumps(shown)}" if os.path.exists(os.path.join(folder, ".git"))
+               else f"the download from {page} into {json.dumps(shown)}")
+        return (f"nouez {latest} is out; this dispatcher runs {SERVER_VERSION}. What changed: {page}. Tell the "
+                "user once, in a line, and go on with what they asked. Updating takes the computer, so don't "
+                f"run anything for it here: at the computer, {get}, then `server.py dispatcher install`, run "
+                "the way it was first installed (the same --folder and Claude Code profile), which starts the "
+                "dispatcher again and so ends the chats it has open: finish those first.")
     reconnect = ("ask the user to run /mcp and reconnect consultants, which loads the new "
                  "version; consultants keep their conversations.")
     if os.path.exists(os.path.join(folder, ".git")) and quoted:
@@ -1445,10 +1486,10 @@ def nouez_update_notice():
             + how)
 
 
-def safe_nouez_update_notice():
+def safe_nouez_update_notice(pending=None):
     """nouez_update_notice, but an optional note can never fail a consultation."""
     try:
-        return nouez_update_notice()
+        return nouez_update_notice(pending)
     except Exception as e:
         log(f"nouez update notice skipped: {e}")
         return ""
@@ -2013,8 +2054,9 @@ CLAUDE_SESSION_VARS = frozenset((
     "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "AI_AGENT", "CLAUDE_CODE_CHILD_SESSION",
     "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_SSE_PORT", "NOUEZ_DISPATCHER",
 ))
+DISPATCHER_MARK = "NOUEZ_DISPATCHER"  # set for the dispatcher's claude, never passed on to a session it opens
 
 
 def fresh_claude_env(env):
@@ -9163,15 +9205,17 @@ INSTRUCTIONS_HEAD = (
 )
 # What a clone gets with no CLAUDE.md or skill of the user's: consulting at the points where a
 # second opinion pays, without being asked. Left out when no consultant CLI is installed, or with
-# NOUEZ_NO_AUTO_CONSULT=1. All of the instructions with it, 3,566 characters, reached a new Claude Code
-# session whole (checked 2026-11-24); Claude Code's limit isn't documented, so keep them about that size.
+# NOUEZ_NO_AUTO_CONSULT=1. All of the instructions with it, 3,865 characters, reached a new Claude Code
+# session whole (checked 2026-11-25); Claude Code's limit isn't documented, so keep them about that size.
 AUTO_CONSULT = (
     "Unless the user's own instructions say otherwise, also consult without being asked: before "
     "committing a change to behavior, to several files or to anything risky (not typos, formatting "
     "or one-line fixes), ask for a review of what you will commit (revision=true when that is all "
     "your uncommitted work, else the staged diff in the message), and commit after its verdict; when a failure's cause isn't obvious after a first look, ask for a bug "
     "hunt; and before acting on a consequential plan, design, formula or rule of your own, ask for a critique: show the draft, say a critique is under way, and give its "
-    "verdict before building on it. Skip one, saying so, when ConsultantBudget (read it about once an "
+    "verdict before building on it; and hand a consultant research across sources, an audit or explanation "
+    "spanning many files, or a consequential claim a first check left uncertain, for a short answer. "
+    "Skip one, saying so, when ConsultantBudget (read it about once an "
     "hour) shows that subscription used up or running out before its reset. Keep writing code and "
     "single lookups in this session. "
 )
@@ -9694,6 +9738,12 @@ def dispatch(msg, cancel):
             _on_reply.pending = None
             with _cancel_guard:  # once the id is gone, no cancellation can arrive for it
                 _cancel_events.pop(msg_id, None)
+        if is_error:  # the result the call meant to send, with what it kept, isn't the one sent
+            pending.clear()
+        if not is_error and params.get("name") in DISPATCHER_TOOLS and in_dispatcher():
+            notice = safe_nouez_update_notice(pending)
+            text = f"{text}\n\n{notice}" if notice else text
+            start_release_check(again_after=3600)  # the dispatcher's server runs for days
         if not cancel.is_set():
             respond(msg_id, {"content": [{"type": "text", "text": text}], "isError": is_error})
             for keep in pending:  # only once the response is written: a failed write raises first
@@ -9815,6 +9865,9 @@ DISPATCHER_SIGN_IN_TRIES = 12       # looks at nouez's sign-in start, 5 s apart,
 NOUEZ_HEAD = b'"""nouez: MCP server'  # how nouez's server.py starts: a sign-in start running another server.py isn't nouez's
 DISPATCHER_TOOLS = ("OpenClaudeSession", "ListClaudeSessions", "ListProjects", "CloseClaudeSession",
                     "ListConsultants", "ConsultantBudget", "OpenStatusScreen", "ArrangeWindows")
+# Tools added to DISPATCHER_TOOLS since 0.23.0, and the version each came in: the supervisor adds
+# their rules to a folder set up before (add_missing_dispatcher_rules).
+DISPATCHER_TOOLS_ADDED = {"ListConsultants": "0.24.0"}
 LAUNCHCTL = "/bin/launchctl"
 TERMINAL_CODES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]")
 # The status line claude remote-control redraws: `·✔︎· Connected · dispatcher`, `·|· Reconnecting · dispatcher`.
@@ -9934,7 +9987,8 @@ def account_home():
 
 def dispatcher_file(name):
     """One of the dispatcher's files in dispatcher_dir(): dispatcher.lock, dispatcher.json,
-    dispatcher.stop, dispatcher-install.lock, dispatcher.log, dispatcher-claude.log or, on Linux,
+    dispatcher.stop, dispatcher-install.lock, dispatcher.log, dispatcher-claude.log,
+    dispatcher-rules.json (dispatcher_rules_record), dispatcher-rules.lock or, on Linux,
     dispatcher-autostart (autostart_path) and dispatcher-path (use_saved_path). OSError if that
     folder can't be used."""
     return os.path.join(dispatcher_dir(), name)
@@ -10016,6 +10070,7 @@ def dispatcher_env(exe, config_dir=None, environ=None):
     env = fresh_claude_env(os.environ if environ is None else environ)
     key = next((k for k in env if k.upper() == "PATH"), "PATH")
     env[key] = path_with(os.path.dirname(exe), env.get(key, ""))
+    env[DISPATCHER_MARK] = "1"  # its sessions' nouez gives update notices there (in_dispatcher)
     if config_dir:
         env["CLAUDE_CONFIG_DIR"] = config_dir
     return env
@@ -10481,7 +10536,11 @@ def run_dispatcher_once(folder, stop, state, popen=subprocess.Popen, config_dir=
     if not os.path.isdir(folder):
         dispatcher_log(f"the dispatcher folder {folder} doesn't exist; run `server.py dispatcher setup`")
         return None
-    kwargs = {"cwd": folder, "env": dispatcher_env(exe, config_dir), "stdin": subprocess.DEVNULL,
+    try:
+        add_missing_dispatcher_rules(folder, dispatcher_log)
+    except Exception as e:  # an optional step: claude starts either way
+        dispatcher_log(f"couldn't check the dispatcher's allow rules: {e}")
+    kwargs ={"cwd": folder, "env": dispatcher_env(exe, config_dir), "stdin": subprocess.DEVNULL,
               "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | 0x00000004  # CREATE_SUSPENDED
@@ -11014,6 +11073,143 @@ def write_settings(settings, data, raw, out):
             settings.remove(tmp)
 
 
+def dispatcher_rules_record():
+    """Where nouez notes, per dispatcher folder, the allow rules for tools added by an update
+    (DISPATCHER_TOOLS_ADDED) that the folder has had: granted by `setup` or the supervisor, or seen
+    there. Each is added by the supervisor at most once, so one the user removes stays removed."""
+    return dispatcher_file("dispatcher-rules.json")
+
+
+def dispatcher_rules_lock():
+    """Held while `setup` or the supervisor reads and rewrites dispatcher_rules_record(), so
+    neither writes back notes the other has just changed."""
+    return FileLock(dispatcher_file("dispatcher-rules.lock"), 30,
+                    "another nouez is noting the dispatcher's allow rules; try again when it has ended")
+
+
+def folder_identity(folder):
+    """A key for `folder` that names the folder itself, not how its path is spelled: its device and
+    file number, or its normalized path where the system gives no file number."""
+    st = os.stat(folder)
+    if st.st_ino:
+        return f"{st.st_dev}-{st.st_ino}"
+    return os.path.normcase(os.path.abspath(folder))
+
+
+def read_rules_record():
+    """dispatcher_rules_record()'s notes, {} if there are none yet, or None if it can't be read
+    (not a regular file, not JSON, not an object), which counts as not known, never as empty."""
+    path = dispatcher_rules_record()
+    try:
+        raw = read_regular_file(path, limit=256 * 1024)
+    except OSError:
+        return None
+    if raw is None:
+        return {}
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(record, dict) or not all(isinstance(v, list) for v in record.values()):
+        return None
+    return record
+
+
+def note_dispatcher_rules(folder, rules, out):
+    """Note that `folder` has had `rules` (see dispatcher_rules_record). True if noted."""
+    try:
+        with dispatcher_rules_lock():
+            return note_dispatcher_rules_locked(folder, rules, out)
+    except (BridgeError, OSError) as e:
+        out(f"couldn't note the dispatcher's allow rules: {e}")
+        return False
+
+
+def note_dispatcher_rules_locked(folder, rules, out):
+    record = read_rules_record()
+    if record is None:
+        out(f"couldn't read {dispatcher_where('dispatcher-rules.json')}, so rules added by an update "
+            "aren't noted there")
+        return False
+    try:
+        key = folder_identity(folder)
+    except OSError:
+        return False
+    done = record.get(key, [])
+    if all(r in done for r in rules):
+        return True
+    record[key] = done + [r for r in rules if r not in done]
+    return write_json_atomic(dispatcher_rules_record(), record)
+
+
+def add_missing_dispatcher_rules(folder, out):
+    """Before the supervisor starts claude: add the allow rules for session tools an update brought
+    (DISPATCHER_TOOLS_ADDED) to the dispatcher folder's .claude/settings.json, so they work from the
+    phone without `setup` run again. Only while that file still has every rule an earlier nouez
+    gave it, so a folder whose rules the user changed is left to `setup`, and each rule once per
+    folder: the note that it was added is saved first, and nothing is added while the notes can't
+    be read. As `setup` does it: backed up first, nothing else changed, left alone if it isn't
+    plain JSON or changed meanwhile. The rules added."""
+    if not plain_folder(folder) or linked_part(folder, os.path.join(".claude", "settings.json")):
+        return []
+    try:
+        with dispatcher_rules_lock():
+            return add_missing_dispatcher_rules_locked(folder, out)
+    except (BridgeError, OSError) as e:
+        out(f"couldn't check the dispatcher's allow rules: {e}")
+        return []
+
+
+def add_missing_dispatcher_rules_locked(folder, out):
+    record = read_rules_record()
+    if record is None:
+        out(f"couldn't read {dispatcher_where('dispatcher-rules.json')}; no allow rules are added "
+            "until it can be (delete it to start again)")
+        return []
+    try:
+        key = folder_identity(folder)
+        settings = SettingsFolder(folder)
+    except OSError:
+        return []
+    done = record.get(key, [])
+    try:
+        if not settings.exists:
+            return []
+        try:
+            data, raw = read_settings_for_edit(settings)
+        except (OSError, ValueError) as e:
+            out(f"couldn't check the dispatcher's allow rules: {e}")
+            return []
+        allow = (data.get("permissions") or {}).get("allow") or []
+        earlier = [f"mcp__consultants__{t}" for t in DISPATCHER_TOOLS if t not in DISPATCHER_TOOLS_ADDED]
+        new = [f"mcp__consultants__{t}" for t in DISPATCHER_TOOLS_ADDED if f"mcp__consultants__{t}" not in done]
+        seen = [r for r in new if r in allow]  # granted already, by `setup` or the user: never again
+        missing = [r for r in new if r not in allow]
+        if raw is None or any(r not in allow for r in earlier):
+            missing = []
+        if not seen and not missing:
+            return []
+        record[key] = done + seen + missing
+        if not write_json_atomic(dispatcher_rules_record(), record):
+            out(f"couldn't save {dispatcher_where('dispatcher-rules.json')}, so no allow rules were added")
+            return []
+        if not missing:
+            return []
+        data.setdefault("permissions", {})["allow"] = allow + missing
+        try:
+            write_settings(settings, data, raw, out)
+        except OSError as e:
+            # The note stays: undoing it could race a `setup` that granted the rule meanwhile and
+            # saw the note, and then a rule the user removes could come back. `setup` adds it.
+            out(f"couldn't add the dispatcher's new allow rules ({', '.join(missing)}): {e}; "
+                "run `dispatcher setup` to add them")
+            return []
+    finally:
+        settings.close()
+    out(f"added allow rules for tools this nouez's dispatcher has: {', '.join(missing)}")
+    return missing
+
+
 def dispatcher_setup(folder, dry_run=False, out=print):
     """`server.py dispatcher setup`: make the dispatcher folder, its CLAUDE.md (only if it has none)
     and the allow rules for nouez's session tools in its .claude/settings.json (only those, the
@@ -11081,6 +11277,10 @@ def dispatcher_setup(folder, dry_run=False, out=print):
                     return 1
     finally:
         settings.close()
+    if not dry_run:  # the folder has these now, so the supervisor never adds one the user takes out
+        added = [f"mcp__consultants__{t}" for t in DISPATCHER_TOOLS_ADDED]
+        if not note_dispatcher_rules(folder, [r for r in added if r in allow + missing], out):
+            out(f"couldn't note this in {dispatcher_where('dispatcher-rules.json')}")
     registered = consultants_registered(folder)
     if registered is False:
         out("Claude Code doesn't run nouez as `consultants` there, so the dispatcher has none of its tools: "
@@ -12001,7 +12201,8 @@ def dispatcher_cache_problems():
     of one of their names isn't a plain file, or, on Linux, dispatcher-path isn't one `install`
     saved (saved_path)."""
     names = ("dispatcher.stop", "dispatcher.json", "dispatcher.lock", "dispatcher-install.lock", "dispatcher.log",
-             "dispatcher.log.1", "dispatcher-claude.log", "dispatcher-claude.log.1")
+             "dispatcher.log.1", "dispatcher-claude.log", "dispatcher-claude.log.1", "dispatcher-rules.json",
+             "dispatcher-rules.lock")
     problems = []
     try:
         for name in names:

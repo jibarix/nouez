@@ -836,8 +836,12 @@ User-Agent: nouez/0.12.4
 200 {"tag_name": "v0.13.0", ...}             (drafts and pre-releases are never "latest")
 \end{plain}
 nouez keeps the version only if the tag reads \code{v}$n.n.n$; anything else, and any failure
-(offline, a proxy, a rate limit), means no notice. The notice appears once per server process,
-only for a version newer than the running one. The command it gives uses the folder
+(offline, a proxy, a rate limit), means no notice. The notice appears once per release in each
+server process, only for a version newer than the running one. In the phone dispatcher, whose
+supervisor marks its \code{claude} with \code{NOUEZ\_DISPATCHER=1} (a session it opens doesn't get
+the mark), the dispatcher's own tools carry the notice instead, each call there may look again an
+hour after the last lookup, and the notice tells Claude to run nothing: the update takes the
+computer, then \code{dispatcher install} again. The command it gives uses the folder
 \code{server.py} runs from, in single quotes, which PowerShell and POSIX shells read literally,
 so a folder name like \code{\$(...)} can't run anything. A folder whose name has a \code{'} or a
 control character gets no command: Claude is told to ask the user to run the pull. If the folder
@@ -1366,7 +1370,7 @@ Claude Code (from the status line, saved 2 min ago):
 Model scores: Artificial Analysis Intelligence Index v4, fetched 2d 3h ago. Source: Artificial Analysis (https://artificialanalysis.ai); credit it when you show these.
   ...
 
-Usage counts against the user's subscriptions. Choose by the user's own routing rules (their CLAUDE.md or consult skill); without rules, show this and let the user decide.
+Usage counts against the user's subscriptions. Choose by the user's own routing rules (their CLAUDE.md or consult skill); without rules, keep each consultant's current model and effort, and show this when the user asks which to use.
 \end{plain}
 
 \subsection{Usage log and status screen}

@@ -602,9 +602,95 @@ class NouezUpdateTest(unittest.TestCase):
 
     def notice(self, latest, current="0.9.0"):
         with mock.patch.object(server, "_nouez_latest", latest), \
-             mock.patch.object(server, "_nouez_noted", False), \
+             mock.patch.object(server, "_nouez_noted", None), \
              mock.patch.object(server, "SERVER_VERSION", current):
             return server.nouez_update_notice(), server.nouez_update_notice()
+
+    def test_each_newer_release_is_told_once(self):
+        """0.24.0: a server that runs for days tells about a later release too, not only the first."""
+        with mock.patch.object(server, "_nouez_latest", "0.10.0"), \
+             mock.patch.object(server, "_nouez_noted", None), \
+             mock.patch.object(server, "SERVER_VERSION", "0.9.0"):
+            self.assertIn("nouez 0.10.0 is out", server.nouez_update_notice())
+            self.assertEqual(server.nouez_update_notice(), "")
+            server._nouez_latest = "0.11.0"
+            self.assertIn("nouez 0.11.0 is out", server.nouez_update_notice())
+            self.assertEqual(server.nouez_update_notice(), "")
+
+    def test_the_dispatcher_says_how_to_update_at_the_computer(self):
+        """0.24.0: in the phone dispatcher the notice says the update takes the computer and a new
+        `dispatcher install`, which ends its chats; nothing is run from the phone. The mark is
+        set only for the dispatcher's claude, never for a session it opens."""
+        with mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER": "1"}):
+            first, second = self.notice("0.10.0")
+        self.assertIn("this dispatcher runs 0.9.0", first)
+        self.assertIn("dispatcher install", first)
+        self.assertIn("don't run anything for it here", first)
+        self.assertNotIn("/mcp", first)
+        self.assertEqual(second, "")
+        env = server.dispatcher_env(sys.executable, None, {"PATH": "", "NOUEZ_DISPATCHER": "0"})
+        self.assertTrue(server.in_dispatcher(env))
+        self.assertNotIn("NOUEZ_DISPATCHER", server.fresh_claude_env(env))
+        self.assertFalse(server.in_dispatcher({}))
+
+    def test_the_dispatchers_tools_carry_the_notice(self):
+        """0.24.0: in the dispatcher, its tools' results carry the notice, and each call may look for
+        a release again (an hour apart at most); elsewhere, and for other tools, nothing changes."""
+        sent, calls = [], []
+        tools = {"ListProjects": lambda args, cancel, progress: "listed",
+                 "GetConsultantReply": lambda args, cancel, progress: "reply"}
+
+        def call(name):
+            server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": name, "arguments": {}}}, threading.Event())
+            return sent.pop()["content"][0]["text"]
+
+        with mock.patch.dict(server.HANDLERS, tools), \
+             mock.patch.object(server, "respond", lambda msg_id, result=None, error=None: sent.append(result)), \
+             mock.patch.object(server, "start_release_check", lambda again_after=None: calls.append(again_after)), \
+             mock.patch.object(server, "_nouez_latest", "0.10.0"), \
+             mock.patch.object(server, "_nouez_noted", None), \
+             mock.patch.object(server, "SERVER_VERSION", "0.9.0"):
+            with mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER": ""}):
+                self.assertEqual(call("ListProjects"), "listed")
+            with mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER": "1"}):
+                self.assertEqual(call("GetConsultantReply"), "reply")
+                self.assertEqual(calls, [])
+                text = call("ListProjects")
+                self.assertTrue(text.startswith("listed\n\nnouez 0.10.0 is out"), text)
+                self.assertEqual(call("ListProjects"), "listed")
+                self.assertEqual(calls, [3600, 3600])
+                server._nouez_latest = "0.11.0"  # a call cancelled meanwhile leaves the notice for the next
+                cancelled = threading.Event()
+                server.HANDLERS["ListProjects"] = lambda args, cancel, progress: cancelled.set() or "listed"
+                server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                               "params": {"name": "ListProjects", "arguments": {}}}, cancelled)
+                self.assertEqual(sent, [])
+
+                def fails(args, cancel, progress):  # as a StartConsultant that read the notice, then failed
+                    server.safe_nouez_update_notice()
+                    raise server.BridgeError("no daemon")
+                server.HANDLERS["GetConsultantReply"] = fails
+                self.assertEqual(call("GetConsultantReply"), "no daemon")
+                server.HANDLERS["ListProjects"] = lambda args, cancel, progress: "listed"
+                self.assertIn("nouez 0.11.0 is out", call("ListProjects"))
+
+    def test_a_long_running_server_looks_again_hourly(self):
+        clock = [1000.0]
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_UPDATE_CHECK": ""}), \
+             mock.patch.object(server, "_release_check", {"running": False, "started": None}), \
+             mock.patch.object(server.time, "monotonic", lambda: clock[0]), \
+             mock.patch.object(server.threading, "Thread") as thread:
+            server.start_release_check()
+            server.start_release_check(again_after=3600)  # one already running
+            self.assertEqual(thread.call_count, 1)
+            server._release_check["running"] = False
+            clock[0] += 100
+            server.start_release_check(again_after=3600)
+            self.assertEqual(thread.call_count, 1)
+            clock[0] += 3600
+            server.start_release_check(again_after=3600)
+            self.assertEqual(thread.call_count, 2)
 
     def test_newer_release_told_once(self):
         first, second = self.notice("0.10.0")
@@ -7584,6 +7670,79 @@ class DispatcherTest(unittest.TestCase):
             narrow = server.top_bar(scr, groups, 7, time.time(), 40)
             self.assertIn("● sign-in Dec 5, 11d", narrow)
             self.assertLessEqual(server.visible(narrow), 40)
+
+    def test_the_supervisor_adds_rules_an_update_brought(self):
+        """0.24.0: a folder with every rule an earlier nouez gave gets the rules for tools added
+        since, before claude starts, backed up first, and each only once, so one the user removes
+        stays removed. A folder whose rules the user changed, or that setup never gave them, is
+        left alone."""
+        out = []
+        add = lambda: server.add_missing_dispatcher_rules(self.folder, out.append)
+        self.assertEqual(add(), [])  # no folder yet
+        os.makedirs(os.path.join(self.folder, ".claude"))
+        settings = os.path.join(self.folder, ".claude", "settings.json")
+
+        def write(rules):
+            with open(settings, "w", encoding="utf-8") as f:
+                json.dump({"permissions": {"allow": ["Bash(git status)"] + rules}, "theme": "dark"}, f)
+
+        def allowed():
+            with open(settings, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data["theme"], "dark")
+            return data["permissions"]["allow"]
+
+        self.assertEqual(add(), [])  # no file
+        write([])
+        self.assertEqual(add(), [])  # never set up
+        new = "mcp__consultants__ListConsultants"
+        earlier = [r for r in server.dispatcher_rules() if r != new]
+        write(earlier[1:])
+        self.assertEqual(add(), [])  # the user took one out: left to setup
+        write(earlier)
+        self.assertEqual(add(), [new])
+        self.assertEqual(allowed(), ["Bash(git status)"] + earlier + [new])
+        backups = [n for n in os.listdir(os.path.dirname(settings)) if n.endswith(".bak")]
+        self.assertEqual(len(backups), 1, backups)
+        self.assertEqual(add(), [])  # nothing more to add
+        write(earlier)  # the user removes it again
+        self.assertEqual(add(), [])
+        self.assertEqual(allowed(), ["Bash(git status)"] + earlier)
+        key = server.folder_identity(self.folder)
+        self.assertEqual(json.loads(self.read("dispatcher-rules.json")), {key: [new]})
+        record = os.path.join(self.cache, "dispatcher-rules.json")
+        with open(record, "w", encoding="utf-8") as f:
+            f.write("{not json")  # notes it can't read: nothing is added, never "no notes"
+        self.assertEqual(add(), [])
+        self.assertEqual(allowed(), ["Bash(git status)"] + earlier)
+        self.assertTrue(any("delete it to start again" in line for line in out), out)
+        os.remove(record)
+        write(earlier + [new])  # granted by setup or the user: noted, so never added back
+        self.assertEqual(add(), [])
+        self.assertEqual(json.loads(self.read("dispatcher-rules.json")), {key: [new]})
+        write(earlier)
+        self.assertEqual(add(), [])
+        os.remove(record)
+        with open(settings, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertEqual(add(), [])
+        self.assertTrue(any("isn't valid JSON" in line for line in out), out)
+
+    def test_setup_notes_the_rules_it_grants(self):
+        """A rule `setup` grants counts as added, so the supervisor never puts it back once the user
+        takes it out."""
+        code, out = self.setup()
+        self.assertEqual(code, 0, out)
+        new = "mcp__consultants__ListConsultants"
+        self.assertEqual(json.loads(self.read("dispatcher-rules.json")),
+                         {server.folder_identity(self.folder): [new]})
+        settings = os.path.join(self.folder, ".claude", "settings.json")
+        with open(settings, encoding="utf-8") as f:
+            data = json.load(f)
+        data["permissions"]["allow"].remove(new)
+        with open(settings, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        self.assertEqual(server.add_missing_dispatcher_rules(self.folder, lambda line: None), [])
 
     # --- setup ---
 

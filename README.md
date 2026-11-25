@@ -172,7 +172,7 @@ In any Claude Code session with nouez, from the phone or at the computer, ask fo
 
 Claude starts a background consultant in the project (Codex if it is installed, otherwise Antigravity), or reuses the one already working there, sends it the question and gets the answer back as a tool result, without a second terminal to copy text into. A consultant Claude starts is always read-only: it never edits your files.
 
-Claude also consults without being asked, while the subscription has room: a review before it commits a change to behavior, several files or anything risky, a bug hunt when a failure's cause isn't obvious, and a critique of a plan or design of its own before it builds on it. Your own `CLAUDE.md` can change that, and `NOUEZ_NO_AUTO_CONSULT=1` turns it off. [Consultants](docs/consultants.md) covers reusing one, your own Codex session, choosing a model and effort, briefs and verdicts, and Antigravity.
+Claude also consults without being asked, while the subscription has room: a review before it commits a change to behavior, several files or anything risky, a bug hunt when a failure's cause isn't obvious, a critique of a plan or design of its own before it builds on it, and research across sources, audits spanning many files, and checks of consequential claims. Your own `CLAUDE.md` can change that, and `NOUEZ_NO_AUTO_CONSULT=1` turns it off. [Consultants](docs/consultants.md) covers reusing one, your own Codex session, choosing a model and effort, briefs and verdicts, and Antigravity.
 
 ## Documentation
 
