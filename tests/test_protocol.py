@@ -4128,13 +4128,19 @@ class AgyTest(unittest.TestCase):
         self.assertEqual(last["status"], "interrupted")
 
         # The log: sends with provider and model, a reply with tokens. Never the message text.
-        time.sleep(0.2)  # the send's usage snapshot is written from a thread
-        events = self.events()
-        sends = [e for e in events if e["event"] == "send"]
+        # A send's usage snapshot is written from a thread, so wait for both. Only this consultant's
+        # count: a thread left from an earlier test can write late into this test's log.
+        deadline = time.monotonic() + 10
+        while True:
+            events = self.events()
+            sends = [e for e in events if e["event"] == "send" and e["thread"] == cid]
+            if len(sends) >= 2 or time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
         self.assertEqual([(e["provider"], e["model"], e["effort"]) for e in sends],
                          [("antigravity", "gemini-4-neon-high", "high"), ("antigravity", "gemini-4-neon-low", "low")])
         self.assertEqual(sends[1]["changed"], ["effort"])  # 0.16.0: high to low is the level, not the model
-        reply = [e for e in events if e["event"] == "reply"][0]
+        reply = [e for e in events if e["event"] == "reply" and e["thread"] == cid][0]
         self.assertEqual((reply["provider"], reply["tokens"]["output_tokens"], reply["ms"]), ("antigravity", 120, 7500))
         with open(self.log, encoding="utf-8") as f:
             self.assertNotIn("Which fruit", f.read())
