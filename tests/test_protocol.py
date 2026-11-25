@@ -4457,6 +4457,60 @@ class SuggestTest(unittest.TestCase):
                                         self.NOW)
         self.assertEqual(got["provider"], "codex")
 
+    def test_usage_that_would_go_unused_goes_first(self):
+        """0.25.0: a week under 60% at a reset within three days takes research and quick checks
+        even when the first choice has room; Antigravity's two quota groups count apart."""
+        codex = self.codex()  # about 35% at a reset five days away: room, nothing to spend
+        sonnet = [f"gemini-4-neon-{lv}" for lv in ("low", "high", "xhigh")] + ["claude-opus-5-5-high",
+                                                                                "claude-sonnet-5-5-low"]
+        # Gemini at 50% with two days left (about 70%), the Claude and GPT group idle
+        agy = self.agy(gemini=50, claude=0, days_left=2, models=sonnet)
+        got = server.suggest_consultant("research", {"codex": codex, "antigravity": agy}, self.NOW)
+        self.assertEqual((got["provider"], got["model"], got["effort"]), ("antigravity", "claude-opus-5-5", "high"))
+        self.assertIn("Codex is on pace for about 35% of its week", got["why"])
+        self.assertIn("Antigravity's Claude and GPT models resets within 3 days at about 0% of its week, "
+                      "so the rest would go unused", got["why"])
+        self.assertTrue(any("switches to this model" in n for n in got["notes"]), got["notes"])
+        self.assertEqual(self.pick("quick-check", codex=codex, antigravity=agy),
+                         ("antigravity", "claude-sonnet-5-5", "low"))
+        # never reviews, bug hunts, plan critiques or fact checks: they keep their first choice
+        for kind, first in (("review", "codex"), ("bug-hunt", "codex"), ("re-check", "codex"),
+                            ("fact-check", "codex"), ("plan-critique", "antigravity")):
+            got = server.suggest_consultant(kind, {"codex": codex, "antigravity": agy}, self.NOW)
+            self.assertEqual(got["provider"], first, kind)
+            self.assertNotEqual(got["model"], "claude-opus-5-5", kind)
+        # four days to the reset: not yet
+        later = self.agy(gemini=50, claude=0, days_left=4, models=sonnet)
+        self.assertEqual(self.pick("research", codex=codex, antigravity=later), ("codex", "gpt-6.2-astra", "xhigh"))
+        # both would go unused: the one that resets first
+        soon = self.codex(used=10, days_left=1)
+        self.assertEqual(self.pick("research", codex=soon, antigravity=agy), ("codex", "gpt-6.2-astra", "xhigh"))
+        # Gemini tight, the other group calm: Antigravity's research moves to it, not one level down
+        tight = self.agy(gemini=80, claude=0, days_left=1)
+        got = server.suggest_consultant("research", {"antigravity": tight}, self.NOW)
+        self.assertEqual((got["model"], got["effort"]), ("claude-opus-5-5", "high"))
+        self.assertIn("Antigravity's Gemini Models is on pace for about 93% of its week", got["why"])
+        # "ask Gemini" never moves to the Claude group
+        got = server.suggest_consultant("research", {"antigravity": agy}, self.NOW, only="antigravity")
+        self.assertEqual(got["model"], "gemini-4-neon")
+        # a tie in reset time keeps the first choice
+        both_spare = {"codex": self.codex(used=10, days_left=2), "antigravity": self.agy(gemini=10, days_left=2)}
+        self.assertEqual(self.pick("research", **both_spare), ("codex", "gpt-6.2-astra", "xhigh"))
+        # unknown usage is said as such, not as room
+        unknown = {"codex": {"windows": [], "models": None}, "antigravity": agy}
+        got = server.suggest_consultant("research", unknown, self.NOW)
+        self.assertEqual(got["model"], "claude-opus-5-5")
+        self.assertIn("Codex: usage not known", got["why"])
+        # work that checks Claude's own never goes to a Claude model, not even through the default
+        # model of an Antigravity that lists only Opus, with Codex tight or absent
+        opus_only = self.agy(claude=0, days_left=2, models=["claude-opus-5-5-high"])
+        for kind in server.INDEPENDENT_KINDS:
+            for st in ({"codex": self.codex(used=80, days_left=1), "antigravity": opus_only},
+                       {"antigravity": opus_only}):
+                got = server.suggest_consultant(kind, st, self.NOW)
+                self.assertNotEqual(got.get("model"), "claude-opus-5-5", (kind, st.keys()))
+        self.assertIn("shares the author's blind spots", self.pick("review", antigravity=opus_only))
+
     def test_models_not_listed(self):
         # a newer version of the family is used; a missing family falls back to the default model
         newer = self.codex(models=["gpt-6.3-sol", "gpt-6.3-astra", "gpt-6.10-astra"])
@@ -4487,7 +4541,7 @@ class SuggestTest(unittest.TestCase):
 
     def test_unknown_usage_and_claude(self):
         got = server.suggest_consultant("review", {"codex": {"windows": [], "models": None}}, self.NOW)
-        self.assertIn("Codex's usage isn't known", got["why"])
+        self.assertIn("Codex: usage not known", got["why"])
         o = server.claude_outlook
         self.assertIn("isn't known", o({}, self.NOW))
         self.assertIn("Hand read-only work", o({"windows": [(7 * self.DAY, 60, self.NOW + 2 * self.DAY, self.NOW)]},

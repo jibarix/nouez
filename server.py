@@ -67,7 +67,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.24.0"
+SERVER_VERSION = "0.25.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -5837,7 +5837,9 @@ def aa_lines(cache, note, now):
 
 CONSULT_PICKS = {
     "quick-check": (("codex", "gpt-6.2-sol", "low", "a fast model is enough for a quick check"),
-                    ("antigravity", "gemini-4-neon", "low", "a low level is enough for a quick check")),
+                    ("antigravity", "gemini-4-neon", "low", "a low level is enough for a quick check"),
+                    ("antigravity", "claude-sonnet-5-5", "low",
+                     "a fast model, on Google's quota, not Claude Code's")),
     "re-check": (("codex", "gpt-6.2-sol", "medium", "checking named fixes needs less than a first review"),
                  ("antigravity", "gemini-4-neon", "medium", "checking named fixes needs less than a first review")),
     "review": (("codex", "gpt-6.2-astra", "high", "the strongest Codex model; it runs git and the tests itself"),
@@ -5874,6 +5876,15 @@ SECOND_OPINION = ("When you and the consultant disagree on a finding, ask the ot
                   "not the finding, which it sees only after its own verdict. A decision costly to undo "
                   "(a release, a migration, deleting data, a security setting) goes to both at once.")
 EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+# Usage that would go unused: a week under 60% at its reset, with the reset this close.
+SPARE_DAYS = 3
+# The kinds a week that would go unused takes first even when the first choice has room: kinds where
+# every option is good enough. Not reviews, bug hunts or plan critiques: a Claude model on
+# Antigravity shares the author's blind spots, and the first choices there are much stronger.
+SPEND_FIRST_KINDS = ("research", "quick-check")
+# The kinds that check Claude's own work: never a Claude model, which shares the author's blind spots,
+# even through the default model or a quota that is tight.
+INDEPENDENT_KINDS = ("review", "re-check", "bug-hunt", "plan-critique")
 PROVIDER_TITLES = {"codex": "Codex", "antigravity": "Antigravity"}
 
 
@@ -5881,7 +5892,7 @@ def usage_outlook(windows, now):
     """Where a subscription stands for one more consultation, from its (length, used, resets_at
     [, read at]) windows: ("blocked", why) when one is used up or runs out before its reset at
     this rate; otherwise by where the weekly window's pace lands at its reset: ("tight", %) past
-    90, ("busy", %) past 70, ("spare", %) under 60 with the reset within two days (usage that
+    90, ("busy", %) past 70, ("spare", %) under 60 with the reset within SPARE_DAYS (usage that
     would go unused), ("ok", % or None); ("unknown", None) with no reading. A reading too old to
     project from counts only as the least the week will reach: never "spare", and "ok" with None."""
     week, seen = None, False
@@ -5910,7 +5921,7 @@ def usage_outlook(windows, now):
         return ("busy", pct)
     if not projected:
         return ("ok", None)
-    if pct < 60 and resets - now < 2 * 86400:
+    if pct < 60 and resets - now < SPARE_DAYS * 86400:
         return ("spare", pct)
     return ("ok", pct)
 
@@ -6007,6 +6018,16 @@ def agy_group_of(model):
     return "Gemini 4 Argon" if model and "argon" in model else "Gemini Models"
 
 
+def quota_title(provider, model):
+    """The usage a pick spends, by name: Codex, or the Antigravity quota group of its model."""
+    return "Codex" if provider == "codex" else f"Antigravity's {agy_group_of(model)}"
+
+
+def week_resets(windows):
+    """When the weekly window among `windows` resets, or None."""
+    return next((number(w[2]) for w in windows or () if w[0] and w[0] >= 7 * 86400 and number(w[2])), None)
+
+
 def provider_windows(provider, model, st):
     if provider == "codex":
         return st.get("windows")
@@ -6037,30 +6058,49 @@ def suggest_consultant(kind, state, now, only=None):
         if only == "antigravity" == provider and not (got[0] or "").startswith("gemini-"):
             blocked.append("Antigravity lists no Gemini model")  # "ask Gemini": never a Claude or GPT one
             continue
-        outlook = usage_outlook(provider_windows(provider, got[0], st), now)
+        if kind in INDEPENDENT_KINDS and (got[0] or "").startswith("claude-"):
+            blocked.append(f"{PROVIDER_TITLES[provider]} {got[0]}: a Claude model shares the author's blind spots")
+            continue
+        windows = provider_windows(provider, got[0], st)
+        outlook = usage_outlook(windows, now)
         if outlook[0] == "blocked":
             blocked.append(f"{PROVIDER_TITLES[provider]} {got[0] or 'default model'}: {outlook[1]}")
             continue
-        options.append({"provider": provider, "model": got[0], "effort": got[1], "why": [why],
-                        "notes": [got[2]] if got[2] else [], "outlook": outlook})
+        notes = [got[2]] if got[2] else []
+        if provider == "antigravity" and (got[0] or "").startswith(("claude-", "gpt-")):
+            notes.append("A reused Antigravity consultant switches to this model for the message and keeps "
+                         "its conversation.")
+        options.append({"provider": provider, "model": got[0], "effort": got[1], "why": [why], "notes": notes,
+                        "outlook": outlook, "title": quota_title(provider, got[0]), "resets": week_resets(windows)})
     if not options:
         return {"none": "; ".join(blocked) if blocked else "no consultant CLI is installed"}
     best = options[0]
-    others = [o for o in options if o["provider"] != best["provider"]]
+    # Options trade by the usage they spend: Codex, and each of Antigravity's quota groups.
+    others = [o for o in options if o["title"] != best["title"]]
     calm = [o for o in others if o["outlook"][0] in ("ok", "spare")]
     spare = [o for o in others if o["outlook"][0] == "spare"]
-    first = f"{PROVIDER_TITLES[best['provider']]} is on pace for about {best['outlook'][1] or 0:.0f}% of its week"
+    pct = best["outlook"][1]
+    first = (f"{best['title']} is on pace for about {pct:.0f}% of its week" if isinstance(pct, (int, float))
+             else f"{best['title']}: usage not known" if best["outlook"][0] == "unknown"
+             else f"{best['title']} has room")
+    # The first choice first, so another week takes its place only by resetting sooner.
+    soonest = min(([best] if best["outlook"][0] == "spare" else []) + spare,
+                  key=lambda o: o["resets"] or float("inf"), default=None)
     if best["outlook"][0] == "tight" and calm:
         best = {**calm[0], "why": calm[0]["why"] + [first]}
     elif best["outlook"][0] == "busy" and spare and kind != "fact-check":
         best = {**spare[0], "why": spare[0]["why"] + [first]}
+    elif kind in SPEND_FIRST_KINDS and best["outlook"][0] in ("ok", "spare", "unknown") and soonest \
+            and soonest is not best:
+        # Usage that would go unused goes first, the week that resets soonest first.
+        best = {**soonest, "why": soonest["why"] + [first]}
     else:
         best = {**best, "why": list(best["why"])}
-    outlook, title = best["outlook"], PROVIDER_TITLES[best["provider"]]
+    outlook, title = best["outlook"], best["title"]
     if outlook[0] == "unknown":
-        best["why"].append(f"{title}'s usage isn't known")
+        best["why"].append(f"{title}: usage not known")
     elif outlook[0] == "spare":
-        best["why"].append(f"{title}'s week resets within two days at about {outlook[1]:.0f}%, "
+        best["why"].append(f"{title} resets within {SPARE_DAYS} days at about {outlook[1]:.0f}% of its week, "
                            "so the rest would go unused")
     elif outlook[1] is not None:
         best["why"].append(f"{title} on pace for about {outlook[1]:.0f}% of its week")

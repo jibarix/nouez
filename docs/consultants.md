@@ -70,7 +70,7 @@ Each kind of consultation has a starting point and a fallback on the other provi
 
 | Kind | First choice | Without it |
 |---|---|---|
-| Quick check | Codex `gpt-6.2-sol`, low | Antigravity `gemini-4-neon`, low |
+| Quick check | Codex `gpt-6.2-sol`, low | Antigravity `gemini-4-neon`, low; then Antigravity's `claude-sonnet-5-5`, low |
 | Re-check (named fixes only) | Codex `gpt-6.2-sol`, medium | `gemini-4-neon`, medium |
 | Review | Codex `gpt-6.2-astra`, high | `gemini-4-neon`, high |
 | Bug hunt | Codex `gpt-6.2-astra`, high | `gemini-4-neon`, high |
@@ -88,9 +88,9 @@ The suggestion then follows the usage `ConsultantBudget` shows:
 
 - **No room:** a subscription whose window is used up, or runs out before its reset at the current rate, isn't suggested. When none has room, the suggestion says to skip the consultation and tell you. Free full resets are never used; only you decide that.
 - **An old reading:** usage read too long ago to project from counts only as the least that week will reach, so it can make a provider tight or busy but never spare.
-- **Tight:** when the first choice's week is on pace for over 90% at its reset, the other provider takes it if it has room. Otherwise the first choice stays, one effort level down.
-- **Would go unused:** when the first choice is past 70% and the other provider's week resets within two days under 60%, the other one takes it. Fact checks are the exception.
-- **Antigravity's quota groups:** Gemini models count against its Gemini group, and `claude-opus-5-5` against its Claude and GPT group, both on Google's quota, not Claude Code's.
+- **Each quota counts on its own:** Codex, and each of Antigravity's quota groups. Gemini models count against its Gemini group, and `claude-opus-5-5` and `claude-sonnet-5-5` against its Claude and GPT group, both on Google's quota, not Claude Code's. So a full Gemini group can hand work to the Claude and GPT group, and the other way round.
+- **Tight:** when the first choice's week is on pace for over 90% at its reset, another quota with room takes it. Otherwise the first choice stays, one effort level down.
+- **Would go unused:** a week on pace for under 60% at a reset within three days would reset with usage left. It takes the work from a first choice past 70%, except fact checks. For research and quick checks it goes first even when the first choice has room, the week that resets soonest first, so research can go to `claude-opus-5-5` and quick checks to `claude-sonnet-5-5` at `low` on Antigravity. Reviews, re-checks, bug hunts and plan critiques don't move this way, and never go to a Claude model, not even as Antigravity's default: it shares the blind spots of the Claude that wrote the work.
 - **Claude Code's own week:** past about 70% on pace, Claude hands read-only work that saves real effort (reviews, research, long reading) to a consultant and asks for short replies. Past about 90%, it also puts off optional work and says so.
 - **A model that isn't listed:** nouez takes the newest listed model of the same family (`gpt-6.3-astra` for `gpt-6.2-astra`), else the provider's default model, and says so. An effort the model doesn't list becomes the closest listed level below it. A level is always named, since a reused consultant keeps the one it last had.
 
@@ -105,7 +105,7 @@ nouez's own eval checks that fresh Claude Code sessions follow this. See [The co
 ```
 python tests/consult_eval.py --reps 2                  # all cases, both providers, plenty of room
 python tests/consult_eval.py --setup antigravity --cases plan,research-config
-python tests/consult_eval.py --scenario codex-tight    # also codex-out, claude-busy
+python tests/consult_eval.py --scenario codex-tight    # also codex-out, claude-busy, agy-unused
 python tests/consult_eval.py --server old-server.py    # compare with another version
 ```
 
@@ -119,6 +119,8 @@ Results on 2026-11-25, with Claude Opus 5.5, both providers installed and plenty
 | 0.24.0 | 6 of 8 | 0 of 10 | 6 of 6, each after calling `ConsultantBudget` |
 
 With only Codex, 2 of the 4 cases that should consult did (4 of 4 in an earlier run); with only Antigravity, 3 of 4; with Codex's week tight, where nouez moves every kind to Antigravity, 3 of 4. Each of those consultations took the suggestion. With neither installed, Claude didn't try to consult. The case missed most often is the plan, missed in every run: asked to plan and build, Claude writes a short plan and starts building before it asks. A change to commit is sometimes committed without a review. Research went from 0 of 4 to 4 of 4 when the instructions said "instead of searching the web yourself": Claude had treated its own web search as the research.
+
+In 0.25.0, the suggestions in each of those setups and scenarios are the same as in 0.24.0, so the results above still hold. In the `agy-unused` scenario, where Antigravity's Claude and GPT group is idle two days before its reset, all 4 research consultations went to Antigravity's `claude-opus-5-5` at high as suggested, and the one review stayed on Codex `gpt-6.2-astra`; the plan was again missed in both runs and the change committed without a review in one.
 
 ## Choosing a consultant
 

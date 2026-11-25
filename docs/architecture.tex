@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.24.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.25.0\\[0.3em]\large Architecture and message reference}
 \date{November 24, 2026}
 \author{}
 
@@ -1393,12 +1393,17 @@ the (provider, model, effort) options in order of preference, from the public be
 \item Each option's usage outlook comes from its windows (for Antigravity, the quota group of its
   model): \emph{blocked} when a window is used up or runs out before its reset at the current pace,
   \emph{tight} over 90\% on pace at the weekly reset, \emph{busy} over 70\%, \emph{spare} under 60\%
-  with the reset within two days, otherwise ok, or unknown with no windows. A reading older than 30
+  with the reset within three days, otherwise ok, or unknown with no windows. A reading older than 30
   minutes gives no pace: its percentage counts only as the least the week will reach, so it can
   make an option tight or busy, never spare.
-\item Blocked options are skipped. The first that is left is the choice, except that a tight one
-  gives way to a later ok or spare option on another provider, a busy one to a spare one on another
-  provider (not for fact checks), and a tight one that stays drops one effort level.
+\item Options trade by the quota they spend: Codex, or one of Antigravity's quota groups. Blocked
+  options are skipped. The first that is left is the choice, except that a tight one gives way to a
+  later ok or spare option on another quota, a busy one to a spare one on another quota (not for
+  fact checks), and a tight one that stays drops one effort level. For research and quick checks,
+  a spare option on another quota also takes the place of an ok, spare or unknown first choice,
+  the one whose week resets first, the first choice winning a tie. Reviews, re-checks, bug hunts and
+  plan critiques never move this way, and a Claude model is never an option for them, not even as
+  Antigravity's default model: it shares the blind spots of the Claude that wrote the work.
 \end{itemize}
 
 With no option left, the text says to skip the consultation and tell the user why. For an

@@ -50,12 +50,13 @@ SCENARIOS = {
     "codex-tight": ((80, 1), (10, 0, 5), (30, 3)),    # Codex on pace for about 93%
     "codex-out": ((100, 2), (10, 0, 5), (30, 3)),     # Codex used up
     "claude-busy": ((10, 5), (10, 0, 5), (60, 2)),    # Claude Code on pace for about 84%
+    "agy-unused": ((10, 5), (50, 0, 2), (30, 3)),     # Antigravity's Claude and GPT group idle, two days left
 }
 CODEX_MODELS = (("gpt-6.2-sol", True), ("gpt-6.2-astra", False), ("gpt-6.1-terra", False))
 CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 AGY_MODEL_IDS = ([f"gemini-4-neon-{lv}" for lv in ("low", "medium", "high", "xhigh")]
                  + [f"gemini-4-carbon-{lv}" for lv in ("low", "high")]
-                 + [f"claude-opus-5-5-{lv}" for lv in ("low", "medium", "high")]
+                 + [f"claude-{m}-5-5-{lv}" for m in ("opus", "sonnet") for lv in ("low", "medium", "high")]
                  + ["gpt-oss-120b-medium"])
 
 

@@ -6,6 +6,14 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-11-25
+
+Usage that would reset unused goes first, and Antigravity's Claude and GPT quota is no longer left idle. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version.
+
+### Changed
+
+- Usage that would reset unused goes first. A week on pace for under 60% at a reset within three days (two before) now takes research and quick checks even when the first choice has room, the week that resets soonest first. Antigravity's two quota groups count as separate choices, so Opus and Sonnet on its Claude and GPT group, which is Google's quota and not Claude Code's, take research and quick checks (`claude-sonnet-5-5` at `low`) late in that group's week instead of resetting unused, and a tight Gemini group hands work to it. Reviews, re-checks, bug hunts and plan critiques never go to a Claude model, not even as Antigravity's default model: it shares the blind spots of the Claude that wrote the work. A tie in reset time keeps the first choice, and unknown usage is said as such, not as room. The reasons name the quota group, and switching a reused Antigravity consultant to another group's model is noted.
+
 ## [0.24.0] - 2026-11-25
 
 nouez chooses the consultant. Claude asks `ConsultantBudget` before each consultation and gets the provider, model and effort to use, from public benchmarks and the usage left on each subscription, so consultations go where they cost least of what would run out, and Claude Code's own week lasts. No `CLAUDE.md` lines or skill are needed: if you copied nouez's `consult` skill to `~/.claude/skills/consult/`, delete it. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version.
@@ -636,7 +644,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/jibarix/nouez/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/jibarix/nouez/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/jibarix/nouez/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/jibarix/nouez/compare/v0.21.0...v0.22.0
