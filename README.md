@@ -65,11 +65,11 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.23.0 |
-| Claude Code | 2.1.331 |
+| nouez | 0.24.0 |
+| Claude Code | 2.1.332 |
 | Codex CLI | 0.170.0 |
-| Codex app-server daemon | 0.171.0 |
-| Antigravity CLI (optional: Antigravity consultants, its quota) | 1.5.16 |
+| Codex app-server daemon | 0.172.0 |
+| Antigravity CLI (optional: Antigravity consultants, its quota) | 1.5.17 |
 | Python | 3.11.9 |
 | OS | Windows 11 (the dispatcher's sign-in start on macOS and Linux is covered by tests, not yet run on those systems) |
 
@@ -172,7 +172,7 @@ In any Claude Code session with nouez, from the phone or at the computer, ask fo
 
 Claude starts a background consultant in the project (Codex if it is installed, otherwise Antigravity), or reuses the one already working there, sends it the question and gets the answer back as a tool result, without a second terminal to copy text into. A consultant Claude starts is always read-only: it never edits your files.
 
-Claude also consults without being asked, while the subscription has room: a review before it commits a change to behavior, several files or anything risky, a bug hunt when a failure's cause isn't obvious, a critique of a plan or design of its own before it builds on it, and research across sources, audits spanning many files, and checks of consequential claims. Your own `CLAUDE.md` can change that, and `NOUEZ_NO_AUTO_CONSULT=1` turns it off. [Consultants](docs/consultants.md) covers reusing one, your own Codex session, choosing a model and effort, briefs and verdicts, and Antigravity.
+Claude also consults without being asked, while the subscription has room: a review before it commits a change to behavior, several files or anything risky, a bug hunt when a failure's cause isn't obvious, a critique of a plan or design of its own before it builds on it, and research across sources, audits spanning many files, and checks of consequential claims. nouez suggests the provider, model and effort for each from the usage left and public benchmarks. Your own `CLAUDE.md` can change that, and `NOUEZ_NO_AUTO_CONSULT=1` turns it off. [Consultants](docs/consultants.md) covers reusing one, your own Codex session, how nouez picks a model and effort, briefs and verdicts, and Antigravity.
 
 ## Documentation
 
@@ -180,7 +180,7 @@ Claude also consults without being asked, while the subscription has room: a rev
 |---|---|
 | [Setup](docs/setup.md) | Each setup step in full, and updating nouez and Codex |
 | [Working from your phone](docs/phone.md) | Opening, resuming, listing and closing sessions; trusting a folder from the phone; the sign-in warning; how the dispatcher runs |
-| [Consultants](docs/consultants.md) | Reusing a consultant, your own Codex session, model and effort, usage and model scores, the consult skill, briefs, tips, Antigravity |
+| [Consultants](docs/consultants.md) | Reusing a consultant, your own Codex session, how nouez picks a model and effort, usage and model scores, briefs, tips, Antigravity |
 | [Status screen and windows](docs/status-screen.md) | The usage log, the status screen (`server.py top`) and its consultations page, and arranging nouez's windows on Windows |
 | [Tools](docs/tools.md) | Every tool and its arguments, and how Claude waits for a reply |
 | [Troubleshooting](docs/troubleshooting.md) | `doctor`, and what to do about each message |

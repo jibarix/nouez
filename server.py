@@ -67,7 +67,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.23.0"
+SERVER_VERSION = "0.24.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -4776,7 +4776,7 @@ def start_consultant(args, cancel=None, progress=None):
         + "Send it work with SendConsultantMessage."
         + (f"\nOther consultants in this repo:\n{format_threads(others)}" if others else "")
         + user_note
-        + "\nOnly if the user asks for a separate consultant, call StartConsultant with new=true."
+        + "\nOnly for a separate consultant the user asked for, or a blind second opinion, call StartConsultant with new=true."
         + (f"\n{notice}" if notice else "")
     )
 
@@ -5158,6 +5158,11 @@ def send_consultant_message(args, cancel=None, progress=None):
             ensure_loaded(client, thread)
             current = latest_turn(client, tid)
             busy = bool(current) and current.get("status") == "inProgress"
+            if busy:
+                # The values the running turn already has change nothing (ConsultantBudget's suggestion
+                # is passed with every message), so they don't stop a steer.
+                overrides = {k: v for k, v in overrides.items()
+                             if v != thread.get("model" if k == "model" else "reasoningEffort")}
             # Only nouez's own record counts, as for steering: the turn's items may not show a steer
             # yet (nor at all in the summary thread/turns/list gives), and the same text typed in a
             # terminal is not a message this server delivered.
@@ -5500,8 +5505,12 @@ def window_text(label, used, resets_at, length, now, sampled=None):
     return text
 
 
-def codex_budget(client, now):
-    """Lines on the Codex account's usage windows and the models it offers."""
+def codex_budget(client, now, state=None):
+    """Lines on the Codex account's usage windows and the models it offers. A `state` dict gets
+    the same as data, for suggest_consultant: {"windows": [(length, used, resets_at)], "models":
+    {id: (efforts, default effort, is the default model)} or None when they couldn't be read}."""
+    state = {} if state is None else state
+    state.update(windows=[], models=None)
     lines = []
     limits = client.request("account/rateLimits/read", None)
     limits = limits if isinstance(limits, dict) else {}
@@ -5518,8 +5527,10 @@ def codex_budget(client, now):
                                    w.get("resetsAt"), length, now)
                 if text:
                     lines.append(f"  - {text}")
+                    state["windows"].append((length, number(w["usedPercent"]), number(w["resetsAt"])))
         if isinstance(snap.get("rateLimitReachedType"), str):
             lines.append(f"  - limit reached: {snap['rateLimitReachedType']}")
+            state["windows"].append((None, 100, now + 1))
         credits = snap.get("credits")
         if isinstance(credits, dict) and (credits.get("unlimited") is True or credits.get("hasCredits") is True):
             balance = "unlimited" if credits.get("unlimited") is True else credits.get("balance")
@@ -5536,11 +5547,14 @@ def codex_budget(client, now):
     except BridgeError:
         models = None
     shown = []
+    if isinstance(models, list):
+        state["models"] = {}
     for m in models if isinstance(models, list) else []:
         if not isinstance(m, dict) or m.get("hidden") or not isinstance(m.get("id"), str):
             continue
         efforts = [e.get("reasoningEffort") for e in m.get("supportedReasoningEfforts") or []
                    if isinstance(e, dict) and isinstance(e.get("reasoningEffort"), str)]
+        state["models"][m["id"]] = (efforts, m.get("defaultReasoningEffort"), m.get("isDefault") is True)
         desc = m["id"] + (" (default)" if m.get("isDefault") is True else "")
         if efforts:
             desc += f": effort {', '.join(efforts)}"
@@ -5647,8 +5661,11 @@ def run_statusline(argv):
     return 0
 
 
-def claude_budget(now, path=None):
-    """Lines on Claude Code's own usage windows, from the file the user's status line saves."""
+def claude_budget(now, path=None, state=None):
+    """Lines on Claude Code's own usage windows, from the file the user's status line saves. A
+    `state` dict gets {"windows": [(length, used, resets_at, when it was read)]}."""
+    state = {} if state is None else state
+    state["windows"] = []
     path = path or os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE)
     try:
         with open(path, encoding="utf-8-sig") as f:
@@ -5669,6 +5686,8 @@ def claude_budget(now, path=None):
                                    now, number(w.get("observed")) or at)
                 if text:
                     lines.append(f"  - {text}")
+                    state["windows"].append((length, number(w["used_percentage"]), number(w["resets_at"]),
+                                             min(number(w.get("observed")) or at or now, now)))
     if not lines:
         return ["Claude Code: no current usage window saved (a window is dropped once it resets, and "
                 "none is reported before a session's first reply)."]
@@ -5810,30 +5829,357 @@ def aa_lines(cache, note, now):
     return lines
 
 
+# --- Choosing a consultant ------------------------------------------------------
+# What ConsultantBudget suggests for each kind of consultation: starting points from public
+# benchmarks (sources and dates in docs/consultants.md, "How nouez picks a model"), checked
+# against the CLIs installed, the models they list and the usage left. Each kind lists
+# (provider, model, effort, why) in order of preference; model None means the provider's default.
+
+CONSULT_PICKS = {
+    "quick-check": (("codex", "gpt-6.2-sol", "low", "a fast model is enough for a quick check"),
+                    ("antigravity", "gemini-4-neon", "low", "a low level is enough for a quick check")),
+    "re-check": (("codex", "gpt-6.2-sol", "medium", "checking named fixes needs less than a first review"),
+                 ("antigravity", "gemini-4-neon", "medium", "checking named fixes needs less than a first review")),
+    "review": (("codex", "gpt-6.2-astra", "high", "the strongest Codex model; it runs git and the tests itself"),
+               ("antigravity", "gemini-4-neon", "high", "put the diff in the message (revision and attach_diff)")),
+    "bug-hunt": (("codex", "gpt-6.2-astra", "high", "the strongest Codex model; it can run the failing test"),
+                 ("antigravity", "gemini-4-neon", "high", "put the failing command's output in the message")),
+    "plan-critique": (("antigravity", "gemini-4-neon", "xhigh",
+                       "at xhigh it says a premise is wrong most often (BullshitBench)"),
+                      ("codex", "gpt-6.2-astra", "high", "ask it about premises outright: it pushes back less often")),
+    "research": (("codex", "gpt-6.2-astra", "xhigh", "the strongest Codex model, with web search"),
+                 ("antigravity", "gemini-4-neon", "xhigh", "Gemini 4 Neon at its top level"),
+                 ("antigravity", "claude-opus-5-5", "high",
+                  "on Google's quota, not Claude Code's, but Claude's own family: for heavy reading")),
+    "fact-check": (("codex", "gpt-6.2-astra", "high", "the model least likely to make up an answer"),
+                   ("antigravity", "claude-opus-5-5", "high",
+                    "Gemini models seldom say they don't know; this one runs on Google's quota, not Claude Code's"),
+                   ("antigravity", "gemini-4-neon", "high", "Gemini models seldom say they don't know: ask for sources")),
+    "other": (("codex", None, None, "the provider's default model"),
+              ("antigravity", None, None, "the provider's default model")),
+}
+CONSULT_NOTES = {
+    "review": "Ask for every finding in the first round; later rounds that only check named fixes are re-checks. "
+              "After three rounds of changes on the same work, show the user the open points.",
+    "re-check": "When new work comes up for review, send the review's model and effort again.",
+    "bug-hunt": "Give it the failing command, its output and what you have ruled out.",
+    "plan-critique": "In the brief, ask it first to say whether any premise, assumption or framing is wrong.",
+    "research": "Ask for a short answer with its sources.",
+    "fact-check": "Ask for its sources, and check the ones you will rely on.",
+}
+# The subjects where Artificial Analysis's scores put Gemini 4 Neon ahead of every Codex model.
+NEON_SUBJECTS = "finance, legal, medicine, economics or strategy"
+SECOND_OPINION = ("When you and the consultant disagree on a finding, ask the other provider blind: "
+                  "StartConsultant with its provider and new=true, the original brief and the work but "
+                  "not the finding, which it sees only after its own verdict. A decision costly to undo "
+                  "(a release, a migration, deleting data, a security setting) goes to both at once.")
+EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+PROVIDER_TITLES = {"codex": "Codex", "antigravity": "Antigravity"}
+
+
+def usage_outlook(windows, now):
+    """Where a subscription stands for one more consultation, from its (length, used, resets_at
+    [, read at]) windows: ("blocked", why) when one is used up or runs out before its reset at
+    this rate; otherwise by where the weekly window's pace lands at its reset: ("tight", %) past
+    90, ("busy", %) past 70, ("spare", %) under 60 with the reset within two days (usage that
+    would go unused), ("ok", % or None); ("unknown", None) with no reading. A reading too old to
+    project from counts only as the least the week will reach: never "spare", and "ok" with None."""
+    week, seen = None, False
+    for w in windows or ():
+        length, used, resets = w[0], number(w[1]), number(w[2])
+        at = min(number(w[3]) or now, now) if len(w) > 3 else now
+        if used is None or resets is None or resets <= now:
+            continue
+        seen = True
+        label = window_label(length) if length else "usage"
+        if used >= 100:
+            return ("blocked", f"its {label} window is used up")
+        pace = window_pace(used, resets, length, at) if length and now - at <= CLAUDE_USAGE_STALE else None
+        if pace and pace[0] == "runs out":
+            return ("blocked", f"its {label} window runs out before its reset at this rate")
+        if length and length >= 7 * 86400:
+            week = (pace[1] if pace else used, resets, bool(pace))
+    if not seen:
+        return ("unknown", None)
+    if week is None:
+        return ("ok", None)
+    pct, resets, projected = week
+    if pct > 90:
+        return ("tight", pct)
+    if pct > 70:
+        return ("busy", pct)
+    if not projected:
+        return ("ok", None)
+    if pct < 60 and resets - now < 2 * 86400:
+        return ("spare", pct)
+    return ("ok", pct)
+
+
+def newest_of_family(model, ids):
+    """The listed model of `model`'s family with the highest version (gpt-6.3-astra for
+    gpt-6.2-astra), or None."""
+    found = re.search(r"\d+(?:[.-]\d+)*", model)
+    if not found:
+        return None
+    family = re.compile(re.escape(model[:found.start()]) + r"(\d+(?:[.-]\d+)*)" + re.escape(model[found.end():]))
+    best = None
+    for i in ids:
+        m = family.fullmatch(i)
+        if m:
+            version = tuple(int(x) for x in re.split(r"[.-]", m.group(1)))
+            if best is None or version > best[0]:
+                best = (version, i)
+    return best[1] if best else None
+
+
+def provider_models(provider, st):
+    """{model: its effort levels} a provider lists, or None if not known."""
+    if provider == "codex":
+        models = st.get("models")
+        return None if models is None else {i: m[0] for i, m in models.items()}
+    if not st.get("models"):
+        return None
+    levels = {}
+    for i in st["models"]:
+        levels.setdefault(agy_base(i), []).extend([agy_level(i)] if agy_level(i) else [])
+    return levels
+
+
+def provider_default(provider, st):
+    """(model, effort) a provider starts on: the model it marks as default, else the first listed;
+    (None, None) when it lists none."""
+    models = provider_models(provider, st)
+    if provider == "antigravity":
+        if not models:
+            return (AGY_MODEL, AGY_EFFORT)
+        if AGY_MODEL in models:
+            return (AGY_MODEL, listed_level(AGY_EFFORT, models[AGY_MODEL]))
+        model = next((m for m in models if m.startswith("gemini-")), next(iter(models)))
+        return (model, listed_level(AGY_EFFORT, models[model]))
+    listed = st.get("models") or {}
+    found = next(((i, m) for i, m in listed.items() if m[2]), None) or next(iter(listed.items()), None)
+    if not found:
+        return (None, None)
+    model, (efforts, default, _) = found
+    return (model, default if default in efforts else listed_level("medium", efforts))
+
+
+def listed_level(effort, levels):
+    """The listed level closest to `effort`, preferring the one below; None when none is listed. A
+    level is always named, since a reused consultant keeps the one it last had, which the new model
+    may not offer."""
+    if not levels:
+        return None
+    if effort in levels:
+        return effort
+    rank = {e: i for i, e in enumerate(EFFORT_ORDER)}
+    want = rank.get(effort, rank["medium"])
+    known = [lv for lv in levels if lv in rank]
+    if not known:
+        return levels[0]
+    below = [lv for lv in known if rank[lv] < want]
+    return max(below, key=rank.get) if below else min(known, key=rank.get)
+
+
+def resolve_pick(provider, model, effort, st):
+    """(model, effort, note) to pass for one pick, checked against the models the provider lists;
+    None when neither the model nor one of its family is listed."""
+    if model is None:
+        return provider_default(provider, st) + (None,)
+    models = provider_models(provider, st)
+    note = None
+    if models is not None and model not in models:
+        newer = newest_of_family(model, models)
+        if not newer:
+            return None
+        note, model = f"{model} isn't listed, so {newer}, the newest of its family", newer
+    if models is not None and effort and effort not in models[model]:
+        level = listed_level(effort, models[model])
+        note = (note + "; " if note else "") + f"{model} has no {effort} level, so {level or 'its default'}"
+        effort = level
+    return (model, effort, note)
+
+
+def agy_group_of(model):
+    """The Antigravity quota group a model runs on."""
+    if model and model.startswith(("claude-", "gpt-")):
+        return "Claude and GPT models"
+    return "Gemini 4 Argon" if model and "argon" in model else "Gemini Models"
+
+
+def provider_windows(provider, model, st):
+    if provider == "codex":
+        return st.get("windows")
+    return (st.get("groups") or {}).get(agy_group_of(model))
+
+
+def suggest_consultant(kind, state, now, only=None):
+    """The consultant to use for one kind of consultation: {"provider", "model", "effort", "why":
+    [...], "notes": [...]}, or {"none": why} when no installed one has room. `state` maps "codex"
+    and "antigravity" to what codex_budget and agy_budget gathered (missing or None: not installed).
+    `only`: the provider the user named; for Antigravity ("ask Gemini") only its Gemini models."""
+    picks = CONSULT_PICKS.get(kind) or CONSULT_PICKS["other"]
+    if only == "antigravity":
+        picks = tuple(p for p in picks if p[0] != "antigravity" or not p[1] or p[1].startswith("gemini-"))
+    options, blocked = [], []
+    for rank, (provider, model, effort, why) in enumerate(picks):
+        st = state.get(provider)
+        if st is None:
+            continue
+        got = resolve_pick(provider, model, effort, st)
+        if got is None:
+            if any(p[0] == provider and resolve_pick(*p[:3], st) for p in picks):
+                continue  # another pick of this provider is listed
+            if any(o["provider"] == provider for o in options) or \
+                    any(p[0] == provider for p in picks[:rank]):
+                continue  # the default is added once, for the provider's first pick
+            got = provider_default(provider, st) + (f"{model} isn't listed, so the default model",)
+        if only == "antigravity" == provider and not (got[0] or "").startswith("gemini-"):
+            blocked.append("Antigravity lists no Gemini model")  # "ask Gemini": never a Claude or GPT one
+            continue
+        outlook = usage_outlook(provider_windows(provider, got[0], st), now)
+        if outlook[0] == "blocked":
+            blocked.append(f"{PROVIDER_TITLES[provider]} {got[0] or 'default model'}: {outlook[1]}")
+            continue
+        options.append({"provider": provider, "model": got[0], "effort": got[1], "why": [why],
+                        "notes": [got[2]] if got[2] else [], "outlook": outlook})
+    if not options:
+        return {"none": "; ".join(blocked) if blocked else "no consultant CLI is installed"}
+    best = options[0]
+    others = [o for o in options if o["provider"] != best["provider"]]
+    calm = [o for o in others if o["outlook"][0] in ("ok", "spare")]
+    spare = [o for o in others if o["outlook"][0] == "spare"]
+    first = f"{PROVIDER_TITLES[best['provider']]} is on pace for about {best['outlook'][1] or 0:.0f}% of its week"
+    if best["outlook"][0] == "tight" and calm:
+        best = {**calm[0], "why": calm[0]["why"] + [first]}
+    elif best["outlook"][0] == "busy" and spare and kind != "fact-check":
+        best = {**spare[0], "why": spare[0]["why"] + [first]}
+    else:
+        best = {**best, "why": list(best["why"])}
+    outlook, title = best["outlook"], PROVIDER_TITLES[best["provider"]]
+    if outlook[0] == "unknown":
+        best["why"].append(f"{title}'s usage isn't known")
+    elif outlook[0] == "spare":
+        best["why"].append(f"{title}'s week resets within two days at about {outlook[1]:.0f}%, "
+                           "so the rest would go unused")
+    elif outlook[1] is not None:
+        best["why"].append(f"{title} on pace for about {outlook[1]:.0f}% of its week")
+    if outlook[0] == "tight" and best["effort"] in EFFORT_ORDER[2:]:
+        lower = EFFORT_ORDER[EFFORT_ORDER.index(best["effort"]) - 1]
+        models = provider_models(best["provider"], state[best["provider"]])
+        if models is None or lower in models.get(best["model"], ()):
+            best["effort"] = lower
+            best["why"].append("one level down while its week is tight")
+    best["notes"] = best["notes"] + ([CONSULT_NOTES[kind]] if kind in CONSULT_NOTES else [])
+    return best
+
+
+def claude_outlook(claude_state, now):
+    """One line on what Claude Code's own usage means for handing work to a consultant."""
+    state, pct = usage_outlook((claude_state or {}).get("windows"), now)
+    if state == "blocked":
+        at = pct  # why: a window used up, or running out before its reset
+    else:
+        at = f"on pace for about {pct:.0f}% of its week" if pct is not None else "has room"
+    if state == "unknown":
+        return "Claude Code: its usage isn't known, so consult at the usual points."
+    if state in ("blocked", "tight"):
+        return (f"Claude Code: {at}. Hand every read-only job that saves real work (reviews, research, long "
+                "reading) to a consultant, put off optional work, and tell the user.")
+    if state == "busy":
+        return (f"Claude Code: {at}. Hand read-only work that saves real effort (reviews, research, long "
+                "reading) to a consultant, asking for short replies.")
+    return f"Claude Code: {at}."
+
+
+def call_text(pick):
+    """A pick as the arguments to pass: provider "x", model "y", effort "z"."""
+    return ", ".join([f'provider "{pick["provider"]}"'] + ([f'model "{pick["model"]}"'] if pick["model"] else [])
+                     + ([f'effort "{pick["effort"]}"'] if pick["effort"] else []))
+
+
+def suggestion_text(kind, best):
+    """A suggestion as the calls to make: StartConsultant's provider, SendConsultantMessage's model and effort."""
+    if "none" in best:
+        return f"{kind}: none has room ({best['none']}). Skip it, and tell the user."
+    send = ([f'model "{best["model"]}"'] if best["model"] else []) + \
+           ([f'effort "{best["effort"]}"'] if best["effort"] else [])
+    # A new consultant starts on these too: a new Antigravity one would otherwise check its default
+    # model, which agy may not list.
+    start = [f'provider "{best["provider"]}"'] + (send if best["provider"] == "antigravity" else send[:1])
+    return (f'{kind}: StartConsultant {", ".join(start)}; SendConsultantMessage '
+            + ", ".join(send + [f'kind "{kind}"']) + ". Why: " + "; ".join(best["why"]) + ".")
+
+
+def suggestion_lines(kind, state, now, only=None):
+    """ConsultantBudget's closing part: what to use for `kind`, or for every kind when it's None;
+    `only` is the provider the user named, the only one left in `state`."""
+    if state.get("codex") is None and state.get("antigravity") is None:
+        if only:
+            return [f"Nothing to suggest: {PROVIDER_TITLES[only]} isn't installed. Tell the user, and ask "
+                    "whether to use the other one."]
+        return ["Nothing to suggest: consultations need the Codex or Antigravity CLI (nouez's README, Setup)."]
+    lines = ["Suggested consultant (use it unless the user named a provider or model, or the user's own "
+             "instructions route otherwise):", "  " + claude_outlook(state.get("claude"), now)]
+    for k in [kind] if kind else [k for k in CONSULT_KINDS if k != "other"]:
+        best = suggest_consultant(k, state, now, only)
+        lines.append("  " + suggestion_text(k, best))
+        if "none" in best and only:
+            lines.append("  The user named it: tell them, and ask whether to use the other one.")
+        if not kind or "none" in best:
+            continue
+        lines += [f"  {n}" for n in best["notes"]]
+        if k in ("review", "bug-hunt", "plan-critique"):
+            # The other provider, chosen the same way: from its models, levels and usage.
+            other = suggest_consultant(k, {**state, best["provider"]: None}, now)
+            if "none" not in other:
+                lines.append(f"  {SECOND_OPINION} The other provider now: {call_text(other)}.")
+        neon = state.get("antigravity") is not None and resolve_pick("antigravity", "gemini-4-neon", "xhigh",
+                                                                       state["antigravity"])
+        if k in ("review", "research", "plan-critique") and best["provider"] == "codex" and neon \
+                and neon[0].startswith("gemini-4-neon") and usage_outlook(provider_windows(
+                    "antigravity", neon[0], state["antigravity"]), now)[0] != "blocked":
+            lines.append(f"  For {NEON_SUBJECTS}, Gemini 4 Neon scores best (Artificial Analysis by subject): "
+                         + call_text({"provider": "antigravity", "model": neon[0], "effort": neon[1]}) + ".")
+    lines.append("  A reused consultant keeps the model and effort it last had, so pass these with the message."
+                 + ("" if kind else " Pass kind for one kind, with its notes."))
+    return lines
+
+
 def consultant_budget(args, cancel=None, progress=None):
     now = time.time()
+    kind, only = args.get("kind"), args.get("provider")
+    if kind is not None and kind not in CONSULT_KINDS:
+        raise BridgeError(f"`kind` must be one of {', '.join(CONSULT_KINDS)}.")
+    if only is not None and only not in PROVIDERS:
+        raise BridgeError(f"`provider` must be one of {', '.join(PROVIDERS)}.")
     out = [f"Consultation budget, {time.strftime('%a %b %d %H:%M', time.localtime(now))}:", ""]
+    state = {"claude": {}}
     if not codex_installed():
         out.append("Codex: not installed.")
     else:
+        state["codex"] = {}
         try:
             with contextlib.closing(CodexClient()) as client:
-                out += codex_budget(client, now)
+                out += codex_budget(client, now, state["codex"])
         except BridgeError as e:
             out.append(f"Codex: usage unavailable ({e}).")
     out.append("")
-    out += claude_budget(now)
+    out += claude_budget(now, state=state["claude"])
     out += login_lines(now)
     out.append("")
-    agy = agy_budget(now)
+    state["antigravity"] = {}
+    agy = agy_budget(now, state=state["antigravity"])
     if agy:
         out += agy + [""]
+    else:
+        state["antigravity"] = None
     check_cancel(cancel)
     cache, note = aa_scores(now, refresh=flag(args, "refresh"))
     out += aa_lines(cache, note, now)
-    out += ["", "Usage counts against the user's subscriptions. Choose by the user's own routing rules "
-            "(their CLAUDE.md or consult skill); without rules, keep each consultant's current model and effort, "
-            "and show this when the user asks which to use."]
+    if only:
+        state = {p: v for p, v in state.items() if p in (only, "claude")}
+    out += ([""] if out[-1] else []) + suggestion_lines(kind, state, now, only)
     return "\n".join(out)
 
 
@@ -7418,7 +7764,7 @@ def start_agy_consultant(args, cwd):
                    if ignored else "")
                 + "Send it work with SendConsultantMessage."
                 + (f"\nOther Antigravity consultants in this repo:\n{format_agy(others)}" if others else "")
-                + "\nOnly if the user asks for a separate consultant, call StartConsultant with new=true." + notice)
+                + "\nOnly for a separate consultant the user asked for, or a blind second opinion, call StartConsultant with new=true." + notice)
     model = agy_model_id(f"{AGY_MODEL}-{AGY_EFFORT}", args.get("model"), args.get("effort"), agy_models())
     instructions = args.get("instructions") or ""
     if not isinstance(instructions, str):
@@ -7722,12 +8068,15 @@ def run_agy_waiter(rec, turn_id):
     return 0
 
 
-def agy_budget(now, agy_live=None):
-    """Lines on Antigravity's quota groups for ConsultantBudget, or [] if agy isn't installed."""
+def agy_budget(now, agy_live=None, state=None):
+    """Lines on Antigravity's quota groups for ConsultantBudget, or [] if agy isn't installed. A
+    `state` dict gets {"groups": {group name: [(length, used, resets_at)]}, "models": agy's ids or None}."""
     live = read_agy_usage() if agy_live is None else agy_live
     if live is None:
         return []
     models = agy_models()
+    state = {} if state is None else state
+    state.update(groups={}, models=models)
     tail = ([f"  Models (model for StartConsultant with provider antigravity, effort the level): "
              f"{agy_model_families(models)}"] if models else [])
     if live.get("error"):
@@ -7745,6 +8094,8 @@ def agy_budget(now, agy_live=None):
                                length, now)
             if text:
                 lines.append(f"  - {g['name']}: {text}")
+                state["groups"].setdefault(g["name"], []).append(
+                    (length, round(100 * (1 - b["remaining_fraction"]), 1), iso_seconds(b.get("reset_time"))))
     head = ("Antigravity (Google; the Claude and GPT models group runs those models on Google's quota, "
             "not Claude Code's):")
     return [head] + (lines or ["  - no current quota window reported"]) + tail
@@ -7792,8 +8143,7 @@ def columns(blocks, widths):
 def consultation_rows(scr, summary, days, compact=False, table=True):
     period = period_text(days)
     if not summary["sends"] and not summary["other_replies"]:
-        return [scr.dim(f"  No consultations logged ({period}). nouez logs them from 0.14.0 on; "
-                        "the consult skill adds each one's kind and reason.")]
+        return [scr.dim(f"  No consultations logged ({period}). nouez logs them from 0.14.0 on.")]
     s = summary
     changed = ", ".join(f"{k} {n}" for k, n in s["changed_what"].most_common())
     unfinished = ", ".join(f"{n} {k}" for k, n in s["statuses"].most_common() if k != "completed")
@@ -9205,18 +9555,20 @@ INSTRUCTIONS_HEAD = (
 )
 # What a clone gets with no CLAUDE.md or skill of the user's: consulting at the points where a
 # second opinion pays, without being asked. Left out when no consultant CLI is installed, or with
-# NOUEZ_NO_AUTO_CONSULT=1. All of the instructions with it, 3,865 characters, reached a new Claude Code
-# session whole (checked 2026-11-25); Claude Code's limit isn't documented, so keep them about that size.
+# NOUEZ_NO_AUTO_CONSULT=1. All of the instructions with it are 3,837 characters; 3,865 reached a new
+# Claude Code session whole (checked 2026-11-25). Claude Code's limit isn't documented, so keep them
+# about that size.
 AUTO_CONSULT = (
     "Unless the user's own instructions say otherwise, also consult without being asked: before "
     "committing a change to behavior, to several files or to anything risky (not typos, formatting "
     "or one-line fixes), ask for a review of what you will commit (revision=true when that is all "
-    "your uncommitted work, else the staged diff in the message), and commit after its verdict; when a failure's cause isn't obvious after a first look, ask for a bug "
-    "hunt; and before acting on a consequential plan, design, formula or rule of your own, ask for a critique: show the draft, say a critique is under way, and give its "
-    "verdict before building on it; and hand a consultant research across sources, an audit or explanation "
+    "your uncommitted work, else the staged diff in the message), and commit after its verdict; when "
+    "a failure's cause isn't obvious after a first look, ask for a bug hunt; and before acting on a "
+    "consequential plan, design, formula or rule of your own, ask for a critique: show the draft, say "
+    "a critique is under way, and give its verdict before building on it; and hand a consultant "
+    "research across sources instead of searching the web yourself, an audit or explanation "
     "spanning many files, or a consequential claim a first check left uncertain, for a short answer. "
-    "Skip one, saying so, when ConsultantBudget (read it about once an "
-    "hour) shows that subscription used up or running out before its reset. Keep writing code and "
+    "Skip one, saying so, when ConsultantBudget says none has room. Keep writing code and "
     "single lookups in this session. "
 )
 INSTRUCTIONS = (
@@ -9227,10 +9579,11 @@ INSTRUCTIONS = (
     "It reuses a consultant it started earlier in this repo, keeping its context, or starts a new "
     "read-only one; it never picks a Codex session the user opened. Without provider it uses Codex "
     "when it is installed, otherwise Antigravity, and says which; pass provider=\"antigravity\" for "
-    "Antigravity when Codex is installed too, only when the user asks for it or the user's own rules "
-    "call for it. If neither CLI is installed, consultations are off and the Claude Code session tools "
+    "Antigravity when Codex is installed too, when the user asks for it or ConsultantBudget suggests "
+    "it. If neither CLI is installed, consultations are off and the Claude Code session tools "
     "still work. Talk to a consultant with SendConsultantMessage, passing the name StartConsultant "
-    "returns as `to`. Pass new=true only when the user asks for a separate consultant. Message a "
+    "returns as `to`. Pass new=true only when the user asks for a separate consultant, or for a "
+    "blind second opinion as ConsultantBudget describes. Message a "
     "Codex session the user opened only when the user asks you to, with allow_user_session=true. "
     "A Codex consultant can read files and run read-only commands; an Antigravity one can read files "
     "but runs no commands, so put the diff, test output or command results it needs in the message. "
@@ -9243,13 +9596,12 @@ INSTRUCTIONS = (
     "GetConsultantReply and the returned turn_id when the user asks or when you next need it. Pass "
     "wait=\"done\" only if the user asks you to wait for the reply. A result that says 'still "
     "working' is not a reply, even if it shows output so far: never treat it as done. An Antigravity "
-    "consultant takes one message at a time, so wait for its reply before the next. Change a "
-    "consultant's model or reasoning effort (SendConsultantMessage model and effort) only when the "
-    "user asks or the user's own instructions, such as their CLAUDE.md, call for it. The change keeps "
-    "the consultant's context and stays for later messages, so once the harder part is done, send "
-    "the usual values again. ConsultantBudget shows the usage left on each subscription, with reset "
-    "times, and model scores, for seeing whether a subscription has room and choosing a consultant's "
-    "model and effort by the user's own rules."
+    "consultant takes one message at a time, so wait for its reply before the next. Before each "
+    "consultation, call ConsultantBudget with its kind (and provider, if the user named one): from "
+    "the usage left on each subscription and public benchmarks, it suggests the provider for "
+    "StartConsultant and the model and effort for SendConsultantMessage. Use them unless the user "
+    "named others or the user's own instructions route otherwise. A model or effort change keeps the "
+    "consultant's context and stays for later messages, so pass the suggested values with each message."
 )
 
 
@@ -9299,8 +9651,8 @@ TOOLS = [
                 "model": {"type": "string", "description": "Model for a new consultant: a Codex model, or for provider antigravity an agy model such as gemini-4-neon (ConsultantBudget lists them). Default: the user's Codex config; for Antigravity, gemini-4-neon at level high. Ignored when an existing consultant is reused."},
                 "title": {"type": "string", "description": "Title for a new consultant (shown in Codex for a Codex one). Ignored when an existing consultant is reused."},
                 "instructions": {"type": "string", "description": "Standing instructions for a new consultant's role. Ignored when an existing consultant is reused."},
-                "new": {"type": "boolean", "description": "Start a new session even though a consultant already works in this repo. Default false. Use only when the user asked for a separate consultant."},
-                "provider": {"type": "string", "enum": list(PROVIDERS), "description": "Which CLI the consultant runs on: codex, or antigravity for Google's Antigravity CLI (agy) and its models, such as gemini-4-neon. Default: codex when it is installed, otherwise antigravity. An Antigravity consultant is read-only by agy's deny rules (no file writes or edits, commands or MCP tools) and takes one message at a time. Reuse looks only among consultants of the same provider. When both are installed, pass antigravity only when the user asks or their own rules call for it."},
+                "new": {"type": "boolean", "description": "Start a new session even though a consultant already works in this repo. Default false. Use only when the user asked for a separate consultant, or for a blind second opinion as ConsultantBudget describes."},
+                "provider": {"type": "string", "enum": list(PROVIDERS), "description": "Which CLI the consultant runs on: codex, or antigravity for Google's Antigravity CLI (agy) and its models, such as gemini-4-neon. Default: codex when it is installed, otherwise antigravity. An Antigravity consultant is read-only by agy's deny rules (no file writes or edits, commands or MCP tools) and takes one message at a time. Reuse looks only among consultants of the same provider. When both are installed, pass antigravity when the user asks for it or ConsultantBudget suggests it."},
                 "effort": {"type": "string", "description": "Antigravity only: the model level for a new consultant, such as low, medium, high or xhigh. Default high."},
             },
         },
@@ -9357,8 +9709,8 @@ TOOLS = [
                 "revision": {"type": "boolean", "description": "Optional: add a line with the consultant's repository commit, branch and number of uncommitted paths, and ask it to name that revision in its answer. With uncommitted changes, nouez also takes their diff (tracked changes and untracked files, leaving out binary files, untracked files over 256 KB and untracked files whose path looks like a secret), saves it in its cache folder under its SHA-256 and asks the consultant to review that diff. An Antigravity consultant gets only the line, unless attach_diff is true. Default false."},
                 "base": {"type": "string", "description": "With revision=true, review the working tree against the merge base of HEAD and this local branch, tag or commit id. Includes committed and uncommitted changes."},
                 "attach_diff": {"type": "boolean", "description": "Optional, Antigravity consultants with revision=true only: put the revision diff nouez takes in the message, so the consultant reviews exactly that. Its text goes to Google, deleted lines and untracked files included. Default false."},
-                "model": {"type": "string", "description": "Model id for this message and later ones: Codex, e.g. gpt-6-astra; Antigravity, e.g. gemini-4-neon. Default: unchanged. Set it when the user asks, or when the user's own rules call for another model."},
-                "effort": {"type": "string", "description": "Reasoning effort (Codex) or model level (Antigravity) for this message and later ones, such as low, medium, high or xhigh; which levels exist depends on the model. Default: unchanged. Set it when the user asks, or when the user's own rules call for more or less effort."},
+                "model": {"type": "string", "description": "Model id for this message and later ones: Codex, e.g. gpt-6-astra; Antigravity, e.g. gemini-4-neon. Default: unchanged. Pass the model ConsultantBudget suggests, or the one the user asked for."},
+                "effort": {"type": "string", "description": "Reasoning effort (Codex) or model level (Antigravity) for this message and later ones, such as low, medium, high or xhigh; which levels exist depends on the model. Default: unchanged. Pass the effort ConsultantBudget suggests, or the one the user asked for."},
                 "kind": {"type": "string", "enum": list(CONSULT_KINDS), "description": "Optional: what kind of consultation this is, for the user's usage log (nouez/usage-log.jsonl on this computer). Default: not recorded."},
                 "reason": {"type": "string", "description": f"Optional: one line on why this consultant, model and effort, for the same log (up to {REASON_CHARS} characters). Never the message itself."},
                 "wait": wait_schema(SEND_WAIT_SECONDS),
@@ -9555,18 +9907,21 @@ TOOLS = [
     {
         "name": "ConsultantBudget",
         "description": (
-            "Show what a consultation would cost and what each model scores, to choose a consultant's "
-            "model and effort: the usage used on the Codex subscription, Claude Code's own and, when "
-            "the Antigravity CLI is installed, Antigravity's quota groups (each window with its reset "
-            "time and where the current pace lands), the Codex and Antigravity models and their "
-            "effort levels, and Artificial Analysis Intelligence Index scores for OpenAI, Google and "
-            "Anthropic models (fetched about weekly and kept; credit Artificial Analysis when you show "
-            "them). Call it before choosing a model or effort for a consultation when the user's own "
-            "rules say to weigh usage or scores. It changes nothing."
+            "Choose a consultant: call it before each consultation, with its kind. It suggests the "
+            "provider for StartConsultant and the model and effort for SendConsultantMessage, from "
+            "the CLIs installed, the models they list, the usage left on each subscription and "
+            "public benchmarks, and says when none has room. It also shows that usage: the Codex "
+            "subscription, Claude Code's own and Antigravity's quota groups, each window with its "
+            "reset time and where the current pace lands; the Codex and Antigravity models and "
+            "their effort levels; and Artificial Analysis Intelligence Index scores for OpenAI, "
+            "Google and Anthropic models (fetched about weekly and kept; credit Artificial Analysis "
+            "when you show them). It changes nothing."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "kind": {"type": "string", "enum": list(CONSULT_KINDS), "description": "The kind of consultation, for one suggestion with its notes. Default: one line for each kind."},
+                "provider": {"type": "string", "enum": list(PROVIDERS), "description": "Only when the user named a provider (\"ask Codex\", \"ask Gemini\"): suggest a model and effort on that one."},
                 "refresh": {"type": "boolean", "description": "Fetch the model scores again now if the saved ones are over an hour old. Default false; pass true only when the user asks for fresh scores."},
             },
         },

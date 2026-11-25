@@ -148,11 +148,12 @@ class ProtocolTest(unittest.TestCase):
             reply = self.server.request(1, "initialize", {"protocolVersion": requested, "capabilities": {}})
             self.assertEqual(reply["result"]["protocolVersion"], requested)
 
-    def test_instructions_leave_model_choice_to_the_user(self):
+    def test_instructions_choose_by_the_budget(self):
         reply = self.server.request(1, "initialize", {"protocolVersion": server.PROTOCOL_VERSIONS[0], "capabilities": {}})
         text = reply["result"]["instructions"]
-        self.assertIn("only when the user asks or the user's own instructions", text)
-        self.assertIn("send the usual values again", text)
+        self.assertIn("call ConsultantBudget with its kind", text)
+        self.assertIn("unless the user named others or the user's own instructions route otherwise", text)
+        self.assertIn("pass the suggested values with each message", text)
 
     def test_instructions_consult_unasked_only_with_a_consultant_cli(self):
         # A clone with no CLAUDE.md or skill still gets reviews, bug hunts and critiques unasked;
@@ -1588,6 +1589,21 @@ class HandlerTest(unittest.TestCase):
         self.assertIn("Nothing was sent", str(caught.exception))
         self.assertNotIn("turn/steer", daemon.calls)
         self.assertNotIn("turn/start", daemon.calls)
+
+    def test_the_values_a_busy_consultant_has_dont_stop_a_steer(self):
+        """0.24.0: Claude passes ConsultantBudget's suggestion with every message, so the model and
+        effort the running turn already has are no change, and the message is steered in."""
+        thread = self.consultant("tune05", model="gpt-6.2-astra", reasoningEffort="high")
+        running = {"id": "turn-1", "status": "inProgress", "items": [user("q")]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        with mock.patch.object(server, "_bridge_turns", {"turn-1"}), mock.patch.object(server, "_delivered", {}):
+            out = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0,
+                                                  "model": "gpt-6.2-astra", "effort": "high"})
+            with self.assertRaisesRegex(server.BridgeError, "can't change its effort"):
+                server.send_consultant_message({"to": thread["id"], "message": "other", "wait": 0,
+                                                "model": "gpt-6.2-astra", "effort": "xhigh"})
+        self.assertIn("steered into the running turn", out)
+        self.assertEqual(daemon.calls.count("turn/steer"), 1)
 
     def test_steered_timeout_hides_output_from_before_the_message(self):
         thread = self.consultant("busy01")
@@ -4342,6 +4358,194 @@ def agy_result(text, status="SUCCESS", **extra):
                                           "duration_seconds": 7.5, "usage": {"input_tokens": 900, "output_tokens": 120,
                                                                              "thinking_tokens": 80, "total_tokens": 1020},
                                           **extra}}
+
+
+class SuggestTest(unittest.TestCase):
+    """0.24.0: ConsultantBudget suggests the provider, model and effort for each kind."""
+    NOW = 1_800_000_000.0
+    DAY = 86400
+    EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+
+    def codex(self, used=10, days_left=5, models=None):
+        gone = 7 - days_left  # a window that started (7 - days_left) days ago, used evenly
+        week = (7 * self.DAY, used, self.NOW + days_left * self.DAY)
+        listed = models if models is not None else ["gpt-6.2-sol", "gpt-6.2-astra"]
+        return {"windows": [week] if gone else [],
+                "models": {m: (self.EFFORTS, "low", i == 0) for i, m in enumerate(listed)}}
+
+    def agy(self, gemini=10, claude=0, days_left=5, models=None):
+        ids = models if models is not None else (
+            [f"gemini-4-neon-{lv}" for lv in ("low", "medium", "high", "xhigh")]
+            + [f"claude-opus-5-5-{lv}" for lv in ("low", "medium", "high")])
+        reset = self.NOW + days_left * self.DAY
+        return {"groups": {"Gemini Models": [(7 * self.DAY, gemini, reset)],
+                           "Claude and GPT models": [(7 * self.DAY, claude, reset)]}, "models": ids}
+
+    def pick(self, kind, **state):
+        got = server.suggest_consultant(kind, state, self.NOW)
+        return got.get("none") or (got["provider"], got["model"], got["effort"])
+
+    def test_both_installed_with_room(self):
+        both = {"codex": self.codex(), "antigravity": self.agy()}
+        self.assertEqual(self.pick("review", **both), ("codex", "gpt-6.2-astra", "high"))
+        self.assertEqual(self.pick("quick-check", **both), ("codex", "gpt-6.2-sol", "low"))
+        self.assertEqual(self.pick("re-check", **both), ("codex", "gpt-6.2-sol", "medium"))
+        self.assertEqual(self.pick("research", **both), ("codex", "gpt-6.2-astra", "xhigh"))
+        self.assertEqual(self.pick("plan-critique", **both), ("antigravity", "gemini-4-neon", "xhigh"))
+        self.assertEqual(self.pick("fact-check", **both), ("codex", "gpt-6.2-astra", "high"))
+        self.assertEqual(self.pick("other", **both), ("codex", "gpt-6.2-sol", "low"))
+
+    def test_one_provider(self):
+        self.assertEqual(self.pick("plan-critique", codex=self.codex()), ("codex", "gpt-6.2-astra", "high"))
+        agy = {"antigravity": self.agy()}
+        self.assertEqual(self.pick("review", **agy), ("antigravity", "gemini-4-neon", "high"))
+        self.assertEqual(self.pick("fact-check", **agy), ("antigravity", "claude-opus-5-5", "high"))
+        self.assertEqual(self.pick("other", **agy), ("antigravity", "gemini-4-neon", "high"))
+        # "ask Gemini": Antigravity's Gemini models only, so a fact check doesn't go to Claude Opus
+        got = server.suggest_consultant("fact-check", agy, self.NOW, only="antigravity")
+        self.assertEqual((got["provider"], got["model"]), ("antigravity", "gemini-4-neon"))
+        # ... nor through the default model, when agy lists no Gemini one
+        opus = {"antigravity": self.agy(models=["claude-opus-5-5-high"])}
+        got = server.suggest_consultant("fact-check", opus, self.NOW, only="antigravity")
+        self.assertEqual(got, {"none": "Antigravity lists no Gemini model"})
+        # Neon listed at one level only: that level, so StartConsultant doesn't ask for high
+        self.assertEqual(self.pick("other", antigravity=self.agy(models=["gemini-4-neon-low"])),
+                         ("antigravity", "gemini-4-neon", "low"))
+        self.assertEqual(self.pick("review"), "no consultant CLI is installed")
+        lines = server.suggestion_lines(None, {"codex": None, "antigravity": None}, self.NOW)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("need the Codex or Antigravity CLI", lines[0])
+        named = server.suggestion_lines("review", {"claude": {}}, self.NOW, "antigravity")
+        self.assertIn("Antigravity isn't installed", named[0])
+
+    def test_used_up_or_running_out(self):
+        # used up: the other provider; both used up: none, with why
+        both = {"codex": self.codex(used=100), "antigravity": self.agy()}
+        self.assertEqual(self.pick("review", **both), ("antigravity", "gemini-4-neon", "high"))
+        none = self.pick("review", codex=self.codex(used=100), antigravity=self.agy(gemini=100))
+        self.assertIn("Codex gpt-6.2-astra: its weekly window is used up", none)
+        self.assertIn("Antigravity gemini-4-neon", none)
+        # 2 of 7 days gone and 50% used: runs out before the reset
+        self.assertEqual(self.pick("review", codex=self.codex(used=50))[:5], "Codex")
+        # the Gemini group used up, the Claude and GPT one free: research moves there
+        self.assertEqual(self.pick("research", antigravity=self.agy(gemini=100)),
+                         ("antigravity", "claude-opus-5-5", "high"))
+        text = server.suggestion_lines("review", {"codex": self.codex(used=100), "antigravity": None,
+                                                  "claude": {}}, self.NOW)
+        self.assertIn("none has room", text[2])
+        self.assertIn("Skip it, and tell the user", text[2])
+
+    def test_tight_and_unused_weeks(self):
+        # Codex tight (6 of 7 days gone, 80% used: about 93%), Gemini fine: the review moves
+        tight = self.codex(used=80, days_left=1)
+        got = server.suggest_consultant("review", {"codex": tight, "antigravity": self.agy()}, self.NOW)
+        self.assertEqual((got["provider"], got["effort"]), ("antigravity", "high"))
+        self.assertIn("Codex is on pace for about 93% of its week", got["why"])
+        # no other provider: the same, one level down
+        got = server.suggest_consultant("review", {"codex": tight}, self.NOW)
+        self.assertEqual((got["model"], got["effort"]), ("gpt-6.2-astra", "medium"))
+        self.assertIn("one level down while its week is tight", got["why"])
+        # Gemini past 70%, Codex's week ending within two days half unused: the critique goes to Codex
+        busy = self.agy(gemini=60, days_left=2)  # 5 of 7 days gone: about 84%
+        spare = self.codex(used=30, days_left=1)  # about 35% at a reset a day away
+        got = server.suggest_consultant("plan-critique", {"codex": spare, "antigravity": busy}, self.NOW)
+        self.assertEqual((got["provider"], got["model"]), ("codex", "gpt-6.2-astra"))
+        self.assertTrue(any("would go unused" in w for w in got["why"]), got["why"])
+        # but a fact check stays with the first choice
+        got = server.suggest_consultant("fact-check", {"codex": self.codex(used=60, days_left=2),
+                                                       "antigravity": self.agy(gemini=10, claude=10, days_left=1)},
+                                        self.NOW)
+        self.assertEqual(got["provider"], "codex")
+
+    def test_models_not_listed(self):
+        # a newer version of the family is used; a missing family falls back to the default model
+        newer = self.codex(models=["gpt-6.3-sol", "gpt-6.3-astra", "gpt-6.10-astra"])
+        self.assertEqual(self.pick("review", codex=newer), ("codex", "gpt-6.10-astra", "high"))
+        got = server.suggest_consultant("review", {"codex": self.codex(models=["other-1"])}, self.NOW)
+        self.assertEqual((got["model"], got["effort"]), ("other-1", "low"))
+        self.assertIn("gpt-6.2-astra isn't listed, so the default model", got["notes"])
+        # an effort the model doesn't list: the closest listed one below it, always named, since a
+        # reused consultant would otherwise keep a level the new model may not have
+        st = self.codex()
+        st["models"]["gpt-6.2-astra"] = (["low", "medium"], "low", False)
+        got = server.suggest_consultant("review", {"codex": st}, self.NOW)
+        self.assertEqual(got["effort"], "medium")
+        self.assertIn("gpt-6.2-astra has no high level, so medium", got["notes"])
+        self.assertEqual(server.listed_level("low", ["high", "xhigh"]), "high")
+        self.assertIsNone(server.listed_level("high", []))
+        # Antigravity without Neon: a listed Gemini model, not a default agy can't run
+        got = server.suggest_consultant("other", {"antigravity": self.agy(models=["gemini-4-carbon-low"])}, self.NOW)
+        self.assertEqual((got["model"], got["effort"]), ("gemini-4-carbon", "low"))
+        # no model list at all: the pick as is; agy without opus: neon for the fact check
+        self.assertEqual(self.pick("review", codex={"windows": [], "models": None}),
+                         ("codex", "gpt-6.2-astra", "high"))
+        self.assertEqual(self.pick("fact-check", antigravity=self.agy(models=["gemini-4-neon-high"])),
+                         ("antigravity", "gemini-4-neon", "high"))
+        self.assertEqual(server.newest_of_family("claude-opus-5-5", ["claude-opus-5-5", "claude-opus-6-0"]),
+                         "claude-opus-6-0")
+        self.assertIsNone(server.newest_of_family("plain", ["plain"]))
+
+    def test_unknown_usage_and_claude(self):
+        got = server.suggest_consultant("review", {"codex": {"windows": [], "models": None}}, self.NOW)
+        self.assertIn("Codex's usage isn't known", got["why"])
+        o = server.claude_outlook
+        self.assertIn("isn't known", o({}, self.NOW))
+        self.assertIn("Hand read-only work", o({"windows": [(7 * self.DAY, 60, self.NOW + 2 * self.DAY, self.NOW)]},
+                                                self.NOW))  # about 84%
+        self.assertIn("put off optional work", o({"windows": [(7 * self.DAY, 80, self.NOW + self.DAY, self.NOW)]},
+                                                  self.NOW))
+        self.assertEqual(o({"windows": [(7 * self.DAY, 12, self.NOW + 3 * self.DAY, self.NOW)]}, self.NOW),
+                         "Claude Code: on pace for about 21% of its week.")
+        # Claude's window used up or running out: said, not a crash
+        for used in (100, 90):
+            line = o({"windows": [(5 * 3600, used, self.NOW + 4 * 3600, self.NOW)]}, self.NOW)
+            self.assertIn("Hand every read-only job", line)
+            self.assertIn("window", line)
+        # an old reading gives no pace, only the least the week will reach: never spare
+        old = self.NOW - 3600
+        self.assertEqual(server.usage_outlook([(7 * self.DAY, 30, self.NOW + self.DAY, old)], self.NOW),
+                         ("ok", None))
+        self.assertEqual(server.usage_outlook([(7 * self.DAY, 80, self.NOW + self.DAY, old)], self.NOW),
+                         ("busy", 80))
+
+    def test_lines_for_one_kind(self):
+        state = {"codex": self.codex(), "antigravity": self.agy(), "claude": {}}
+        lines = server.suggestion_lines("review", state, self.NOW)
+        text = "\n".join(lines)
+        self.assertIn('review: StartConsultant provider "codex", model "gpt-6.2-astra"; SendConsultantMessage '
+                      'model "gpt-6.2-astra", effort "high", kind "review".', text)
+        self.assertIn("three rounds", text)
+        self.assertIn('blind', text)
+        self.assertIn('The other provider now: provider "antigravity", model "gemini-4-neon", effort "high".', text)
+        self.assertIn('Gemini 4 Neon scores best (Artificial Analysis by subject): provider "antigravity", '
+                      'model "gemini-4-neon", effort "xhigh".', text)
+        # an Antigravity suggestion names the model and level for StartConsultant too
+        agy = server.suggestion_lines("plan-critique", state, self.NOW)
+        self.assertIn('StartConsultant provider "antigravity", model "gemini-4-neon", effort "xhigh"; ', "\n".join(agy))
+        # Gemini used up, Carbon only listed: no Neon note and no blind Antigravity review
+        state["antigravity"] = self.agy(gemini=100, models=["gemini-4-carbon-low"])
+        text = "\n".join(server.suggestion_lines("research", state, self.NOW))
+        self.assertNotIn("Gemini 4 Neon scores best", text)
+        text = "\n".join(server.suggestion_lines("review", state, self.NOW))
+        self.assertNotIn("The other provider now", text)
+        every = server.suggestion_lines(None, state, self.NOW)
+        self.assertEqual(sum(line.startswith("  ") and '; SendConsultantMessage' in line for line in every),
+                         len(server.CONSULT_KINDS) - 1)
+        self.assertNotIn("blind", "\n".join(every))
+
+    def test_budget_takes_kind_and_provider(self):
+        with mock.patch.object(server, "codex_installed", lambda: False), \
+             mock.patch.object(server, "claude_budget", return_value=["Claude Code: x"]), \
+             mock.patch.object(server, "aa_scores", return_value=({}, "no key")), \
+             mock.patch.object(server, "agy_budget", return_value=[]):
+            self.assertIn("Nothing to suggest", server.consultant_budget({"kind": "review"}))
+            with self.assertRaises(server.BridgeError):
+                server.consultant_budget({"kind": "chat"})
+            with self.assertRaises(server.BridgeError):
+                server.consultant_budget({"provider": "other"})
+        schema = next(t for t in server.TOOLS if t["name"] == "ConsultantBudget")["inputSchema"]["properties"]
+        self.assertEqual(schema["kind"]["enum"], list(server.CONSULT_KINDS))
+        self.assertEqual(schema["provider"]["enum"], list(server.PROVIDERS))
 
 
 class AgyTest(unittest.TestCase):

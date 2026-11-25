@@ -26,7 +26,7 @@ codex app-server daemon start
 
 > We're done. Stop the consultant.
 
-**Claude also consults without being asked**, at four points: before committing a change to behavior, to several files or to anything risky (a review of what it will commit: all its uncommitted work, or else the staged diff; it commits after the verdict; not typos, formatting or one-line fixes), when a failure's cause isn't obvious after a first look (a bug hunt), before acting on a consequential plan, design, formula or rule of its own (a critique, whose verdict it shows you before building on the plan), and for research across sources, an audit or explanation spanning many files, or a consequential claim a first check left uncertain (it asks for a short answer, which saves its own usage). It first checks `ConsultantBudget` and skips one, saying so, when that subscription is used up or would run out before its reset. nouez's server instructions say this, so it works with no `CLAUDE.md` lines and no skill. Your own instructions override it: write when to consult, or not to, in `~/.claude/CLAUDE.md`. To turn it off altogether, set `NOUEZ_NO_AUTO_CONSULT=1` in nouez's environment (with a Codex API key rather than a subscription, each consultation costs money). Without a consultant CLI it is off.
+**Claude also consults without being asked**, at four points: before committing a change to behavior, to several files or to anything risky (a review of what it will commit: all its uncommitted work, or else the staged diff; it commits after the verdict; not typos, formatting or one-line fixes), when a failure's cause isn't obvious after a first look (a bug hunt), before acting on a consequential plan, design, formula or rule of its own (a critique, whose verdict it shows you before building on the plan), and for research across sources instead of searching the web itself, an audit or explanation spanning many files, or a consequential claim a first check left uncertain (it asks for a short answer, which saves its own usage). It first calls `ConsultantBudget`, takes the consultant it suggests (see [How nouez picks a model](#how-nouez-picks-a-model)), and skips one, saying so, when no subscription has room. nouez's server instructions say this, so it works with no `CLAUDE.md` lines and no skill. Your own instructions override it: write when to consult, or not to, in `~/.claude/CLAUDE.md`. To turn it off altogether, set `NOUEZ_NO_AUTO_CONSULT=1` in nouez's environment (with a Codex API key rather than a subscription, each consultation costs money). Without a consultant CLI it is off.
 
 Claude calls `StartConsultant` to create a background consultant in your project (Codex if it is installed, otherwise Antigravity) (or reuses one already working there, see [Reusing a consultant](#reusing-a-consultant)), `SendConsultantMessage` to ask questions, and `StopConsultant` when you're finished. Each message reaches the consultant prefixed with `[Message from Claude Code via the consultants bridge]`, and Claude gets the answer back as a tool result.
 
@@ -60,20 +60,65 @@ If you'd rather see Codex work in its own window, open it yourself (`cd my-proje
 
 ## Choosing model and effort
 
-A Codex consultant uses the model and reasoning effort from your Codex config (`model` and `model_reasoning_effort` in `~/.codex/config.toml`); an Antigravity one starts on `gemini-4-neon` at level `high` (`ConsultantBudget` lists agy's models and their levels). Claude can change either one for a hard question without starting over: `SendConsultantMessage` takes `model` and `effort`, the consultant keeps its context, and the setting stays for later messages until Claude sends the usual values again. nouez tells Claude to do this only when you ask, or when your own instructions say when. Which model suits which work is your call, so nouez doesn't decide it for you.
+A Codex consultant starts on the model and reasoning effort from your Codex config (`model` and `model_reasoning_effort` in `~/.codex/config.toml`); an Antigravity one on `gemini-4-neon` at level `high`. Before each consultation, Claude calls `ConsultantBudget` with the kind of consultation, and nouez suggests the provider to pass to `StartConsultant` and the model and effort to pass to `SendConsultantMessage`. A change keeps the consultant's context and stays for later messages, so Claude passes the suggested values with each message. No `CLAUDE.md` lines or skill are needed for this.
 
-To have Claude pick models and efforts this way without being asked, write your rules in `~/.claude/CLAUDE.md`. Claude Code reads that file in every project, so the rules apply wherever you use a consultant. A project's own `CLAUDE.md` covers only that project. A starting point to adapt (the model ids are examples; `/model` in Codex lists the ones your account offers):
+You can always name your own: *"ask Gemini"*, *"use gpt-6.2-sol at low"*. Claude then asks `ConsultantBudget` for that provider only (for Antigravity, its Gemini models). Your own instructions also come first: to route differently, write your rules in `~/.claude/CLAUDE.md`.
 
-```markdown
-- **Model and effort routing.** Defaults: Claude Code on <model> at <effort>; Codex consultants on
-  gpt-6.1-sol at high. Send research to a Codex consultant (StartConsultant, then
-  SendConsultantMessage); for hard research across many sources, send that message with
-  model "gpt-6-astra". When a result is poor, find out why before changing anything: missing
-  information → fix the context or the prompt; steps skipped or rushed → raise effort one level;
-  tried properly and still failed → a stronger model. Use the top effort levels only after the
-  level below has failed. A consultant's model and effort stay set for later messages, so send
-  the defaults again once the hard part is done.
+### How nouez picks a model
+
+Each kind of consultation has a starting point and a fallback on the other provider:
+
+| Kind | First choice | Without it |
+|---|---|---|
+| Quick check | Codex `gpt-6.2-sol`, low | Antigravity `gemini-4-neon`, low |
+| Re-check (named fixes only) | Codex `gpt-6.2-sol`, medium | `gemini-4-neon`, medium |
+| Review | Codex `gpt-6.2-astra`, high | `gemini-4-neon`, high |
+| Bug hunt | Codex `gpt-6.2-astra`, high | `gemini-4-neon`, high |
+| Plan critique | Antigravity `gemini-4-neon`, xhigh | Codex `gpt-6.2-astra`, high, asked first whether any premise is wrong |
+| Research | Codex `gpt-6.2-astra`, xhigh | `gemini-4-neon`, xhigh; then Antigravity's `claude-opus-5-5`, high |
+| Fact check | Codex `gpt-6.2-astra`, high | Antigravity's `claude-opus-5-5`, high; then `gemini-4-neon`, high |
+
+Why these, from public benchmarks:
+
+- **Artificial Analysis** ([artificialanalysis.ai](https://artificialanalysis.ai), Intelligence Index v5 and its benchmarks, 2026-11-22). GPT-6.2 Astra at high scores 60.1 and Sol at xhigh 55.7, so Sol is for quick checks and re-checks only. Gemini 4 Neon at xhigh leads every Codex model on finance, legal, medicine, economics and strategy, so for those subjects the suggestion names it too. On not making up an answer, Astra scores 59.1 and Neon 14.4, so fact checks go to Astra, and to Neon only last and with sources asked for.
+- **BullshitBench** ([petergpt.github.io/bullshit-benchmark](https://petergpt.github.io/bullshit-benchmark/), 2026-11-19) asks questions built on a false premise. Neon at xhigh clearly says so 84% of the time, Astra at max 55% and Sol at max 42%. So plan critiques go to Neon at xhigh, and to Astra with the premise question asked outright.
+- **A long-running coding benchmark** ([kevinkern.dev](https://kevinkern.dev/benchmarks/marlies-workflows/long-running/), one feature, a small private test) had GPT-6.2 Sol building with an Astra review on top. One task, so it only supports Astra as the reviewer.
+
+The suggestion then follows the usage `ConsultantBudget` shows:
+
+- **No room:** a subscription whose window is used up, or runs out before its reset at the current rate, isn't suggested. When none has room, the suggestion says to skip the consultation and tell you. Free full resets are never used; only you decide that.
+- **An old reading:** usage read too long ago to project from counts only as the least that week will reach, so it can make a provider tight or busy but never spare.
+- **Tight:** when the first choice's week is on pace for over 90% at its reset, the other provider takes it if it has room. Otherwise the first choice stays, one effort level down.
+- **Would go unused:** when the first choice is past 70% and the other provider's week resets within two days under 60%, the other one takes it. Fact checks are the exception.
+- **Antigravity's quota groups:** Gemini models count against its Gemini group, and `claude-opus-5-5` against its Claude and GPT group, both on Google's quota, not Claude Code's.
+- **Claude Code's own week:** past about 70% on pace, Claude hands read-only work that saves real effort (reviews, research, long reading) to a consultant and asks for short replies. Past about 90%, it also puts off optional work and says so.
+- **A model that isn't listed:** nouez takes the newest listed model of the same family (`gpt-6.3-astra` for `gpt-6.2-astra`), else the provider's default model, and says so. An effort the model doesn't list becomes the closest listed level below it. A level is always named, since a reused consultant keeps the one it last had.
+
+For reviews, the suggestion also says to ask for every finding in the first round, to treat later rounds as re-checks, and to show you the open points after three rounds of changes. When the other provider has room, a disagreement goes to it blind, on the model and effort nouez names for it: a new consultant gets the brief and the work, and sees the disputed finding only after its own verdict. A decision costly to undo goes to both at once.
+
+nouez's own eval checks that fresh Claude Code sessions follow this. See [The consult eval](#the-consult-eval).
+
+### The consult eval
+
+`tests/consult_eval.py` checks two things on fresh Claude Code sessions: whether Claude consults where nouez's instructions say to, and not where they don't, and whether it takes the consultant `ConsultantBudget` suggests. Each run is a new `claude -p` session in its own scratch repo, with made-up code and prompts, none of your settings, memory or `CLAUDE.md`, and a stub nouez. The stub loads a real `server.py` but fakes the Codex and Antigravity CLIs, the usage numbers, and `StartConsultant` and `SendConsultantMessage`, so nothing reaches a real consultant or your cache. The scratch repos use none of your git config or hooks either. The stub logs the calls it accepted, in order, and the score comes from that log: a consultation counts only when a message reached a consultant `StartConsultant` returned, and it took the suggestion only when its provider, model and effort match and its kind fits the case. With no provider installed or with room, every case counts as one that shouldn't consult. A run that times out or ends in an error counts in neither and is listed. It uses Claude Code usage, about a minute per run.
+
 ```
+python tests/consult_eval.py --reps 2                  # all cases, both providers, plenty of room
+python tests/consult_eval.py --setup antigravity --cases plan,research-config
+python tests/consult_eval.py --scenario codex-tight    # also codex-out, claude-busy
+python tests/consult_eval.py --server old-server.py    # compare with another version
+```
+
+The cases are a change to commit (should consult), a typo and a one-line change to commit (shouldn't), a plan to build (should), two questions that need research across sources (should), three lookups or replies Claude can answer itself (shouldn't), and a test that fails only after another one runs (may or may not).
+
+Results on 2026-11-25, with Claude Opus 5.5, both providers installed and plenty of room:
+
+| Server | Consulted where it should | Consulted where it shouldn't | Took the suggestion |
+|---|---|---|---|
+| 0.23.0 | 1 of 8 | 0 of 10 | 0 of 1 (`gpt-6.2-sol`, no effort, for research) |
+| 0.24.0 | 6 of 8 | 0 of 10 | 6 of 6, each after calling `ConsultantBudget` |
+
+With only Codex, 2 of the 4 cases that should consult did (4 of 4 in an earlier run); with only Antigravity, 3 of 4; with Codex's week tight, where nouez moves every kind to Antigravity, 3 of 4. Each of those consultations took the suggestion. With neither installed, Claude didn't try to consult. The case missed most often is the plan, missed in every run: asked to plan and build, Claude writes a short plan and starts building before it asks. A change to commit is sometimes committed without a review. Research went from 0 of 4 to 4 of 4 when the instructions said "instead of searching the web yourself": Claude had treated its own web search as the research.
 
 ## Choosing a consultant
 
@@ -84,20 +129,7 @@ To have Claude pick models and efforts this way without being asked, write your 
 - **Claude Code's own usage.** Claude Code tells only its status line how much of its 5-hour and weekly windows is used, so nouez reads a file the status line saves (below). Without it this part says "not known".
 - **Model scores.** The [Artificial Analysis](https://artificialanalysis.ai) Intelligence Index for the top OpenAI, Google and Anthropic models, with API price and speed. Higher is smarter. Data from Artificial Analysis; credit it when you share it.
 
-nouez reports; it doesn't choose. Your rules decide, in `~/.claude/CLAUDE.md` (see [Choosing model and effort](#choosing-model-and-effort)) or a skill. nouez ships one to start from, `skills/consult/SKILL.md`: it sorts consultations by kind (quick check, review, bug hunt, plan critique, research), works with Codex, Antigravity, both or neither, gives each kind a starting model and effort, then routes by what `ConsultantBudget` shows to keep Claude Code going: past about 70% of Claude Code's week on pace, read-only work that saves real effort goes to a consultant; the subscription whose week would otherwise reset unused goes first; one effort level down on a subscription on pace for over 90% of its week; and no consulting on a window that runs out before its reset. For a disagreement it asks the other provider blind, without the first verdict, and a decision that is costly to undo goes to both at once. Edit its table to your own models. To use it in every project, copy it to your Claude Code skills folder (if you already have a `consult` skill there, compare them first rather than overwrite it):
-
-```sh
-# macOS and Linux
-mkdir -p ~/.claude/skills/consult && cp "/absolute/path/to/nouez/skills/consult/SKILL.md" ~/.claude/skills/consult/
-```
-
-```powershell
-# Windows (PowerShell)
-New-Item -ItemType Directory -Force "$HOME\.claude\skills\consult" | Out-Null
-Copy-Item "C:/Users/you/nouez/skills/consult/SKILL.md" "$HOME\.claude\skills\consult\"
-```
-
-To use it in one project only, copy it to that project's `.claude/skills/consult/` instead. In a new Claude Code session, `/consult` should then be listed, and asking for a second opinion uses it.
+`ConsultantBudget` ends with the suggestion (see [How nouez picks a model](#how-nouez-picks-a-model)). Earlier versions of nouez asked you to copy a `consult` skill to `~/.claude/skills/consult/`. If you did, delete that copy: as your own skill it comes before nouez's suggestions, with older tables.
 
 **Model scores need a free Artificial Analysis key.** Create an account at [artificialanalysis.ai](https://artificialanalysis.ai) and an API key (free tier, 100 requests a day). Set it as `ARTIFICIAL_ANALYSIS_API_KEY` in the environment Claude Code starts nouez from, for example as a user environment variable on Windows, or in the server's `env` when you register it:
 
