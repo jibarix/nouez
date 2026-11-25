@@ -247,5 +247,58 @@ class BoundaryTest(unittest.TestCase):
         self.assertEqual(crossings('S = "a curly brace, wgetter, curl-free"\n'), [])  # whole words only
 
 
+class LinkTest(unittest.TestCase):
+    """0.23.0: the README's sections moved to docs/, and every link between the files must still lead somewhere."""
+
+    NAMES = {"README.md", "CHANGELOG.md", "docs/phone.md", "docs/images/a.png"}
+
+    def problems(self, readme, **others):
+        texts = {"README.md": readme, "CHANGELOG.md": "# Changes\n\n## Added\n\n## Fixed\n\n## Added\n",
+                 "docs/phone.md": "# Phone\n\n## Fix (a `tool`), now!\n\nSetext\n------\n", **others}
+        return verify.link_problems(texts, self.NAMES | set(others))
+
+    def test_links_that_resolve_pass(self):
+        self.assertEqual(self.problems(
+            "[a](docs/phone.md#fix-a-tool-now) [b](docs/phone.md#setext) [c](CHANGELOG.md#added-1)"
+            " ![d](docs/images/a.png) [e](docs/) [f](<docs/phone.md>) [g](https://example.com/x)"
+            " [h](#top)\n\n# Top\n"), [])
+
+    def test_a_repeated_heading_is_numbered_in_order(self):
+        self.assertEqual(verify.heading_anchors("# A\n# A\n# A-1\n# A\n"), {"a", "a-1", "a-1-1", "a-2"})
+
+    def test_a_missing_file_or_heading_fails(self):
+        self.assertEqual(len(self.problems("[a](docs/nope.md) [b](docs/phone.md#nope) [c](CHANGELOG.md#added-2)")), 3)
+
+    def test_letter_case_must_match_as_on_github(self):
+        self.assertEqual(len(self.problems("[a](docs/Phone.md)")), 1)
+
+    def test_a_title_or_parentheses_dont_hide_the_target(self):
+        self.assertEqual(len(self.problems('[a](docs/nope.md "a title")')), 1)
+        self.assertEqual(self.problems("[a](docs/x(1).md)", **{"docs/x(1).md": "# X\n"}), [])
+        self.assertEqual(len(self.problems("[a](docs/x(2).md)", **{"docs/x(1).md": "# X\n"})), 1)
+
+    def test_a_reference_definition_is_checked(self):
+        self.assertEqual(len(self.problems("[a][ref]\n\n[ref]: docs/nope.md\n")), 1)
+        self.assertEqual(self.problems("[a][ref]\n\n[ref]: <docs/phone.md#phone>\n"), [])
+
+    def test_code_is_not_a_link(self):
+        self.assertEqual(self.problems(
+            "`[a](nope.md)`\n\n```md\n[b](nope.md)\n```\n\n~~~\n[c](nope.md)\n```\n[d](nope.md)\n~~~\n"), [])
+        self.assertEqual(len(self.problems("~~~\n~~~\n[e](nope.md)\n")), 1)
+        self.assertEqual(self.problems("> ```\n> [f](nope.md)\n> ```\n"), [])
+
+    def test_a_destination_on_the_next_line_is_checked(self):
+        self.assertEqual(len(self.problems("[a](\n  docs/nope.md)\n")), 1)
+        self.assertEqual(len(self.problems("[a][r]\n\n[r]:\n  docs/nope.md\n")), 1)
+        self.assertEqual(len(self.problems("[a](docs/nope.md) and [b](")), 1)  # the last line, unfinished
+
+    def test_escapes_queries_and_network_paths(self):
+        self.assertEqual(self.problems(r"[a](docs/x\(1\).md)", **{"docs/x(1).md": "# X\n"}), [])
+        self.assertEqual(self.problems("[a](docs/phone.md?plain=1#phone) [b](//example.net/page)"), [])
+
+    def test_a_reference_link_in_a_heading_reads_as_its_text(self):
+        self.assertEqual(verify.heading_anchors("## [My guide][ref]\n\n[ref]: x.md\n"), {"my-guide"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,19 @@ _AGY_EMPTY = tempfile.mkdtemp(prefix="nouez-test-agy-")
 server.agy_root = lambda: os.path.join(_AGY_EMPTY, "agy")
 
 server.CONNECT_SECONDS = 0  # OpenClaudeSession tests look for the new session once, not for 15 s
+
+# Tests never see this computer's own phone dispatcher, nor its sign-in task or other Remote Control
+# servers; DispatcherTest points these at its own folders.
+_REAL_DISPATCHER = {name: getattr(server, name) for name in ("dispatcher_installed", "other_remote_controls")}
+_REAL_FILELOCK = server.FileLock
+_REAL_DISPATCHER_TRUSTED, _REAL_FOLDER_TRUSTED = server.dispatcher_trusted, server.folder_trusted
+_REAL_NOUEZ_SCRIPT = server.nouez_script
+_DISPATCHER_EMPTY = tempfile.mkdtemp(prefix="nouez-test-dispatcher-")
+server._dispatcher_root[:] = [os.path.join(_DISPATCHER_EMPTY, "cache")]
+os.makedirs(server._dispatcher_root[0], exist_ok=True)
+server.dispatcher_default_folder = lambda: os.path.join(_DISPATCHER_EMPTY, "Projects", "dispatcher")
+server.dispatcher_installed = lambda check_off=True, want=None: "no"
+server.other_remote_controls = lambda own=None: []
 
 # Tests never open a real terminal window: one that reaches a launcher without mocking Popen fails.
 _REAL_POPEN = subprocess.Popen
@@ -1155,7 +1169,7 @@ class FakeDaemon:
         self.calls = []
         self.info = {}
 
-    def __call__(self):
+    def __call__(self, on_spawn=None):  # as CodexClient(): a ConsultationFeed passes on_spawn
         return self
 
     def close(self):
@@ -1196,10 +1210,7 @@ class FakeDaemon:
 
 class HandlerTest(unittest.TestCase):
     def use(self, daemon):
-        self.panes = []
-        # Never open a real terminal from a test.
-        fake_viewer = lambda thread, info, quiet=False: self.panes.append(thread["id"]) or "Opened (test)."
-        for attr, value in (("CodexClient", daemon), ("POLL_SECONDS", 0.01), ("show_viewer", fake_viewer),
+        for attr, value in (("CodexClient", daemon), ("POLL_SECONDS", 0.01),
                             ("_delivered", {})):  # turn ids repeat across tests
             self.addCleanup(setattr, server, attr, getattr(server, attr))
             setattr(server, attr, value)
@@ -1211,7 +1222,7 @@ class HandlerTest(unittest.TestCase):
     def test_start_never_reuses_a_user_session(self):
         mine = {"id": "0199aaaa-0000-0000-0000-000000user01", "cwd": ROOT}
         daemon = self.use(FakeDaemon([mine]))
-        out = server.start_consultant({"cwd": ROOT, "watch": False})
+        out = server.start_consultant({"cwd": ROOT})
         self.assertIn("thread/start", daemon.calls)
         self.assertTrue(out.startswith("Started "))
         self.assertIn("were not used", out)
@@ -1229,7 +1240,7 @@ class HandlerTest(unittest.TestCase):
                         raise error
                     return plain(method, params)
                 daemon.request = request
-                out = server.start_consultant({"cwd": ROOT, "watch": False, "title": "t"})
+                out = server.start_consultant({"cwd": ROOT, "title": "t"})
                 self.assertTrue(out.startswith("Started "))
                 self.assertIn("0199ffff-0000-0000-0000-000000new001", out)
                 self.assertIn("title couldn't be set", out)
@@ -1237,7 +1248,7 @@ class HandlerTest(unittest.TestCase):
     def test_start_reuses_its_own_consultant(self):
         ours = {"id": "0199aaaa-0000-0000-0000-000000ours01", "cwd": ROOT, "threadSource": "nouez"}
         daemon = self.use(FakeDaemon([ours]))
-        out = server.start_consultant({"cwd": ROOT, "watch": False, "model": "m"})
+        out = server.start_consultant({"cwd": ROOT, "model": "m"})
         self.assertNotIn("thread/start", daemon.calls)
         self.assertTrue(out.startswith(f"Using {server.short_name(ours)}"))
         self.assertIn("Ignored model", out)
@@ -1247,7 +1258,7 @@ class HandlerTest(unittest.TestCase):
         for existing in ([], [self.consultant("ours02")]):
             self.use(FakeDaemon(existing))
             with mock.patch.object(server, "update_notice", return_value="Codex 9.9.9 is out.") as notice:
-                out = server.start_consultant({"cwd": ROOT, "watch": False})
+                out = server.start_consultant({"cwd": ROOT})
             notice.assert_called_once()
             self.assertTrue(out.endswith("\nCodex 9.9.9 is out."))
             self.assertIn("Send it work with SendConsultantMessage.", out)
@@ -1434,8 +1445,8 @@ class HandlerTest(unittest.TestCase):
             server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0.01})
         self.assertNotIn("turn/steer", daemon.calls)
 
-    def test_never_steers_a_turn_typed_in_the_pane(self):
-        """0.18.0: a turn started in the watch pane may not be read-only, so a message waits for it."""
+    def test_never_steers_a_turn_typed_in_a_terminal(self):
+        """0.18.0: a turn started in a terminal (codex resume) may not be read-only, so a message waits for it."""
         thread = self.consultant("busy02")
         running = {"id": "turn-1", "status": "inProgress", "items": [user("edit the files")]}
         daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
@@ -1507,7 +1518,7 @@ class HandlerTest(unittest.TestCase):
             patcher = mock.patch.object(server, "rooted", lambda path: path.startswith("/"))
             patcher.start()
             self.addCleanup(patcher.stop)
-            found = {"codex": codex, "claude": "/bin/claude", "wt": "wt", "tmux": "/bin/tmux"}
+            found = {"codex": codex, "claude": "/bin/claude", "wt": "wt"}
             with mock.patch.object(server, "which", lambda name, env=None: found.get(name)),                  mock.patch.object(server, "agy_command", lambda env=None: agy),                  mock.patch.object(server, "codex_version", lambda exe: "0.170.0"),                  mock.patch.object(server, "run_status", lambda argv, timeout=20: login),                  mock.patch.object(server, "run_text", lambda argv, timeout=20: "1.5.14"),                  mock.patch.object(server, "read_agy_usage", lambda: usage),                  mock.patch.object(server, "CodexClient", FakeDaemon([])),                  mock.patch.object(server, "claude_config_dir", lambda: tempfile.gettempdir() + "/no-such-dir"),                  contextlib.redirect_stdout(io.StringIO()) as out:
                 return server.run_doctor(), out.getvalue()
         code, out = doctor(None, None)
@@ -1952,7 +1963,7 @@ class HandlerTest(unittest.TestCase):
         out = server.get_consultant_history({"to": thread["id"]})
         self.assertIn("turn-2 [completed] Codex carrying on the work of turn turn-1, with no new message "
                       "-> \"carried-on answer\"", out)
-        self.assertNotIn("someone in the Codex pane", out.splitlines()[1])
+        self.assertNotIn("someone typing in Codex", out.splitlines()[1])
         daemon.turns[thread["id"]][0]["items"].insert(0, user(
             "[Message from lead via the consultants bridge]\nand also this"))
         daemon.turns[thread["id"]].append({"id": "turn-0", "status": "completed", "items": []})
@@ -2050,6 +2061,22 @@ class LaunchTest(unittest.TestCase):
         self.assertIn("do script (item 1 of argv)", source)
         self.assertNotIn("activate", " ".join(server.apple_terminal("x", activate=False)))
 
+    def test_linux_terminal(self):
+        argv = ["claude", "--name", "x"]
+        with mock.patch.object(server.sys, "platform", "linux"), mock.patch.object(server.os, "name", "posix"), \
+                mock.patch.dict(server.os.environ, {"DISPLAY": ":0"}):
+            with mock.patch.object(server, "which", lambda name, env=None: {"wezterm": "/usr/bin/wezterm"}.get(name)):
+                self.assertEqual(server.linux_terminal(argv),
+                                 (["/usr/bin/wezterm", "start", "--", "claude", "--name", "x"], "wezterm"))
+            with mock.patch.object(server, "which", lambda name, env=None: None):
+                with self.assertRaisesRegex(server.BridgeError,
+                                            "No terminal emulator found \\(x-terminal-emulator, gnome-terminal, konsole"):
+                    server.linux_terminal(argv)
+            with mock.patch.object(server, "which", lambda name, env=None: {"xterm": "/usr/bin/xterm"}.get(name)), \
+                    mock.patch.dict(server.os.environ, {"DISPLAY": "", "WAYLAND_DISPLAY": ""}):
+                with self.assertRaisesRegex(server.BridgeError, "there is no display"):
+                    server.linux_terminal(argv)
+
     def test_linux_terminals_and_display(self):
         found = {"kitty": "/usr/bin/kitty", "xterm": "/usr/bin/xterm"}
         with mock.patch.object(server, "which", lambda name, env=None: found.get(name)):
@@ -2061,34 +2088,6 @@ class LaunchTest(unittest.TestCase):
                 self.assertIn("no display", server.no_display())
             with mock.patch.dict(server.os.environ, {"WAYLAND_DISPLAY": "wayland-0"}):
                 self.assertEqual(server.no_display(), "")
-
-    def test_open_terminal_on_linux(self):
-        calls = []
-
-        def fake_launch(argv, how, **kw):
-            calls.append(argv)
-            if "fail" in how:
-                raise server.BridgeError(f"{how} didn't open (exit code 1)")
-            return how
-        cwd = tempfile.gettempdir()
-        with mock.patch.object(server.sys, "platform", "linux"), mock.patch.object(server.os, "name", "posix"),              mock.patch.object(server, "launch", fake_launch), mock.patch.dict(server.os.environ, {"TMUX": "", "DISPLAY": ":0"}),              mock.patch.object(server, "pane_resume", lambda codex, tid, remote: ["codex", "resume", tid]):
-            with mock.patch.object(server, "which", lambda name, env=None: {"wezterm": "/usr/bin/wezterm"}.get(name)):
-                self.assertEqual(server.open_terminal(cwd, "t-1"), "wezterm")
-                self.assertEqual(calls[-1], ["/usr/bin/wezterm", "start", "--", "codex", "resume", "t-1"])
-            with mock.patch.object(server, "which", lambda name, env=None: {"xterm": "/usr/bin/fail"}.get(name)):
-                with self.assertRaises(server.BridgeError) as e:
-                    server.open_terminal(cwd, "t-1")
-                self.assertIn("Pass watch=false", str(e.exception))
-                self.assertIn("codex resume t-1", str(e.exception))
-            with mock.patch.object(server, "which", lambda name, env=None: None):
-                with self.assertRaises(server.BridgeError) as e:
-                    server.open_terminal(cwd, "t-1")
-                self.assertIn("No terminal emulator found (x-terminal-emulator, gnome-terminal, konsole", str(e.exception))
-            with mock.patch.object(server, "which", lambda name, env=None: {"xterm": "/usr/bin/xterm"}.get(name)),                  mock.patch.dict(server.os.environ, {"DISPLAY": ""}):
-                with self.assertRaises(server.BridgeError) as e:
-                    server.open_terminal(cwd, "t-1")
-                self.assertIn("there is no display", str(e.exception))
-
 
 class PosixCloseTest(unittest.TestCase):
     """0.18.0: on macOS and Linux CloseClaudeSession signals only a confirmed Claude Code session."""
@@ -2200,20 +2199,6 @@ class ReleaseTest(unittest.TestCase):
 
 
 class HostWindowTests(unittest.TestCase):
-    def test_title_ignores_the_spinner(self):
-        self.assertTrue(server._same_title("◐ Fix the build", "✳ Fix the build"))
-        self.assertTrue(server._same_title("Fix the build", "Fix the build"))
-        self.assertFalse(server._same_title("◐ Fix the build", "◐ Other session"))
-
-    def test_unknown_window_gets_a_window_of_its_own(self):
-        user32 = mock.Mock(GetForegroundWindow=mock.Mock(return_value=0))  # no real Win32 calls on any system
-        with mock.patch.object(server, "wt_host_window", return_value=None), \
-                mock.patch.object(server, "_wt_user32", return_value=(mock.Mock(), user32, mock.Mock())), \
-                mock.patch.object(server.subprocess, "Popen") as popen:
-            popen.return_value.wait.return_value = 0
-            how = server.run_in_host_window("wt", ".", ["cmd", "a;b"])
-        self.assertEqual(popen.call_args[0][0], ["wt", "-w", "new", "cmd", "a\\;b"])
-        self.assertIn("new Windows Terminal window", how)
 
     def test_failed_wt_is_reported(self):  # 0.18.0: a wt.exe that fails isn't taken for an open pane
         with mock.patch.object(server, "which", return_value="wt"), \
@@ -2224,10 +2209,13 @@ class HostWindowTests(unittest.TestCase):
                 server.open_window("C:/a", ["claude"], "Claude: x")
 
     def test_console_without_wt_is_checked(self):
-        """0.18.0: without wt, the console's own process is watched for a quick failure."""
-        for wait, want in ((mock.Mock(return_value=2), "closed at once \\(exit code 2"),
-                           (mock.Mock(side_effect=subprocess.TimeoutExpired("x", 1)), None)):
+        """0.18.0: without wt, the console's own process is watched for a quick failure. 0.23.0: it
+        leaves its job only under the phone dispatcher's supervisor."""
+        for wait, want, under in ((mock.Mock(return_value=2), "closed at once \\(exit code 2", False),
+                                  (mock.Mock(side_effect=subprocess.TimeoutExpired("x", 1)), None, False),
+                                  (mock.Mock(side_effect=subprocess.TimeoutExpired("x", 1)), None, True)):
             with mock.patch.object(server, "which", return_value=None), mock.patch.object(server.os, "name", "nt"), \
+                    mock.patch.object(server, "in_dispatcher_job", lambda: under), \
                     mock.patch.object(server.subprocess, "CREATE_NEW_CONSOLE", 16, create=True), \
                     mock.patch.object(server.subprocess, "Popen") as popen:
                 popen.return_value.wait = wait
@@ -2236,23 +2224,7 @@ class HostWindowTests(unittest.TestCase):
                         server.open_window("C:/a", ["claude"], "Claude: x")
                 else:
                     self.assertEqual(server.open_window("C:/a", ["claude"], "Claude: x"), "a new console window")
-            self.assertEqual(popen.call_args.kwargs["creationflags"], 16)
-
-    def test_powershell_command_only_for_a_native_codex(self):
-        """0.18.0: a .cmd would go through cmd again, so no PowerShell command is given for one;
-        an argument keeps its backslashes."""
-        cwd = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, cwd, True)
-        for program, given in (("C:/x%y/codex.cmd", False), ("C:/x%y/codex.exe", True)):
-            resume = [program, "resume", "t-1", "-c", "a=C:\\p q"]
-            with mock.patch.object(server.os, "name", "nt"), mock.patch.object(server, "pane_resume", return_value=resume), \
-                    mock.patch.dict(os.environ, {"TMUX": ""}):
-                with self.assertRaises(server.BridgeError) as e:
-                    server.open_terminal(cwd, "t-1", program)
-            self.assertIn("characters cmd reads as operators", str(e.exception))
-            self.assertEqual("In PowerShell" in str(e.exception), given, str(e.exception))
-            if given:
-                self.assertIn("'a=C:\\p q'", str(e.exception))
+            self.assertEqual(popen.call_args.kwargs["creationflags"], 16 | (0x01000000 if under else 0))
 
     def test_semicolons_are_escaped_for_wt(self):
         self.assertEqual(server.wt_escape("demo;calc.exe;"), "demo\\;calc.exe\\;")
@@ -2479,7 +2451,8 @@ class OpenClaudeSessionTests(unittest.TestCase):
         self.assertEqual(argv[-2], "claude")
         with open(argv[-1], encoding="utf-8") as f:
             self.assertEqual(json.load(f), {"cwd": os.path.abspath(ROOT), "name": os.path.basename(ROOT),
-                                            "prompt": "a; b \"c\"", "model": "opus", "effort": "medium"})
+                                            "prompt": "a; b \"c\"", "model": "opus", "effort": "medium",
+                                            "arrange": True})
         os.remove(argv[-1])
         self.assertIn("Remote Control", out)
 
@@ -2641,7 +2614,7 @@ class AdditionsTest(HandlerTest):
         thread = self.consultant("ctx001", createdAt=int(time.time()) - 3 * 86400, reasoningEffort="high", model="m1")
         turns = [self.done("turn-2", "second question", "agentic_training"), self.done("turn-1", "first")]
         self.use(FakeDaemon([thread], {thread["id"]: turns}))
-        out = server.start_consultant({"cwd": ROOT, "watch": False, "instructions": "be brief"})
+        out = server.start_consultant({"cwd": ROOT, "instructions": "be brief"})
         self.assertIn("(3 days ago); 2 turn(s)", out)
         self.assertIn("last turn: turn-2 [completed", out)
         self.assertIn('from agentic_training: "second question" -> "answer to second question"', out)
@@ -2660,7 +2633,7 @@ class AdditionsTest(HandlerTest):
         self.assertNotIn("turn-0", out)
         self.assertIn("took 4s", out)
         out = server.get_consultant_history({"to": thread["id"]})
-        self.assertIn('turn-0 [completed] from someone in the Codex pane: "typed in the pane" -> "ok"', out)
+        self.assertIn('turn-0 [completed] from someone typing in Codex: "typed in the pane" -> "ok"', out)
         with self.assertRaises(server.BridgeError):
             server.get_consultant_history({"to": thread["id"], "limit": 0})
 
@@ -3475,7 +3448,7 @@ class UsageLogTest(HandlerTest):
 
     def test_start_is_logged_and_the_log_can_be_turned_off(self):
         self.use(FakeDaemon([]))
-        server.start_consultant({"cwd": ROOT, "watch": False})
+        server.start_consultant({"cwd": ROOT})
         (start,) = self.events()
         self.assertEqual((start["event"], start["new"]), ("start", True))
         with mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": "1"}):
@@ -4188,7 +4161,7 @@ class AgyTest(unittest.TestCase):
                     self.assertIn("failed in Antigravity", out)
                     self.assertNotIn("Codex", out)
 
-    def test_waiter_and_watch(self):
+    def test_waiter(self):
         _, name = self.start()
         rec = server.agy_resolve(name)
         self.replies = [[agy_result("done here")]]
@@ -4201,9 +4174,6 @@ class AgyTest(unittest.TestCase):
         self.assertIn("The consultant's turn has ended (Antigravity consultant", out.getvalue())
         self.assertIn("done here", out.getvalue())
         self.assertIn("has no turn 0199aaaa", out.getvalue())
-        watch = server.watch_consultant({"to": name})
-        self.assertIn("no live pane", watch)
-        self.assertIn("agy --conversation conv-1234-abcd", watch)
         self.assertIn("characters 2-9 of 9", server.get_consultant_reply({"to": name, "offset": 2}))
 
     def test_conversation_id_is_never_an_option(self):
@@ -4556,7 +4526,8 @@ class AgyTest(unittest.TestCase):
         self.assertEqual(self.runs, [])
 
 class PaneTest(unittest.TestCase):
-    """0.15.1: panes are found and closed from Windows' own process list, not WMI."""
+    """0.23.0: the Codex panes earlier versions opened are found from Windows' own process list
+    (not WMI) and closed once when a server starts."""
     TID = "01a2ffff-0000-7000-8000-00000000abcd"
 
     def setUp(self):
@@ -4564,8 +4535,8 @@ class PaneTest(unittest.TestCase):
         key.start()
         self.addCleanup(key.stop)
 
-    def test_codex_viewers(self):
-        t = self.TID
+    def test_old_panes(self):
+        t, u = self.TID, self.TID[:-1] + "e"
         table = {10: (1, "cmd.exe"), 11: (10, "codex.exe"), 12: (1, "codex.exe"), 13: (1, "codex.exe"),
                  14: (1, "cmd.exe"), 15: (14, "codex.exe"), 16: (1, "python.exe"), 17: (1, "codex.exe"),
                  18: (1, "cmd.exe"), 19: (18, "node.exe"), 20: (19, "codex.exe"), 21: (1, "cmd.exe"),
@@ -4584,46 +4555,16 @@ class PaneTest(unittest.TestCase):
                  # shells the user typed: no options, other options, or more commands after it
                  23: f"cmd /k codex resume {t}", 24: f'cmd /d /s /k "codex resume {t} --yolo"',
                  25: f'cmd /d /s /k "codex resume {t} {up} & del x"',
-                 26: f"cmd /k C:\c\codex.exe resume {t} {old}",  # typed, or a pane before the token
+                 26: rf"cmd /k C:\c\codex.exe resume {t} {old}",  # typed, or a pane before the token
                  27: f'cmd /d /s /k "codex resume {t} {old} -c projects={{}}"',
-                 28: f'cmd /d /s /k "codex resume {t} -c nouez_pane=p{"0" * 32} {old}"'}  # a wrong token
-        viewers, shells = server.codex_viewers(t, table, lines.get)
-        self.assertEqual(sorted(viewers), [11, 12, 15, 20])
-        self.assertEqual(sorted(shells), [10, 18])  # only the panes nouez opens
+                 28: f'cmd /d /s /k "codex resume {t} -c nouez_pane=p{"0" * 32} {old}"',  # a wrong token
+                 # the last versions' panes: attached to the daemon, from a path with spaces
+                 29: f'C:\\WINDOWS\\system32\\cmd.exe /d /s /k ""C:\\Program Files\\c\\codex.exe" resume {u} '
+                     f'-c nouez_pane={server.pane_token(u)} --remote unix:// -c check_for_update_on_startup=false"'}
+        table[29] = (1, "cmd.exe")
+        self.assertEqual(server.old_panes(table, lines.get), {10: t, 18: t, 29: u})  # only panes nouez opened
         self.assertNotEqual(server.pane_token(t), server.pane_token(t[:-1] + "e"))
-
-    def test_pane_line_matches_open_terminal(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            resume = server.pane_resume("C:\\Program Files\\c\\codex.exe", self.TID)
-            # the daemon's app server, not one of its own in the pane, which the thread's lock keeps out
-            self.assertEqual(resume[5:], ["--remote", "unix://", "-c", "check_for_update_on_startup=false"])
-            line = f'C:\\WINDOWS\\system32\\cmd.exe /d /s /k "{subprocess.list2cmdline(resume)}"'
-            self.assertTrue(server.is_nouez_pane(line, self.TID), line)
-            self.assertFalse(server.is_nouez_pane(line, self.TID[:-1] + "e"))
-            sock = os.path.join(tmp, "a b", "x.sock")
-            resume = server.pane_resume("codex", self.TID, "unix://" + sock)
-            self.assertEqual(resume[5:7], ["--remote", "unix://" + sock])
-            line = f'C:\WINDOWS\system32\cmd.exe /d /s /k "{subprocess.list2cmdline(resume)}"'
-            self.assertTrue(server.is_nouez_pane(line, self.TID), line)
-
-    def test_pane_reaches_the_daemons_own_socket(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            sock = os.path.join(tmp, "app-server-control", "app-server-control.sock")
-            self.assertEqual(server.daemon_socket({"codexHome": tmp}), "unix://")  # no socket there yet
-            os.makedirs(os.path.dirname(sock))
-            open(sock, "w").close()
-            self.assertEqual(server.daemon_socket({"codexHome": tmp}), "unix://" + sock)
-            for info in (None, {}, {"codexHome": "relative"}, {"codexHome": 3}):
-                self.assertEqual(server.daemon_socket(info), "unix://")
-        with tempfile.TemporaryDirectory() as tmp:
-            home = os.path.join(tmp, "a&b")
-            os.makedirs(os.path.join(home, "app-server-control"))
-            open(os.path.join(home, "app-server-control", "app-server-control.sock"), "w").close()
-            with mock.patch.object(server.os, "name", "nt"):
-                self.assertEqual(server.daemon_socket({"codexHome": home}), "unix://")  # not for a cmd line
-            with mock.patch.object(server.os, "name", "posix"):  # shlex quotes it for a shell
-                self.assertEqual(server.daemon_socket({"codexHome": home}),
-                                 "unix://" + os.path.join(home, "app-server-control", "app-server-control.sock"))
+        self.assertIsNone(server.pane_thread(lines[10].replace(t, u)))  # another thread's token
 
     def test_pane_key_is_made_once(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(server, "nouez_cache_dir", return_value=tmp):
@@ -4661,31 +4602,56 @@ class PaneTest(unittest.TestCase):
                 own = server.pane_key()  # unusable cache: this server's own
             self.assertEqual(len(own), 32)
 
-    def test_posix_stop_kills_only_tokened_panes(self):
+    def test_posix_cleanup_kills_only_tokened_panes(self):
         # 41: the terminal emulator running `-e codex resume ...`; 42: codex, from a path with a space.
-        # 43: codex, but another session's, on a number a pane that just ended had.
+        # 43: codex, but another session's. 44: a wrong token. 45: codex asked about a pane's command,
+        # its words in one argument. 46: ended before it could be held.
         token = server.pane_token(self.TID)
-        pane = f"/opt/Codex Tools/bin/codex resume {self.TID} -c nouez_pane={token}"
-        programs = {"41": ("/usr/bin/x-terminal-emulator", "x-terminal-emulator -e " + pane),
-                    "42": ("/opt/Codex Tools/bin/codex", pane), "43": ("codex", "codex resume other")}
-        calls, killed = [], []
+        pane = ["/opt/Codex Tools/bin/codex", "resume", self.TID, "-c", f"nouez_pane={token}", "-c", "x=1"]
+        argvs = {41: ["/usr/bin/x-terminal-emulator", "-e", *pane], 42: pane, 43: ["codex", "resume", "other"],
+                 44: ["codex", "resume", self.TID, "-c", "nouez_pane=p" + "0" * 32],
+                 45: ["codex", "exec", " ".join(pane)]}
+        real_open, held, signalled, closed = open, {}, [], []
 
-        def run(argv):
-            calls.append(argv)
-            if argv[0] == "pgrep":
-                return "41\n42\n43\n"
-            return programs[argv[-1]][argv[2] == "args="] + "\n"
-        with mock.patch.object(server.os, "name", "posix"), mock.patch.object(server, "run_text", side_effect=run), \
-             mock.patch.object(server.os, "kill", side_effect=lambda pid, sig: killed.append(pid)), \
+        def pidfd_open(pid):
+            if pid not in argvs:
+                raise ProcessLookupError(pid)
+            held[100 + pid] = pid
+            return 100 + pid
+
+        def fake_open(path, *a, **k):
+            m = re.fullmatch(r"/proc/(\d+)/cmdline", str(path))
+            if not m:
+                return real_open(path, *a, **k)
+            return io.BytesIO(b"".join(arg.encode() + b"\0" for arg in argvs[int(m.group(1))]))
+        with mock.patch.object(server.sys, "platform", "linux"), \
+             mock.patch.object(server.os, "pidfd_open", pidfd_open, create=True), \
+             mock.patch.object(server.os, "listdir", return_value=["41", "42", "43", "44", "45", "46", "self"]), \
+             mock.patch.object(server.os, "close", side_effect=closed.append), \
+             mock.patch.object(server.os, "name", "posix"), mock.patch("builtins.open", fake_open), \
+             mock.patch.object(server.signal, "pidfd_send_signal", create=True,
+                               side_effect=lambda fd, sig: signalled.append(held[fd])), \
              mock.patch.object(server.signal, "SIGTERM", 15):
-            self.assertEqual(server.close_terminals(self.TID), (1, 1))
-        self.assertEqual(killed, [42])
-        pattern = calls[0][-1]
-        self.assertEqual(pattern, f"codex[^ ]* resume {self.TID} -c nouez_pane={token}( |$)")
-        for line, hit in ((f"/opt/Codex Tools/bin/codex resume {self.TID} -c nouez_pane={token} -c x=1", True),
-                          (f"codex resume {self.TID} -c nouez_pane={token}", True),
-                          (f"codex resume {self.TID} -c nouez_pane={token}0", False)):
-            self.assertEqual(bool(re.search(pattern, line)), hit, line)
+            self.assertEqual(server.close_old_panes(), 1)
+        self.assertEqual(signalled, [42])  # through the pidfd held while its arguments were read
+        self.assertEqual(sorted(closed), [141, 142, 143, 144, 145])  # every pidfd closed
+        self.assertEqual(server.pane_argv(pane), self.TID)
+        self.assertIsNone(server.pane_argv(pane[:4]))
+        self.assertIsNone(server.pane_argv(["codex", "resume", self.TID, "-c", f"nouez_pane={token}\u00e9"]))
+        with mock.patch.object(server.os, "name", "posix"), mock.patch.object(server.sys, "platform", "darwin"), \
+             mock.patch.object(server.os, "listdir") as listdir:
+            self.assertEqual(server.close_old_panes(), 0)  # macOS: no handle that outlasts a pid, so none
+        listdir.assert_not_called()
+
+    def test_only_the_viewer_counts(self):
+        # A pane's shell is ended only while nothing but the viewer and its console runs in it.
+        t, token = self.TID, server.pane_token(self.TID)
+        self.assertTrue(server.is_viewer(f'"C:\\x\\codex.exe" resume {t} -c nouez_pane={token} --remote unix://', t))
+        self.assertTrue(server.is_viewer(
+            f'"C:\\n\\node.exe" "C:\\npm\\codex\\bin\\codex.js" resume {t} -c nouez_pane={token}', t))
+        for line in (f"codex resume {t}", f"node other.js resume {t} -c nouez_pane={token}",
+                     f"codex resume {t} -c nouez_pane={server.pane_token(t[:-1] + 'e')}", "python app.py", None):
+            self.assertFalse(server.is_viewer(line, t), line)
 
     def test_windows_arguments(self):
         split = server.split_windows_args
@@ -4731,11 +4697,21 @@ class PaneTest(unittest.TestCase):
         self.addCleanup(newer.kill)
         table[older.pid] = table[newer.pid] = (proc.pid, "python.exe")
         reach = {proc.pid, *kids, older.pid, newer.pid}
+        refused = []
         with mock.patch.object(server, "open_process",
                                side_effect=lambda pid, *a: real_open(pid, *a) if pid in reach else None):
-            server.end_tree(handle, proc.pid, table)
+            # Something besides the viewer runs in it: nothing is ended.
+            self.assertFalse(server.end_tree(handle, proc.pid, table, allowed=lambda h, exe: refused.append(exe)))
+            self.assertTrue(refused)
+            # A process the first snapshot didn't name, started in it since: nothing is ended either.
+            started = lambda: {**server.process_table(), 4: (proc.pid, "cmd.exe")}
+            self.assertFalse(server.end_tree(handle, proc.pid, table, snapshot=started, allowed=lambda h, exe: True))
+            # A second snapshot that failed checks nothing: nothing is ended.
+            self.assertFalse(server.end_tree(handle, proc.pid, table, snapshot=dict, allowed=lambda h, exe: True))
+            self.assertEqual(server.process_table().get(kids[0], (None,))[0], proc.pid)
+            self.assertTrue(server.end_tree(handle, proc.pid, table))
         time.sleep(0.5)
-        self.assertNotIn(kids[0], server.process_table())
+        self.assertNotEqual(server.process_table().get(kids[0], (None,))[0], proc.pid)  # its pid may be reused
         self.assertIsNone(older.poll())
         self.assertIsNone(newer.poll())
         self.assertIsNone(proc.poll())  # end_tree leaves the root itself to its caller
@@ -4798,21 +4774,27 @@ class TopReloadTest(unittest.TestCase):
              mock.patch("builtins.print"):
             for asked in ("65535", "30"):
                 self.assertEqual(server.run_top(["--once", "--days", asked]), 0)
-            for bad in (["--days", "70000"], ["--days", "-1"], ["--since", "1"], ["--since", "a:b"]):
+            for bad in (["--days", "70000"], ["--days", "-1"], ["--since", "1"], ["--since", "a:b"],
+                        ["--page", "consultations"], ["--page", "x"]):
                 self.assertEqual(server.run_top(["--once", *bad]), 2, bad)
         self.assertEqual(seen, [0xFFFF, 30])
 
     def test_screen_tells_its_supervisor(self):
         # q ends the window; an update restarts it, with the period the screen had then.
-        def screen(keys, due, argv=("--screen", "--days", "7")):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+
+        def screen(keys, due, argv=("--screen", "--supervised", "--days", "7")):
             keys, due = iter(keys), iter(due)
             with mock.patch.object(server, "read_scan_state", return_value={}), \
+                 mock.patch.object(server, "nouez_cache_dir", lambda: root), \
+                 mock.patch.object(server.ConsultationFeed, "run"), \
                  mock.patch.object(server, "scan_usage"), mock.patch.object(server, "write_json_atomic"), \
                  mock.patch.object(server, "read_codex_usage"), mock.patch.object(server, "read_agy_usage"), \
                  mock.patch.object(server, "read_usage_log", return_value=[]), \
                  mock.patch.object(server, "top_frame", return_value=[]), \
                  mock.patch.object(server, "enable_ansi", return_value=False), \
-                 mock.patch.object(server, "read_key", side_effect=lambda t: next(keys)), \
+                 mock.patch.object(server, "read_key", side_effect=lambda t, wake=None: next(keys)), \
                  mock.patch.object(server, "top_reload_due", side_effect=lambda *a: (next(due), (1, 1))), \
                  mock.patch.object(server.sys.stdin, "isatty", return_value=False), \
                  mock.patch.object(server.sys, "stdout", io.StringIO()):
@@ -4822,10 +4804,27 @@ class TopReloadTest(unittest.TestCase):
         periods = list(server.TOP_PERIODS.values())
         self.assertEqual(screen(["a"], [False, True]), server.TOP_RELOAD + 1 + periods.index(None))
         self.assertEqual(screen(["3"], [False, True]), server.TOP_RELOAD + 1 + periods.index(30))
-        self.assertLess(server.TOP_RELOAD + len(periods), 256)  # an exit code any system keeps
-        with mock.patch.object(server, "supervise_top", return_value=0) as sup:
+        self.assertEqual(screen(["c"], [False, True]), server.reload_code(7, "consultations", 7))
+        self.assertLess(server.reload_code(None, server.TOP_PAGES[-1], 7), 128)  # an exit code any system keeps
+        # A screen started by 0.22.0's supervisor, which knows only the usage page's codes up to 75:
+        old = ("--screen", "--days", "7")
+        self.assertEqual(screen(["c"], [False, True], old), server.TOP_RELOAD)
+        self.assertEqual(screen(["3"], [False, True], old), server.TOP_RELOAD + 1 + periods.index(30))
+        with mock.patch.object(server, "nouez_cache_dir", lambda: root), \
+             mock.patch.object(server, "supervise_top", return_value=0) as sup:
             self.assertEqual(server.run_top(["--days", "7"]), 0)  # on every system
-        sup.assert_called_once_with(["--days", "7"])
+            sup.assert_called_once_with(["--days", "7"])
+            holder = server.hold_status_screen()
+            try:
+                with mock.patch.object(server, "show_status_window", return_value=False), \
+                     mock.patch("builtins.print") as said:
+                    self.assertEqual(server.run_top(["--days", "30", "--page", "consultations"]), 0)
+            finally:
+                server.release_status_screen(holder)
+            sup.assert_called_once()  # no second screen
+            self.assertIn("already open", said.call_args[0][0])
+        command = server.cache_json(os.path.join(root, "status-command.json"))
+        self.assertEqual((command["page"], command["days"]), ("consultations", 30))
 
     def test_failed_update_keeps_the_window(self):
         for failed in (1, 0):  # a crash, or a file cut short that does nothing and exits cleanly
@@ -4975,11 +4974,9 @@ class TopReloadTest(unittest.TestCase):
 
 
 class RoundTwoFixesTest(unittest.TestCase):
-    def test_viewer_needs_a_codex_it_can_find(self):
+    def test_codex_version_needs_a_codex_it_can_find(self):
         """0.18.0: no bare `codex`, which could run one in the project folder."""
         with mock.patch.object(server, "which", return_value=None):
-            with self.assertRaisesRegex(server.BridgeError, "isn't on PATH"):
-                server.viewer_codex({})
             self.assertIsNone(server.codex_version("codex"))
 
     def test_usage_log_skips_a_window_that_has_reset(self):
@@ -5562,23 +5559,2446 @@ class ListProjectsTest(unittest.TestCase):
 class StatusScreenTest(unittest.TestCase):
     """0.19.0: OpenStatusScreen opens `top` in the home folder."""
 
+    def setUp(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        for name, value in (("nouez_cache_dir", lambda: root),  # none open, then the new one is
+                            ("status_screen_open", mock.Mock(side_effect=[False, True, True]))):
+            patch = mock.patch.object(server, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
     def test_opens_top_in_the_home_folder(self):
         with mock.patch.object(server, "open_window", return_value="a new window") as window:
             out = server.open_status_screen({"days": 30})
         cwd, argv, _ = window.call_args[0]
         self.assertEqual(cwd, os.path.expanduser("~"))
-        self.assertEqual(argv[-4:], [os.path.abspath(server.__file__), "top", "--days", "30"])
+        self.assertEqual(argv[-7:], [os.path.abspath(server.__file__), "top", "--arranged", "--days", "30",
+                                     "--page", "usage"])
         self.assertIn("ConsultantBudget", out)
 
     def test_a_whole_number_sent_as_a_float_is_taken(self):
         with mock.patch.object(server, "open_window", return_value="a new window") as window:
             server.open_status_screen({"days": 7.0})
-        self.assertEqual(window.call_args[0][1][-1], "7")
+        self.assertEqual(window.call_args[0][1][-3], "7")
 
     def test_only_the_screens_periods(self):
         for bad in (2, True, "7", 7.5):
             with self.assertRaises(server.BridgeError):
                 server.open_status_screen({"days": bad})
+
+
+class ConsultationsPageTest(unittest.TestCase):
+    """0.23.0: the status screen's consultations page, which replaces the Codex panes."""
+
+    CODEX = "0199aaaa-0000-0000-0000-00000000c0de"
+
+    def thread(self, tid, cwd, status="idle", updated=100, bridge=True):
+        return {"id": tid, "cwd": cwd, "model": "gpt-6.2-astra", "reasoningEffort": "high",
+                "status": {"type": status}, "updatedAt": updated,
+                "threadSource": server.BRIDGE_SOURCE if bridge else "cli"}
+
+    def test_overview_lists_only_nouez_consultants_working_first(self):
+        mine = self.thread(self.CODEX, "/w/alpha", updated=300)
+        busy = self.thread(self.CODEX[:-4] + "beef", "/w/beta", status="active", updated=100)
+        users = self.thread(self.CODEX[:-4] + "0001", "/w/alpha", updated=999, bridge=False)
+        rec = {"id": "0199bbbb-0000-0000-0000-0000000a9e01", "name": "agy-alpha-9e01", "cwd": "/w/alpha",
+               "model": "gemini-4-neon-xhigh", "created": 50}
+        events = [{"event": "send", "thread": self.CODEX, "turn": "t1", "kind": "review", "ts": 1},
+                  {"event": "reply", "thread": self.CODEX, "turn": "t1", "status": "completed", "verdict": "changes", "ts": 2},
+                  {"event": "send", "thread": busy["id"], "turn": "t2", "kind": "research", "ts": 3},
+                  {"event": "send", "thread": rec["id"], "turn": "a2", "kind": "plan-critique", "ts": 4},
+                  {"event": "reply", "thread": rec["id"], "turn": "a1", "status": "completed", "verdict": "yes", "ts": 5}]
+        rows = server.consultant_overview([mine, busy, users], [rec], events, {rec["id"]: None})
+        self.assertEqual([r["id"] for r in rows], [busy["id"], self.CODEX, rec["id"]])  # never the user's session
+        self.assertTrue(rows[0]["busy"])
+        self.assertEqual((rows[1]["kind"], rows[1]["verdict"]), ("review", "changes"))
+        self.assertEqual((rows[0]["kind"], rows[0]["verdict"]), ("research", None))  # still working
+        # The reply on record is to an earlier message than the last one sent: no verdict yet.
+        self.assertEqual((rows[2]["kind"], rows[2]["verdict"]), ("plan-critique", None))
+        self.assertEqual((rows[2]["model"], rows[2]["effort"]), ("gemini-4-neon", "xhigh"))
+        running = {"id": "a3", "status": "inProgress", "startedAt": 400, "items": []}
+        rows = server.consultant_overview([], [rec], [], {rec["id"]: running})
+        self.assertTrue(rows[0]["busy"])
+        self.assertEqual(rows[0]["updated"], 400)
+
+    def test_turn_text_is_plain_and_in_order(self):
+        turn = {"status": "completed", "items": [
+            {"type": "userMessage", "content": [{"type": "text", "text":
+                "[Message from Claude Code via the consultants bridge]\n\nReview \x1b[2Jthis‮ diff"}]},
+            {"type": "reasoning", "summary": ["Reading the diff"]},
+            {"type": "reasoning", "summary": []},
+            {"type": "commandExecution", "command": "pwsh -c git diff", "exitCode": 1,
+             "commandActions": [{"type": "unknown", "command": "git diff"}]},
+            {"type": "webSearch", "query": "codex resume"},
+            {"type": "agentMessage", "phase": "final_answer", "text": "Verdict: yes\n\tall good"}]}
+        self.assertEqual([(label, text) for _, label, text in server.turn_paragraphs(turn)],
+                         [("from Claude Code", "Review \x1b[2Jthis‮ diff"), ("thinking", "Reading the diff"),
+                          ("", "$ git diff (exit 1)"), ("search", "codex resume"), ("reply", "Verdict: yes\n\tall good")])
+        lines = server.turn_lines(server.Screen(False), turn, 40)
+        self.assertIs(server.turn_lines(server.Screen(False), turn, 40), lines)  # laid out once per turn read
+        self.assertIn("Review [2Jthis diff", lines)  # no escape or bidi control reaches the terminal
+        self.assertIn("    all good", lines)
+        self.assertFalse(any("\x1b" in line or "\t" in line for line in lines))
+        long = server.turn_lines(server.Screen(False), {"items": [server_agent("word " * 30)]}, 20)
+        self.assertTrue(all(server.visible(line) <= 20 for line in long))
+        running = server.turn_lines(server.Screen(False), {"status": "inProgress", "items": [server_agent("so far")]}, 40)
+        self.assertEqual(running[-1], "working…")
+
+    def test_strings_from_a_consultant_or_a_log_are_made_safe(self):
+        owner = ("The user's own words, as they typed them:\n<<<\nkeep the\x1b[31m old API\n>>>\n\n"
+                 "The rest of this message is Claude Code's.\n\n")
+        turn = {"status": "failed", "error": {"message": "bad\x1b]0;title\x07 turn"}, "items": [
+            {"type": "userMessage", "content": [{"type": "text", "text":
+                "[Message from Cl\x1b[2Jaude via the consultants bridge]\n\n" + owner + "Review it"}]}]}
+        paragraphs = [(label, text) for _, label, text in server.turn_paragraphs(turn)]
+        self.assertEqual(paragraphs, [("the user's words, passed on from Cl\x1b[2Jaude", "keep the\x1b[31m old API"),
+                                      ("from Cl\x1b[2Jaude", "Review it")])
+        lines = server.turn_lines(server.Screen(True), turn, 60)
+        text = server.ANSI.sub("", "\n".join(lines))
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x07", text)
+        self.assertIn("keep the[31m old API", text)
+        row = {**self.rows(1)[0], "kind": "re\x1b[2Jview", "verdict": "y\x1bes", "command": "codex\x1b[2J resume x"}
+        lines, _ = server.consultations_frame(server.Screen(False), 200, [row], ((row["provider"], row["id"]),
+                                              {"status": "odd\x1b[2J", "items": []}), "lost\x1b[2J", (row["provider"], row["id"]),
+                                              0, 120, 30, "T", "K")
+        self.assertFalse(any("\x1b" in line for line in lines))
+
+    def test_wrapping_is_one_pass(self):
+        text = ("word " * 4000).strip()
+        start = time.monotonic()
+        pieces = server.wrap_cells(text, 80)
+        self.assertLess(time.monotonic() - start, 1)
+        self.assertTrue(all(server.visible(p) <= 80 for p in pieces))
+        self.assertEqual(" ".join(pieces), text)  # cut at spaces, nothing lost
+        self.assertEqual(server.wrap_cells("x" * 25, 10), ["x" * 10, "x" * 10, "x" * 5])
+        self.assertEqual(server.wrap_cells("漢字" * 6, 5), ["漢字", "漢字", "漢字", "漢字", "漢字", "漢字"])
+        self.assertEqual(server.wrap_cells("", 10), [""])
+
+    def test_older_consultants_from_the_usage_log(self):
+        old = self.CODEX[:-4] + "0010"
+        daemon = FakeDaemon([self.thread(self.CODEX, ROOT), self.thread(old, ROOT)], {})
+        events = [{"event": "send", "thread": old, "turn": "t"}, {"event": "send", "thread": "agy-x", "provider": "antigravity"},
+                  {"event": "send", "thread": self.CODEX[:-4] + "0011", "user_session": True}]
+        self.assertEqual(server.logged_codex_threads(events), [old])
+        with mock.patch.object(server, "CodexClient", daemon), mock.patch.object(server, "read_usage_log", return_value=events), \
+             mock.patch.object(server, "RECENT_SAVED_THREADS", 0), mock.patch.object(server, "loaded_ids", return_value=[]), \
+             mock.patch.object(server, "agy_consultants", return_value=[]):
+            feed = server.ConsultationFeed()
+            feed._list()
+        self.assertEqual([r["id"] for r in feed.state()[0]], [old])  # past the recent list, still shown
+        self.assertTrue(feed.state()[0][0]["command"].startswith(f"codex resume {old}"))
+
+    def test_feed_closing_while_it_connects(self):
+        feed = server.ConsultationFeed(lambda: None)
+        proxies = []
+
+        class Client:  # a proxy started, its handshake still waiting, when the screen quits
+            def __init__(self, on_spawn):
+                self.close = mock.Mock()
+                proxies.append(self)
+                on_spawn(self)
+                feed.close()
+                self.close.assert_called_once()  # ended by close() itself, before the handshake returns
+        with mock.patch.object(server, "CodexClient", Client):
+            with self.assertRaises(server.BridgeError):
+                feed._codex()
+            self.assertIsNone(feed.client)
+            self.assertIsNone(feed.starting)
+            with self.assertRaises(server.BridgeError):  # closed: a proxy started now is refused
+                feed._spawned(mock.Mock())
+
+    def test_feed_close_ends_its_connection(self):
+        closed = threading.Event()
+
+        class Client:
+            info = {}
+
+            def close(self):
+                closed.set()
+        feed = server.ConsultationFeed()
+        feed.client = Client()
+        thread = threading.Thread(target=feed.run, daemon=True)
+        with mock.patch.object(feed, "_list"), mock.patch.object(feed, "_read_turn"):
+            thread.start()
+            feed.close(thread)
+        self.assertTrue(closed.is_set())
+        self.assertFalse(thread.is_alive())
+
+    def rows(self, n):
+        return [{"provider": "codex", "id": f"0199aaaa-0000-0000-0000-{i:012d}", "name": f"codex-p{i}-{i:06d}",
+                 "cwd": f"/w/p{i}", "model": "gpt-6.2-astra", "effort": "high", "busy": i == 0,
+                 "updated": 100 - i, "kind": None, "verdict": "yes" if i else None} for i in range(n)]
+
+    def test_frame_fills_the_height_and_shows_the_selection(self):
+        scr, rows = server.Screen(False), self.rows(20)
+        for row in rows:
+            row["command"] = server.resume_command(row)  # as the feed reads it
+        key = ("codex", rows[15]["id"])
+        turn = (key, {"status": "completed", "items": [server_agent("\n".join(f"line {i}" for i in range(100)))]})
+        for height in (12, 24, 40):
+            lines, scroll = server.consultations_frame(scr, 200, rows, turn, None, key, 0, 100, height, "TOP", "KEYS")
+            self.assertEqual(len(lines), height)
+            self.assertEqual((lines[0], lines[-1]), ("TOP", "KEYS"))
+            self.assertTrue(any("> codex-p15-000015" in line for line in lines), height)  # scrolled into view
+            self.assertTrue(any("line 99" in line for line in lines))  # the end of the turn, followed
+            self.assertIn(f"codex resume {rows[15]['id']}", "\n".join(lines))
+        lines, scroll = server.consultations_frame(scr, 200, rows, turn, None, key, 10 ** 9, 100, 40, "TOP", "KEYS")
+        self.assertTrue(any("line 0" in line for line in lines))  # Home: the start, the scroll clamped
+        self.assertLess(scroll, 100)
+        other = ("codex", rows[3]["id"])  # selected, but its turn not read yet
+        lines, _ = server.consultations_frame(scr, 200, rows, turn, None, other, 0, 100, 40, "TOP", "KEYS")
+        self.assertIn("Reading its latest turn", "\n".join(lines))
+        for state, text in ((None, "Reading the consultants"), ([], "No consultants yet")):
+            lines, _ = server.consultations_frame(scr, 200, state, None, "Codex: down", None, 0, 100, 10, "T", "K")
+            self.assertEqual(len(lines), 10)
+            self.assertIn(text, "\n".join(lines))
+            self.assertIn("Codex: down", "\n".join(lines))
+
+    def test_resume_command(self):
+        row = self.rows(1)[0]
+        self.assertEqual(server.resume_command(row), f"codex resume {row['id']}")
+        home = tempfile.mkdtemp(suffix=" with space")
+        self.addCleanup(shutil.rmtree, home, True)
+        os.makedirs(os.path.join(home, "app-server-control"))
+        sock = os.path.join(home, "app-server-control", "app-server-control.sock")
+        self.assertEqual(server.resume_command(row, home), f"codex resume {row['id']}")  # no socket there
+        open(sock, "w").close()
+        command = server.resume_command(row, home)
+        words = server.split_windows_args(command) if os.name == "nt" else server.shlex.split(command)
+        shown = sock.replace("\\", "/") if os.name == "nt" else sock  # both shells read / on Windows
+        self.assertEqual(words, ["codex", "resume", row["id"], "--remote", "unix://" + shown])
+        if os.name == "nt":
+            self.assertIn('"unix://', command)  # PowerShell's quoting, not the C runtime's
+        odd = "C:/it$s" if os.name == "nt" else "/it$s"
+        with mock.patch.object(server.os.path, "exists", return_value=True):  # $ kept from the shell
+            self.assertTrue(server.resume_command(row, odd).endswith(
+                f" --remote 'unix://{odd}/app-server-control/app-server-control.sock'"))
+        agy = {**row, "provider": "antigravity"}
+        with mock.patch.object(server, "agy_conversation", return_value="conv-1"), \
+                mock.patch.object(server, "agy_shown", return_value="agy"):
+            self.assertEqual(server.resume_command(agy), "agy --conversation conv-1")
+        with mock.patch.object(server, "agy_conversation", return_value="conv-1"), \
+                mock.patch.object(server, "agy_shown", return_value="& 'C:/A B/agy.exe'"):
+            self.assertEqual(server.resume_command(agy), "& 'C:/A B/agy.exe' --conversation conv-1")  # as typed
+        with mock.patch.object(server, "agy_conversation", return_value=None):
+            self.assertEqual(server.resume_command(agy), "")
+
+    def test_feed_reads_the_running_turn_until_it_ends(self):
+        tid = self.CODEX
+        daemon = FakeDaemon([self.thread(tid, ROOT, status="active")],
+                            {tid: [{"id": "t1", "status": "inProgress", "items": []}]})
+        with mock.patch.object(server, "CodexClient", daemon), mock.patch.object(server, "read_usage_log", return_value=[]):
+            feed = server.ConsultationFeed()
+            feed._list()
+            key = ("codex", tid)
+            feed.show(key, True)
+            feed._read_turn(key)
+            self.assertEqual(feed.state()[1], (key, daemon.turns[tid][0]))
+            reads = daemon.calls.count("thread/turns/list")
+            daemon.turns[tid][0]["status"] = "completed"
+            daemon.threads[tid]["status"] = {"type": "idle"}
+            feed._read_turn(key)  # the list still says working: read again
+            feed._list()
+            feed._read_turn(key)  # ended: read once more, as the list now says
+            feed._read_turn(key)
+            self.assertEqual(daemon.calls.count("thread/turns/list"), reads + 2)
+            self.assertEqual(feed.state()[1][1]["status"], "completed")
+
+    def test_feed_survives_a_lost_daemon(self):
+        class Lost:
+            def __init__(self, on_spawn=None):
+                raise server.BridgeError("closed the connection")
+        feed = server.ConsultationFeed()
+        feed.rows = self.rows(2)
+        with mock.patch.object(server, "CodexClient", Lost), mock.patch.object(server, "read_usage_log", return_value=[]):
+            feed._guarded(feed._list)
+        rows, _, error = feed.state()
+        self.assertEqual(len(rows), 2)  # the Codex consultants last seen stay
+        self.assertIn("closed the connection", error)
+        self.assertIsNone(feed.client)
+
+    def test_keys_by_name(self):
+        if os.name == "nt":
+            fake = mock.Mock(kbhit=lambda: True, getwch=iter(["\xe0", "P", "\x00", "I", "\xe0", "X"]).__next__)
+            with mock.patch.dict(sys.modules, {"msvcrt": fake}):
+                self.assertEqual([server.read_key(1) for _ in range(3)], ["down", "pgup", ""])
+        self.assertEqual(server.POSIX_KEYS[b"[A"], "up")
+        self.assertEqual(server.POSIX_KEYS[b"[6~"], "pgdn")
+        wake = threading.Event()
+        wake.set()
+        start = time.monotonic()
+        with mock.patch.object(server.os, "name", "nt"), \
+                mock.patch.dict(sys.modules, {"msvcrt": mock.Mock(kbhit=lambda: False)}):
+            self.assertIsNone(server.read_key(5, wake))
+        self.assertLess(time.monotonic() - start, 2)
+
+    def test_reload_keeps_page_and_period(self):
+        periods = list(server.TOP_PERIODS.values())
+        cases = [(30, "usage", 7, ["--days", "30"]), (None, "consultations", 7, ["--days", "0", "--page", "consultations"]),
+                 (14, "consultations", 14, ["--days", "14", "--page", "consultations"]),
+                 (14, "usage", 14, ["--days", "14"])]
+        for days, page, given, expect in cases:
+            code = server.reload_code(days, page, given)
+            self.assertLess(code, 128)
+            self.assertGreater(code, server.TOP_RELOAD)
+            self.assertEqual(server.reload_args(["--days", str(given), "--page", "consultations"], code), expect)
+        self.assertEqual(server.reload_args(["--days", "7"], server.TOP_RELOAD), ["--days", "7"])
+        self.assertEqual(server.reload_code(None, "consultations", None),
+                         server.TOP_RELOAD + 1 + 2 * (len(periods) + 1) - 1)
+
+    def test_single_status_screen(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with mock.patch.object(server, "nouez_cache_dir", lambda: root):
+            self.assertFalse(server.status_screen_open())
+            holder = server.hold_status_screen()
+            self.assertIsNotNone(holder)
+            self.assertIsNone(server.hold_status_screen())  # a second screen runs, but isn't the one
+            self.assertTrue(server.status_screen_open())
+            self.assertIsNone(server.take_status_screen())  # held: the open screen is switched instead
+            with mock.patch.object(server, "open_window") as window, \
+                    mock.patch.object(server, "show_status_window", return_value=False):
+                out = server.open_status_screen({"page": "consultations"})
+                window.assert_not_called()
+                self.assertIn("already open", out)
+                command = server.cache_json(server.status_command_file())
+                self.assertEqual((command["page"], "days" in command), ("consultations", False))
+                server.open_status_screen({"days": 30})
+                command2 = server.cache_json(server.status_command_file())
+                self.assertEqual((command2["page"], command2["days"]), ("usage", 30))
+                self.assertGreater(command2["seq"], command["seq"])
+            server.release_status_screen(holder)
+            self.assertFalse(server.status_screen_open())
+            self.assertFalse(os.path.exists(server.status_screen_file()))
+            # A screen that can't note its id doesn't keep the lock: requests would go to whatever
+            # id a crashed screen left in the file.
+            server.write_json_atomic(server.status_screen_file(), {"pid": 1, "id": "crashed"})
+            with mock.patch.object(server, "write_json_atomic", return_value=False):
+                self.assertIs(server.hold_status_screen(), False)
+            self.assertFalse(server.status_screen_open())
+            self.assertFalse(os.path.exists(server.status_screen_file()))
+            # The open screen closed between a failed try and the check: tried again, not run unlocked.
+            lock = object()
+            with mock.patch.object(server, "hold_status_screen", side_effect=[None, lock]), \
+                    mock.patch.object(server.time, "sleep"):
+                self.assertIs(server.take_status_screen(), lock)
+            with mock.patch.object(server, "hold_status_screen", return_value=None), \
+                    mock.patch.object(server, "status_screen_open", return_value=False), \
+                    mock.patch.object(server.time, "sleep"):
+                self.assertIs(server.take_status_screen(), False)  # a cache that holds no lock
+            server.release_status_screen(False)
+            # A request is addressed to the screen open when it is written, never to the next one.
+            holder = server.hold_status_screen()
+            first = server.cache_json(server.status_screen_file())["id"]
+            self.assertTrue(server.write_status_command({"page": "consultations"}))
+            self.assertEqual(server.cache_json(server.status_command_file())["screen"], first)
+            server.release_status_screen(holder)
+            self.assertIsNone(server.write_status_command({"page": "usage"}))  # none open: nothing written
+            self.assertEqual(server.cache_json(server.status_command_file())["page"], "consultations")
+            # A screen registers between requests: while one is being written, it waits.
+            writing = server.FileLock(os.path.join(root, "status-command.lock"), 0, "")
+            writing.__enter__()
+            got = []
+            opening = threading.Thread(target=lambda: got.append(server.hold_status_screen()))
+            opening.start()
+            opening.join(0.5)
+            self.assertEqual(got, [])
+            self.assertFalse(server.status_screen_open())
+            writing.__exit__(None, None, None)
+            opening.join(10)
+            holder = got[0]
+            self.assertIsNotNone(holder)
+            self.assertNotEqual(server.cache_json(server.status_screen_file())["id"], first)
+            # Writers at once take turns: each gets its own number, even on a clock that hasn't moved.
+            base = server.command_seq(server.status_command_file())
+            with mock.patch.object(server.time, "time_ns", return_value=1):
+                done = []
+                writers = [threading.Thread(target=lambda: done.append(server.write_status_command({"days": 1})))
+                           for _ in range(8)]
+                for w in writers:
+                    w.start()
+                for w in writers:
+                    w.join(30)
+            self.assertEqual(done, [True] * 8)
+            self.assertEqual(server.cache_json(server.status_command_file())["seq"], base + 8)
+            # A request not applied yet is kept: a later one adds to it, a bare `top` leaves it.
+            def pending():
+                command = server.cache_json(server.status_command_file())
+                return command.get("page"), command.get("days")
+            self.assertTrue(server.write_status_command({"page": "consultations", "days": 30}))
+            self.assertTrue(server.write_status_command({}))
+            self.assertEqual(pending(), ("consultations", 30))
+            self.assertTrue(server.write_status_command({"days": 7}))
+            self.assertEqual(pending(), ("consultations", 7))
+            mark = server.cache_json(server.status_screen_file())
+            server.write_json_atomic(server.status_screen_file(),  # the screen applied it
+                                     {**mark, "applied": server.command_seq(server.status_command_file())})
+            self.assertTrue(server.write_status_command({"days": 1}))
+            self.assertEqual(pending(), (None, 1))
+            # A screen that closed between the failed try and the request: the next try runs it.
+            with mock.patch.object(server, "take_status_screen", side_effect=[None, "lock"]), \
+                    mock.patch.object(server, "write_status_command", return_value=None):
+                self.assertEqual(server.take_or_switch([]), ("lock", None))
+            # A screen restarted by a 0.22.0 supervisor while this one is open hands it the page.
+            with mock.patch.object(server, "read_scan_state", return_value={}), \
+                    mock.patch.object(server, "agy_command", return_value=None), \
+                    mock.patch.object(server, "show_status_window", return_value=True), \
+                    mock.patch.object(server.sys, "stdout", io.StringIO()):
+                self.assertEqual(server.run_top(["--screen", "--days", "7", "--page", "consultations"]),
+                                 server.TOP_QUIT)
+            self.assertEqual(server.cache_json(server.status_command_file())["page"], "consultations")
+            server.release_status_screen(holder)
+            with mock.patch.object(server, "open_window", return_value="a new window") as window, \
+                    mock.patch.object(server, "status_screen_open", side_effect=[False, False, True, True]):
+                out = server.open_status_screen({"page": "consultations"})
+            self.assertEqual(window.call_args[0][1][-4:], ["--days", "7", "--page", "consultations"])
+            self.assertIn("on its consultations page", out)
+            clock = iter(range(0, 1000, 2))
+            with mock.patch.object(server, "open_window", return_value="a new window"), \
+                    mock.patch.object(server, "status_screen_open", return_value=False), \
+                    mock.patch.object(server.time, "sleep"), \
+                    mock.patch.object(server.time, "monotonic", side_effect=lambda: next(clock)):
+                out = server.open_status_screen({})
+            self.assertIn("hadn't started yet", out)  # not reported as open
+            with self.assertRaises(server.BridgeError):
+                server.open_status_screen({"page": "panes"})
+
+    def test_screen_follows_a_command(self):
+        # OpenStatusScreen's command switches the open screen's page and period; a restart keeps them.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+
+        screen_id = [""]  # the id the supervisor gives the screen
+
+        def run(early=None, late=None):
+            drawn = []
+
+            def keys(timeout, wake):
+                if len(drawn) == 1 and late:
+                    server.write_json_atomic(server.status_command_file(), late)
+                    self.assertTrue(wake.wait(5))  # the screen noticed it at once, not on its next refresh
+                elif len(drawn) == 1:
+                    time.sleep(1.2)  # the command thread has read the file by now
+                return None
+            if early:  # written after the supervisor took the lock, before this screen polls
+                server.write_json_atomic(server.status_command_file(), early)
+            with mock.patch.object(server, "read_scan_state", return_value={}), \
+                 mock.patch.object(server, "scan_usage"), \
+                 mock.patch.object(server, "read_codex_usage"), mock.patch.object(server, "read_agy_usage"), \
+                 mock.patch.object(server, "read_usage_log", return_value=[]), \
+                 mock.patch.object(server.ConsultationFeed, "run"), \
+                 mock.patch.object(server, "top_frame", side_effect=lambda *a: drawn.append("usage") or []), \
+                 mock.patch.object(server, "consultations_frame",
+                                   side_effect=lambda *a: drawn.append("consultations") or ([], 0)), \
+                 mock.patch.object(server, "enable_ansi", return_value=False), \
+                 mock.patch.object(server, "read_key", side_effect=keys), \
+                 mock.patch.object(server, "top_reload_due", side_effect=lambda *a: (len(drawn) >= 2, (1, 1))), \
+                 mock.patch.object(server.sys.stdin, "isatty", return_value=False), \
+                 mock.patch.dict(server.os.environ, {"NOUEZ_STATUS_SCREEN": screen_id[0]}), \
+                 mock.patch.object(server.sys, "stdout", io.StringIO()):
+                return server.run_top(["--screen", "--supervised", "--days", "7"]), drawn
+        with mock.patch.object(server, "nouez_cache_dir", lambda: root):
+            server.write_json_atomic(server.status_command_file(), {"seq": 5, "page": "consultations"})
+            holder = server.hold_status_screen()  # as the supervisor does
+            me = server.cache_json(server.status_screen_file())["id"]
+            self.assertEqual(holder.screen_id, me)
+            screen_id[0] = me
+            try:
+                stale = run()  # a request from before this screen opened isn't applied
+                self.assertEqual(stale[1], ["usage", "usage"])
+                other = {"seq": time.time_ns(), "page": "consultations", "screen": "another screen's"}
+                self.assertEqual(run(early=other)[1], ["usage", "usage"])  # nor one for another screen
+                late = {"seq": time.time_ns(), "page": "consultations", "days": 30, "screen": me}
+                self.assertEqual(run(late=late), (server.reload_code(30, "consultations", 7), ["usage", "consultations"]))
+                self.assertEqual(server.cache_json(server.status_screen_file())["applied"], late["seq"])
+                self.assertEqual(run()[1], ["usage", "usage"])  # applied already: not again after a restart
+                screen_id[0] = "this screen's"  # the file names another screen: nothing applied
+                self.assertEqual(run(early={"seq": time.time_ns(), "page": "consultations", "screen": me})[1],
+                                 ["usage", "usage"])
+                screen_id[0] = me
+                early = {"seq": time.time_ns(), "page": "consultations", "screen": me}
+                code, drawn = run(early=early)
+                self.assertEqual(drawn[-1], "consultations")
+            finally:
+                server.release_status_screen(holder)
+
+    def test_old_pane_cleanup_runs_in_the_background(self):
+        done = threading.Event()
+        with mock.patch.object(server, "close_old_panes", side_effect=lambda: done.set() or 2), \
+                mock.patch.object(server, "log") as log:
+            server.start_pane_cleanup()
+            self.assertTrue(done.wait(5))
+            for _ in range(100):
+                if log.called:
+                    break
+                time.sleep(0.01)
+        self.assertIn("closed 2 Codex pane(s)", log.call_args[0][0])
+        with mock.patch.object(server, "close_old_panes", side_effect=OSError("denied")), \
+                mock.patch.object(server, "log") as log:
+            server.start_pane_cleanup()
+            for _ in range(100):
+                if log.called:
+                    break
+                time.sleep(0.01)
+        self.assertIn("skipped: denied", log.call_args[0][0])
+
+
+def server_agent(text, phase="final_answer"):
+    return {"type": "agentMessage", "phase": phase, "text": text}
+
+
+class FakeScreen:
+    """Two screens side by side, the first with a 40-pixel taskbar, and windows that go where
+    they are put unless told to refuse (refuse: Windows takes the move but the window stays;
+    dead: Windows refuses it, as for a terminal that doesn't respond)."""
+
+    MONITORS = {1: (0, 0, 1920, 1040), 2: (1920, 0, 3840, 1080)}
+
+    def __init__(self):
+        self.windows, self.refuse, self.dead, self.blind, self.moves = {}, set(), set(), set(), []
+
+    def add(self, hwnd, rect):
+        self.windows[hwnd] = {"rect": rect, "usable": True, "owner": hwnd}
+
+    def owner(self, console):
+        return self.windows[console]["owner"] if console in self.windows else 0
+
+    def is_wt(self, hwnd):
+        return hwnd in self.windows
+
+    def usable(self, hwnd):
+        return self.windows[hwnd]["usable"]
+
+    def rects(self, hwnd):
+        r = self.windows[hwnd]["rect"]
+        return r, r
+
+    def centre(self, hwnd):
+        if hwnd in self.blind:  # its rectangle can't be read just now
+            return None
+        l, t, r, b = self.windows[hwnd]["rect"]
+        return (l + r) // 2, (t + b) // 2
+
+    def monitor_at(self, point):
+        return next((m for m, (l, t, r, b) in self.MONITORS.items()
+                     if l <= point[0] < r and t <= point[1] < (1080 if m == 1 else b)), 0)
+
+    def monitor_of(self, hwnd):
+        l, t, r, b = self.windows[hwnd]["rect"]
+        return self.monitor_at(((l + r) // 2, (t + b) // 2)) or 1
+
+    def device(self, monitor):
+        return f"DISPLAY{monitor}" if monitor in self.MONITORS else None
+
+    def monitor_named(self, device):
+        return next((m for m in self.MONITORS if f"DISPLAY{m}" == device), 0)
+
+    def primary(self):
+        return 1
+
+    def work_area(self, monitor):
+        return self.MONITORS.get(monitor)
+
+    def scale(self, monitor):
+        return 1.0
+
+    def place(self, hwnd, box):
+        self.moves.append(hwnd)
+        if hwnd in self.dead:
+            return False
+        if hwnd not in self.refuse:
+            self.windows[hwnd]["rect"] = tuple(box)
+        return True
+
+
+class ArrangeTest(unittest.TestCase):
+    """0.23.0: nouez arranges the windows it opened in a grid on one screen (Windows)."""
+
+    def setUp(self):
+        self.cache = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.cache, True)
+        self.starts = {}
+        for patch in (mock.patch.object(server, "nouez_cache_dir", return_value=self.cache),
+                      mock.patch.object(server, "process_start", side_effect=lambda pid: self.starts.get(pid))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.screen = FakeScreen()
+
+    def open(self, hwnd, rect=(100, 100, 900, 600)):
+        """A window registered as a helper would: hwnd doubles as its console, pid and slot."""
+        self.screen.add(hwnd, rect)
+        self.starts[hwnd] = 1000 + hwnd
+        server.write_json_atomic(os.path.join(server.windows_folder(create=True), f"{hwnd}-{1000 + hwnd}.json"),
+                                 {"hwnd": hwnd, "console": hwnd, "pid": hwnd, "start": 1000 + hwnd,
+                                  "kind": "status", "slot": hwnd, "box": None, "left": False})
+
+    def close(self, hwnd):
+        del self.starts[hwnd]  # the helper ended
+        del self.screen.windows[hwnd]
+
+    def where(self):
+        return {h: w["rect"] for h, w in self.screen.windows.items()}
+
+    def test_grid_shapes(self):
+        shapes = [server.grid_columns(n, 2560, 1392, 560, 320) for n in range(1, 7)]
+        self.assertEqual(shapes, [[1], [1, 1], [1, 2], [2, 2], [1, 2, 2], [2, 2, 2]])
+        self.assertEqual(server.grid_columns(9, 1920, 1040, 840, 480), [2, 2])  # only 4 fit at 150%
+        self.assertEqual(server.grid_columns(3, 500, 300, 560, 320), [])
+        for columns in ([1], [1, 2], [2, 3, 3], [3, 3, 3, 3]):
+            boxes = server.grid_boxes(columns, 7, 11, 1001, 703)
+            self.assertEqual(len(boxes), sum(columns))
+            self.assertEqual(sum((r - l) * (b - t) for l, t, r, b in boxes), 1001 * 703)  # no gap
+            for i, a in enumerate(boxes):  # and no overlap
+                for b in boxes[i + 1:]:
+                    self.assertFalse(a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3])
+
+    def test_windows_fill_one_screen_and_close_up(self):
+        self.open(1)
+        server.arrange_pass(self.screen)
+        self.assertEqual(self.where(), {1: (100, 100, 900, 600)})  # one window is left alone
+        self.open(2)
+        self.open(3)
+        out = server.arrange_pass(self.screen)
+        self.assertEqual(out["arranged"], 3)
+        self.assertEqual(self.where(), {1: (0, 0, 960, 1040), 2: (960, 0, 1920, 520), 3: (960, 520, 1920, 1040)})
+        self.close(1)
+        server.arrange_pass(self.screen)  # the others move up, in the same order: no swap
+        self.assertEqual(self.where(), {2: (0, 0, 960, 1040), 3: (960, 0, 1920, 1040)})
+        self.close(2)
+        self.close(3)
+        server.arrange_pass(self.screen)
+        self.assertEqual(os.listdir(server.windows_folder()), [])  # entries and screen.json gone
+
+    def test_moved_by_hand(self):
+        for h in (1, 2, 3):
+            self.open(h)
+        server.arrange_pass(self.screen)
+        self.screen.windows[1]["rect"] = (1000, 600, 1900, 1000)  # dropped on window 3's box
+        server.arrange_pass(self.screen)
+        self.assertEqual(self.where()[3], (0, 0, 960, 1040))
+        self.assertEqual(self.where()[1], (960, 520, 1920, 1040))
+        self.screen.windows[2]["rect"] = (1000, 60, 1900, 500)  # nudged inside its own box: goes back
+        server.arrange_pass(self.screen)
+        self.assertEqual(self.where()[2], (960, 0, 1920, 520))
+        self.screen.windows[2]["rect"] = (2000, 100, 2800, 600)  # taken to the other screen: stays there
+        server.arrange_pass(self.screen)
+        self.assertEqual(self.where(), {3: (0, 0, 960, 1040), 1: (960, 0, 1920, 1040), 2: (2000, 100, 2800, 600)})
+        server.arrange_pass(self.screen)
+        self.assertEqual(self.where()[2], (2000, 100, 2800, 600))
+        out = server.arrange_pass(self.screen, explicit=True)  # ArrangeWindows brings it back
+        self.assertEqual((out["arranged"], out["left"]), (3, 0))
+        self.assertEqual(self.where()[2][2], 1920)
+
+    def test_minimized_and_refusing_windows(self):
+        for h in (1, 2, 3):
+            self.open(h)
+        server.arrange_pass(self.screen)
+        self.screen.windows[2]["usable"] = False  # minimized: the others take its room
+        out = server.arrange_pass(self.screen)
+        self.assertEqual(out["skipped"], 1)
+        self.assertEqual(self.where()[3], (960, 0, 1920, 1040))
+        self.screen.windows[2]["usable"] = True
+        self.screen.windows[2]["owner"] = 3  # its tab was dragged into window 3
+        server.arrange_pass(self.screen)
+        self.assertEqual(self.where()[3], (960, 0, 1920, 1040))
+        self.screen.windows[2]["owner"] = 2
+        self.screen.windows[2]["rect"] = (1000, 40, 1800, 480)  # off its box, though not dropped on another
+        memory = {}
+        self.screen.refuse.add(2)  # a window that won't take its box is tried a few times, then left
+        for _ in range(4):
+            server.arrange_pass(self.screen, memory=memory)
+        self.assertEqual(self.screen.moves.count(2), 1 + server.ARRANGE_TRIES)
+        self.assertEqual(self.where()[3], (960, 520, 1920, 1040))  # and it isn't swapped with its neighbour
+
+    def test_screen_is_kept_and_chosen_again(self):
+        self.open(1, (2000, 100, 2800, 600))
+        self.open(2, (100, 100, 900, 600))
+        server.arrange_pass(self.screen)  # the oldest window's screen
+        self.assertEqual(self.where(), {1: (1920, 0, 2880, 1080), 2: (2880, 0, 3840, 1080)})
+        self.screen.MONITORS = {1: (0, 0, 1920, 1040)}  # that screen was unplugged
+        self.screen.windows[1]["rect"], self.screen.windows[2]["rect"] = (0, 0, 900, 500), (900, 0, 1800, 500)
+        server.arrange_pass(self.screen)
+        self.assertEqual(self.where(), {1: (0, 0, 960, 1040), 2: (960, 0, 1920, 1040)})  # none left the grid
+
+    def entry(self, hwnd):
+        with open(os.path.join(server.windows_folder(), f"{hwnd}-{1000 + hwnd}.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_refused_moves_dont_swap_windows_back_and_forth(self):
+        for h in (1, 2):
+            self.open(h)
+        server.arrange_pass(self.screen)
+        self.screen.dead.update((1, 2))  # from now on Windows refuses every move
+        self.screen.windows[1]["rect"] = (1000, 100, 1900, 900)  # dropped on window 2's box
+        memory, slots = {}, []
+        for _ in range(5):
+            out = server.arrange_pass(self.screen, memory=memory)
+            slots.append((self.entry(1)["slot"], self.entry(2)["slot"]))
+        self.assertEqual(slots[1:], [slots[0]] * 4)  # swapped once, as asked, then left alone
+        self.assertEqual(out["arranged"], 0)  # neither holds its new box, so neither counts
+        self.assertEqual([self.screen.moves.count(h) for h in (1, 2)], [1 + server.ARRANGE_TRIES] * 2)
+        self.assertEqual([self.entry(h)["box"] for h in (1, 2)], [None, None])
+
+    def test_a_window_is_marked_left_only_when_seen_on_another_screen(self):
+        for h in (1, 2):
+            self.open(h)
+        server.arrange_pass(self.screen)
+        self.screen.blind.add(1)  # where it is can't be read: not taken as moved to another screen
+        server.arrange_pass(self.screen)
+        self.assertFalse(self.entry(1)["left"])
+        self.screen.blind.clear()
+        self.screen.windows[2]["rect"] = (2000, 100, 2800, 600)  # Windows moved it: screens changed
+        server.arrange_pass(self.screen, reconcile=True)
+        self.assertFalse(self.entry(2)["left"])
+        self.assertEqual(self.where()[2], (960, 0, 1920, 1040))  # back in the grid
+
+    def test_screen_is_pinned_by_its_name(self):
+        self.open(1, (2000, 100, 2800, 600))
+        self.open(2, (2100, 100, 2900, 600))
+        server.arrange_pass(self.screen)
+        with open(server.screen_file(), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"device": "DISPLAY2"})
+        # The screens were rearranged: DISPLAY2 is now on the left, where DISPLAY1 was.
+        self.screen.MONITORS = {2: (0, 0, 1920, 1080), 1: (1920, 0, 3840, 1040)}
+        self.screen.windows[1]["rect"], self.screen.windows[2]["rect"] = (0, 0, 960, 1080), (960, 0, 1920, 1080)
+        server.arrange_pass(self.screen)
+        self.assertEqual(self.where(), {1: (0, 0, 960, 1080), 2: (960, 0, 1920, 1080)})
+
+    def test_cache_files_are_not_read_or_deleted_through_a_link(self):
+        elsewhere = os.path.join(self.cache, "elsewhere.json")
+        with open(elsewhere, "w", encoding="utf-8") as f:
+            json.dump({"auto": False}, f)
+        file_link(self, elsewhere, server.arrange_settings_file())
+        self.assertTrue(server.arrange_auto())  # the link isn't read
+        os.makedirs(server.windows_folder(create=True), exist_ok=True)
+        file_link(self, elsewhere, server.screen_file())
+        server.remove_cache_file(server.screen_file())
+        server.arrange_pass(self.screen)  # no window: it clears the pin, but not through a link
+        self.assertTrue(os.path.exists(elsewhere))
+
+    def test_registering_never_stops_the_window(self):
+        with mock.patch.object(server.os, "name", "nt"), \
+                mock.patch.object(server.threading.Thread, "start", side_effect=RuntimeError("no threads")):
+            self.starts[os.getpid()] = 1
+            entry = server.WindowEntry("claude")
+            entry.close()
+        self.assertIsNone(entry.path)
+        with mock.patch.object(server.os, "name", "nt"), \
+                mock.patch.object(server, "process_start", side_effect=OSError("denied")):
+            server.WindowEntry("status").close()
+
+    @unittest.skipUnless(os.name == "nt", "the arranger runs on Windows only")
+    def test_arranger_hands_over_only_after_a_clean_end(self):
+        tag = f"nouez-test-{os.getpid()}"
+        for code in (0, 1, RuntimeError("no window")):
+            arranger = mock.Mock()
+            arranger.return_value.run.side_effect = [code] if isinstance(code, Exception) else None
+            arranger.return_value.run.return_value = code
+            with mock.patch.object(server, "ARRANGE_MUTEX", "Local\\" + tag + "-m"), \
+                    mock.patch.object(server, "ARRANGE_WAKE", "Local\\" + tag + "-w"), \
+                    mock.patch.object(server, "Arranger", arranger), \
+                    mock.patch.object(server, "arrange_entries", return_value=[("p", {})]), \
+                    mock.patch.object(server, "wake_arranger") as wake:
+                server.run_arrange([])
+            self.assertEqual(wake.call_count, 1 if code == 0 else 0, code)
+
+    def test_dead_and_broken_entries_are_deleted(self):
+        self.open(1)
+        folder = server.windows_folder()
+        with open(os.path.join(folder, "5-6.json"), "w") as f:
+            f.write('{"hwnd": "x"}')
+        del self.starts[1]
+        server.arrange_entries()
+        self.assertEqual(os.listdir(folder), [])
+
+    def test_arrange_windows_tool(self):
+        if os.name != "nt":
+            with self.assertRaises(server.BridgeError) as e:
+                server.arrange_windows({})
+            self.assertIn("Windows only", str(e.exception))
+            return
+        for bad in (1, "yes"):
+            with self.assertRaises(server.BridgeError):
+                server.arrange_windows({"auto": bad})
+        self.assertTrue(server.arrange_auto())
+        with mock.patch.object(server, "wake_arranger") as wake:
+            out = server.arrange_windows({"auto": False})
+        wake.assert_called_once_with(start=False)
+        self.assertFalse(server.arrange_auto())
+        self.assertIn("off", out)
+        done = mock.Mock(stdout='{"windows": 3, "arranged": 2, "not_fitting": 1, "left": 0, "skipped": 0}\n')
+        with mock.patch.object(server.subprocess, "run", return_value=done) as run, \
+                mock.patch.object(server, "wake_arranger") as wake:
+            out = server.arrange_windows({"auto": True})
+        self.assertEqual(run.call_args[0][0][-2:], ["arrange", "--once"])
+        wake.assert_called_once_with()
+        self.assertTrue(server.arrange_auto())
+        self.assertIn("Arranged 2 of the 3", out)
+        self.assertIn("1 didn't fit", out)
+        with mock.patch.object(server.subprocess, "run", return_value=mock.Mock(stdout='{"error": "busy"}\n')), \
+                self.assertRaises(server.BridgeError):
+            server.arrange_windows({})
+
+    def test_only_nouezs_windows_register(self):
+        with mock.patch.object(server, "WindowEntry") as entry, \
+                mock.patch.object(server, "supervise_top", return_value=0) as top:
+            server.run_top(["--arranged", "--days", "7"])
+            server.run_top(["--days", "7"])
+        top.assert_called_with(["--days", "7"])
+        entry.assert_called_once_with("status")
+        entry.return_value.close.assert_called_once_with()
+        with mock.patch.object(server, "open_window", return_value="a window") as window, \
+                mock.patch.object(server, "folder_trusted", return_value=True):
+            server.open_claude_session({"cwd": ROOT})
+        path = window.call_args[0][1][-1]
+        with open(path, encoding="utf-8") as f:
+            self.assertIs(json.load(f)["arrange"], True)
+        child = mock.Mock(pid=999998)
+        child.wait.return_value = 0
+        with mock.patch.object(server, "find_program", return_value="claude"), \
+                mock.patch.object(server.subprocess, "Popen", return_value=child), \
+                mock.patch.object(server, "WindowEntry") as entry:
+            server.run_claude(path)
+        entry.assert_called_once_with("claude")
+        entry.return_value.close.assert_called_once_with()
+
+
+class FakeClaude:
+    """A stand-in for `claude remote-control`: prints `lines`, then exits with `code`, or with
+    code None runs until ended."""
+
+    def __init__(self, lines=(), code=0):
+        self.stdout = io.BytesIO(b"".join(line.encode() + b"\n" for line in lines))
+        self.code, self.pid, self.ended = code, 4242, False
+
+    def poll(self):
+        return self.code if self.code is not None else (-15 if self.ended else None)
+
+    def wait(self, timeout=None):
+        if self.code is None and not self.ended:
+            if timeout is None:
+                raise AssertionError("waited forever on a claude that runs until ended")
+            time.sleep(min(timeout, 0.01))
+            raise subprocess.TimeoutExpired("claude", timeout)
+        return self.poll()
+
+
+class FakeJob:
+    def __init__(self):
+        self.closed = False
+
+    def assign(self, proc):
+        return True
+
+    def resume(self, proc):
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+class CountingStop(threading.Event):
+    """A stop event whose waits return at once, recorded; it is set after `waits` of them."""
+
+    def __init__(self, waits):
+        super().__init__()
+        self.waits, self.left = [], waits
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        self.left -= 1
+        if self.left <= 0:
+            self.set()
+        return self.is_set()
+
+
+FAKE_CLAUDE = r'''import os, subprocess, sys, time
+folder = os.getcwd()
+count = os.path.join(folder, "runs")
+n = int(open(count).read()) + 1 if os.path.exists(count) else 1
+open(count, "w").write(str(n))
+open(os.path.join(folder, "argv"), "w").write(" ".join(sys.argv[1:]))
+out = sys.stdout.buffer
+out.write("\u00b7|\u00b7 Connecting \u00b7 dispatcher\r".encode())
+out.flush()
+left = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+open(os.path.join(folder, "left-%d" % n), "w").write(str(left.pid))
+out.write("\u00b7\u2714\ufe0e\u00b7 Connected \u00b7 dispatcher\n".encode())
+out.flush()
+go = os.path.join(folder, "go-%d" % n)  # the first run ends once the test has seen it
+deadline = time.time() + (60 if n == 1 else 120)
+while time.time() < deadline and not (n == 1 and os.path.exists(go)):
+    time.sleep(0.05)
+sys.exit(3)
+'''  # a stand-in claude for the supervisor
+
+
+class DispatcherTest(unittest.TestCase):
+    """0.23.0: `server.py dispatcher` keeps Claude Code's Remote Control server running for the
+    phone app, and installs itself to start at sign-in on Windows, macOS and Linux."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.cache = os.path.join(self.home, "cache")
+        self.projects = os.path.join(self.home, "Projects")
+        os.makedirs(self.projects)
+        self.folder = os.path.join(self.projects, "dispatcher")
+        os.makedirs(self.cache)
+        for patch in (mock.patch.object(server, "nouez_cache_dir", return_value=self.cache),
+                      mock.patch.object(server, "_dispatcher_root", [self.cache]),
+                      mock.patch.object(server, "dispatcher_default_folder", lambda: self.folder),
+                      mock.patch.object(server, "dispatcher_installed", _REAL_DISPATCHER["dispatcher_installed"]),
+                      mock.patch.object(server, "other_remote_controls", lambda own=None: []),
+                      mock.patch.object(server, "consultants_registered", lambda folder: True),
+                      mock.patch.object(server, "dispatcher_trusted", lambda folder, state_file=None: False),
+                      mock.patch.object(server, "_dispatcher_seen", [0.0, (False, None)]),
+                      mock.patch.object(server, "nouez_script", lambda path: "other" not in path)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def read(self, name):
+        with open(os.path.join(self.cache, name), encoding="utf-8") as f:
+            return f.read()
+
+    def state(self):
+        return json.loads(self.read("dispatcher.json"))
+
+    # --- running claude ---
+
+    def test_claude_is_found_where_its_installer_puts_it(self):
+        bin_dir = os.path.join(self.home, ".local", "bin")
+        os.makedirs(bin_dir)
+        exe = os.path.join(bin_dir, "claude.exe" if os.name == "nt" else "claude")
+        with open(exe, "w") as f:
+            f.write("")
+        os.chmod(exe, 0o755)
+        with mock.patch.object(server, "which", lambda name, env=None: None), \
+                mock.patch.object(server, "claude_install_folders", lambda: [bin_dir]):
+            self.assertEqual(server.dispatcher_claude(), exe)
+            os.remove(exe)
+            self.assertIsNone(server.dispatcher_claude())
+        with mock.patch.object(server, "which", lambda name, env=None: "/bin/claude"):
+            self.assertEqual(server.dispatcher_claude(), "/bin/claude")
+
+    def test_output_is_logged_once_and_tells_when_it_connects(self):
+        state = server.DispatcherState(self.folder)
+        state.save(claude_pid=1)
+        linked = threading.Event()
+        redraws = "\x1b[2K\r\x1b[32m·✔︎· Connected · dispatcher\x1b[0m\r" * 3
+        lines = [b"Remote Control starting\n", redraws.encode() + b"\n", b"Remote Control starting\n",
+                 "·|· Reconnecting · dispatcher\n".encode(), redraws.encode() + b"\n"]
+        server.dispatcher_output(io.BytesIO(b"".join(lines)), state, linked)
+        self.assertTrue(linked.is_set())
+        log = self.read("dispatcher-claude.log")
+        self.assertEqual(log.count("Connected · dispatcher"), 1, log)
+        self.assertEqual(log.count("Remote Control starting"), 1, log)
+        self.assertNotIn("\x1b", log)
+        self.assertEqual(self.state()["phase"], "connected")
+        self.assertIn("lost Remote Control", self.read("dispatcher.log"))
+        self.assertIsNotNone(self.state()["connected_since"])
+
+    def test_a_word_that_merely_contains_connected_doesnt_count(self):
+        state = server.DispatcherState(self.folder)
+        state.save(claude_pid=1)
+        linked = threading.Event()
+        text = (b"Not yet Disconnected\nUnconnected peers: 0\nWaiting for Connected status\n"
+                b"Connectedness check failed\nConnected\n")
+        server.dispatcher_output(io.BytesIO(text), state, linked)
+        self.assertFalse(linked.is_set())
+        self.assertFalse(self.state()["connected"])
+
+    def test_only_the_status_line_says_whether_claude_is_connected(self):
+        """0.23.0: the line claude remote-control redraws, `·✔︎· Connected · dispatcher`; a line that
+        only mentions the word, or a status cut off before the name begins, says nothing."""
+        for line, want in (("·✔︎· Connected · dispatcher", True), ("·✔︎· Reconnected · dispatcher", True),
+                           ("·|· Connecting · dispatcher", False), ("·|· Reconnecting · dispatcher", False),
+                           ("·|· Disconnected · dispatcher", False), ("Not connected · dispatcher", False),
+                           ("·✔︎· Connected · d", True), ("·✔︎· Connected", None), ("·✔︎· Connected · ", None),
+                           ("Connected", None), ("Waiting for Connected status", None),
+                           ("Connectedness check failed", None), ("Not yet Disconnected", None),
+                           ("Status: Connected · fine", None), ("", None)):
+            self.assertIs(server.dispatcher_link(line), want, line)
+
+    def test_a_status_redrawn_with_no_line_end_is_read_at_once(self):
+        """0.23.0: claude redraws its status with carriage returns and never ends the line; the
+        reader sees it while the pipe is still open."""
+        state = server.DispatcherState(self.folder)
+        run = state.begin(1)
+        linked = threading.Event()
+        r, w = os.pipe()
+        stream = os.fdopen(r, "rb")
+        self.addCleanup(stream.close)
+        reader = threading.Thread(target=server.dispatcher_output, args=(stream, state, linked, run), daemon=True)
+        reader.start()
+        try:
+            os.write(w, "\x1b[2K\r\x1b[32m·✔︎· Connected · dispatcher\x1b[0m\r".encode())
+            self.assertTrue(linked.wait(5))
+            self.assertTrue(self.state()["connected"])
+        finally:
+            os.close(w)
+            reader.join(5)
+        self.assertFalse(reader.is_alive())
+
+    def test_not_connected_is_down_and_an_old_run_changes_nothing(self):
+        state = server.DispatcherState(self.folder)
+        run = state.begin(1)
+        linked = threading.Event()
+        server.dispatcher_output(io.BytesIO("·✔︎· Connected · dispatcher\n·|· Not connected · dispatcher\n".encode()),
+                                 state, linked, run)
+        self.assertEqual(self.state()["phase"], "reconnecting")
+        state.end(0)
+        state.begin(2)
+        self.assertFalse(state.link(True, run))  # the reader of the run before
+        self.assertFalse(self.state()["connected"])
+
+    @unittest.skipIf(not hasattr(os, "mkfifo"), "needs pipes in the file system")
+    def test_logs_are_never_written_through_a_pipe_or_a_link(self):
+        os.makedirs(self.cache, exist_ok=True)
+        path = os.path.join(self.cache, "dispatcher.log")
+        os.mkfifo(path)
+        writer = threading.Thread(target=server.append_capped, args=(path, "line"), daemon=True)
+        writer.start()
+        writer.join(5)
+        self.assertFalse(writer.is_alive(), "waited on a pipe")
+        os.remove(path)
+        secret = os.path.join(self.home, "secret")
+        with open(secret, "w") as f:
+            f.write("private words")
+        os.symlink(secret, path)
+        server.append_capped(path, "line")
+        with open(secret) as f:
+            self.assertEqual(f.read(), "private words")
+        out = []
+        server.dispatcher_status_text(out.append)
+        self.assertNotIn("private words", "\n".join(out))
+        os.remove(path)
+        with open(path, "w") as f:
+            f.write("x" * 100)
+        os.symlink(secret, path + ".1")
+        server.append_capped(path, "line", cap=10)  # no move onto a link
+        self.assertTrue(os.path.islink(path + ".1"))
+        with open(secret) as f:
+            self.assertEqual(f.read(), "private words")
+
+    @unittest.skipIf(os.name == "nt", "process groups")
+    def test_ending_claude_ends_what_it_left_running(self):
+        """0.23.0: claude, exited already, is collected only after the last signal to its group,
+        and only once nothing else runs in it; a member that has ended but that nobody has
+        collected yet (an orphan waiting on PID 1) doesn't count."""
+        proc = subprocess.Popen(["sh", "-c", "sleep 60 & echo $!; exit 0"], start_new_session=True,
+                                stdout=subprocess.PIPE)
+        self.addCleanup(proc.stdout.close)
+        child = int(proc.stdout.readline())
+        deadline = time.monotonic() + 10
+        while not server.exited_unreaped(proc):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        self.assertIsNone(proc.returncode)  # exited, not collected: its id is still its group's
+        self.assertIn(child, server.group_members(proc.pid, proc.pid))
+        server.end_dispatcher_claude(proc)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(server.group_members(proc.pid, proc.pid), [])
+
+    @unittest.skipIf(os.name == "nt", "process groups")
+    def test_an_exit_is_seen_without_collecting_the_process(self):
+        proc = subprocess.Popen(["sh", "-c", "exit 3"])
+        deadline = time.monotonic() + 10
+        while not server.exited_unreaped(proc):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        self.assertIsNone(proc.returncode)
+        os.kill(proc.pid, 0)  # still there, uncollected
+        self.assertEqual(proc.wait(5), 3)
+        self.assertTrue(server.exited_unreaped(proc))
+
+    @unittest.skipIf(not hasattr(os, "waitid"), "waitid")
+    def test_a_stopped_claude_hasnt_exited(self):
+        proc = subprocess.Popen(["sh", "-c", "sleep 30"])
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        stopped = mock.Mock(si_code=os.CLD_STOPPED)
+        with mock.patch.object(server.os, "waitid", lambda *a: stopped):
+            self.assertFalse(server.exited_unreaped(proc))
+        with mock.patch.object(server.os, "waitid", lambda *a: mock.Mock(si_code=os.CLD_KILLED)):
+            self.assertTrue(server.exited_unreaped(proc))
+
+    @unittest.skipIf(os.name == "nt", "macOS and Linux")
+    def test_an_exit_is_never_collected_to_see_it(self):
+        """0.23.0: when waitid can't look, the process table tells of claude's exit, and claude
+        isn't collected meanwhile, so its group's id stays its own."""
+        proc = subprocess.Popen(["sh", "-c", "exit 3"])
+        deadline = time.monotonic() + 10
+        while not server.is_zombie(proc.pid):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+
+        def denied(*a):
+            raise PermissionError("denied")
+        with mock.patch.object(server.os, "waitid", denied, create=True):
+            self.assertTrue(server.exited_unreaped(proc))
+            with mock.patch.object(server, "is_zombie", lambda pid: False):
+                self.assertFalse(server.exited_unreaped(proc))
+        self.assertIsNone(proc.returncode)
+        self.assertEqual(proc.wait(5), 3)
+        running = subprocess.Popen(["sh", "-c", "sleep 30"])
+        self.addCleanup(lambda: (running.kill(), running.wait()))
+        self.assertFalse(server.is_zombie(running.pid))
+
+    @unittest.skipIf(os.name == "nt", "macOS and Linux")
+    def test_a_claude_collected_elsewhere_isnt_signalled(self):
+        """0.23.0: claude collected by something else (SIGCHLD ignored, say) may have left its id to
+        another process: its group isn't signalled. The supervisor doesn't ignore SIGCHLD."""
+        proc = subprocess.Popen(["sh", "-c", "exit 0"])
+        proc.wait(5)
+        proc.returncode = None  # as if collected by something else
+
+        def gone(*a):
+            raise ChildProcessError("no child")
+        with mock.patch.object(server.os, "waitid", gone, create=True), \
+                mock.patch.object(server.select, "kqueue", None, create=True), \
+                mock.patch.object(server.os, "killpg") as killpg:
+            server.end_dispatcher_claude(proc)
+        killpg.assert_not_called()
+        self.assertTrue(proc._nouez_lost)
+        self.assertIn("its group isn't signalled", self.read("dispatcher.log"))
+        if threading.current_thread() is threading.main_thread():
+            saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGCHLD)}
+            self.addCleanup(lambda: [signal.signal(s, h) for s, h in saved.items()])
+            signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+            with mock.patch.object(server, "supervisor_job", lambda: (None, None)), \
+                    mock.patch.object(server, "dispatcher_may_start", lambda *a: False):
+                self.assertEqual(server.run_dispatcher_supervisor(self.folder), 0)
+            self.assertEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_DFL)
+
+    @unittest.skipIf(not hasattr(server.select, "kqueue"), "kqueue (macOS)")
+    def test_a_kqueue_that_cant_be_made_leaves_claude_uncollected(self):
+        """0.23.0: out of descriptors, say: the process table tells of the exit instead."""
+        proc = subprocess.Popen(["sh", "-c", "exit 3"])
+
+        def full():
+            raise OSError(24, "Too many open files")
+        with mock.patch.object(server.select, "kqueue", full):
+            deadline = time.monotonic() + 10
+            while not server.exited_kqueue(proc):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.05)
+        self.assertIsNone(proc.returncode)
+        self.assertEqual(proc.wait(5), 3)
+
+    @unittest.skipIf(not hasattr(server.select, "kqueue"), "kqueue (macOS)")
+    def test_an_exit_is_seen_through_a_kqueue_without_collecting(self):
+        """0.23.0: macOS before Python 3.13 has no waitid: a kqueue tells of the exit, both for a
+        claude watched while it runs and for one that has exited before the first look."""
+        for pause in (0, 0.5):
+            proc = subprocess.Popen(["sh", "-c", "sleep 0.2; exit 3"])
+            time.sleep(pause)
+            deadline = time.monotonic() + 10
+            while not server.exited_kqueue(proc):
+                self.assertLess(time.monotonic(), deadline, pause)
+                time.sleep(0.05)
+            self.assertIsNone(proc.returncode, pause)
+            os.kill(proc.pid, 0)  # still there, uncollected
+            self.assertTrue(server.exited_kqueue(proc))
+            self.assertEqual(proc.wait(5), 3)
+
+    @unittest.skipIf(os.name != "nt", "Windows jobs")
+    def test_a_job_holds_claude_from_its_start_and_ends_what_it_started(self):
+        job = server.KillOnCloseJob()
+        code = ("import subprocess, sys, time; p = subprocess.Popen([sys.executable, '-c', 'import time; "
+                "time.sleep(60)']); print(p.pid, flush=True); time.sleep(60)")
+        proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                                creationflags=subprocess.CREATE_NO_WINDOW | 0x4)
+        self.addCleanup(proc.kill)
+        self.assertTrue(job.assign(proc))
+        self.assertTrue(job.resume(proc))
+        child = int(proc.stdout.readline())
+        proc.stdout.close()
+        server.end_dispatcher_claude(proc, job)
+        self.assertIsNotNone(proc.wait(5))
+        alive = subprocess.run(["tasklist", "/FI", f"PID eq {child}", "/NH"], capture_output=True, text=True).stdout
+        self.assertNotIn(str(child), alive)
+        job.close()  # again: nothing happens
+
+    @unittest.skipIf(os.name != "nt", "Windows jobs")
+    def test_a_named_job_tells_processes_theyre_under_the_supervisor(self):
+        """0.23.0: the supervisor's own job is named in dispatcher.json; what runs in it knows it is
+        under the dispatcher, and only there leaves its job for the windows it starts."""
+        name = f"Local\\nouez-dispatcher-test-{os.getpid()}-{time.time_ns()}"
+        job = server.KillOnCloseJob(name)
+        self.addCleanup(job.close)
+        with self.assertRaises(OSError):
+            server.KillOnCloseJob(name)  # someone else's of that name is never joined
+        server.DispatcherState(self.folder, job=name).save()
+        code = (f"import sys; sys.path.insert(0, {ROOT!r}); import server; "
+                f"server._dispatcher_root[:] = [{self.cache!r}]; print(server.in_dispatcher_job())")
+        inside = subprocess.Popen([sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, text=True,
+                                  creationflags=subprocess.CREATE_NO_WINDOW | 0x4)
+        self.addCleanup(inside.kill)
+        self.assertTrue(job.assign(inside))
+        self.assertTrue(job.resume(inside))
+        self.assertEqual(inside.communicate(timeout=60)[0].strip(), "True")
+        outside = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertEqual(outside.stdout.strip(), "False")
+
+    def test_what_nouez_starts_leaves_its_job_only_under_the_dispatcher(self):
+        flags = []
+
+        def popen(argv, **kwargs):
+            flags.append(kwargs.get("creationflags", 0))
+            return mock.Mock()
+        with mock.patch.object(server.os, "name", "nt"), mock.patch.object(server.subprocess, "Popen", popen):
+            for under in (False, True):
+                with mock.patch.object(server, "in_dispatcher_job", lambda: under):
+                    server.popen_outside_job(["x"], creationflags=0x10)
+            with mock.patch.object(server, "in_dispatcher_job", lambda: False):
+                server.popen_outside_job(["x"], always=True, creationflags=0x10)
+        self.assertEqual(flags, [0x10, 0x10 | 0x01000000, 0x10 | 0x01000000])
+        self.assertFalse(server.in_dispatcher_job())  # no supervisor's job named here
+
+    def test_the_dispatchers_folder_follows_no_environment_variable(self):
+        """0.23.0: the supervisor started at sign-in and the commands run from any shell use the same
+        files, whatever LOCALAPPDATA or XDG_CACHE_HOME say."""
+        elsewhere = os.path.join(self.home, "elsewhere")
+        with mock.patch.object(server, "_dispatcher_root", []), \
+                mock.patch.dict(server.os.environ, {"LOCALAPPDATA": elsewhere, "XDG_CACHE_HOME": elsewhere}):
+            if os.name == "nt":
+                with mock.patch.object(server, "known_local_appdata", lambda: self.home):
+                    found = server.dispatcher_dir()
+                self.assertEqual(found, os.path.join(self.home, "nouez"))
+                self.assertTrue(server.plain_folder(found))
+                self.assertTrue(server.rooted(server.known_local_appdata()))
+            else:
+                import pwd
+                with mock.patch.object(pwd, "getpwuid", lambda uid: mock.Mock(pw_dir=self.home)):
+                    found = server.dispatcher_dir()
+                self.assertEqual(found, os.path.join(self.home, ".cache", "nouez"))
+                self.assertEqual(os.stat(found).st_mode & 0o777, 0o700)
+            self.assertEqual(server.dispatcher_file("dispatcher.lock"), os.path.join(found, "dispatcher.lock"))
+        self.assertFalse(os.path.exists(elsewhere))
+
+    def test_the_claude_environment(self):
+        exe = os.path.join(self.home, "bin", "claude")
+        env = server.dispatcher_env(exe, self.home, {"PATH": os.pathsep.join(["/usr/bin", "/bin"]), "CLAUDECODE": "1"})
+        self.assertEqual(env["PATH"].split(os.pathsep)[0], os.path.dirname(exe))
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], self.home)
+        self.assertNotIn("CLAUDECODE", env)
+        env = server.dispatcher_env(exe, None, {"PATH": os.path.dirname(exe)})
+        self.assertEqual(env["PATH"], os.path.dirname(exe))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", env)
+
+    def test_a_log_that_cant_move_aside_stops_growing(self):
+        path = os.path.join(self.cache, "dispatcher.log")
+        os.makedirs(path + ".1")  # not a regular file: nothing is moved onto it
+        for i in range(30):
+            server.append_capped(path, f"line {i} " + "x" * 50, cap=500)
+        self.assertLessEqual(os.path.getsize(path), 500 + 100)
+        self.assertTrue(os.path.isdir(path + ".1"))
+
+    def test_logs_move_aside_past_their_cap(self):
+        path = os.path.join(self.cache, "dispatcher.log")
+        for i in range(30):
+            server.append_capped(path, f"line {i} " + "x" * 50, cap=500)
+        self.assertTrue(os.path.isfile(path + ".1"))
+        self.assertLessEqual(os.path.getsize(path), 500 + 100)
+        self.assertIn("line 29", self.read("dispatcher.log"))
+
+    def run_supervisor(self, procs, stop, connect_within=None, job=FakeJob):
+        os.makedirs(self.folder, exist_ok=True)
+        started = []
+
+        def popen(argv, **kwargs):
+            started.append((argv, kwargs))
+            return procs.pop(0)
+        patches = [mock.patch.object(server, "dispatcher_claude", lambda env=None: "/bin/claude"),
+                   mock.patch.object(server, "KillOnCloseJob", job),
+                   mock.patch.object(server, "end_dispatcher_claude",
+                                     lambda proc, job=None: setattr(proc, "ended", True))]
+        if connect_within is not None:
+            patches.append(mock.patch.object(server, "DISPATCHER_CONNECT_WITHIN", connect_within))
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            code = server.supervise_dispatcher(self.folder, stop, popen=popen)
+        return code, started
+
+    def test_a_claude_that_ends_at_once_is_started_again_later_not_in_a_loop(self):
+        stop = CountingStop(3)
+        code, started = self.run_supervisor([FakeClaude(code=1) for _ in range(3)], stop)
+        self.assertEqual(code, 0)
+        self.assertEqual(stop.waits, [30, 60, 120])  # doubling from 30 s, each wait interruptible
+        argv, kwargs = started[0]
+        self.assertEqual(argv, ["/bin/claude", "remote-control", "--name", "dispatcher", "--spawn", "same-dir"])
+        self.assertEqual(kwargs["cwd"], self.folder)
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertNotIn("CLAUDECODE", kwargs["env"])
+        self.assertTrue(kwargs.get("start_new_session") or kwargs.get("creationflags"))
+        self.assertEqual(self.state()["phase"], "stopped")
+        self.assertIn("claude exited with code 1", self.read("dispatcher.log"))
+
+    def test_a_long_run_resets_the_wait(self):
+        stop = CountingStop(3)
+        clock = iter(range(0, 10 ** 6, 400))  # each look at the clock is 400 s on
+        with mock.patch.object(server.time, "monotonic", lambda: next(clock)):
+            self.run_supervisor([FakeClaude(code=0) for _ in range(3)], stop)
+        self.assertEqual(stop.waits, [30, 30, 30])
+
+    def test_a_claude_not_connected_in_time_is_ended(self):
+        stop = CountingStop(1)
+        claude = FakeClaude(["Do you trust this folder?"], code=None)
+        self.run_supervisor([claude], stop, connect_within=0)
+        self.assertTrue(claude.ended)
+        self.assertIn("isn't connected after 0 s; ending it", self.read("dispatcher.log"))
+
+    def test_stopping_ends_claude(self):
+        stop = threading.Event()
+
+        class Stopped(FakeClaude):  # stopped once claude runs: Windows waits on it, elsewhere it is polled
+            def wait(self, timeout=None):
+                stop.set()
+                return super().wait(timeout)
+
+            def poll(self):
+                stop.set()
+                return super().poll()
+        claude = Stopped(["·✔︎· Connected · dispatcher"], code=None)
+        code, _ = self.run_supervisor([claude], stop)
+        self.assertEqual(code, 0)
+        self.assertTrue(claude.ended)
+        self.assertIn("stopping claude", self.read("dispatcher.log"))
+
+    def test_an_untied_claude_is_ended_not_left_behind(self):
+        class NoJob(FakeJob):
+            def assign(self, proc):
+                return False
+        os.makedirs(self.folder)
+        claude = FakeClaude(code=None)
+        state = server.DispatcherState(self.folder)
+        jobs = []
+        with mock.patch.object(server, "dispatcher_claude", lambda env=None: "/bin/claude"), \
+                mock.patch.object(server, "end_dispatcher_claude", lambda proc, job=None: setattr(proc, "ended", True)):
+            self.assertIsNone(server.run_dispatcher_once(self.folder, threading.Event(), state,
+                                                         popen=lambda argv, **kw: claude,
+                                                         new_job=lambda: jobs.append(NoJob()) or jobs[-1]))
+        self.assertTrue(claude.ended)
+        self.assertTrue(jobs[0].closed)
+
+    def test_each_run_has_its_own_job(self):
+        jobs = []
+
+        def new_job():
+            jobs.append(FakeJob())
+            return jobs[-1]
+        with mock.patch.object(server.os, "name", "nt"), \
+                mock.patch.object(server.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True):
+            self.run_supervisor([FakeClaude(code=1) for _ in range(2)], CountingStop(2), job=new_job)
+        self.assertEqual(len(jobs), 2)
+        self.assertTrue(all(job.closed for job in jobs))
+
+    def test_one_supervisor_at_a_time(self):
+        with server.FileLock(os.path.join(self.cache, "dispatcher.lock"), 0, "busy"), \
+                mock.patch.object(server, "FileLock", lambda path, seconds, busy: _REAL_FILELOCK(path, 0, busy)), \
+                mock.patch.object(server, "supervise_dispatcher") as supervise:
+            self.assertEqual(server.run_dispatcher_supervisor(self.folder), 0)
+        supervise.assert_not_called()
+        self.assertIn("another dispatcher supervisor is running", self.read("dispatcher.log"))
+
+    def start_supervisor(self, sign_in=True):
+        """run_dispatcher_supervisor in a thread, with supervise_dispatcher recorded, not run."""
+        os.makedirs(self.folder, exist_ok=True)
+        calls, result = [], []
+        patches = [mock.patch.object(server, "supervise_dispatcher",
+                                     lambda folder, stop, config_dir=None, state=None: calls.append(state) or 0),
+                   mock.patch.object(server, "supervisor_job", lambda: (None, None))]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        thread = threading.Thread(target=lambda: result.append(
+            server.run_dispatcher_supervisor(self.folder, None, sign_in)), daemon=True)
+        thread.start()
+        return thread, calls, result
+
+    def wait_for_state(self, **want):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with contextlib.suppress(OSError, ValueError, KeyError):
+                state = self.state()
+                if all(state.get(k) == v for k, v in want.items()):
+                    return state
+            time.sleep(0.05)
+        self.fail(f"dispatcher.json never showed {want}")
+
+    def test_a_supervisor_waits_for_install_and_heeds_a_stop_meanwhile(self):
+        """0.23.0: a supervisor holds back claude while an install or uninstall works; one asked to
+        stop meanwhile exits without starting it."""
+        with server.FileLock(os.path.join(self.cache, "dispatcher-install.lock"), 0, "busy"):
+            thread, calls, result = self.start_supervisor()
+            state = self.wait_for_state(sign_in=True, phase="starting")
+            self.assertTrue(server.wait_for_supervisor(self.folder, None, state["since"], seconds=0))
+            self.assertTrue(server.wait_for_supervisor(self.folder, None, state["since"], pid=os.getpid(), seconds=0))
+            self.assertFalse(server.wait_for_supervisor(self.folder, None, state["since"], pid=os.getpid() + 1,
+                                                        seconds=0))
+            self.assertEqual(server.wait_for_supervisor(self.folder, self.home, state["since"], seconds=0), "other")
+            self.assertEqual(server.wait_for_supervisor(self.home, None, state["since"], seconds=0), "other")
+            others = []
+            self.assertEqual(server.wait_for_supervisor(self.home, None, state["since"], seconds=0, others=others),
+                             "other")
+            self.assertEqual(others, [(os.getpid(), state["since"])])
+            self.assertFalse(server.wait_for_supervisor(self.home, None, state["since"], seconds=0, others=others))
+            self.assertFalse(server.wait_for_supervisor(self.folder, None, state["since"], seconds=0, others=others))
+            self.assertFalse(server.wait_for_supervisor(self.folder, None, state["since"] + 5, seconds=0))
+            with open(os.path.join(self.cache, "dispatcher.stop"), "w"):
+                pass
+            thread.join(10)
+        self.assertEqual(result, [0])
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state()["phase"], "stopped")
+        self.assertIn("asked to stop before claude started", self.read("dispatcher.log"))
+
+    def test_a_sign_in_start_that_comes_after_uninstall_exits(self):
+        with mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "no"):
+            thread, calls, result = self.start_supervisor()
+            thread.join(10)
+        self.assertEqual((result, calls), ([0], []))
+        self.assertIn("sign-in start is gone", self.read("dispatcher.log"))
+
+    def test_a_supervisor_deletes_a_stale_stop_request_and_starts(self):
+        request = os.path.join(self.cache, "dispatcher.stop")
+        with open(request, "w"):
+            pass
+        with mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "yes"):
+            thread, calls, result = self.start_supervisor()
+            thread.join(10)
+        self.assertEqual(result, [0])
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0].value["sign_in"], True)
+        self.assertFalse(os.path.lexists(request))
+        thread, calls, result = self.start_supervisor(sign_in=False)  # by hand: no sign-in start needed
+        thread.join(10)
+        self.assertEqual((result, len(calls)), ([0], 1))
+
+    def test_a_stop_request_that_isnt_a_plain_file(self):
+        """0.23.0: a folder or a link named dispatcher.stop is no request: a supervisor doesn't start,
+        install and uninstall say so, and doctor and status show it."""
+        request = os.path.join(self.cache, "dispatcher.stop")
+        os.makedirs(request)
+        thread, calls, result = self.start_supervisor()
+        thread.join(10)
+        self.assertEqual((result, calls), ([0], []))
+        self.assertIn("isn't a plain file", self.read("dispatcher.log"))
+        stop = threading.Event()
+        watcher = threading.Thread(target=server.watch_stop_request, args=(request, stop), daemon=True)
+        watcher.start()
+        time.sleep(1.5)
+        self.assertFalse(stop.is_set())
+        stop.set()
+        watcher.join(5)
+        out = []
+        with server.FileLock(os.path.join(self.cache, "dispatcher.lock"), 0, "busy"):
+            self.assertFalse(server.stop_dispatcher(out.append, seconds=5))
+        self.assertIn("isn't a plain file", out[-1])
+        self.assertTrue(os.path.isdir(request))
+        self.assertTrue(any("dispatcher.stop isn't a plain file" in p for p in server.dispatcher_cache_problems()))
+        out = []
+        server.dispatcher_status_text(out.append)
+        self.assertTrue(any(line.startswith("Problem:") for line in out), out)
+
+    def test_the_supervisor_end_to_end(self):
+        """0.23.0: the real supervisor, in a process of its own, against a stand-in claude that
+        prints the status line and leaves a process running: the first run exits with code 3, what
+        it left is ended before the second starts, and a stop request ends the supervisor, the
+        second run and what that left."""
+        os.makedirs(self.folder, exist_ok=True)
+        bin_dir = os.path.join(self.home, "bin")
+        os.makedirs(bin_dir)
+        fake = os.path.join(bin_dir, "fake_claude.py")
+        with open(fake, "w", encoding="utf-8") as f:
+            f.write(FAKE_CLAUDE)
+        if os.name == "nt":
+            with open(os.path.join(bin_dir, "claude.cmd"), "w") as f:
+                f.write(f'@"{sys.executable}" "{fake}" %*\n@exit /b %errorlevel%\n')
+        else:
+            launcher = os.path.join(bin_dir, "claude")
+            with open(launcher, "w") as f:
+                f.write(f'#!/bin/sh\nexec "{sys.executable}" "{fake}" "$@"\n')
+            os.chmod(launcher, 0o755)
+        code = (f"import sys; sys.path.insert(0, {ROOT!r}); import server; "
+                f"server._dispatcher_root[:] = [{self.cache!r}]; server.DISPATCHER_FIRST_WAIT = 1; "
+                f"sys.exit(server.run_dispatcher_supervisor({self.folder!r}))")
+        env = {**os.environ, "PATH": bin_dir + os.pathsep + os.environ.get("PATH", "")}
+        supervisor = subprocess.Popen([sys.executable, "-I", "-c", code], env=env,
+                                      **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
+        self.addCleanup(lambda: supervisor.poll() is None and supervisor.kill())
+
+        def alive(pid):
+            if os.name == "nt":
+                return pid in server.process_table()
+            seen = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+            return bool(seen.strip()) and not seen.strip().startswith("Z")
+
+        def until(check, what, seconds=60):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                with contextlib.suppress(OSError, ValueError, KeyError):
+                    found = check()
+                    if found:
+                        return found
+                self.assertIsNone(supervisor.poll(), f"the supervisor exited while waiting for {what}")
+                time.sleep(0.1)
+            self.fail(f"never saw {what}; log: {self.read('dispatcher.log')}")
+        def text(name):
+            with open(os.path.join(self.folder, name)) as f:
+                return f.read()
+        first = until(lambda: self.state()["connected"] and self.state()["claude_pid"], "the first run connected")
+        left = [int(text("left-1"))]
+        with open(os.path.join(self.folder, "go-1"), "w"):
+            pass
+        until(lambda: text("runs") == "2" and os.path.exists(os.path.join(self.folder, "left-2")), "the second run")
+        self.assertFalse(alive(left[0]), "the first run's leftover process outlived it")
+        second = until(lambda: self.state()["connected"] and self.state()["claude_pid"] != first
+                       and self.state()["claude_pid"], "the second run connected")
+        left.append(int(text("left-2")))
+        self.assertEqual(text("argv"), " ".join(server.DISPATCHER_ARGS))
+        self.assertIn("claude exited with code 3", self.read("dispatcher.log"))
+        out = []
+        self.assertTrue(server.stop_dispatcher(out.append, seconds=60), out)
+        self.assertEqual(supervisor.wait(30), 0)
+        until(lambda: not any(alive(pid) for pid in (second, *left)), "everything the runs started end", 15)
+        state = self.state()
+        self.assertEqual((state["phase"], state["connected"], state["claude_pid"]), ("stopped", False, None))
+        self.assertFalse(os.path.lexists(os.path.join(self.cache, "dispatcher.stop")))
+
+    def test_status_summary_and_badge(self):
+        scr = mock.Mock(paint=lambda text, colour: f"<{colour}>{text}")
+        self.assertEqual(server.dispatcher_status(), (False, None))
+        self.assertEqual(server.dispatcher_badge(scr), "")
+        state = server.DispatcherState(self.folder)
+        state.save(phase="connected", connected=True, connected_since=time.time())
+        with server.FileLock(os.path.join(self.cache, "dispatcher.lock"), 0, "busy"):
+            running, found = server.dispatcher_status()
+            self.assertIs(running, True)
+            self.assertIn("connected to Remote Control since", server.dispatcher_summary(running, found))
+            server._dispatcher_seen[0] = 0.0
+            self.assertEqual(server.dispatcher_badge(scr), "<32>● dispatcher")
+            state.save(phase="waiting", last_exit=1, next_start=time.time() + 60)
+            server._dispatcher_seen[0] = 0.0
+            self.assertEqual(server.dispatcher_badge(scr), "<33>● dispatcher not connected")
+            self.assertIn("starts again at", server.dispatcher_summary(*server.dispatcher_status()))
+        server._dispatcher_seen[0] = 0.0
+        self.assertEqual(server.dispatcher_badge(scr), "<31>● dispatcher stopped")  # ended without stopping
+        state.save(phase="stopped")  # stopped as asked: uninstall, or a sign-in start after it
+        server._dispatcher_seen[0] = 0.0
+        self.assertEqual(server.dispatcher_badge(scr), "")
+        self.assertEqual(server.dispatcher_summary(False, {"phase": "stopped"}), "the dispatcher isn't running")
+        state.save(phase="failed")  # couldn't check its sign-in start
+        server._dispatcher_seen[0] = 0.0
+        self.assertEqual(server.dispatcher_badge(scr), "<31>● dispatcher stopped")
+        self.assertIn("couldn't tell whether nouez's sign-in start is there",
+                      server.dispatcher_summary(False, {"phase": "failed"}))
+        self.assertEqual(server.dispatcher_summary(False, {"phase": "waiting", "last_exit_at": None}),
+                         "the dispatcher isn't running")
+
+    def test_setup_quotes_the_folder_for_powershell(self):
+        """0.23.0: on Windows setup says how to get to the folder in PowerShell: one single-quoted
+        string, where PowerShell also takes the curly single quotes as quotes, and $ is plain."""
+        self.assertEqual(server.powershell_quoted("D:\\O\u2019Neil's $x \u2018y\u201b"),
+                         "'D:\\O\u2019\u2019Neil''s $x \u2018\u2018y\u201b\u201b'")
+
+    def test_the_dispatchers_folder_needs_trust_of_its_own(self):
+        """0.23.0: the folder has its own shared settings, so Claude Code asks again there when only a
+        folder above it is trusted: setup, install and doctor don't count that trust."""
+        state = os.path.join(self.home, ".claude.json")
+        os.makedirs(self.folder)
+        for projects, want in (({self.projects: {"hasTrustDialogAccepted": True}}, False),
+                               ({self.folder: {"hasTrustDialogAccepted": True}}, True), ({}, False)):
+            with open(state, "w", encoding="utf-8") as f:
+                json.dump({"projects": projects}, f)
+            with mock.patch.object(server, "dispatcher_trusted", _REAL_DISPATCHER_TRUSTED), \
+                    mock.patch.object(server, "folder_trusted", _REAL_FOLDER_TRUSTED), \
+                    mock.patch.object(server, "git_root", lambda path: None), \
+                    mock.patch.object(server, "claude_state_file", lambda env=None: state):
+                self.assertIs(server.dispatcher_trusted(self.folder), want, projects)
+                out = []
+                server.dispatcher_setup(self.folder, out=out.append)
+            self.assertEqual("doesn't count" in "\n".join(out), not want, out)
+        self.assertIs(_REAL_DISPATCHER_TRUSTED(os.path.join(self.home, "missing")), False)
+        # doctor: the profile the supervisor runs with, not this shell's
+        other = os.path.join(self.home, "other-profile")
+        os.makedirs(other)
+        with open(os.path.join(other, ".claude.json"), "w", encoding="utf-8") as f:
+            json.dump({"projects": {self.folder: {"hasTrustDialogAccepted": True}}}, f)
+        with open(os.path.join(self.folder, "CLAUDE.md"), "w"):
+            pass
+        for config_dir, shell, said in ((other, None, "Claude Code is trusted there"),
+                                        (None, None, "isn't trusted there itself"),
+                                        (None, other, "Claude Code is trusted there")):  # run by hand from it
+            with mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": shell} if shell else {}),                     mock.patch.object(server, "claude_state_file",
+                                      lambda env=None: os.path.join((env or {}).get("CLAUDE_CONFIG_DIR") or self.home,
+                                                                    ".claude.json") if env is not None else
+                                      os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or self.home, ".claude.json")):
+                server.DispatcherState(self.folder, config_dir).save(phase="stopped")
+            lines = []
+            with mock.patch.object(server, "dispatcher_trusted", _REAL_DISPATCHER_TRUSTED), \
+                    mock.patch.object(server, "folder_trusted", _REAL_FOLDER_TRUSTED), \
+                    mock.patch.object(server, "git_root", lambda path: None), \
+                    mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "no"), \
+                    mock.patch.object(server, "claude_state_file",
+                                      lambda env=None: os.path.join((env or {}).get("CLAUDE_CONFIG_DIR") or self.home,
+                                                                    ".claude.json") if env is not None else state):
+                server.dispatcher_report(lambda ok, text: lines.append(text))
+            self.assertTrue(any(said in line for line in lines), (config_dir, lines))
+
+    def test_the_top_bar_shows_the_dispatcher_and_keeps_the_sign_in_badge(self):
+        groups = [{"title": "Codex", "entries": [(None, "weekly", {"rank": 1, "used": 10.0, "colour": "32"})]}]
+        scr = server.Screen(False)
+        with mock.patch.object(server, "dispatcher_badge", lambda scr: "● dispatcher"), \
+                mock.patch.object(server, "login_badge", lambda scr, now: "● sign-in Dec 5, 11d"):
+            line = server.top_bar(scr, groups, 7, time.time(), 200)
+            self.assertLess(line.index("● dispatcher"), line.index("Codex"))
+            narrow = server.top_bar(scr, groups, 7, time.time(), 40)
+            self.assertIn("● sign-in Dec 5, 11d", narrow)
+            self.assertLessEqual(server.visible(narrow), 40)
+
+    # --- setup ---
+
+    def setup(self, *args, **kwargs):
+        out = []
+        code = server.dispatcher_setup(self.folder, *args, out=out.append, **kwargs)
+        return code, "\n".join(out)
+
+    def test_setup_makes_the_folder_its_instructions_and_rules(self):
+        code, out = self.setup()
+        self.assertEqual(code, 0, out)
+        with open(os.path.join(self.folder, "CLAUDE.md"), encoding="utf-8") as f:
+            md = f.read()
+        self.assertIn(f"directly inside `{self.projects}`", md)
+        self.assertNotIn("{projects}", md)
+        self.assertNotIn("dangerously", md.lower())
+        with open(os.path.join(self.folder, ".claude", "settings.json"), encoding="utf-8") as f:
+            allow = json.load(f)["permissions"]["allow"]
+        self.assertEqual(allow, [f"mcp__consultants__{t}" for t in server.DISPATCHER_TOOLS])
+        self.assertIn("claude remote-control --name dispatcher --spawn same-dir", out)
+        code, out = self.setup()
+        self.assertIn("already allows", out)
+        self.assertIn("kept as it is", out)
+
+    def test_setup_keeps_the_users_files_and_backs_up_what_it_changes(self):
+        os.makedirs(os.path.join(self.folder, ".claude"))
+        with open(os.path.join(self.folder, "CLAUDE.md"), "w", encoding="utf-8") as f:
+            f.write("my own")
+        settings = os.path.join(self.folder, ".claude", "settings.json")
+        raw = b'{"model": "opus", "permissions": {"allow": ["Bash(ls *)", "mcp__consultants__ListProjects"]}}'
+        with open(settings, "wb") as f:
+            f.write(raw)
+        code, out = self.setup()
+        self.assertEqual(code, 0, out)
+        with open(os.path.join(self.folder, "CLAUDE.md"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "my own")
+        with open(settings, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["model"], "opus")
+        self.assertEqual(data["permissions"]["allow"][:2], ["Bash(ls *)", "mcp__consultants__ListProjects"])
+        self.assertEqual(len(data["permissions"]["allow"]), 1 + len(server.DISPATCHER_TOOLS))
+        backups = glob.glob(settings + ".nouez-*.bak")
+        self.assertEqual(len(backups), 1)
+        with open(backups[0], "rb") as f:
+            self.assertEqual(f.read(), raw)
+
+    def test_setup_refuses_settings_it_cant_change_safely(self):
+        os.makedirs(os.path.join(self.folder, ".claude"))
+        settings = os.path.join(self.folder, ".claude", "settings.json")
+        for raw in (b'{"permissions": {', b'{"permissions": {"allow": "all"}}', b"[]"):
+            with open(settings, "wb") as f:
+                f.write(raw)
+            code, out = self.setup()
+            self.assertEqual(code, 1, out)
+            self.assertIn("fix it first", out)
+            with open(settings, "rb") as f:
+                self.assertEqual(f.read(), raw)
+        self.assertFalse(os.path.exists(os.path.join(self.folder, "CLAUDE.md")))
+
+    def test_setup_changes_nothing_when_the_settings_change_meanwhile(self):
+        os.makedirs(os.path.join(self.folder, ".claude"))
+        settings = os.path.join(self.folder, ".claude", "settings.json")
+        with open(settings, "wb") as f:
+            f.write(b'{"permissions": {"allow": []}}')
+        edited = b'{"permissions": {"allow": [], "deny": ["Bash"]}}'
+        real = server.backup_file
+
+        def backup_then_edit(folder, raw, name="settings.json"):
+            copy = real(folder, raw, name)
+            with open(settings, "wb") as f:
+                f.write(edited)
+            return copy
+        with mock.patch.object(server, "backup_file", backup_then_edit):
+            code, out = self.setup()
+        self.assertEqual(code, 1, out)
+        self.assertIn("changed while setup ran", out)
+        with open(settings, "rb") as f:
+            self.assertEqual(f.read(), edited)
+        self.assertEqual([n for n in os.listdir(os.path.dirname(settings)) if n.endswith(".tmp")], [])
+
+    def test_settings_are_never_reached_through_a_linked_claude_folder(self):
+        """0.23.0: setup and doctor read and write .claude/settings.json only in a .claude that is a
+        plain folder, checked before anything is read or made."""
+        os.makedirs(self.folder)
+        with open(os.path.join(self.folder, "CLAUDE.md"), "w") as f:
+            f.write("mine")
+        elsewhere = os.path.join(self.home, "elsewhere")
+        os.makedirs(elsewhere)
+        with open(os.path.join(elsewhere, "settings.json"), "wb") as f:
+            f.write(b'{"permissions": {"allow": []}}')
+        dir_link(elsewhere, os.path.join(self.folder, ".claude"))
+        with self.assertRaises(OSError):
+            server.SettingsFolder(self.folder)
+        code, out = self.setup()
+        self.assertEqual(code, 1, out)
+        self.assertIn("is a link", out)
+        self.assertEqual(sorted(os.listdir(elsewhere)), ["settings.json"])
+        with mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "no"):
+            said = self.report()
+        self.assertTrue(any("couldn't check the dispatcher's settings" in text for _, text in said), said)
+
+    def test_settings_go_through_one_folder(self):
+        os.makedirs(self.folder)
+        with server.SettingsFolder(self.folder) as settings:
+            self.assertFalse(settings.exists)
+            self.assertIsNone(settings.read("settings.json"))
+        with server.SettingsFolder(self.folder, create=True) as settings:
+            self.assertTrue(settings.exists)
+            with settings.create("a.tmp") as f:
+                f.write(b"{}")
+            with self.assertRaises(FileExistsError):
+                settings.create("a.tmp")
+            settings.replace("a.tmp", "settings.json")
+            self.assertEqual(settings.read("settings.json"), b"{}")
+            settings.remove("settings.json")
+            self.assertIsNone(settings.read("settings.json"))
+
+    def test_setup_dry_run_changes_nothing(self):
+        code, out = self.setup(dry_run=True)
+        self.assertEqual(code, 0, out)
+        self.assertIn("Would make", out)
+        self.assertFalse(os.path.exists(self.folder))
+
+    def test_setup_says_when_nouez_isnt_registered(self):
+        with mock.patch.object(server, "consultants_registered", lambda folder: False):
+            code, out = self.setup()
+        self.assertEqual(code, 0)
+        self.assertIn("doesn't run nouez as `consultants`", out)
+
+    def test_setup_refuses_a_linked_folder(self):
+        target = os.path.join(self.home, "elsewhere")
+        os.makedirs(target)
+        dir_link(target, self.folder)
+        code, out = self.setup()
+        self.assertEqual(code, 1)
+        self.assertIn("is a link", out)
+        self.assertEqual(os.listdir(target), [])
+
+    def test_options(self):
+        opts = server.dispatcher_options(["--folder", self.folder, "--dry-run"], {"folder", "dry-run"})
+        self.assertEqual(opts, {"folder": self.folder, "config-dir": None, "dry-run": True, "force": False,
+                                "sign-in": False})
+        opts = server.dispatcher_options(["--config-dir", self.home], {"folder", "config-dir"})
+        self.assertEqual(opts["config-dir"], self.home)
+        for argv in (["--config-dir", "relative"], ["--config-dir", self.home]):
+            with self.assertRaises(ValueError):
+                server.dispatcher_options(argv, {"folder", "config-dir"} if argv[1] == "relative" else {"folder"})
+        with mock.patch.object(server, "run_dispatcher_supervisor") as run:
+            server.run_dispatcher(["run", "--folder", self.folder, "--config-dir", self.home])
+        run.assert_called_once_with(self.folder, self.home, False)
+        with mock.patch.object(server, "run_dispatcher_supervisor") as run:
+            server.run_dispatcher(["run", "--folder", self.folder, "--sign-in"])
+        run.assert_called_once_with(self.folder, None, True)
+        with self.assertRaises(ValueError):
+            server.dispatcher_options(["--sign-in"], {"folder", "dry-run", "force"})
+        self.assertEqual(server.dispatcher_options([], set())["folder"], self.folder)
+        for argv in (["--force"], ["--folder"], ["--folder", "relative"], ["extra"]):
+            with self.assertRaises(ValueError):
+                server.dispatcher_options(argv, {"folder", "dry-run"})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(server.run_dispatcher(["bogus"]), 2)
+        self.assertIn("usage: server.py dispatcher setup", out.getvalue())
+
+    # --- sign-in starts ---
+
+    def test_the_windows_task(self):
+        import xml.etree.ElementTree as ET
+        argv = ["C:\\Py thon\\pythonw.exe", "-I", "C:\\nouez\\server.py", "dispatcher", "run",
+                "--folder", "C:\\Users\\me\\R&D <x>\\dispatcher"]
+        xml = server.windows_task_xml(argv, "PC\\me")
+        root = ET.fromstring(xml.encode("utf-16"))
+        ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+        self.assertEqual(root.find("t:Settings/t:MultipleInstancesPolicy", ns).text, "IgnoreNew")
+        self.assertEqual(root.find("t:Settings/t:ExecutionTimeLimit", ns).text, "PT0S")
+        self.assertEqual(root.find("t:Settings/t:DisallowStartIfOnBatteries", ns).text, "false")
+        self.assertEqual(root.find("t:Principals/t:Principal/t:RunLevel", ns).text, "LeastPrivilege")
+        self.assertEqual(root.find("t:Triggers/t:LogonTrigger/t:UserId", ns).text, "PC\\me")
+        self.assertEqual(root.find("t:Actions/t:Exec/t:Command", ns).text, argv[0])
+        self.assertEqual(root.find("t:Actions/t:Exec/t:Arguments", ns).text, subprocess.list2cmdline(argv[1:]))
+
+    def test_the_launch_agent(self):
+        import plistlib
+        argv = ["/usr/bin/python3", "-I", "/n/server.py", "dispatcher", "run", "--folder", "/u/dispatcher"]
+        plist = plistlib.loads(server.launch_agent(argv, "/Users/me/.local/bin:/usr/bin"))
+        self.assertEqual(plist["ProgramArguments"], argv)
+        self.assertEqual(plist["KeepAlive"], {"SuccessfulExit": False})
+        self.assertTrue(plist["RunAtLoad"])
+        self.assertEqual(plist["EnvironmentVariables"]["PATH"], "/Users/me/.local/bin:/usr/bin")
+
+    def test_the_autostart_entry(self):
+        entry = server.autostart_entry(["/usr/bin/python3", "-I", "/home/me/My Tools/server.py", "run"])
+        self.assertIn('Exec=/usr/bin/python3 -I "/home/me/My Tools/server.py" run\n', entry)
+        self.assertIn("NoDisplay=true", entry)
+        for bad in ('/home/me/a"b', "/home/me/$HOME", "/home/me/100%", "/home/me/a\\b"):
+            with self.assertRaises(ValueError):
+                server.autostart_entry(["/usr/bin/python3", bad])
+
+    def test_the_sign_in_start_is_known_by_its_whole_command(self):
+        """0.23.0: nouez's sign-in start runs exactly what dispatcher_command makes; anything else of
+        that name is someone else's, and install and uninstall leave it alone."""
+        ours = server.dispatcher_argv_ours
+        posix = ["/usr/bin/python3", "-I", "/n/server.py", "dispatcher", "run", "--folder", "/u/d", "--sign-in"]
+        win = ["C:\\Py thon\\pythonw.exe", "-I", "C:\\nouez\\server.py", "dispatcher", "run", "--folder",
+               "C:\\Users\\me\\dispatcher", "--sign-in"]
+        self.assertTrue(ours(posix, windows=False))
+        self.assertTrue(ours(posix[:7] + ["--config-dir", "/u/.claude", "--sign-in"], windows=False))
+        self.assertTrue(ours(win, windows=True))
+        self.assertTrue(ours(["/opt/py/bin/python3.12"] + posix[1:], windows=False))
+        self.assertTrue(ours(server.dispatcher_command(sys.executable, os.path.abspath(self.folder))))
+        for bad in (["/usr/bin/example"] + posix[1:], ["python3"] + posix[1:], posix[:1] + posix[2:],
+                    posix[:2] + ["/n/other.py"] + posix[3:], posix[:2] + ["n/server.py"] + posix[3:],
+                    posix[:6] + ["u/d", "--sign-in"], posix[:7], posix + ["--extra"],
+                    posix[:7] + ["--config-dir", "rel", "--sign-in"], posix[:7] + ["--force", "x", "--sign-in"],
+                    posix[:6] + ["/u/d", "--config-dir"], posix[:2] + ["/other/server.py"] + posix[3:],
+                    ["/usr/bin/python3", "dispatcher", "run"], "not a list", None):
+            self.assertFalse(ours(bad, windows=False), bad)
+        self.assertFalse(ours(["\\Python\\pythonw.exe"] + win[1:], windows=True))  # no drive
+        self.assertFalse(ours(win, windows=False))
+
+    def test_a_failed_settings_write_leaves_no_partial_copy(self):
+        """0.23.0: the new settings file is removed when writing it fails, and on Windows nothing
+        is removed once the folder or .claude is no longer a plain folder."""
+        os.makedirs(self.folder)
+        claude = os.path.join(self.folder, ".claude")
+
+        class Failing:
+            def __init__(self, f):
+                self.f = f
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.f.close()
+
+            def write(self, data):
+                raise OSError("disk full")
+        with server.SettingsFolder(self.folder, create=True) as settings:
+            real = settings.create
+            settings.create = lambda name: Failing(real(name))
+            with self.assertRaises(OSError):
+                server.write_settings(settings, {"permissions": {"allow": []}}, None, lambda line: None)
+        self.assertEqual(os.listdir(claude), [])
+        if os.name == "nt":
+            with server.SettingsFolder(self.folder) as settings:
+                with open(os.path.join(claude, "kept.tmp"), "w"):
+                    pass
+                with mock.patch.object(settings, "check", side_effect=OSError("a link now")):
+                    settings.remove("kept.tmp")
+                self.assertTrue(os.path.exists(os.path.join(claude, "kept.tmp")))
+                settings.remove("kept.tmp")
+                self.assertFalse(os.path.exists(os.path.join(claude, "kept.tmp")))
+
+    def test_a_late_run_for_another_folder_is_stopped_and_the_new_one_started_again(self):
+        """0.23.0: a run of the old sign-in start that took the lock during install, for another
+        folder or profile, is asked to stop and the new supervisor started again, so one runs."""
+        for seen, stops, want, started in ((["other", True], True, True, 2), (["other"], False, None, 1),
+                                           ([False, False, False], True, False, 3)):
+            starts, out = [], []
+            with mock.patch.object(server, "wait_for_supervisor", lambda *a, others: seen.pop(0)), \
+                    mock.patch.object(server, "stop_dispatcher", lambda out: stops):
+                result = server.start_new_supervisor(lambda: starts.append(7) or 7, self.folder, None, 0, False,
+                                                     out.append)
+            self.assertIs(result, want, out)
+            self.assertEqual(len(starts), started)
+            self.assertEqual(any("another folder or profile took the lock" in line for line in out), started < 3)
+            self.assertEqual(any("that supervisor didn't stop" in line for line in out), not stops)
+        self.assertIsNone(server.start_new_supervisor(lambda: False, self.folder, None, 0, False, print))
+        # the one asked to stop leaves its record until the new one writes its own: it isn't stopped too
+        other = {"pid": 5, "since": 100.0, "folder": self.home, "config_dir": None, "sign_in": True, "phase": "starting"}
+        new = dict(other, pid=7, since=101.0, folder=self.folder)
+        records = iter([other, dict(other, phase="stopped"), other, new])
+        stopped = []
+        with mock.patch.object(server, "dispatcher_status", lambda: (True, next(records))), \
+                mock.patch.object(server, "stop_dispatcher", lambda out: stopped.append(1) or True), \
+                mock.patch.object(server.time, "sleep", lambda s: None):
+            self.assertIs(server.start_new_supervisor(lambda: None, self.folder, None, 50, False, out.append), True)
+        self.assertEqual(stopped, [1])
+        with mock.patch.object(server, "wait_for_supervisor") as wait:
+            self.assertIs(server.start_new_supervisor(lambda: None, self.folder, None, 0, True, print), True)
+        wait.assert_not_called()
+
+    def test_only_nouezs_own_server_py_counts(self):
+        """0.23.0: a sign-in start running another program's server.py, or one that is gone, isn't
+        nouez's; with a command to match, a start of nouez's for another folder or profile isn't
+        the one asked about."""
+        real = _REAL_NOUEZ_SCRIPT
+        self.assertTrue(real(os.path.join(ROOT, "server.py")))
+        other = os.path.join(self.home, "server.py")
+        with open(other, "w") as f:
+            f.write('"""another program"""\n')
+        self.assertFalse(real(other))
+        self.assertFalse(real(os.path.join(self.home, "gone", "server.py")))
+        self.assertFalse(real(self.home))
+        if hasattr(os, "mkfifo"):
+            fifo = os.path.join(self.home, "fifo", "server.py")
+            os.makedirs(os.path.dirname(fifo))
+            os.mkfifo(fifo)
+            self.assertFalse(real(fifo))  # no writer: open() would wait for one
+        want = ["", "-I", "/n/server.py", "dispatcher", "run", "--folder", "/u/d", "--sign-in"]
+        argv = ["/usr/bin/python3"] + want[1:]
+        self.assertTrue(server.same_command(argv, want))
+        self.assertTrue(server.same_command(argv, None))
+        self.assertFalse(server.same_command(argv[:6] + ["/u/e", "--sign-in"], want))
+        self.assertFalse(server.same_command(argv[:7] + ["--config-dir", "/u/c", "--sign-in"], want))
+        self.assertFalse(server.same_command(argv[:2] + ["/m/server.py"] + argv[3:], want))
+        path = os.path.join(self.home, "auto", "n.desktop")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            f.write(server.autostart_entry(argv))
+        with mock.patch.object(server, "autostart_path", lambda: path):
+            self.assertEqual(server.autostart_state(want), "yes")
+            self.assertEqual(server.autostart_state(want[:6] + ["/u/e", "--sign-in"]), "other")
+
+    def test_a_supervisor_started_at_sign_in_needs_its_own_sign_in_start(self):
+        """0.23.0: one started at sign-in starts claude only while nouez's sign-in start runs its
+        own folder and profile; one for another folder, or one it can't tell about, makes it exit."""
+        asked = []
+
+        def installed(check_off=True, want=None):
+            asked.append(want)
+            return "yes" if want == server.dispatcher_command("", self.folder) else "other"
+        with mock.patch.object(server, "dispatcher_installed", installed):
+            thread, calls, result = self.start_supervisor()
+            thread.join(10)
+        self.assertEqual((result, len(calls)), ([0], 1))
+        self.assertEqual(asked, [server.dispatcher_command("", self.folder)])
+        with mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "other"):
+            thread, calls, result = self.start_supervisor()
+            thread.join(10)
+        self.assertEqual((result, calls), ([0], []))
+        self.assertIn("now starts another folder or profile", self.read("dispatcher.log"))
+        with mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: None), \
+                mock.patch.object(server, "DISPATCHER_SIGN_IN_TRIES", 1):
+            thread, calls, result = self.start_supervisor()
+            thread.join(10)
+        self.assertEqual((result, calls), ([0], []))
+        self.assertIn("can't tell whether nouez's sign-in start is there", self.read("dispatcher.log"))
+        self.assertEqual(self.state()["phase"], "failed")  # not asked to stop: the badge stays red
+
+    def test_a_supervisor_without_its_job_doesnt_start_claude(self):
+        def no_job():
+            raise OSError("denied")
+        os.makedirs(self.folder)
+        with mock.patch.object(server, "supervisor_job", no_job), mock.patch.object(server.signal, "signal"), \
+                mock.patch.object(server, "supervise_dispatcher") as supervise:
+            self.assertEqual(server.run_dispatcher_supervisor(self.folder), 1)
+        supervise.assert_not_called()
+        self.assertIn("can't run the supervisor in a job of its own (denied)", self.read("dispatcher.log"))
+        if os.name != "nt":
+            self.assertEqual(server.supervisor_job(), (None, None))
+
+    def test_the_autostart_entry_is_found_where_install_put_it(self):
+        """0.23.0: Linux: install records where it wrote the entry, so a shell with another
+        XDG_CONFIG_HOME finds the same one; uninstall forgets it."""
+        record = os.path.join(self.cache, "dispatcher-autostart")
+        name = server.DISPATCHER_AUTOSTART
+        put = os.path.join(self.home, "elsewhere", "autostart", name)
+        with mock.patch.dict(server.os.environ, {"XDG_CONFIG_HOME": os.path.join(self.home, ".xdg")}):
+            default = server.autostart_path()
+            self.assertEqual(default, os.path.join(self.home, ".xdg", "autostart", name))
+            with open(record, "w") as f:
+                f.write(put + "\n")
+            self.assertEqual(server.autostart_path(), put)
+            for text in (os.path.join("relative", "autostart", name), os.path.join(self.home, "autostart", "other.desktop"),
+                         os.path.join(self.home, "x", name)):
+                with open(record, "w") as f:
+                    f.write(text + "\n")
+                with self.assertRaises(OSError, msg=text):
+                    server.autostart_path()
+            for raw in (b"/x/\xff/autostart/" + name.encode(),
+                        os.path.join(self.home, "a\0", "autostart", name).encode()):
+                with open(record, "wb") as f:  # not as install writes it
+                    f.write(raw + b"\n")
+                with self.assertRaises(OSError, msg=raw):
+                    server.autostart_path()
+            out = []
+            with mock.patch.object(server, "dispatcher_change_lock", lambda dry_run: contextlib.nullcontext()), \
+                    mock.patch.object(server, "stop_dispatcher", lambda out: True), \
+                    mock.patch.object(server.os, "name", "posix"), mock.patch.object(server.sys, "platform", "linux"):
+                self.assertEqual(server.dispatcher_uninstall(out=out.append), 1)
+                status = []
+                self.assertEqual(server.dispatcher_status_text(status.append), 0)
+                with mock.patch.object(server, "other_remote_controls", lambda own: []), \
+                        mock.patch.object(server, "SettingsFolder", mock.Mock(side_effect=OSError("not here"))):
+                    server.dispatcher_report(lambda ok, text: status.append(text))
+            self.assertNotIn("no dispatcher is set up", "\n".join(status))
+            self.assertIn("couldn't tell whether it starts at sign-in (", "\n".join(status))
+            self.assertIn("doesn't name an autostart entry", "\n".join(out))
+            self.assertIn("Starts at sign-in: can't tell (", "\n".join(status))
+            self.assertIn("doesn't name an autostart entry", "\n".join(status))
+            self.assertTrue(os.path.exists(record))  # where the entry went is still to be found
+            os.remove(record)
+            self.assertEqual(server.autostart_path(), default)
+        self.setup()
+        saved, a = os.path.join(self.cache, "dispatcher-path"), os.path.abspath
+        claude = os.path.dirname(a("/opt/bin/claude"))  # where install finds claude here
+        with mock.patch.dict(server.os.environ, {"PATH": os.pathsep.join(
+                [a("/usr/bin"), claude, "rel/bin", a("/bin"), a("/usr/bin")])}):
+            self.install("linux", claude=a("/opt/bin/claude"))
+        with open(record) as f:
+            self.assertEqual(f.read(), os.path.join(self.home, "auto", "n.desktop") + "\n")
+        with open(saved) as f:  # claude's folder first, though PATH had it second; no relative folder
+            self.assertEqual(f.read(), os.pathsep.join([claude, a("/usr/bin"), a("/bin")]) + "\n")
+        for name in (record, saved):
+            os.remove(name)
+        with mock.patch.object(server, "DISPATCHER_PATH_BYTES", len(claude) + 1),                 mock.patch.dict(server.os.environ, {"PATH": a("/usr/bin")}):  # claude's folder alone fits
+            code, out, _, popen = self.install("linux", claude=a("/opt/bin/claude"))
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing was installed: this PATH can't be saved for the sign-in start (", out)
+        popen.assert_not_called()
+        self.assertFalse(os.path.exists(record) or os.path.exists(saved))
+
+    def test_a_sign_in_start_on_linux_uses_the_path_install_saved(self):
+        """0.23.0: an autostart entry can't carry a PATH, so install saves one (above) and a
+        supervisor the sign-in start ran puts it ahead of the desktop's."""
+        saved, a = os.path.join(self.cache, "dispatcher-path"), os.path.abspath
+        desktop = os.pathsep.join([a("/usr/bin"), "rel", a("/bin")])
+
+        def path_after(sign_in=True, platform="linux", osname="posix"):
+            with mock.patch.dict(server.os.environ, {"PATH": desktop}), \
+                    mock.patch.object(server.os, "name", osname), mock.patch.object(server.sys, "platform", platform):
+                server.use_saved_path(sign_in)
+                return server.os.environ["PATH"], server.dispatcher_cache_problems()
+
+        def write(raw):
+            with open(saved, "wb") as f:
+                f.write(raw)
+        self.assertEqual(path_after(), (desktop, []))  # none saved: as it was
+        nvm = os.path.join(a("/home/me/.nvm"), "bin ")  # a name may end with a space
+        write(os.pathsep.join([nvm, a("/usr/bin")]).encode() + b"\n")
+        self.assertEqual(path_after(), (os.pathsep.join([nvm, a("/usr/bin"), a("/bin")]), []))
+        self.assertEqual(path_after(sign_in=False)[0], desktop)  # started by hand: its own PATH
+        self.assertEqual(path_after(platform="darwin")[0], desktop)  # the launch agent carries it
+        self.assertEqual(path_after(platform="win32", osname="nt")[0], desktop)
+        write(b"\n")  # no folder saved
+        self.assertEqual(path_after(), (desktop, []))
+        sep = os.pathsep.encode()
+        for raw in (a("/x/").encode() + b"\xff\n", a("/a").encode() + b"\n" + a("/b").encode() + b"\n",
+                    a("/a").encode() + b"\0\n", a("/a").encode(), a("/a").encode() + sep + b"rel\n",
+                    a("/a").encode() + b"\n\n", b"/" + b"x" * server.DISPATCHER_PATH_BYTES + b"\n"):
+            write(raw)
+            path, problems = path_after()
+            self.assertEqual(path, desktop, raw)  # not used, and told
+            self.assertEqual(len(problems), 1, raw)
+            self.assertIn("dispatcher-path", problems[0])
+            self.assertIn("a sign-in start uses the desktop's PATH until then", problems[0])
+        with self.assertRaises(ValueError):
+            server.saved_path_record(a("/opt/bin"), a("/a\nb"))
+        with self.assertRaises(ValueError):  # it would come back as two folders
+            server.saved_path_record(a("/home/claude") + os.pathsep + "profile/bin", "")
+        self.assertEqual(server.saved_path_record("", ""), b"\n")
+
+    def install(self, platform, osname="posix", force=False, dry_run=False, trusted=True, installed="no",
+                pythonw="C:\\Python\\pythonw.exe", config_dir=None, service=(113, "Could not find service"),
+                bootstrap=(), claude="/opt/bin/claude"):
+        bootstrap = list(bootstrap)
+        out, ran, real_command, is_trusted = [], [], server.dispatcher_command, trusted
+
+        def command(python, folder, config_dir=None):  # a macOS or Linux one, wherever the test runs
+            argv = real_command(python, folder, config_dir)
+            return argv if osname == "nt" else [a.replace("\\", "/") for a in argv]
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+        if config_dir:
+            env["CLAUDE_CONFIG_DIR"] = config_dir
+
+        def run_status(argv, timeout=20, raw=False):
+            ran.append(argv)
+            if argv[1:2] == ["bootstrap"] and bootstrap:
+                return bootstrap.pop(0)
+            if argv[1:2] != ["print"]:
+                return 0, ""
+            return service.pop(0) if isinstance(service, list) else service
+        with mock.patch.object(server, "dispatcher_claude", lambda env=None: claude), \
+                mock.patch.object(server, "LAUNCH_AGENT_UNLOAD_TRIES", 2), \
+                mock.patch.object(server, "LAUNCH_AGENT_BOOTSTRAP_TRIES", 2), \
+                mock.patch.object(server, "dispatcher_trusted", lambda folder, state_file=None: is_trusted), \
+                mock.patch.object(server, "pythonw_path", lambda: pythonw), \
+                mock.patch.object(server, "dispatcher_command", command), \
+                mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: installed), \
+                mock.patch.object(server, "wait_for_supervisor", lambda *a, **k: True), \
+                mock.patch.object(server, "windows_account", lambda: ("S-1-5-21-1", "PC\\me")), \
+                mock.patch.object(server, "system_program", lambda name: name), \
+                mock.patch.object(server, "dispatcher_change_lock", lambda dry_run: contextlib.nullcontext()), \
+                mock.patch.dict(server.os.environ, env, clear=True), \
+                mock.patch.object(server, "run_status", run_status), \
+                mock.patch.object(server.subprocess, "Popen") as popen, \
+                mock.patch.object(server, "launch_agent_path", lambda: os.path.join(self.home, "LA", "agent.plist")), \
+                mock.patch.object(server, "autostart_path", lambda: os.path.join(self.home, "auto", "n.desktop")), \
+                mock.patch.object(server.os, "getuid", lambda: 501, create=True), \
+                mock.patch.object(server.os, "name", osname), mock.patch.object(server.sys, "platform", platform):
+            code = server.dispatcher_install(self.folder, dry_run=dry_run, force=force, out=out.append)
+        return code, "\n".join(out), ran, popen
+
+    def test_install_checks_first(self):
+        code, out, ran, popen = self.install("linux")
+        self.assertEqual(code, 1)
+        self.assertIn("isn't set up: run `server.py dispatcher setup`", out)
+        self.assertEqual(ran, [])
+        self.setup()
+        code, out, ran, popen = self.install("linux", trusted=False)
+        self.assertEqual(code, 1)
+        self.assertIn("isn't trusted", out)
+        popen.assert_not_called()
+        code, out, ran, popen = self.install("linux", trusted=False, force=True)
+        self.assertEqual(code, 0, out)
+
+    def test_install_on_each_system(self):
+        self.setup()
+        code, out, ran, _ = self.install("win32", "nt")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(ran[0][:5], ["schtasks.exe", "/Create", "/TN", "nouez dispatcher", "/XML"])
+        self.assertEqual(ran[1], ["schtasks.exe", "/Run", "/TN", "nouez dispatcher"])
+        self.assertRegex(os.path.basename(ran[0][5]), r"^dispatcher-task-.+\.xml$")
+        self.assertFalse(os.path.exists(ran[0][5]), "the task's XML is deleted after")
+        plist = os.path.join(self.home, "LA", "agent.plist")
+        code, out, ran, _ = self.install("darwin")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(ran[-2:], [["/bin/launchctl", "enable", "gui/501/io.github.jibarix.nouez.dispatcher"],
+                                    ["/bin/launchctl", "bootstrap", "gui/501", plist]])
+        self.assertNotIn("bootout", str(ran))
+        self.assertTrue(os.path.isfile(plist))
+        code, out, ran, popen = self.install("linux")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.isfile(os.path.join(self.home, "auto", "n.desktop")))
+        self.assertEqual(popen.call_args[0][0][-5:], ["dispatcher", "run", "--folder",
+                                                            self.folder.replace("\\", "/"), "--sign-in"])
+        code, out, ran, popen = self.install("linux", dry_run=True)
+        self.assertIn("Would start now", out)
+        popen.assert_not_called()
+        code, out, ran, popen = self.install("linux", config_dir=self.home)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(popen.call_args[0][0][-3:], ["--config-dir", self.home.replace("\\", "/"), "--sign-in"])
+
+    def test_install_on_macos_unloads_only_nouezs_launch_agent(self):
+        """0.23.0: what launchd has loaded under the label is unloaded only when it came from
+        nouez's plist; one from elsewhere, or one launchd can't be asked about, stops install."""
+        self.setup()
+        plist = os.path.join(self.home, "LA", "agent.plist")
+        loaded, gone = (0, f"gui/501/x = {{\n\tpath = {plist}\n}}"), (113, "Could not find service")
+        code, out, ran, _ = self.install("darwin", service=[loaded, loaded, gone])
+        self.assertEqual(code, 0, out)
+        self.assertEqual([argv[1] for argv in ran[1:]], ["bootout", "print", "print", "enable", "bootstrap"])
+        code, out, ran, _ = self.install("darwin", service=[loaded] * 3)  # launchd doesn't let go: no bootstrap
+        self.assertEqual(code, 1, out)
+        self.assertIn("still has", out)
+        self.assertNotIn("bootstrap", str(ran))
+        busy = (5, "Bootstrap failed: 5: Input/output error")
+        code, out, ran, _ = self.install("darwin", service=[loaded, gone], bootstrap=[busy])  # 5 for a moment
+        self.assertEqual(code, 0, out)
+        self.assertEqual([argv[1] for argv in ran[1:]], ["bootout", "print", "enable", "bootstrap", "bootstrap"])
+        code, out, ran, _ = self.install("darwin", service=[loaded, gone], bootstrap=[busy, busy])
+        self.assertEqual(code, 1, out)
+        self.assertIn("Couldn't load the launch agent: Bootstrap failed: 5", out)
+        os.remove(plist)
+        code, out, ran, _ = self.install("darwin", bootstrap=[busy])  # nothing was unloaded: no second try
+        self.assertEqual(code, 1, out)
+        self.assertEqual([argv[1] for argv in ran].count("bootstrap"), 1)
+        for service, said in (((0, "x = {\n\tpath = /Library/LaunchAgents/other.plist\n}"), "leaves it alone"),
+                              ((0, "x = {\n}"), "leaves it alone"), ((5, "Operation not permitted"), "Couldn't tell")):
+            os.remove(plist)
+            code, out, ran, _ = self.install("darwin", service=service)
+            self.assertEqual(code, 1, out)
+            self.assertIn(said, out)
+            self.assertEqual(len(ran), 1, ran)  # only the look
+            self.assertFalse(os.path.exists(plist))
+            with open(plist, "w"):
+                pass
+
+    def test_install_leaves_alone_what_isnt_nouezs(self):
+        self.setup()
+        for installed, said in (("other", "isn't nouez's"), (None, "couldn't tell")):
+            code, out, ran, popen = self.install("win32", "nt", force=True, installed=installed)
+            self.assertEqual(code, 1, out)
+            self.assertIn(said, out)
+            self.assertEqual(ran, [])
+        code, out, ran, popen = self.install("win32", "nt", force=True, pythonw=None)
+        self.assertEqual(code, 1, out)
+        self.assertIn("no pythonw.exe", out)
+        self.assertNotIn("--force installs anyway", out)
+        self.assertEqual(ran, [])
+
+    def test_whose_the_windows_task_is(self):
+        argv = ["C:\\Python\\pythonw.exe", "-I", "C:\\nouez\\server.py", "dispatcher", "run", "--folder", "C:\\d",
+                "--sign-in"]
+        xml = server.windows_task_xml(argv, "PC\\me")
+        users = {"s-1-5-21-1-1001", "pc\\me", "me"}
+
+        def state(text, encoding="ascii", ids=users):
+            return server.task_xml_state(text.encode(encoding), ids)
+        console = xml.replace("\n", "\r\r\n")  # what schtasks prints through a pipe
+        self.assertEqual(state(xml, "utf-16"), "yes")
+        self.assertEqual(state(console), "yes")
+        # Task Scheduler keeps the principal as the user's SID
+        stored = xml.replace("<Principal id=\"Author\">\n      <UserId>PC\\me</UserId>",
+                             "<Principal id=\"Author\">\n      <UserId>S-1-5-21-1-1001</UserId>")
+        self.assertNotEqual(stored, xml)
+        self.assertEqual(state(stored), "yes")
+        off = xml.replace("    <Enabled>true</Enabled>\n    <Hidden>", "    <Enabled>false</Enabled>\n    <Hidden>")
+        self.assertEqual(state(off, "utf-16"), "off")
+        trigger_off = xml.replace("      <Enabled>true</Enabled>", "      <Enabled>false</Enabled>")
+        self.assertEqual(state(trigger_off), "off")
+        for other in (xml.replace("nouez:", "Mine:"), xml.replace("dispatcher run", "other"),
+                      xml.replace("C:\\Python\\pythonw.exe", "C:\\Tools\\example.exe"),
+                      xml.replace("--sign-in", "--sign-in --more"),
+                      xml.replace("<Principal id=\"Author\">\n      <UserId>PC\\me</UserId>",
+                                  "<Principal id=\"Author\">\n      <UserId>S-1-5-21-9-500</UserId>"),
+                      xml.replace("</Exec>", "</Exec>\n    <Exec><Command>C:\\x.exe</Command></Exec>")):
+            self.assertNotEqual(other, xml)
+            self.assertEqual(state(other), "other", other)
+        self.assertIsNone(state("ERROR: no"))
+        rene = [a.replace("C:\\nouez", "C:\\Users\\Ren\u00e9 \u65e5\u672c") for a in argv]
+        named = server.windows_task_xml(rene, "PC\\me").replace("\n", "\r\r\n")
+        self.assertEqual(state(named, "utf-8"), "yes")
+        self.assertIsNone(state(named.replace("\u65e5\u672c", ""), "cp850"))  # not the code page asked for
+        asked = []
+
+        def run_status(command, timeout=20, raw=False):
+            asked.append(command)
+            return 0, named.encode("utf-8")
+        with mock.patch.object(server, "run_status", run_status), \
+                mock.patch.object(server, "windows_user_ids", lambda: users):
+            self.assertEqual(server.windows_task_state(["", *rene[1:]]), "yes")
+            self.assertEqual(server.windows_task_state(["", *argv[1:]]), "other")
+        self.assertIn(" 65001 >nul 2>nul & ", asked[0])
+        self.assertIn(f'/Query /TN "{server.DISPATCHER_TASK}" /XML', asked[0])
+        self.assertIsNone(state(xml, ids=set()))  # whose it is can't be told
+        if os.name == "nt":
+            sid, account = server.windows_account()
+            self.assertTrue(sid.startswith("S-1-"), sid)
+            self.assertIn(sid.lower(), server.windows_user_ids())
+
+    def test_whose_the_autostart_entry_and_launch_agent_are(self):
+        path = os.path.join(self.home, "auto", "n.desktop")
+        os.makedirs(os.path.dirname(path))
+        with mock.patch.object(server, "autostart_path", lambda: path):
+            self.assertEqual(server.autostart_state(), "no")
+            entry = server.autostart_entry(["/usr/bin/python3", "-I", "/n/server.py", "dispatcher", "run",
+                                            "--folder", "/u/dispatcher", "--sign-in"])
+            for text, want in ((entry, "yes"), (entry + "Hidden=true\n", "off"),
+                               (entry.replace("X-GNOME-Autostart-enabled=true", "X-GNOME-Autostart-enabled=false"), "off"),
+                               ("[Desktop Entry]\nExec=/usr/bin/other\n", "other"),
+                               ("[Desktop Entry]\nExec=/usr/bin/example dispatcher run\n", "other"),
+                               (entry.replace("/usr/bin/python3", "/usr/bin/example"), "other"),
+                               (entry + "Exec=/usr/bin/other\n", "other"),
+                               (entry.replace("--sign-in", "--sign-in 'unclosed"), "other")):
+                with open(path, "w") as f:
+                    f.write(text)
+                self.assertEqual(server.autostart_state(), want, text)
+        import plistlib
+        agent = os.path.join(self.home, "LA", "agent.plist")
+        os.makedirs(os.path.dirname(agent))
+        disabled = []
+        status = [0]
+        argv = ["/usr/bin/python3", "-I", "/n/server.py", "dispatcher", "run", "--folder", "/u/d", "--sign-in"]
+        with mock.patch.object(server, "launch_agent_path", lambda: agent), \
+                mock.patch.object(server.os, "getuid", lambda: 501, create=True), \
+                mock.patch.object(server, "run_status", lambda argv, timeout=20: (status[0], "".join(disabled))):
+            self.assertEqual(server.launch_agent_state(), "no")
+            with open(agent, "wb") as f:
+                f.write(server.launch_agent(argv, "/usr/bin"))
+            self.assertEqual(server.launch_agent_state(), "yes")
+            disabled.append('disabled services = {\n\t"io.github.jibarix.nouez.dispatcher" => disabled\n}')
+            self.assertEqual(server.launch_agent_state(), "off")
+            self.assertEqual(server.launch_agent_state(check_off=False), "yes")
+            status[0] = 1
+            self.assertIsNone(server.launch_agent_state())  # launchctl couldn't say: not "yes"
+            status[0] = 0
+            for plist in ({"Label": "someone.else", "ProgramArguments": argv},
+                          {"Label": "io.github.jibarix.nouez.dispatcher", "Program": "/usr/bin/example",
+                           "ProgramArguments": argv},
+                          {"Label": "io.github.jibarix.nouez.dispatcher", "ProgramArguments": ["/usr/bin/example", "dispatcher", "run"]}):
+                with open(agent, "wb") as f:
+                    f.write(plistlib.dumps(plist))
+                self.assertEqual(server.launch_agent_state(), "other")
+
+    def test_the_supervisor_is_asked_to_stop_never_ended_by_a_process_id(self):
+        request = os.path.join(self.cache, "dispatcher.stop")
+        stop, locked = threading.Event(), threading.Event()
+
+        def supervisor():
+            with server.FileLock(os.path.join(self.cache, "dispatcher.lock"), 0, "busy"):
+                locked.set()
+                server.watch_stop_request(request, stop)
+        thread = threading.Thread(target=supervisor, daemon=True)
+        thread.start()
+        self.addCleanup(stop.set)
+        self.assertTrue(locked.wait(5))
+        out = []
+        with mock.patch.object(server.os, "kill") as kill:
+            self.assertTrue(server.stop_dispatcher(out.append, seconds=10))
+        kill.assert_not_called()
+        thread.join(5)
+        self.assertTrue(stop.is_set())
+        self.assertIn("Stopped the dispatcher supervisor.", out)
+        self.assertFalse(os.path.lexists(request))
+        self.assertIn("asked to stop", self.read("dispatcher.log"))
+
+    def test_a_supervisor_that_doesnt_stop_or_cant_be_told(self):
+        out = []
+        with server.FileLock(os.path.join(self.cache, "dispatcher.lock"), 0, "busy"):
+            self.assertFalse(server.stop_dispatcher(out.append, seconds=1))
+        self.assertIn("still running after 1 s", out[-1])
+        self.assertFalse(os.path.lexists(os.path.join(self.cache, "dispatcher.stop")))
+        with mock.patch.object(server, "dispatcher_status", lambda: (None, None)):
+            self.assertFalse(server.stop_dispatcher(out.append))
+        self.assertIn("Can't tell whether a dispatcher supervisor runs", out[-1])
+
+    def test_uninstall_removes_only_nouezs_start(self):
+        out = []
+        with mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "other"), \
+                mock.patch.object(server, "run_status") as run:
+            self.assertEqual(server.dispatcher_uninstall(out=out.append), 1)
+        run.assert_not_called()
+        self.assertIn("isn't nouez's", out[0])
+        path = os.path.join(self.home, "auto", "n.desktop")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            f.write("x")
+        out = []
+        record, saved = os.path.join(self.cache, "dispatcher-autostart"), os.path.join(self.cache, "dispatcher-path")
+        with open(record, "w") as f:
+            f.write(path + "\n")
+        with open(saved, "w") as f:
+            f.write("/opt/bin\n")
+        with mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "yes"), \
+                mock.patch.object(server, "autostart_path", lambda: path), mock.patch.object(server, "dispatcher_change_lock", lambda dry_run: contextlib.nullcontext()), \
+                mock.patch.object(server.os, "name", "posix"), mock.patch.object(server.sys, "platform", "linux"):
+            self.assertEqual(server.dispatcher_uninstall(out=out.append), 0, out)
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(record))
+        self.assertFalse(os.path.exists(saved))
+
+    def test_uninstall_on_macos_deletes_the_plist_only_once_launchd_has_let_go(self):
+        plist = os.path.join(self.home, "LA", "agent.plist")
+        os.makedirs(os.path.dirname(plist))
+        loaded = (0, f"x = {{\n\tpath = {plist}\n}}")
+        for looks, code, kept in (([loaded, (113, "Could not find service")], 0, False),
+                                  ([loaded, loaded, (113, "Could not find service")], 0, False),  # let go late
+                                  ([loaded] * 3, 1, True),
+                                  ([(0, "x = {\n\tpath = /elsewhere.plist\n}")], 1, True),
+                                  ([(5, "Operation not permitted")], 1, True),
+                                  ([(113, "Could not find service")], 0, False)):
+            with open(plist, "w"):
+                pass
+            ran, out, answers = [], [], list(looks)
+
+            def run_status(argv, timeout=20, raw=False):
+                ran.append(argv)
+                return answers.pop(0) if argv[1] == "print" else (0, "")
+            with mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "yes"), \
+                    mock.patch.object(server, "launch_agent_path", lambda: plist), \
+                    mock.patch.object(server, "run_status", run_status), \
+                    mock.patch.object(server, "LAUNCH_AGENT_UNLOAD_TRIES", 2), \
+                    mock.patch.object(server, "dispatcher_change_lock", lambda dry_run: contextlib.nullcontext()), \
+                    mock.patch.object(server.os, "getuid", lambda: 501, create=True), \
+                    mock.patch.object(server.os, "name", "posix"), mock.patch.object(server.sys, "platform", "darwin"):
+                self.assertEqual(server.dispatcher_uninstall(out=out.append), code, (looks, out))
+            self.assertEqual(os.path.exists(plist), kept, (looks, out))
+            self.assertEqual(answers, [], looks)
+            self.assertEqual(any(argv[1] == "bootout" for argv in ran), looks[0] is loaded, (looks, ran))
+
+    def test_one_install_or_uninstall_at_a_time(self):
+        out = []
+        with server.FileLock(os.path.join(self.cache, "dispatcher-install.lock"), 0, "busy"), \
+                mock.patch.object(server, "FileLock", lambda path, seconds, busy: _REAL_FILELOCK(path, 0, busy)), \
+                mock.patch.object(server, "dispatcher_installed") as installed:
+            self.assertEqual(server.dispatcher_uninstall(out=out.append), 1)
+        installed.assert_not_called()
+        self.assertIn("another `server.py dispatcher install` or `uninstall` is running", out[-1])
+
+    # --- doctor ---
+
+    def report(self):
+        said = []
+        server.dispatcher_report(lambda ok, text, cli=False: said.append((ok, text)))
+        return said
+
+    def test_doctor_with_no_dispatcher_says_so_once(self):
+        with mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "no"):
+            said = self.report()
+        self.assertEqual(len(said), 1)
+        self.assertIsNone(said[0][0])
+        self.assertIn("no dispatcher is set up", said[0][1])
+
+    def test_doctor_flags_an_installed_dispatcher_that_doesnt_run(self):
+        self.setup()
+        with mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "yes"), \
+                mock.patch.object(server, "folder_trusted", lambda path, trusted=None: True), \
+                mock.patch.object(server, "other_remote_controls", lambda own=None: [(77, "dispatcher")]):
+            said = self.report()
+        problems = [text for ok, text in said if ok is False]
+        self.assertEqual(len(problems), 1, said)
+        self.assertIn("the dispatcher isn't running", problems[0])
+        self.assertTrue(any("another `claude remote-control` runs (pid 77, named 'dispatcher')" in text
+                            for _, text in said), said)
+        with mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "off"):
+            said = self.report()
+        self.assertTrue(any("turned off" in text and "`server.py dispatcher install` turns it back on" in text
+                            for _, text in said), said)
+
+    def test_other_remote_control_servers_are_found_by_their_command(self):
+        """0.23.0: on macOS and Linux each process's arguments are read as it got them, so a prompt
+        is never taken for a server's name; where only ps's joined line is there, no name is shown."""
+        claude = "/usr/local/bin/claude"
+        args = {10: [claude, "remote-control", "--name", "dispatcher", "--spawn", "same-dir"],
+                11: [claude, "--remote-control", "work"],
+                12: ["/usr/local/bin/claude-helper", "remote-control"],
+                13: ["/usr/bin/vim", "remote-control.md"],
+                14: [claude, "remote-control", "--name", "dispatcher"],
+                15: [claude, "-p", "explain remote-control to me"],
+                16: [claude, "--verbose", "remote-control"],
+                17: [claude, "-p", "remote-control --name PRIVATE_WORD"],
+                18: [claude, "--print", "remote-control", "--name", "PRIVATE_WORD"],
+                19: None}
+        for platform in ("linux", "darwin"):
+            with mock.patch.object(server.os, "name", "posix"), mock.patch.object(server.sys, "platform", platform), \
+                    mock.patch.object(server, "process_ids", lambda: list(args)), \
+                    mock.patch.object(server, "process_args", lambda pid: args[pid]):
+                found = _REAL_DISPATCHER["other_remote_controls"](own=14)
+            self.assertEqual(found, [(10, "dispatcher"), (16, "")], platform)  # never the rest of a command line
+        ps = "".join(f"  {pid} {' '.join(argv)}\n" for pid, argv in args.items() if argv)
+        with mock.patch.object(server.os, "name", "posix"), mock.patch.object(server.sys, "platform", "sunos5"), \
+                mock.patch.object(server, "run_text", lambda argv, timeout=20: ps):
+            found = _REAL_DISPATCHER["other_remote_controls"](own=14)
+        self.assertEqual(found, [(10, None), (16, None)])
+        for words, want in ((["remote-control"], ""), (["--name", "x"], None), (["-p", "remote-control"], None),
+                            (["--print=yes", "remote-control"], None), (["remote-control", "--name=a b"], "a b")):
+            self.assertEqual(server.remote_control_name(words), want, words)
+
+    @unittest.skipIf(not sys.platform.startswith("linux") and sys.platform != "darwin", "native arguments")
+    def test_a_process_arguments_are_read_as_it_got_them(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "two words", ""])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        deadline = time.monotonic() + 10
+        while (server.process_args(proc.pid) or [])[-3:] != ["import time; time.sleep(30)", "two words", ""]:
+            self.assertLess(time.monotonic(), deadline, server.process_args(proc.pid))
+            time.sleep(0.05)
+        self.assertIn(proc.pid, server.process_ids())
 
 
 if __name__ == "__main__":

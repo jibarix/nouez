@@ -22,7 +22,7 @@ Call `ConsultantBudget` (it changes nothing). It shows:
 Then:
 
 - **Neither installed:** don't consult. Tell the user once that consultations need the Codex or
-  Antigravity CLI (nouez's README, Setup step 2), and do the work yourself.
+  Antigravity CLI (nouez's README, Setup step 4), and do the work yourself.
 - **The user named a provider or model** ("ask Codex", "ask Gemini", a model id): use it, before
   any routing below, and pass it as `provider` (and `model`). If it isn't installed, or its usage
   is used up, say so in one line and ask whether to use the other one; don't switch on your own.

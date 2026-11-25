@@ -86,8 +86,8 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.22.0\\[0.3em]\large Architecture and message reference}
-\date{November 7, 2026}
+\title{\textbf{nouez} 0.23.0\\[0.3em]\large Architecture and message reference}
+\date{November 24, 2026}
 \author{}
 
 \begin{document}
@@ -100,7 +100,8 @@ close Claude Code sessions on the same computer. This document
 describes how the pieces fit together, with an example of every message nouez sends
 or acts on at each boundary: the MCP traffic between Claude Code and nouez, the WebSocket
 JSON-RPC traffic between nouez and the Codex app-server daemon, the commands nouez runs on
-the operating system, and its one request to GitHub, which looks for a newer nouez release. The daemon also sends notifications and its own requests, which nouez
+the operating system, and its two web requests: to GitHub, which looks for a newer nouez release,
+and to Artificial Analysis, for model scores. The daemon also sends notifications and its own requests, which nouez
 discards and this document leaves out. Message shapes are as captured in runs of nouez 0.12.4,
 unless a section names a later version, with Claude Code
 2.1.295 and Codex app-server daemon 0.162.0; client behaviour described here (the discovery
@@ -129,13 +130,14 @@ A message makes three hops (Figure~\ref{fig:components}):
   \item \textbf{Claude Code $\leftrightarrow$ nouez.} Claude Code starts \code{server.py} as a child
         process and speaks MCP to it: JSON-RPC~2.0, one JSON object per line on stdin/stdout.
   \item \textbf{nouez $\leftrightarrow$ Codex daemon.} A tool call that needs the daemon starts
-        \code{codex app-server proxy} (usually once per call; WatchConsultant may connect twice),
+        \code{codex app-server proxy} (once per call; the status screen keeps one open while it runs),
         which relays its stdio to the daemon's local control socket.
         Over that pipe nouez performs a WebSocket handshake and then exchanges JSON-RPC messages
         in WebSocket text frames.
-  \item \textbf{nouez $\rightarrow$ operating system.} To show a consultant to the user, nouez opens a
-        terminal pane running \code{codex resume <id>}, which attaches to the same daemon
-        session. It also checks for such panes and, on StopConsultant, tries to close them.
+  \item \textbf{nouez $\rightarrow$ operating system.} nouez opens no window for a consultant: the
+        status screen's consultations page shows each one's latest turn, and gives the
+        \code{codex resume <id>} a user can run to type to it. When a server starts, it closes the
+        panes nouez 0.22.0 and earlier opened (Section~\ref{sec:old-panes}).
         The Claude Code session tools work only at this level: they open terminal windows
         running \code{claude}, read the files Claude Code keeps about its running sessions, and
         end processes.
@@ -149,19 +151,19 @@ A message makes three hops (Figure~\ref{fig:components}):
   \node[box, draw=cx, minimum width=3.0cm, minimum height=2.4cm, right=2.5cm of nz] (px) {\textcolor{cx}{\textbf{codex app-server}}\\\textcolor{cx}{\textbf{proxy}}\\[2pt]\footnotesize short-lived, per call};
   \node[box, draw=cx, minimum width=3.2cm, minimum height=1.3cm, below=1.5cm of px] (dm) {\textcolor{cx}{\textbf{Codex app-server}}\\\textcolor{cx}{\textbf{daemon}}};
   \node[box, draw=cx, dashed, minimum width=3.2cm, below=0.8cm of dm] (th) {\footnotesize Codex threads (sessions)\\\footnotesize nouez's: \code{threadSource="nouez"},\\\footnotesize read-only sandbox, never asks};
-  \node[box, draw=os, minimum width=3.6cm, below=1.5cm of nz] (term) {\textcolor{os}{\textbf{Terminal pane}}\\\footnotesize \code{codex resume <id>}\\\footnotesize WT split / tmux / window};
+  \node[box, draw=os, minimum width=3.6cm, below=1.5cm of nz] (term) {\textcolor{os}{\textbf{Status screen}}\\\footnotesize \code{server.py top}\\\footnotesize consultations page};
   \node[box, draw=os, dashed, minimum width=3.2cm, below=1.5cm of cc] (tmp) {\footnotesize \code{\%TEMP\%/nouez/<turn>.md}\\\footnotesize replies over 60k chars};
 
   \draw[biedge, cc!70!nz] (cc) -- node[above, font=\scriptsize\sffamily, align=center]{stdio\\MCP JSON-RPC} node[below, font=\scriptsize\sffamily, align=center]{one JSON\\per line} (nz);
   \draw[biedge, nz!60!cx] (nz) -- node[above, font=\scriptsize\sffamily, align=center]{stdio\\WebSocket} node[below, font=\scriptsize\sffamily, align=center]{JSON-RPC\\in frames} (px);
   \draw[biedge, cx] (px) -- node[right, font=\scriptsize\sffamily]{control socket} (dm);
   \draw[edge, cx, densely dotted] (dm) -- (th);
-  \draw[edge, os] (nz) -- node[right, font=\scriptsize\sffamily]{opens / closes} (term);
-  \draw[biedge, os, densely dashed] (term) -- node[above, font=\scriptsize\sffamily]{attaches} (dm);
+  \draw[edge, os] (nz) -- node[right, font=\scriptsize\sffamily]{opens / switches} (term);
+  \draw[biedge, os, densely dashed] (term) -- node[above, font=\scriptsize\sffamily]{reads turns} (dm);
   \draw[edge, gray] (nz.south west) -- node[above, sloped, font=\scriptsize\sffamily]{writes} (tmp.north east);
 \end{tikzpicture}
-\caption{Components and links. Solid arrows carry messages; the terminal pane and nouez share a
-Codex session through the daemon, not through each other.}
+\caption{Components and links. Solid arrows carry messages; the status screen reads the
+consultants' turns from the daemon itself, over a proxy of its own, and sends them nothing.}
 \label{fig:components}
 \end{figure}
 
@@ -174,7 +176,7 @@ Codex session through the daemon, not through each other.}
 Lifetime & whole Claude Code session & short-lived, opened by the tool call & per command \\
 Transport & stdin/stdout of \code{server.py} & stdio of \code{codex app-server proxy} & child processes \\
 Framing & newline-delimited JSON & WebSocket frames (RFC 6455) & argv / exit code / stdout \\
-Protocol & MCP (JSON-RPC 2.0) & Codex app-server JSON-RPC (no \code{"jsonrpc"} field) & \code{wt}, \code{tmux}, \code{osascript}, PowerShell, \code{pgrep} \\
+Protocol & MCP (JSON-RPC 2.0) & Codex app-server JSON-RPC (no \code{"jsonrpc"} field) & \code{wt}, \code{osascript}, PowerShell, \code{ps}, Win32 \\
 Who asks & mostly Claude Code; nouez asks \code{roots/list} & nouez (daemon requests are discarded) & always nouez \\
 Section & \ref{sec:mcp} & \ref{sec:codex} & \ref{sec:os} \\
 \bottomrule
@@ -188,6 +190,11 @@ different project (\code{OpenClaudeSession}), see which are running (\code{ListC
 and end a stuck one (\code{CloseClaudeSession}). They don't involve Codex or talk to Claude Code;
 they work through the operating system and the files Claude Code keeps
 (Sections~\ref{sec:claude-tools} and~\ref{sec:claude-os}).
+
+Those tools are what make the phone the main place to work. A \code{claude remote-control}
+server is tied to the folder it runs in, so \code{server.py dispatcher} keeps one running in a
+folder of its own, the dispatcher, from the user's sign-in on: a session the Claude app starts
+there opens, lists and closes sessions in every project (Section~\ref{sec:dispatcher}).
 
 % =============================================================================
 \section{Inside the server}
@@ -208,7 +215,7 @@ while Codex works.
     \code{\_cancel\_events}: request id $\rightarrow$ Event\\
     \code{\_client\_requests}: our id $\rightarrow$ waiter\\
     \code{\_send\_locks}: thread id $\rightarrow$ Lock\\
-    \code{\_watch\_pending}, \code{\_unwatched}};
+    \code{\_delivered}: turn id $\rightarrow$ texts};
   \node[box, draw=nz, minimum width=3.2cm] (out) at (9.4,-3.0) {\textbf{\code{write\_message}}\\\footnotesize one lock for stdout};
   \node[font=\footnotesize\sffamily, right=0.6cm of out] (stdout) {stdout $\rightarrow$ Claude Code};
 
@@ -352,13 +359,13 @@ ListConsultants & true & & \code{openWorldHint: false} \\
 SendConsultantMessage & false & false & \\
 GetConsultantReply & true$^*$ & & \code{openWorldHint: false} \\
 GetConsultantHistory & true & & \code{openWorldHint: false} \\
-WatchConsultant & false & false & \code{idempotentHint: true}, \code{openWorldHint: false} \\
 StopConsultant & false & true & \code{openWorldHint: false} \\
 OpenClaudeSession & false & false & \code{openWorldHint: false} \\
 ListClaudeSessions & true & & \code{openWorldHint: false} \\
 CloseClaudeSession & false & true & \code{openWorldHint: false} \\
 ListProjects & true & & \code{openWorldHint: false} \\
 OpenStatusScreen & false & false & \code{openWorldHint: false} \\
+ArrangeWindows & false & false & \code{openWorldHint: false} \\
 ConsultantBudget & true & & \code{openWorldHint: true} \\
 \bottomrule
 \end{tabular}
@@ -482,8 +489,9 @@ All of these are checked before anything is sent; the last one after the session
 
 \subsection{Connecting}
 
-A tool call that gets past argument checks opens a fresh \code{CodexClient} (WatchConsultant may
-open a second one) and closes it in a \code{finally} block, killing the proxy's process tree. The
+A tool call that gets past argument checks opens a fresh \code{CodexClient} and closes it in a
+\code{finally} block, killing the proxy's process tree. The status screen's consultations page
+keeps one open in a thread of its own while the screen runs, and opens another after it fails. The
 connection has four steps:
 
 \begin{figure}[H]
@@ -638,13 +646,13 @@ sends a continuation, so it can't refuse one.
 \textrm{\textbf{Method}} & \textbf{Params nouez sends} & \textbf{Result nouez reads} & \textbf{Used by} \\
 \midrule
 initialize & \code{clientInfo} & \code{userAgent}, \code{codexHome} & every connection \\
-thread/loaded/list & \code{\{\}} or \code{\{cursor\}} & \code{data}: ids, \code{nextCursor} & finding sessions \\
+thread/loaded/list & \code{\{\}} or \code{\{cursor\}} & \code{data}: ids, \code{nextCursor} & finding sessions, the consultations page \\
 thread/read & \code{threadId} & \code{thread} & finding sessions \\
 thread/list & \code{limit: 50} & \code{data}: summaries & finding unloaded consultants \\
 thread/start & \code{cwd}, \code{sandbox}, \code{approvalPolicy}, \code{threadSource}, opt.\ \code{model}, \code{developerInstructions} & \code{thread} & StartConsultant \\
 thread/name/set & \code{threadId}, \code{name} & -- & StartConsultant \code{title} \\
 thread/resume & \code{threadId}, \code{excludeTurns: true} & -- & SendConsultantMessage \\
-thread/turns/list\textsuperscript{*} & \code{threadId}, \code{limit}, \code{sortDirection: "desc"} & \code{data}: turns, with items & send, wait, reply, watch \\
+thread/turns/list\textsuperscript{*} & \code{threadId}, \code{limit}, \code{sortDirection: "desc"} & \code{data}: turns, with items & send, wait, reply, history, the consultations page \\
 turn/start & \code{threadId}, \code{input}, \code{sandboxPolicy}, \code{approvalPolicy}\textsuperscript{\dag}, opt.\ \code{model}, \code{effort} & \code{turn.id} & send to an idle session \\
 turn/steer & \code{threadId}, \code{expectedTurnId}, \code{input} & \code{turnId} (not read) & send to a busy session \\
 thread/archive & \code{threadId} & -- & StopConsultant \\
@@ -658,7 +666,7 @@ model/list & \code{\{\}} & \code{data}: models & ConsultantBudget \\
 not documented.
 \textsuperscript{\dag}Sent only to nouez's own consultants: a read-only sandbox and
 \code{approvalPolicy: never}, on every turn, because Codex keeps them for later turns and
-permissions changed in a watch pane would otherwise carry over.}
+permissions changed in a \code{codex resume} the user ran would otherwise carry over.}
 
 \subsection{Finding a session}
 \label{sec:resolve}
@@ -716,24 +724,23 @@ approval policy; those are only listed in the result.
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[x=0.92cm,y=0.7cm]
-  \lifelines{0/Claude Code/cc, 5/nouez/nz, 10.5/Codex daemon/cx, 15.5/OS/os}{13.6}
+  \lifelines{0/Claude Code/cc, 5/nouez/nz, 10.5/Codex daemon/cx}{13.6}
   \msg{1.2}{0}{5}{tools/call StartConsultant}
   \side{1.9}{5}{\code{cwd} default: first MCP root; repo root: nearest \code{.git} upward}
   \msg{2.8}{5}{10.5}{connect; find session}
   \side{3.5}{5}{keep nouez-started sessions whose \code{cwd} is inside the repo}
-  \frm{4.1}{8.3}{4.4}{16.9}{alt: nouez already started one here}
-  \msg{5.1}{5}{10.5}{thread/turns/list limit 1}
-  \ret{5.8}{10.5}{5}{latest turn (or none)}
-  \msg{6.7}{5}{15.5}{open pane if watch, has turns, none open}
+  \frm{4.1}{8.3}{4.4}{13.4}{alt: nouez already started one here}
+  \msg{5.1}{5}{10.5}{thread/turns/list limit 100}
+  \ret{5.8}{10.5}{5}{latest turns (or none)}
   \ret{7.6}{5}{0}{"Using codex-nouez-4d9f17 ..."}
-  \frm{8.6}{12.6}{4.4}{16.9}{else: none found, or new=true}
+  \frm{8.6}{12.6}{4.4}{13.4}{else: none found, or new=true}
   \msg{9.6}{5}{10.5}{thread/start read-only, never}
   \ret{10.3}{10.5}{5}{thread}
   \msg{11.0}{5}{10.5}{thread/name/set (if title)}
   \ret{11.9}{5}{0}{"Started codex-nouez-4d9f17 ..."}
 \end{tikzpicture}
-\caption{StartConsultant. A new session's pane opens with its first message, because
-\code{codex resume} can't show a session that has no turns yet.}
+\caption{StartConsultant. It opens no window: the status screen's consultations page shows
+every consultant (Section~\ref{sec:consultations-page}).}
 \end{figure}
 
 \begin{wire}[Request]
@@ -756,7 +763,6 @@ Started codex-nouez-4d9f17
     cwd: C:\Users\you\Projects\nouez
     model: gpt-5.6-sol (openai)
     sandbox: read-only
-A pane showing it opens beside Claude Code when you send its first message.
 Send it work with SendConsultantMessage.
 \end{plain}
 \begin{plain}[Result text: reused]
@@ -771,7 +777,6 @@ Using codex-nouez-4d9f17, which already works in C:\Users\you\Projects\nouez; no
     started: 2026-11-10 09:14 (2 days ago); 14 turn(s)
     last turn: 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31 [completed, 2026-11-12 16:40 (35 min ago), took 212s] from Claude Code: "Review this diff for bugs:" -> "Two issues. 1) route() accepts float ids but ..."
     GetConsultantHistory lists its earlier turns.
-Opened codex-nouez-4d9f17 in a Windows Terminal split pane.
 Ignored title, instructions: they apply only to a new session (new=true).
 To give this consultant new standing instructions and keep its context, send them as a message with SendConsultantMessage.
 Send it work with SendConsultantMessage.
@@ -787,11 +792,7 @@ The \code{started} and \code{last turn} lines come from \code{thread/turns/list}
 turns, newest first; ``100+'' when there may be more), and show when the session was created, how
 many turns it has had, and its last turn the way \code{GetConsultantHistory} does
 (Section~\ref{sec:history}), so Claude can tell whether it is still the right consultant. The
-effort is the one \code{thread/resume} reports. The pane line is omitted with \code{watch: false}. If the session has no turns yet it reads
-\emph{``A pane showing it opens beside Claude Code when you send its first message.''}, and if a
-terminal already shows it, nothing is opened and the line is \emph{``... is already open in a
-terminal; no new one was opened.''} The \code{watch} value of the latest StartConsultant call
-also decides whether later sends open a pane. The ``Ignored'' line appears only when
+effort is the one \code{thread/resume} reports. The ``Ignored'' line appears only when
 \code{model}, \code{title} or \code{instructions} were passed, and the line after it only
 when \code{instructions} were. Other nouez sessions in the same
 repository follow \emph{``Other consultants in this repo:''}, and the user-session note appears
@@ -890,29 +891,27 @@ No Codex sessions in C:\Users\you\Projects\nouez. Start one with StartConsultant
 
 The central tool. A lock per session, held only inside this nouez process, makes sure two of its
 concurrent sends can't both start a turn; it does not cover other clients of the daemon, such as
-the user typing in a Codex terminal. The lock is held through delivery, the check that the new
-turn is listed, and opening the pane, and is released before the long wait, so a slow reply
+the user typing in a Codex terminal. The lock is held through delivery and the check that the new
+turn is listed, and is released before the long wait, so a slow reply
 doesn't block other senders.
 
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[x=0.92cm,y=0.66cm]
-  \lifelines{0/Claude Code/cc, 5/nouez/nz, 10.5/Codex daemon/cx, 15.5/OS/os}{19.0}
+  \lifelines{0/Claude Code/cc, 5/nouez/nz, 10.5/Codex daemon/cx}{19.0}
   \msg{1.2}{0}{5}{tools/call Send...Message}
   \msg{2.1}{5}{10.5}{connect; find session}
-  \frm{2.7}{12.2}{4.4}{16.9}{critical: send lock for this session}
+  \frm{2.7}{10.6}{4.4}{13.4}{critical: send lock for this session}
   \side{3.5}{5}{last chance for a cancel to stop delivery}
   \msg{4.3}{5}{10.5}{thread/resume excludeTurns}
   \msg{5.2}{5}{10.5}{thread/turns/list limit 1}
   \ret{5.9}{10.5}{5}{latest turn}
-  \frm{6.4}{9.8}{4.6}{16.7}{alt}
+  \frm{6.4}{9.8}{4.6}{13.2}{alt}
   \msg{7.2}{5}{10.5}{idle: turn/start}
   \ret{7.9}{10.5}{5}{turn.id}
   \side{8.5}{5}{poll until the turn is listed (gives up after 10 s)}
   \msg{9.3}{5}{10.5}{busy: turn/steer expectedTurnId}
-  \msg{10.6}{5}{15.5}{open pane (first message / pane closed)}
-  \ret{11.5}{15.5}{5}{"Opened ... split pane"}
-  \frm{12.8}{16.9}{-0.6}{16.9}{loop every 1.5 s, until done or \code{wait} runs out}
+  \frm{12.8}{16.9}{-0.6}{13.4}{loop every 1.5 s, until done or \code{wait} runs out}
   \msg{13.8}{5}{10.5}{thread/turns/list limit 10}
   \ret{14.5}{10.5}{5}{turn status}
   \ret{15.3}{5}{0}{progress, at most every 10 s}
@@ -922,7 +921,7 @@ doesn't block other senders.
 \caption{SendConsultantMessage with a \code{wait} above zero (the default is 5 seconds). Before the lock, a
 session the user opened is refused unless \code{allow\_user\_session: true}, and nothing is sent.
 Progress notifications go out only if the request carried a progress token. With
-\code{wait: 0} it returns after the steps inside the lock (delivery, the listing check and the pane), skipping
+\code{wait: 0} it returns after the steps inside the lock (delivery and the listing check), skipping
 only the wait for the reply. The 10~s check stops polling after 10~s, but a slow
 \code{thread/turns/list} request can take up to its own 15~s timeout, so it is not a hard bound.}
 \end{figure}
@@ -1013,7 +1012,7 @@ what Claude meets when it sends again after its context was summarised and it lo
 send. Only nouez's own record counts (\code{\_delivered}: each turn's texts, header included, added
 once \code{turn/start} or \code{turn/steer} returns), as for steering: \code{thread/turns/list}
 gives a summary of a turn's items, its first user message and last agent message, so a steer
-doesn't show there, and the same text typed in the pane is not a message this server delivered. A
+doesn't show there, and the same text typed in \code{codex resume} is not a message this server delivered. A
 send whose acknowledgement was lost is not in the record, and after a restart the record is empty.
 Nothing goes to the daemon and no \code{send} event is logged. A message sent again after the turn
 ended starts a new turn as usual, since the work under review may have changed.
@@ -1043,8 +1042,6 @@ Reply from codex-nouez-4d9f17:
 Two issues. 1) route() accepts float ids but ...
 
 (codex-nouez-4d9f17 runs on model gpt-5.6-sol, effort high.)
-
-(Opened codex-nouez-4d9f17 in a Windows Terminal split pane.)
 \end{plain}
 When the send didn't change \code{model} or \code{effort}, the result says what the consultant
 runs on: in a line after a reply, and in the ``started a new turn'' text. When it did, it says the
@@ -1170,7 +1167,7 @@ Reply from codex-nouez-4d9f17 (turn 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31, comple
 Lists a consultant's recent turns, newest first, one line each, from one
 \code{thread/turns/list} (\code{limit}, default 20, at most 100). Each line gives the turn id,
 status, when it started and how long it took, the sender (the \code{from} label in a bridge
-message's header, or ``someone in the Codex pane'' for text typed there), the first line of the
+message's header, or ``someone typing in Codex'' for text typed in Codex itself), the first line of the
 message and of the reply, and how many messages steered the turn while it ran. A turn with no
 message at all names no sender: one Codex started to carry on another turn's work reads
 \emph{``Codex carrying on the work of turn \ldots, with no new message''}, naming its
@@ -1181,7 +1178,7 @@ sender's own text. It reads only, user sessions included.
 \begin{plain}[Result text]
 codex-nouez-4d9f17 (started 2026-11-10 09:14 (2 days ago)): its 2 most recent turn(s), newest first. Read a whole reply with GetConsultantReply and the turn id.
 - 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31 [completed, 2026-11-12 16:40 (35 min ago), took 212s] from Claude Code: "Review this diff for bugs:" (+1 more message(s) added while it ran) -> "Two issues. 1) route() accepts float ids but ..."
-- 01a1e902-77aa-7c10-9e2d-41b0c3d8a6f0 [completed, 2026-11-10 09:15 (2 days ago), took 48s] from someone in the Codex pane: "what does resolve() do?" -> "It lists sessions, then matches ..."
+- 01a1e902-77aa-7c10-9e2d-41b0c3d8a6f0 [completed, 2026-11-10 09:15 (2 days ago), took 48s] from someone typing in Codex: "what does resolve() do?" -> "It lists sessions, then matches ..."
 \end{plain}
 
 % -----------------------------------------------------------------------------
@@ -1260,45 +1257,18 @@ marked \code{[ok]}, \code{[note]} or \code{[problem]}: nouez's version and path 
 running it; the \code{codex} CLI on the PATH; whether the app-server daemon answers, with its
 version and any update notice (connecting may start it, as any consultation would); whether
 \code{settings.json} in Claude Code's config folder holds the waiter's allow rules; and, on
-Windows, whether Windows Terminal and \code{claude} are on the PATH. It changes nothing, and exits with code~1
-when a problem blocks consultations.
+Windows, whether Windows Terminal (where nouez's windows open and are arranged) and \code{claude} are on the PATH; then the phone dispatcher
+(Section~\ref{sec:dispatcher}): its folder, its allow rules, trust there, whether it starts at
+sign-in, whether it is connected, and any other \code{claude remote-control} running. It changes
+nothing, and exits with code~1 when a problem blocks consultations.
 \begin{plain}[Output]
 [ok] nouez 0.12.4 at C:\Users\you\nouez\server.py, Python 3.13.5 at C:\Python313\python.exe
 [ok] codex CLI 0.165.0 at C:\Users\you\AppData\Roaming\npm\codex.CMD
 [ok] the Codex app-server daemon answers (version 0.167.2)
 [ok] Claude Code allows the waiter command without asking
-[ok] Windows Terminal is installed: panes open beside Claude Code
+[ok] Windows Terminal is installed: Claude Code sessions and the status screen open in it and are arranged
 [ok] claude at C:\Users\you\.local\bin\claude.exe (for OpenClaudeSession)
 No problems found.
-\end{plain}
-
-\subsection{WatchConsultant}
-
-\begin{figure}[H]
-\centering
-\begin{tikzpicture}[x=0.92cm,y=0.7cm]
-  \lifelines{0/Claude Code/cc, 5/nouez/nz, 10.5/Codex daemon/cx, 15.5/OS/os}{8.0}
-  \msg{1.2}{0}{5}{tools/call WatchConsultant}
-  \msg{2.1}{5}{10.5}{connect; find session; turns/list limit 1}
-  \frm{2.7}{6.0}{4.4}{16.9}{alt: has turns}
-  \msg{3.6}{5}{15.5}{viewer already running?}
-  \msg{4.6}{5}{15.5}{if not: open pane codex resume <id>}
-  \side{6.6}{5}{no turns: remember; reconnect and check once more}
-  \ret{7.4}{5}{0}{what happened}
-\end{tikzpicture}
-\caption{WatchConsultant. With no turns, it records the request and opens a second connection
-to check again, in case a send slipped in; otherwise the next SendConsultantMessage opens the
-pane. It works on the user's sessions too.}
-\end{figure}
-
-\begin{wire}[Request]
-{"jsonrpc": "2.0", "id": 17, "method": "tools/call", "params": {"name": "WatchConsultant", "arguments": {"to": "codex-nouez-4d9f17"}}}
-\end{wire}
-\begin{plain}[Result text: variants]
-Opened codex-nouez-4d9f17 in a Windows Terminal split pane.
-codex-nouez-4d9f17 is already open in a terminal; no new one was opened.
-codex-nouez-4d9f17 has no messages yet; a terminal window will open when you send the first one.
-Opened codex-nouez-4d9f17 in Windows Terminal. Warning: the codex CLI on PATH is 0.160.1 but the daemon is 0.162.0, so the window may ask to restart the daemon. Choose Cancel (restarting interrupts running consultants) and update the codex CLI to 0.162.0.
 \end{plain}
 
 % -----------------------------------------------------------------------------
@@ -1307,17 +1277,15 @@ Opened codex-nouez-4d9f17 in Windows Terminal. Warning: the codex CLI on PATH is
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[x=0.92cm,y=0.7cm]
-  \lifelines{0/Claude Code/cc, 5/nouez/nz, 10.5/Codex daemon/cx, 15.5/OS/os}{6.6}
+  \lifelines{0/Claude Code/cc, 5/nouez/nz, 10.5/Codex daemon/cx}{5.6}
   \msg{1.2}{0}{5}{tools/call StopConsultant}
   \msg{2.1}{5}{10.5}{connect; find session (exact only)}
   \side{2.8}{5}{refuse if \code{threadSource} isn't \code{"nouez"}}
   \msg{3.6}{5}{10.5}{thread/archive}
-  \msg{4.6}{5}{15.5}{best effort: close panes running codex resume <id>}
-  \ret{5.7}{5}{0}{"Stopped ... (archived)."}
+  \ret{4.7}{5}{0}{"Stopped ... (archived)."}
 \end{tikzpicture}
-\caption{StopConsultant. Archiving is reversible: \code{codex unarchive <id>}. Panes are found
-by command line; the count in the result is how many matched, and a failed close is not
-reported.}
+\caption{StopConsultant. Archiving is reversible: \code{codex unarchive <id>}. A
+\code{codex resume} the user opened on the session stays open.}
 \end{figure}
 
 \begin{wire}[Request]
@@ -1327,7 +1295,7 @@ reported.}
 {"id": 7, "method": "thread/archive", "params": {"threadId": "01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17"}}
 \end{wire}
 \begin{plain}[Result text]
-Stopped codex-nouez-4d9f17 (archived). Closed 1 terminal window(s) showing it. To bring it back: codex unarchive 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17, then codex resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17.
+Stopped codex-nouez-4d9f17 (archived). To bring it back: codex unarchive 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17, then codex resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17.
 \end{plain}
 \begin{plain}[Result text: refused (isError true)]
 codex-nouez-77c2e0 was not started by StartConsultant. Close it from its own terminal.
@@ -1467,13 +1435,14 @@ combining marks none). Below 149 columns the panels stack, at most 104 wide; fro
 subscriptions are cards 50 wide on the left. Colours are the 16 standard ones, with bright black
 for the faint parts; a Windows console that isn't Windows Terminal, ConEmu or one that sets
 \code{TERM} or \code{TERM\_PROGRAM} gets square corners and \code{|} for the bar's mark of time gone.
-\code{read\_key} returns early when the terminal is resized, and reads an arrow or function key
+\code{read\_key} returns early when the terminal is resized or \code{OpenStatusScreen} sends a command, and reads an arrow or function key
 whole (on Windows the two characters after \code{\textbackslash x00} or \code{\textbackslash xe0}, elsewhere an
 escape sequence) so it does nothing. \code{?} shows a help page; Esc goes back from it and quits
 otherwise. It redraws every 5 seconds, reads Codex's
 usage from the daemon every 60 and the transcripts again every 300 in one background thread, and
 Antigravity's quota every 60 in another, since \code{agy -p /usage} can take a minute; until its
-first reading the Antigravity line says it is checking, and \code{r} only wakes both threads. The
+first reading the Antigravity line says it is checking, and \code{r} only wakes both threads and
+the consultations page's (below). The
 log is read with the files it was rotated into. A period's replies are those to the messages
 sent in it, each turn as it was first read; replies to earlier messages are counted apart.
 Verdicts, reply times and review loops come from those replies, and a loop counts each turn once,
@@ -1489,13 +1458,15 @@ The screen keeps to the \code{server.py} on disk. Before each redraw it compares
 modification time and size with those of the version it runs; once they have changed and stayed
 the same for one redraw, and the new file compiles and still holds \code{def run\_top(} and the
 \code{\_\_main\_\_} entry point (an empty file, or one cut short after a whole function, compiles too),
-the screen starts again on it with the same period. The version it runs is passed to it as
+the screen starts again on it with the same period and page. The version it runs is passed to it as
 \code{-{}-since <mtime>:<size>}, as the process starting it saw the file just before; only the first
 screen started by hand takes it as Python loaded the file. A change after that, even while the
 screen starts, restarts it. On every system \code{server.py top} runs the screen
 as a child (\code{top -{}-screen}), noting the version just before, and reads its exit code: 70
-when the user quit, 71 to start again with the period it was given, 72 to 75 to start again with
-the period of \code{TOP\_PERIODS} (1, 7 or 30 days, or all). Once the screen has restarted, any
+when the user quit, 71 to start again as it was started, and 72 to 81 to start again with a page and
+a period: \code{reload\_code} gives 72, plus 5 times the page's place in \code{TOP\_PAGES} (\code{usage},
+\code{consultations}), plus the period's place in \code{TOP\_PERIODS} (1, 7 or 30 days, or all), or 4
+to keep the period it was given. The supervisor rebuilds \code{-{}-days} and \code{-{}-page} from it. It starts the screen with \code{-{}-supervised}, so the screen knows the supervisor holds the single-screen lock (below) and takes these codes. A screen without it, restarted on this version by a 0.22.0 supervisor that knows only 71 to 75, holds the lock itself and asks for the usage page (71, or 72 to 76), since that supervisor would take 77 and above as a failure; if another screen holds the lock, it switches that one to its page and exits with 70, which closes its window. Once the screen has restarted, any
 other code, 0 included (a file cut short after the entry point can do nothing and exit cleanly),
 leaves the window waiting; it starts the screen again once \code{server.py} differs from the
 version that failed, and Ctrl+C closes it. Ctrl+C reaches the screen and the supervisor
@@ -1507,6 +1478,82 @@ starting is acted on once it has started. The screen takes \code{SIGTERM} as Ctr
 terminal back before it ends. The compile-and-markers check doesn't prove a file whole: one cut short after the entry
 point passes, and its screen ends at once, which leaves the window waiting. The terminal goes into cbreak
 mode inside the block that restores it, so an interrupt at any point leaves it as it was.
+
+\subsubsection*{The consultations page}
+\label{sec:consultations-page}
+
+\code{c} switches the screen to its consultations page and back. nouez opens no window for a
+consultant (up to 0.22.0 it opened a Codex pane, Section~\ref{sec:old-panes}); this page shows all of
+them in one place instead. A \code{ConsultationFeed} reads its data in a thread of its own, so the
+screen keeps answering keys: \code{load\_consultants} over one \code{CodexClient} kept open while the
+screen runs, with the Codex consultants of the last \code{LOGGED\_CONSULTANTS} (100) sends in the usage
+log that the 50 newest saved sessions no longer reach (\code{logged\_codex\_threads}, passed as
+\code{extra\_ids}), and the Antigravity records in nouez's cache folder, every \code{TOP\_LIST\_SECONDS}
+(12); and, only while the page is shown, the selected consultant's latest turn
+(\code{thread/turns/list} with \code{limit} 1, or the last \code{agy/<id>/turns/} entry), every
+\code{TOP\_TURN\_SECONDS} (1.5) while it runs. A turn that has ended is read once more and then not
+again until the consultant's update time changes. A failed read drops the connection, which the next
+read opens again. The feed knows a connection's \code{codex app-server proxy} from the moment it
+starts (\code{on\_spawn}), so closing the screen ends it even while its handshake waits; a failed list keeps the Codex rows it had, with the error under them. The feed asks only
+\code{thread/loaded/list}, \code{thread/read}, \code{thread/list} and \code{thread/turns/list}: it
+sends no consultant anything.
+
+The list (\code{consultant\_overview}) holds only nouez's own consultants (\code{is\_bridge}; a
+session the user opened isn't listed), working ones first, then the most recently active, each
+with its state, how long ago it was active, the verdict of the reply to its last message and that
+message's \code{kind}, both from the usage log, and its project and model. The verdict shows only
+when the logged reply belongs to the last logged send and the consultant isn't working. Below it, the
+selected turn's items in order: the message (with the sender from the bridge header and the revision
+line taken off, and the user's own words, when Claude Code passed them on, under a label of their own before it), thinking summaries, the commands it ran (with the exit code when one failed), searches
+and the consultant's messages, the final reply in bold; then \emph{working…} or the error. Every
+text from a consultant or the usage log (the turn's labels and sender, errors, a turn's state, a
+message's kind and verdict, a model's name) goes through \code{page\_text} or \code{\_printable}, which turns tabs into spaces and drops
+every character Python doesn't count as printable (controls, format characters such as
+bidirectional overrides, separators other than the space), so a reply can't move the
+cursor, change colours or reorder the line. The turn follows its end as it grows; Page Up, Page
+Down and Home scroll back, End follows again. On a short screen the list gives up rows first, so
+the turn keeps at least one line. Under the turn is the command that opens the consultant in its
+own CLI, with its folder, cut from the left when it doesn't fit, since its end names the project.
+\code{resume\_command} builds it in the feed's thread: for Codex, \code{codex resume <id> -{}-remote
+unix://<socket>}, the control socket under the daemon's \code{codexHome} (from its \code{initialize}
+answer), so a terminal with another \code{CODEX\_HOME} finds the thread too, and without
+\code{-{}-remote} when that socket isn't there; for Antigravity, \code{agy -{}-conversation <id>}. Each
+word after the program is quoted for the shell the user types it in, PowerShell on Windows and
+bash or zsh elsewhere (\code{shell\_word}); \code{agy}'s full path is shown as
+\code{agy\_shown} gives it, already in that form. The turn's
+lines are laid out again only when the turn read or the width changes, and wrapped in one pass
+(\code{wrap\_cells}), so a long reply doesn't slow every redraw.
+
+\subsubsection*{One status screen}
+
+The supervisor holds \code{status-screen.lock} in nouez's cache folder, taken without waiting, for as
+long as it runs, across the screen's restarts, and writes its process id and an id of its own
+(\code{uuid4}) to \code{status-screen.json}; it takes the lock, and writes that file, under
+\code{status-command.lock}, as it removes the file and gives up the lock when it ends. If the file
+can't be written, it gives the lock up again and runs the screen without it, since a request would
+otherwise go to an id an earlier screen left there. It hands the id to the screen it starts in
+\code{NOUEZ\_STATUS\_SCREEN}, and the screen trusts the file's \code{applied} only under that
+id. A try that
+fails while no screen holds the lock (the screen closed meanwhile) is tried again; only a cache folder that can hold no
+lock runs the screen without it. A second \code{server.py top} that finds the lock held doesn't start
+another screen: it writes a command for its \code{-{}-page} and \code{-{}-days}, if given, asks for the
+open screen's window to be brought forward, says so and exits; if that screen closed meanwhile, it
+tries again to run its own. \code{OpenStatusScreen}, under \code{status-open.lock} so two
+sessions can't both open one, writes a command when a screen holds that lock:
+\code{status-command.json} (\code{screen}, \code{seq}, \code{page}, and \code{days} when given),
+and, on Windows, restores the screen's window from its entry in nouez's window records and asks for
+it to be brought forward. \code{write\_status\_command} holds \code{status-command.lock} while it
+checks the lock, reads the screen's id into \code{screen} and numbers the command after the one in
+the file (\code{seq}, the time in nanoseconds when that is higher). So a command is addressed to the
+screen registered when it was written, never to one that registers after it, and no two get the
+same number. A command the screen hasn't applied yet is kept: a new one adds its fields to it, and a
+bare \code{server.py top} writes none. A thread in the screen reads the file every half second and wakes \code{read\_key}; it
+acts on a command addressed to it that isn't the last one it applied, which it records in
+\code{status-screen.json} (\code{applied}): a command written while the screen restarts is applied
+once it runs, and none twice. When no screen holds the lock, \code{OpenStatusScreen} opens a
+window and waits up to 5 seconds for the new screen to take the lock, so a call right after it
+switches that one rather than opening another; if the lock still isn't taken then, it says the
+screen hadn't started yet rather than report it open.
 
 When the Antigravity CLI is installed (\code{agy} on \code{PATH}, or on Windows
 \code{\%LOCALAPPDATA\%\textbackslash agy\textbackslash bin\textbackslash agy.exe}), the screen also
@@ -1810,12 +1857,24 @@ Folders in C:\Users\me\Projects (3):
 Open one with OpenClaudeSession, cwd set to its full path. For a folder that isn't trusted, OpenClaudeSession gives a report of everything its project settings would run.
 \end{plain}
 
-\code{OpenStatusScreen} takes \code{days}: 1, 7 (the default), 30 or 0 for everything logged. It
-opens a new terminal window in the user's home folder (not a project folder, which an open window
-would keep from being renamed) running \code{server.py top -{}-days <days>}
-(Section~\ref{sec:usage}).
+\code{OpenStatusScreen} takes \code{page}, \code{usage} (the default) or \code{consultations}, and
+\code{days}: 1, 7, 30 or 0 for everything logged. When a status screen is open, it switches that one
+to the page, and to the period when \code{days} is given (Section~\ref{sec:consultations-page}, ``One
+status screen''). Otherwise it opens a new terminal window in the user's home folder (not a project
+folder, which an open window would keep from being renamed) running \code{server.py top -{}-arranged
+-{}-days <days> -{}-page <page>}, with 7 days when \code{days} isn't given (Section~\ref{sec:usage});
+\code{-{}-arranged} records the window for arranging (Section~\ref{sec:arrange}).
+\begin{plain}[Result text: opened, then switched]
+Opened a new Windows Terminal window on the computer with nouez's status screen, on its usage page (consultations counted: last 7 days). It shows only on the computer's screen: to tell a user who is away from it how their usage stands, use ConsultantBudget instead. [c] switches pages; they close it with q.
+The status screen was already open on the computer: switched it to its consultations page and asked Windows to bring its window forward. It shows only on the computer's screen: ...
+\end{plain}
+
+\code{ArrangeWindows} (Windows only) takes an optional boolean \code{auto}. Without it, it arranges
+nouez's windows once; \code{auto: false} saves the setting and stops the arranger, leaving the
+windows where they are; \code{auto: true} saves it and arranges at once. Section~\ref{sec:arrange}
+describes what arranging does.
 \begin{plain}[Result text]
-Opened a new Windows Terminal window on the computer with nouez's status screen (consultations: last 7 days). It shows only on the computer's screen: to tell a user who is away from it how their usage stands, use ConsultantBudget instead. They close it with q.
+Arranged 3 of the 3 window(s) nouez opened in a grid on one screen. Arranging by itself is on: windows are arranged again as they open, close or are moved.
 \end{plain}
 
 \subsubsection*{The sign-in warning}
@@ -1856,126 +1915,63 @@ Past the earlier date it says ``may already have ended'', and past the last mome
 \section{nouez \texorpdfstring{$\rightarrow$}{->} operating system}
 \label{sec:os}
 
-\subsection{Opening a pane}
+\subsection{Opening a window}
 
-The pane runs the daemon's own \code{codex} binary when nouez can find it, because a viewer whose
-version differs from the daemon's can refuse to attach and offer to restart the shared daemon.
-nouez reads the daemon's version from \code{userAgent} and looks under
-\code{<codexHome>/packages/app-server-daemon/releases/<version>-*/bin/}, confirming with
-\code{codex -{}-version}.
+\code{OpenClaudeSession} and \code{OpenStatusScreen} open a terminal window running a command of
+nouez's; nouez opens none for a consultant.
 
 \begin{center}\small
 \begin{tabularx}{\textwidth}{@{}l >{\ttfamily\raggedright\arraybackslash}X@{}}
 \toprule
-\textbf{Where Claude Code runs} & \textrm{\textbf{Command nouez starts}} \\
+\textbf{Where} & \textrm{\textbf{Command nouez starts}} \\
 \midrule
-tmux (\code{\$TMUX} set) & tmux split-window -h -c <cwd> '<codex> resume <id>' \\
-Windows Terminal (\code{\$WT\_SESSION}) & wt -w 0 split-pane -V -d <cwd> -{}-title "Codex consultant" cmd /d /s /k "<codex> resume <id>", with Claude Code's window brought to the front first (below); new-tab instead of split-pane when Claude Code's tab isn't selected; -w new when the window can't be found or brought to the front. In every argument after -w, \code{;} is passed as \code{\textbackslash;} (wt splits commands at a bare one) \\
-Windows, \code{wt} installed & wt -w new -d <cwd> -{}-title "Codex consultant" cmd /d /s /k "<codex> resume <id>" \\
-Windows, no \code{wt} & cmd /c start "Codex consultant" cmd /d /s /k "<codex> resume <id>" \\
-macOS & osascript -e 'on run argv' -e 'tell application "Terminal" to do script (item 1 of argv)' -e '... activate' -e 'end run' 'cd <cwd> \&\& <codex> resume <id>' (the command is an argument, never part of the script) \\
-Linux & the first of x-terminal-emulator -e, gnome-terminal -{}-, konsole -e, xfce4-terminal -x, kitty, alacritty -e, wezterm start -{}-, foot, xterm -e, then <codex> resume <id>; an error when there is no display (\code{DISPLAY}, \code{WAYLAND\_DISPLAY}) \\
+Windows, \code{wt} installed & wt -w new -d <cwd> -{}-title <title> <command>, where in every argument \code{;} is passed as \code{\textbackslash;} (wt splits commands at a bare one) \\
+Windows, no \code{wt} & <command> in a console of its own (\code{CREATE\_NEW\_CONSOLE}) \\
+macOS & osascript -e 'on run argv' -e 'tell application "Terminal" to do script (item 1 of argv)' -e 'end run' 'cd <cwd> \&\& <command>' (the command is an argument, never part of the script) \\
+Linux & the first of x-terminal-emulator -e, gnome-terminal -{}-, konsole -e, xfce4-terminal -x, kitty, alacritty -e, wezterm start -{}-, foot, xterm -e, then <command>; an error when there is no display (\code{DISPLAY}, \code{WAYLAND\_DISPLAY}) \\
 \bottomrule
 \end{tabularx}
 \end{center}
 
-In every row, \code{<codex> resume <id>} is followed by the pane's token, then two options:
+A launcher that exits with an error within \code{LAUNCH\_GRACE} (1.5 seconds) is reported with what
+it said; one still running then is taken as started.
 
-\begin{plain}[The viewer's options]
--c nouez_pane=p3f9c...                (the pane token; Codex ignores the unknown key)
---remote unix://<codexHome>/app-server-control/app-server-control.sock
--c check_for_update_on_startup=false
-\end{plain}
+\subsection{Closing the panes of earlier versions}
+\label{sec:old-panes}
 
-\code{-{}-remote} attaches the pane to the app server of the daemon nouez talks to, by the socket
-in the \code{codexHome} that daemon reports, so a terminal with another \code{CODEX\_HOME} (a
-macOS Terminal window, a tmux server started elsewhere) reaches the same daemon. When the socket
-isn't there, or on Windows its path holds a character \code{cmd} would read, the option is plain
-\code{unix://} and the pane finds the socket from its own \code{CODEX\_HOME}. Without
-\code{-{}-remote}, a
-\code{codex resume} given any \code{-c} option outside a short list Codex allows starts an app
-server of its own inside the pane, and that one can't take the thread from the daemon, which
-holds its writer: the pane shows ``This conversation is open in another app'' from the first
-message (up to 0.18.1). On the daemon, the pane asks the daemon whether the folder is trusted,
-with no way to pass trust for one run, so in a folder Codex hasn't trusted it asks ``Trust this
-folder?'' first. The answer is the user's, and Codex saves it; the consultant works on meanwhile.
-Up to 0.18.1 nouez passed a one-run trust for the folder, which only an app server in the pane
-used.
+Up to 0.22.0 nouez opened a pane or window running \code{codex resume <id>} for each Codex
+consultant. A server closes those once, when it starts (\code{start\_pane\_cleanup}, a background
+thread, so \code{initialize} never waits on it). It closes only panes an earlier nouez opened, which
+carry a token right after \code{codex resume <id>}: \code{-c nouez\_pane=<token>}, which Codex ignores
+as an unknown key. The token is \code{p} and 32 hex digits of HMAC-SHA256 over the thread id, keyed
+with 32 random bytes in nouez's cache folder (\code{pane-key}, shared by the user's nouez servers;
+made under a lock file all servers take and read again under it, and written in full under a name
+of its own before it is moved into place). A shell the user opened can't hold the token, whatever
+they type, so a \code{codex resume} they started stays open. Panes from before 0.16.0 carry no token
+and are left open too.
 
-On Windows the whole command reaches \code{cmd} as one argument. Arguments with spaces in it are
-quoted for Codex's C runtime (\code{subprocess.list2cmdline}), and the argument as a whole is
-quoted once more, which Windows Terminal does by itself and \code{start} gets written out;
-\code{/s} makes \code{cmd} drop only that outer pair. Without it, a quoted program path followed
-by another quoted argument (a path and a folder that both hold spaces) lost its opening quote, and
-\code{cmd} tried to run \code{C:\textbackslash{}Program}. \code{/d} skips \code{cmd}'s AutoRun
-commands. A command holding one of \code{\& | < > \^{} \%} or \code{!} isn't run at all.
+On Windows nouez runs no command for this. It lists processes with
+\code{CreateToolhelp32Snapshot}, and reads the command line of each \code{cmd.exe} through
+\code{NtQueryInformationProcess} (the information class is
+\code{ProcessCommandLineInformation}), split into arguments as the C runtime does. A pane nouez opened
+is a \code{cmd.exe} whose own \code{/k} command is \code{codex resume <id>} followed at once by the
+token, with nothing else for \code{cmd} to run; one whose \code{codex} runs through npm's
+\code{node}, or has already exited, still counts. Once its \code{codex} has exited, the pane is a
+prompt where the user may have started a program of their own, so the window is ended only while
+nothing runs in it but its console host (\code{conhost.exe} or \code{OpenConsole.exe}) and that
+viewer: a \code{codex.exe} or \code{node.exe} whose own command line, read through its handle, is
+the same \code{codex resume} with the same id and token (\code{is\_viewer}). If anything else runs
+in it, a process in it can't be opened, or the second snapshot fails or names a process under the
+window that wasn't checked (one started since the first), nothing is ended.
 
-\subsubsection*{Finding Claude Code's window (Windows Terminal)}
-\label{sec:wt-host}
-
-\code{wt.exe} can name a window only by number or name, and \code{-w 0} means the most recently
-used window, which may belong to another Claude Code session. So nouez first finds the window that
-shows its own Claude Code session. Claude Code starts \code{server.py} without a console, so nouez
-borrows one: walking up its parent processes, it calls \code{AttachConsole} on each until one has a
-console, which is Claude Code's. In Windows Terminal that console's window
-(\code{GetConsoleWindow}) is a hidden pseudo-console window, owned by the terminal window it is
-shown in (\code{GetWindow(..., GW\_OWNER)}, class \code{CASCADIA\_HOSTING\_WINDOW\_CLASS}).
-\code{AttachConsole} and \code{FreeConsole} replace the standard handles, which carry the MCP pipes
-and are what \code{subprocess} hands to children, so nouez saves them first and restores them after
-each attempt. The lookup runs under a lock, as a process has only one console at a time.
-
-nouez then brings that window to the front (\code{AttachThreadInput} to the foreground thread,
-\code{SetForegroundWindow}) and checks that it is in front. Attaching makes nouez wait on the
-foreground program, so it skips that step when \code{IsHungAppWindow} says the program isn't
-responding. It compares the console's title with
-the window's, ignoring the spinner Claude Code animates at the start: the window shows the title of
-its selected tab, so a mismatch means another tab is selected, and \code{split-pane} would split
-that one. nouez runs \code{wt -w 0 split-pane ...} (or \code{new-tab ...}), waits for
-\code{wt.exe} to exit and another half second for the terminal to act on it, and gives the
-focus back to the window that had it. If the window can't be found or brought to the front, the
-consultant gets a window of its own (\code{wt -w new}). Two gaps remain: another window that
-comes to the front between the check and \code{wt} gets the pane, and two tabs with the same
-title look alike.
-
-\subsection{Detecting and closing panes}
-
-Thread ids are checked against \code{[0-9A-Za-z-]+} before they appear in any command: opening a
-pane refuses a malformed id with an error, and the checks and closing skip it.
-
-On Windows nouez runs no command for this. It lists processes with the Win32 call
-\code{CreateToolhelp32Snapshot}, and reads the command line of each \code{codex.exe} and
-\code{cmd.exe} with \code{NtQueryInformationProcess}, information class
-\code{ProcessCommandLineInformation}. That takes milliseconds even on a busy computer. Up to 0.15.0 it asked WMI through PowerShell, which
-could take minutes then; the check timed out, found no viewer, and opened another pane. A command
-line is split into arguments as the C runtime does, and only \code{codex resume <id>} as separate
-arguments counts, so the same words inside a \code{codex exec} prompt don't. A viewer is any such
-\code{codex.exe}, whoever started it. A pane nouez opened is a \code{cmd.exe} whose own
-\code{/k} command is \code{codex resume <id>} followed at once by \code{-c nouez\_pane=<token>},
-with nothing for \code{cmd} to run after it. The token is \code{p} and 32 hex digits of
-HMAC-SHA256 over the thread id, keyed with 32 random bytes made once in nouez's cache folder
-(\code{pane-key}, shared by the user's nouez servers; made under a lock file all servers take and
-read again under it, so all end on one key, and written in full under a name of its own before it
-is moved into place; if it can't be read or made, a server uses a key of its own, and only it finds
-its panes). A shell the user opened can't hold the token,
-whatever they type; a pane whose \code{codex} runs through npm's \code{node}, or has already
-exited, still counts. Panes from before 0.16.0 carry no token and are left open.
-
-\begin{plain}[Is a viewer already running? Which panes did nouez open? (Windows)]
-codex.exe 72832: C:\...\codex.exe resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17 -c ...
-  -> a viewer is running
-cmd.exe 34288: cmd /d /s /k ""C:\...\codex.exe" resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17 -c ..."
-  -> a pane nouez opened
-\end{plain}
-\begin{plain}[Is a viewer already running? (macOS, Linux)]
-pgrep -f "codex[^ ]* resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17"
-\end{plain}
-\begin{plain}[Closing on StopConsultant (Windows): each pane found as above]
+\begin{plain}[Closing an old pane (Windows)]
 OpenProcess(34288), its /k command checked again through that handle
 OpenProcess(each child, grandchild ...), kept only if it started after its parent
 CreateToolhelp32Snapshot again: kept only if each still has the same parent
+each one a console host or the viewer, or nothing is ended
 TerminateProcess(those, deepest first)       (codex, or node and codex, inside the pane)
 TerminateProcess(34288, exit code 0)         (a clean exit lets Windows Terminal close the pane)
-WaitForSingleObject(34288, 3 s)              (closed only once cmd has ended)
+WaitForSingleObject(34288, 3 s)
 \end{plain}
 
 Every process is checked and ended through a handle opened before the check, so a process id
@@ -1983,32 +1979,29 @@ that passes to another program meanwhile is never touched. A child whose parent 
 isn't taken for the pane's: it started before its parent. Nor is a process that took a child's id
 after the first snapshot: an open handle keeps an id from being reused, so the second snapshot,
 taken with all of them open, names each one's real parent.
-\begin{plain}[Closing on StopConsultant (macOS, Linux)]
-pgrep -f "codex[^ ]* resume 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17 -c nouez_pane=p3f9c...( |$)"
-ps -o comm= -p <pid>; ps -o args= -p <pid>   (for each, just before the signal: the program is
-                                             codex and the command still has the token)
-kill -TERM <pid>
+On Linux, with \code{os.pidfd\_open} (Python 3.9 or later, Linux 5.3 or later), nouez runs no command
+either: for each process in \code{/proc} it opens a pidfd first, then reads
+\code{/proc/<pid>/cmdline}, the argument list split on NUL bytes, so no space or quote can blur it
+(\code{pane\_argv}: a program whose name starts with \code{codex}, then \code{resume}, an id, \code{-c}
+and this thread's token). A process id reused after the pidfd was opened can't receive the signal.
+macOS has no pidfd and \code{ps} reads a process's arguments only after picking it by id, so a
+process that took a pane's id between the check and the signal would be ended; nouez leaves the
+panes open there.
+\begin{plain}[Closing an old pane (Linux)]
+pidfd_open(<pid>)
+read /proc/<pid>/cmdline    (codex... resume <id> -c nouez_pane=<this thread's token>)
+pidfd_send_signal(fd, SIGTERM)
+close(fd)
 \end{plain}
-
-These are Win32 calls, not commands. \code{StopConsultant} then checks again and says so if
-a terminal still shows the consultant.
-
-Each check and close command has a timeout (20~s; 10~s for \code{codex -{}-version}). When it
-fires, nouez stops reading the command's pipes, because on Windows a grandchild process can keep
-a pipe open forever, and kills the process: the whole tree on Windows (\code{taskkill /T}), only
-the direct process elsewhere. A pane started with \code{tmux}, a new terminal window or \code{wt -w new}
-is started without waiting, so it has no timeout. In Claude Code's own Windows Terminal window,
-nouez waits for \code{wt.exe} to exit (up to 10~s) and then half a second more, besides finding
-the window and bringing it to the front (Section~\ref{sec:wt-host}), so that call can take that long.
 
 \subsection{Starting and ending Claude Code sessions}
 \label{sec:claude-os}
 
 \code{OpenClaudeSession} opens a new window: in Windows Terminal with the command below,
 otherwise in a new console (Windows), Terminal (macOS) or the first terminal emulator of the
-panes' list (Linux, Section~\ref{sec:os}). On macOS and Linux a launcher that exits with an
-error within 1.5 seconds (a tmux split, an emulator without a display) is reported with what it
-said, and with the command to run yourself.
+list in Section~\ref{sec:os}. On macOS and Linux a launcher that exits with an error within 1.5
+seconds (an emulator without a display) is reported with what it said, and with the command to run
+yourself.
 
 \begin{plain}[The window's command]
 wt -w new -d <cwd> --title "Claude: <name>"
@@ -2108,6 +2101,321 @@ lock it, so a session saving in the instant between nouez's last check and its r
 that change, and a session that rewrites the file from what it read earlier could drop nouez's.
 The read-back catches the second; the backups are there for the first.
 
+\subsection{Arranging nouez's windows (Windows)}
+\label{sec:arrange}
+
+On Windows, nouez puts the Windows Terminal windows it opened in a grid that fills one screen, and
+arranges them again as they open, close or are moved. Those are the Claude Code sessions from
+\code{OpenClaudeSession} and the status screens from \code{OpenStatusScreen}. It never moves another window:
+not a terminal the user opened, nor one Claude Code runs in.
+Everything below uses \code{ctypes} and the Win32 API; on macOS and Linux nothing is recorded or
+moved.
+
+\subsubsection*{Recording a window}
+
+The helper in each window (\code{server.py claude}, \code{server.py top -{}-arranged}) finds the
+window it is shown in: its own console window, from
+\code{GetConsoleWindow}, is a hidden pseudo-console window owned by the Windows Terminal window
+(\code{GW\_OWNER}, class \code{CASCADIA\_HOSTING\_WINDOW\_CLASS}). Windows Terminal may show the
+window a moment after the tab starts, so a background thread looks for up to 3 seconds. In a
+console that isn't Windows Terminal's, it records nothing. Otherwise it writes
+\code{windows/s<session>/<pid>-<start>.json} in nouez's cache folder, where \code{<session>} is
+the Windows session (\code{ProcessIdToSessionId}): window handles and the arranger belong to one
+sign-in, so two sign-ins to the same account keep their windows apart. Registering is best-effort:
+if it fails in any way, the window opens and isn't arranged.
+
+\begin{wire}[A window's entry]
+{"hwnd": 1442270, "console": 790916, "pid": 21544, "start": 134087365512345678,
+ "kind": "claude", "slot": 1795990211.4, "box": [0, 0, 960, 1128], "left": false}
+\end{wire}
+
+\code{pid} and \code{start} (the process's start time) identify the helper; an entry whose
+helper has ended, or whose pid now belongs to another process, is deleted when entries are read.
+\code{slot} orders the grid (the time the window opened, swapped when the user swaps two windows),
+\code{box} is where nouez last put the window and saw it stay, and \code{left} marks a window taken
+to another screen. The helper deletes its entry when it ends, so the others close up; the
+last one also deletes \code{screen.json}. Every read and delete of these files checks the folders
+and the file itself again, so none is reached through a link (Section~\ref{sec:usage}).
+
+\subsubsection*{The arranger}
+
+Writing an entry wakes the arranger, \code{server.py arrange}, starting it if none runs (its
+mutex, below, tells whether one does: the wake event can outlive the arranger while another process
+holds it open). It is a process of its own, outside the helper's job object when Windows allows, so it outlives the window
+that started it. One runs per user session: it holds the named mutex
+\code{Local\textbackslash{}nouez-arranger}, and others signal its auto-reset event
+\code{Local\textbackslash{}nouez-arrange-wake}. It is per-monitor DPI aware (v2), so every position
+it reads or sets is in the screen's real pixels.
+
+It never polls. It sleeps in \code{MsgWaitForMultipleObjectsEx} on the wake event, one process
+handle per helper (to see one end; at most 62, the wait's limit with the event) and its message
+queue, which brings:
+
+\begin{itemize}
+  \item WinEvents, through \code{SetWinEventHook} out of context, from only the Windows Terminal
+        processes that hold nouez's windows: move and size start and end, minimize start and end,
+        destroy, show and hide, location change (maximizing, Snap), and cloak and uncloak
+        (a switch of virtual desktop). Events for those processes' other
+        windows, or for a control inside a window, are dropped at once.
+  \item Broadcasts to a hidden top-level window of its own: \code{WM\_DISPLAYCHANGE},
+        \code{WM\_SETTINGCHANGE} for the work area (the taskbar), and the session being unlocked.
+\end{itemize}
+
+Each wake restarts a 300 ms timer, so a burst of events makes one pass once they stop. While a
+window is being dragged (between move-size start and end, or with the left mouse button down) it
+waits again. A pass after a screen change, the work area changing or an unlock takes no move as
+the user's: Windows moved the windows. With no window left, it waits 10 seconds for another and
+ends; it ends at once when arranging is turned off. Once it has let its mutex go, it reads the
+entries again and starts a successor if a window registered meanwhile; after a failure (its window,
+event or wait), it starts none, and the next window to register starts one.
+
+\subsubsection*{A pass}
+
+A pass runs under \code{pass.lock} in that folder, so the arranger and \code{ArrangeWindows} never move
+windows at the same time:
+
+\begin{enumerate}
+  \item Read the entries, oldest slot first. Leave out a window that is closed, minimized,
+        maximized, hidden or cloaked (on another virtual desktop), one whose console's owner is no
+        longer that window (its tab was dragged into another window), and a second entry for the
+        same window; clear their boxes.
+  \item Pick the screen: the one named in \code{screen.json} (its device name, such as
+        \code{\textbackslash\textbackslash.\textbackslash{}DISPLAY1}, which stays with it when
+        screens are rearranged) while it is connected, else the oldest window's, else the main
+        screen, and save it. The grid stays on that screen.
+  \item In the arranger's passes, a window the user moved is taken as a request. Taken to another
+        screen (its middle measured on another connected screen), it is marked \code{left} and stays there until it is moved back by hand or
+        \code{ArrangeWindows} brings it back. Moved off its box with its middle inside another
+        window's box, the two swap slots. Anywhere else (a nudge, a resize), it goes back.
+  \item Choose the grid (below) for the screen's work area. Check each window's console owner
+        again, then ask Windows Terminal to place it in its box with \code{SetWindowPos} and the
+        flags \code{SWP\_NOACTIVATE}, \code{SWP\_NOZORDER} and \code{SWP\_ASYNCWINDOWPOS}. The
+        outer rectangle is sized so that the visible part fills the box: the invisible resize
+        border, the difference from \code{DWMWA\_EXTENDED\_FRAME\_BOUNDS}, is left out. The request is posted, so a
+        Windows Terminal that has stopped responding (\code{IsHungAppWindow}, or one that
+        hangs later) never holds up the arranger; the move's own events bring the next pass. A
+        window on another screen than its box is only moved there, so it rescales before a later
+        pass measures its border and sizes it.
+  \item Measure, and save the box only if the window holds it, within 12 pixels at 100\%
+        scaling; only then does it count as arranged. A window that won't take its box (a minimum
+        size, a terminal that doesn't respond, an elevated Windows Terminal, which a normal process
+        can't move) is asked at most three times for the same box, then left as it is, its box
+        cleared so it is never taken as moved by hand.
+\end{enumerate}
+
+The arranger arranges only two or more windows. \code{ArrangeWindows} runs
+\code{server.py arrange -{}-once}, which arranges even one, takes no move as a request, and brings
+back the windows that left; it passes again, 0.3 seconds apart and at most four times, until no
+window needs moving, so its counts are of windows seen in their boxes.
+
+\subsubsection*{The grid}
+
+For $n$ windows in a work area $W \times H$, nouez tries each column count $c$ from 1 to $n$ with
+$r = \lceil n / c \rceil$ rows, keeping those where no column is empty and every box is at least
+$560 \times 320$ pixels at 100\% scaling (about 60 by 16 characters), and picks the one whose box
+shape $\frac{W/c}{H/r}$ is closest to 1.6 (by the absolute value of its logarithm). Columns
+that hold one window fewer come first, so the oldest windows get the taller boxes: three windows
+on a wide screen make one tall box on the left and two stacked on the right. If not all fit, the
+grid is made for as many as fit, and the newest are left where they are. Box edges are computed
+with integer division from the area's edges, so neighbouring boxes share their edge and fill the
+area exactly; a window counts as in its box within the 12-pixel tolerance, so real windows can
+leave or overlap a few pixels.
+
+\code{auto} lives in \code{arrange.json} in nouez's cache folder; it is on unless set to
+\code{false}.
+
+% -----------------------------------------------------------------------------
+\subsection{The phone dispatcher}
+\label{sec:dispatcher}
+
+Remote Control lets the Claude app drive a Claude Code session on the computer. The computer
+connects out to Anthropic and nothing on it listens, but a \code{claude remote-control} server
+starts every session in its own folder. \code{server.py dispatcher} keeps one such server, named
+\code{dispatcher}, running in a folder of its own (\code{\textasciitilde/Projects/dispatcher} unless
+\code{-{}-folder}), and that folder's sessions have nouez's session tools, so one server reaches
+every project (Figure~\ref{fig:dispatcher}).
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=1.2cm]
+  \node[box, draw=cc, minimum width=2.8cm, minimum height=1.6cm] (app) {\textcolor{cc}{\textbf{Claude app}}\\[2pt]\footnotesize on the phone};
+  \node[box, draw=muted, minimum width=2.8cm, minimum height=1.6cm, right=1.6cm of app] (rc) {\textbf{Remote Control}\\[2pt]\footnotesize Anthropic};
+  \node[box, draw=nz, minimum width=3.6cm, minimum height=1.6cm, right=1.6cm of rc] (sup) {\textcolor{nz}{\textbf{supervisor}}\\[2pt]\footnotesize \code{server.py dispatcher run}\\\footnotesize started at sign-in};
+  \node[box, draw=cc, minimum width=3.6cm, minimum height=1.6cm, below=1.1cm of sup] (srv) {\textcolor{cc}{\textbf{claude remote-control}}\\[2pt]\footnotesize \code{-{}-name dispatcher}\\\footnotesize in the dispatcher folder};
+  \node[box, draw=cc, dashed, minimum width=3.6cm, minimum height=1.4cm, below=1.1cm of srv] (ses) {\textcolor{cc}{\textbf{Claude Code sessions}}\\\footnotesize one per project, own window};
+  \node[box, draw=nz, dashed, minimum width=2.8cm, minimum height=1.4cm, left=1.6cm of srv] (tools) {\textcolor{nz}{\textbf{nouez tools}}\\\footnotesize \code{OpenClaudeSession},\\\footnotesize \code{ListProjects}, \ldots};
+
+  \draw[biedge, cc] (app) -- (rc);
+  \draw[biedge, muted] (srv.north west) -- node[above, sloped, font=\scriptsize\sffamily]{connects out} (rc.south east);
+  \draw[edge, nz] (sup) -- node[right, font=\scriptsize\sffamily]{starts, restarts, reads output} (srv);
+  \draw[biedge, nz] (srv) -- node[above, font=\scriptsize\sffamily]{MCP} (tools);
+  \draw[edge, nz] (tools.south) |- node[pos=0.75, below, font=\scriptsize\sffamily]{opens, resumes, closes} (ses.west);
+  \draw[biedge, muted, densely dashed] (ses.east) -- ++(1.0,0) |- node[pos=0.25, right, font=\scriptsize\sffamily, align=left]{Remote Control,\\each its own} ($(sup.north)+(0,0.4)$) -| (rc.north);
+\end{tikzpicture}
+\caption{The phone dispatcher. The phone and the computer both reach Anthropic; the
+computer accepts no connections.}
+\label{fig:dispatcher}
+\end{figure}
+
+\paragraph{Commands.} \code{setup} makes the folder (its parent must exist), writes
+\code{CLAUDE.md} from \code{DISPATCHER\_CLAUDE\_MD} when there is none, and merges allow rules
+\code{mcp\_\_consultants\_\_}\textit{tool} for each of \code{DISPATCHER\_TOOLS} into
+\code{.claude/settings.json}. It reaches that file only through a \code{.claude} that is a
+plain folder (\code{SettingsFolder}: opened with \code{O\_NOFOLLOW} and used through its descriptor
+on macOS and Linux, checked by path on Windows), reads it first, and refuses a link, or a file that
+isn't a JSON object whose \code{permissions.allow} is a list; before changing it, it copies it to
+\code{settings.json.nouez-}\textit{date}\code{-}\textit{time}\code{.bak} and compares the copy, and
+it replaces the file only if it still holds what was read. A save by another program between that
+last check and the replacement would be lost; the copy holds what was read. On Windows the folders
+are checked again before a temporary file is removed, and one left by a failed write is removed too.
+It warns when neither \code{\textasciitilde/.claude.json} (for every project or for that folder)
+nor the folder's \code{.mcp.json} registers nouez as \code{consultants}, the name the rules use. \code{install} checks that the folder has \code{CLAUDE.md}, that
+\code{claude} can be found, that Claude Code is trusted there (a server at sign-in would
+otherwise wait at the trust question), and on Windows that \code{pythonw.exe} is beside Python;
+\code{-{}-force} skips those, but never a missing \code{pythonw.exe} or a
+\code{CLAUDE\_CONFIG\_DIR} that isn't an absolute path. It holds
+\code{dispatcher-install.lock} while it works (\code{uninstall} too), so two don't mix, and goes
+on only when \code{dispatcher\_installed} finds no sign-in start of that name, or nouez's own:
+\code{yes}, or \code{off} when it is turned off; \code{other} and one it can't read stop it.
+\code{other} is a description or label not nouez's, or a command other than the one
+\code{dispatcher\_command} makes, as \code{dispatcher\_argv\_ours} checks it: a Python by its full
+path, \code{-I}, nouez's \code{server.py} by its full path (\code{nouez\_script}: a regular file, opened
+without waiting on a pipe, that begins with \code{NOUEZ\_HEAD}), \code{dispatcher run -{}-folder}
+\textit{folder}, an optional \code{-{}-config-dir} \textit{dir}, \code{-{}-sign-in}, and nothing
+else; on Windows also a task with more than one action, or whose principal is neither this
+user's SID nor name (\code{windows\_user\_ids}), and on macOS a plist with a \code{Program}
+key. It registers the sign-in start, which runs
+\code{[python, -I, server.py, dispatcher, run, -{}-folder, }\textit{folder}\code{, -{}-sign-in]}, with
+\code{-{}-config-dir} before \code{-{}-sign-in} when \code{CLAUDE\_CONFIG\_DIR} is set, asks a running
+supervisor to stop, and starts the new one, checking within \code{DISPATCHER\_START\_WAIT} that it
+runs with that folder, profile and \code{-{}-sign-in}, all while it holds
+\code{dispatcher-install.lock}:
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+\textbf{OS} & \textbf{Sign-in start} \\
+\midrule
+Windows & Task Scheduler task \code{nouez dispatcher}, registered with \code{schtasks /Create /XML}
+from a UTF-16 definition in a new \code{dispatcher-task-}\textit{random}\code{.xml}, deleted after;
+\code{schtasks.exe} and \code{taskkill.exe} are run by their full path in the system folder, and the task is read with \code{schtasks /Query
+/XML} through \code{cmd /d /c} after \code{chcp 65001}, since through a pipe it prints in its
+console's code page, which can't hold every name; anything but UTF-8 back counts as unreadable: a logon trigger for this user, \code{InteractiveToken},
+\code{LeastPrivilege}, runs on battery, no time limit, one instance; run by \code{pythonw}. \\
+macOS & launch agent \code{io.github.jibarix.nouez.dispatcher} in \code{Library/LaunchAgents}
+in the home folder the user database gives (\code{account\_home}), turned on with \code{launchctl enable} and loaded with
+\code{/bin/launchctl bootstrap gui/}\textit{uid}; one already loaded is unloaded (\code{bootout})
+only when \code{launchctl print} names nouez's plist as its path, and an answer that can't be read
+stops \code{install}. \code{bootout} can return while launchd is still unloading, so \code{install}
+loads the new copy, and \code{uninstall} deletes the plist, only once \code{print} no longer finds
+the service, within 10 seconds; a \code{bootstrap} that fails with 5 just after is tried again, up
+to 5 times a second apart;
+\code{RunAtLoad}, output to \code{/dev/null}. \\
+Linux & \code{nouez-dispatcher.desktop} in \code{\$XDG\_CONFIG\_HOME/autostart}, by default
+\code{\textasciitilde/.config}: the desktop starts it at sign-in, so the sessions it opens have a
+display. \code{install} first writes the path to \code{dispatcher-autostart} in the dispatcher's
+folder, and \code{autostart\_path} uses a rooted path recorded there that ends in
+\code{/autostart/nouez-dispatcher.desktop}, so a shell with another \code{XDG\_CONFIG\_HOME} finds
+the same entry. A record that can't be read or names something else stops \code{install} and
+\code{uninstall}, which keep it; \code{uninstall} deletes it once the entry is gone. An entry
+can't carry a PATH, so \code{install} also writes the absolute folders of its own, \code{claude}'s
+folder first, as one line of at most 64 KB, to \code{dispatcher-path} (and installs nothing when
+they don't fit, or \code{claude}'s folder has a colon in its name). A supervisor the entry started puts them ahead of the desktop's absolute folders
+once \code{dispatcher\_may\_start} lets it start, so it reads the record an \code{install} that came
+in between wrote (\code{use\_saved\_path}); a record \code{install} wouldn't write is logged and
+left unused, and \code{status} and doctor show it. \code{uninstall} deletes it too. A path holding a character the entry can't
+carry is refused. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Files are written through a temporary file beside them, never through a link, readable by the
+user only. \code{uninstall} removes only a sign-in start that is nouez's. Neither command ends
+a process by its id: each writes \code{dispatcher.stop}, which the supervisor
+looks for every second, and waits up to \code{DISPATCHER\_STOP\_WAIT} for \code{dispatcher.lock}
+to come free, writing it again if a supervisor starting meanwhile deleted it; the request is
+removed either way. Only a regular file counts as a request: anything else of that name keeps a
+supervisor from starting, makes \code{install} and \code{uninstall} stop with a message, and is
+listed by \code{dispatcher\_cache\_problems} in \code{doctor} and \code{status}. The dispatcher's
+files are in \code{dispatcher\_dir}: \code{nouez} in the local application data folder
+\code{SHGetKnownFolderPath} gives on Windows, else \code{.cache/nouez} in the home folder the
+user database gives, which must be private. No environment variable moves it, so the
+supervisor started at sign-in and the commands run from any shell meet there, and there is no
+other folder to fall back on. \code{status} prints \code{dispatcher\_summary}
+and the end of \code{dispatcher.log}. \code{-{}-dry-run} prints what \code{setup}, \code{install}
+and \code{uninstall} would do.
+
+\paragraph{The supervisor.} \code{run} takes \code{dispatcher.lock}, waiting up to 2 seconds; a
+second supervisor then exits. Before starting \code{claude} it waits while
+\code{dispatcher-install.lock} is held (\code{dispatcher\_may\_start}): a stop request meanwhile
+makes it exit. One started with \code{-{}-sign-in} then starts \code{claude} only when
+\code{dispatcher\_installed} finds nouez's sign-in start running exactly the command for its own
+folder and profile (\code{same\_command}, which ignores the Python); another answer makes it exit,
+and one it can't read is asked again every 5 seconds, \code{DISPATCHER\_SIGN\_IN\_TRIES} times, before
+it exits. So a start that came late can't outlive \code{uninstall}. One that took the lock first
+for another folder or profile while \code{install} worked would make the new one exit and then
+exit itself: \code{wait\_for\_supervisor} reports it as \code{other}, and
+\code{start\_new\_supervisor} asks it to stop and starts the new one again; install fails if
+it doesn't stop. A record that says \code{stopped}, or is one already asked to stop, doesn't
+count: the next supervisor holds the lock a moment before it writes its own.
+Once it has that lock, a request left from before is deleted. It finds \code{claude} on the PATH, then in \code{\textasciitilde/.local/bin}
+(on macOS also \code{/opt/homebrew/bin} and \code{/usr/local/bin}), and starts it with the
+environment \code{OpenClaudeSession} uses, without the variables that mark a child session,
+with \code{claude}'s folder first on the PATH and \code{CLAUDE\_CONFIG\_DIR} from
+\code{-{}-config-dir}, with no window, its output piped. On Windows the supervisor first puts
+itself in a job object named \code{Local\textbackslash nouez-dispatcher-}\textit{pid}\code{-}\textit{random},
+saved in \code{dispatcher.json}, that ends everything in it when its last handle closes, so a
+killed supervisor takes its \code{claude} with it; a job of that name that exists already is never
+joined, and a supervisor that can't make or join its job exits without starting \code{claude}. Each run gets a second job of its own, nested in the first: \code{claude} starts suspended
+(\code{CREATE\_SUSPENDED}), goes into it, and only then runs, so nothing it starts escapes, and
+closing it ends that run only. What nouez starts from inside the supervisor's job
+(\code{in\_dispatcher\_job}: \code{IsProcessInJob} on the named job), the session windows, the
+status screen, the window arranger and the Codex daemon, asks to leave it
+(\code{CREATE\_BREAKAWAY\_FROM\_JOB}), so it outlives the run; anywhere else it stays in its
+caller's job, except Antigravity's turns, which always ask. On macOS and Linux \code{claude}
+gets its own session, and the supervisor signals its process group (\code{SIGTERM}, then
+\code{SIGKILL}) until no member is left (\code{group\_members}: \code{/proc} on Linux, \code{ps}
+elsewhere; a member that has ended doesn't count), even when \code{claude} itself exited first. It
+sees that exit without collecting it: with \code{waitid} and \code{WNOWAIT}, counting only an exit
+or a kill (\code{si\_code}), not a stop, or, where Python has no \code{waitid} (macOS before
+3.13), with a kqueue \code{NOTE\_EXIT} event (\code{exited\_kqueue}); where those can't look,
+from the process table (\code{is\_zombie}), never by collecting it. It collects \code{claude} only after the
+last signal, so the group's id stays its own: the supervisor sets \code{SIGCHLD} back to its
+default, since ignored it collects \code{claude} as it exits, and a \code{claude} something else
+collected anyway (\code{ECHILD}) has its group left alone. A supervisor killed rather than
+stopped can leave that group running. A reader thread reads what is there as it comes (\code{read1}),
+decodes it incrementally, splits on carriage returns and line feeds, and also looks at a line not
+yet ended, since \code{claude} redraws its status in place. It removes terminal codes, drops lines
+seen among the last \code{DISPATCHER\_RECENT}, and writes the rest to \code{dispatcher-claude.log}.
+Only \code{claude}'s status line counts (\code{STATUS\_LINE}: a few symbols, the state, a
+\textperiodcentered{} and the start of the server's name): \code{Connected} or \code{Reconnected}
+marks the link up; \code{Connecting}, \code{Reconnecting}, \code{Disconnected} or
+\code{Not connected} marks it down; a line that only mentions the word changes nothing. Each run is numbered, and a
+reader's change counts only for its own run. Each change is saved to
+\code{dispatcher.json}: the supervisor's and \code{claude}'s process ids, the folder, the phase,
+when it connected, and the next start after an exit.
+
+A \code{claude} not connected within \code{DISPATCHER\_CONNECT\_WITHIN} is ended: it is most
+likely at a question no one can answer. After an exit the supervisor waits
+\code{DISPATCHER\_FIRST\_WAIT}, doubling each time up to \code{DISPATCHER\_MAX\_WAIT}, and back
+to the first wait after a run of \code{DISPATCHER\_STEADY}. A stop request ends the wait at once.
+Remote Control writes no entry to \code{\textasciitilde/.claude/sessions} for the server itself,
+so its output is the only sign of the link; the conversations it starts do get entries.
+
+\paragraph{Status.} \code{dispatcher\_status} tries the lock for an instant (held means
+running), then reads \code{dispatcher.json}. Logs are opened without following a link or waiting
+on a pipe, and only a regular file is read or written; a log whose \code{.1} isn't a regular
+file stops growing at its cap. \code{doctor} reports it, and the status screen's top bar shows
+\code{\textbullet{} dispatcher}, green while connected, amber while not, red when the supervisor
+ended without stopping (it crashed, was killed, or couldn't check its sign-in start: phase
+\code{failed}), nothing when it stopped as asked or none was ever set up; it looks again at most every 5 seconds. Another
+\code{claude} whose first argument that isn't an option is \code{remote-control}, other than the
+supervisor's own, is noted by its process id and \code{-{}-name} only, since two servers named the
+same appear twice in the app. Its arguments are read as the process got them
+(\code{/proc/}\textit{pid}\code{/cmdline} on Linux, \code{KERN\_PROCARGS2} on macOS, the command
+line on Windows), so one run with \code{-p} or \code{-{}-print} isn't taken for a server; on other
+systems only \code{ps}'s joined line is there, and only the process id is given.
+
 % =============================================================================
 \section{Limits and constants}
 
@@ -2130,6 +2438,11 @@ The read-back catches the second; the backups are there for the first.
 \code{MAX\_FRAME\_BYTES} & 64 MiB & largest WebSocket message accepted \\
 Daemon request timeout & 15 s & per Codex request and for the handshake \\
 \code{roots/list} timeout & 5 s & then nouez assumes no roots \\
+Dispatcher restart wait & 30 s to 15 min & doubles per exit; a 10-min run resets it \\
+Dispatcher connect wait & 5 min & then its \code{claude} is ended \\
+Dispatcher stop wait & 40 s & for a supervisor asked to stop \\
+Dispatcher start wait & 8 s & for the one \code{install} starts \\
+Dispatcher log size & 1 MB & then moved to \code{.1} \\
 Default \code{wait} & 5 s / 0 s & SendConsultantMessage / GetConsultantReply \\
 \code{DAEMON\_START\_SECONDS} & 20 s & wait for a daemon nouez started to accept connections \\
 \code{WAITER\_REPLY\_CHARS} & 20,000 & longest reply the waiter prints \\
@@ -2153,6 +2466,11 @@ Default \code{wait} & 5 s / 0 s & SendConsultantMessage / GetConsultantReply \\
 \code{PROJECTS\_SHOWN} & 300 & folders \code{ListProjects} lists \\
 \code{REPORT\_ITEMS} & 20 & items per list in a trust report \\
 \code{REPORT\_ITEM\_CHARS} & 160 & characters per item in a trust report \\
+\code{ARRANGE\_MIN\_BOX} & 560 $\times$ 320 & smallest box in the grid, pixels at 100\% scaling \\
+\code{ARRANGE\_ASPECT} & 1.6 & box shape (width / height) the grid aims for \\
+\code{ARRANGE\_SETTLE\_MS} & 300 ms & quiet after events before a pass \\
+\code{ARRANGE\_IDLE\_MS} & 10 s & the arranger's wait for a window, with none left \\
+\code{ARRANGE\_TRIES} & 3 & moves to the same box before a window is left as it is \\
 \bottomrule
 \end{tabular}
 \end{center}

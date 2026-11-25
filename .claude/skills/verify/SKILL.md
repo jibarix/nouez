@@ -13,7 +13,9 @@ Never weaken a check, skip a test or add a retry to make a step pass.
    `python -I .claude/skills/verify/verify.py static`
    These catch a top-level name defined twice, a top-level function, class or constant nothing
    else in its file uses (dead, or kept only for the tests), `--` inside `\code{}` in TeX, a TeX
-   change without a rebuilt PDF, and version numbers or CHANGELOG links that disagree. The PDF check only sees that
+   change without a rebuilt PDF, version numbers or CHANGELOG links that disagree, and a link
+   between the Markdown files (the README, `docs/*.md`, SECURITY.md) that leads to no file or
+   heading. The PDF check only sees that
    the file changed and is newer; look at the changed pages yourself.
 
 2. **Checklist:** read `REVIEW.md` as it is on GitHub's `main` (`git fetch origin` then
@@ -28,7 +30,7 @@ Never weaken a check, skip a test or add a retry to make a step pass.
 4. **Live checks:** nouez from this working copy, against the real Codex daemon:
    `python -I .claude/skills/verify/verify.py live`
    It runs `server.py doctor`, the MCP handshake and tools/list, then starts a new read-only
-   consultant (no pane), gets a one-word reply, reads its history and stops it.
+   consultant, gets a one-word reply, reads its history and stops it.
 
    When the change touches OpenClaudeSession, ListClaudeSessions, CloseClaudeSession or the
    `claude` helper, add `--sessions`. That opens a Claude Code window named `nouez-verify` in this

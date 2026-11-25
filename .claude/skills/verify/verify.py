@@ -23,11 +23,13 @@ A session that registers later still is left running; a later run refuses to sta
 import ast
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 SERVER = os.path.join(ROOT, "server.py")
@@ -518,6 +520,169 @@ def check_boundaries():
     report(not bad, "server.py stays inside SECURITY.md's lines", "; ".join(f"server.py:{n} {p}" for n, p in bad))
 
 
+FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+
+
+def prose_lines(text):
+    """(line number, line) of each line of a Markdown file outside fenced code blocks, with any
+    blockquote markers taken off. A fence closes on a line of the same character, at least as
+    long, with nothing after it."""
+    fence = None
+    for n, line in enumerate(text.splitlines(), 1):
+        line = re.sub(r"^(?: {0,3}> ?)+", "", line)
+        m = FENCE.match(line)
+        if fence:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not line[m.end():].strip():
+                fence = None
+        elif m:
+            fence = m.group(1)
+        else:
+            yield n, line
+
+
+def heading_anchors(text):
+    """The #anchors GitHub gives a Markdown file: one per heading, in order, a repeated one with
+    -1, -2... as github-slugger numbers them, and any <a name> or id written in HTML."""
+    found, seen, before = set(), {}, ""
+    for _, line in prose_lines(text):
+        title = None
+        m = re.match(r" {0,3}#{1,6}(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$", line)
+        if m:
+            title = m.group(1) or ""
+        elif re.match(r" {0,3}(=+|-+)[ \t]*$", line) and before.strip() and not re.match(r" {0,3}([#>]|[-*+] |\d+[.)] |\|)", before):
+            title = before.strip()  # a setext heading: the line above, underlined
+        before = "" if m or title is not None else line
+        found.update(re.findall(r"""<a\s[^>]*?\b(?:name|id)=["']([^"']+)["']""", line))
+        if title is None:
+            continue
+        title = re.sub(r"!?\[([^\]]*)\](?:\([^)]*\)|\[[^\]]*\])?", r"\1", title)  # a link reads as its text
+        title = re.sub(r"<[^>]+>", "", title)
+        slug = re.sub(r"[^\w\- ]", "", title.lower()).replace(" ", "-")
+        anchor = slug
+        while anchor in seen:
+            seen[slug] += 1
+            anchor = f"{slug}-{seen[slug]}"
+        seen[anchor] = 0
+        found.add(anchor)
+    return found
+
+
+def inline_targets(line):
+    """The destinations of the inline links and images on one line: <...>, or a run without
+    spaces in which parentheses balance; a title after it is left out."""
+    i = line.find("](")
+    while i >= 0:
+        j = i + 2
+        while j < len(line) and line[j] in " \t":
+            j += 1
+        if line.startswith("<", j):
+            k = line.find(">", j)
+            if k > j:
+                yield line[j + 1:k]
+                i = line.find("](", k)
+                continue
+        depth, k = 0, j
+        while k < len(line) and not line[k].isspace():
+            if line[k] == "\\":
+                k += 2
+                continue
+            if line[k] == "(":
+                depth += 1
+            elif line[k] == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            k += 1
+        if k > j:
+            yield line[j:k]
+        i = line.find("](", max(k, i + 2))
+
+
+def markdown_links(text):
+    """(line number, target) of each inline link, image and reference definition in a Markdown
+    file, outside code blocks and code spans, with backslash escapes taken off. A destination may
+    start on the line after `](` or `[label]:`; a link split anywhere else isn't seen."""
+    held = None
+    for n, line in prose_lines(text):
+        line = re.sub(r"(`+)(?!`).*?(?<!`)\1(?!`)", "", line)
+        if held:
+            n, line, held = held[0], held[1] + " " + line.lstrip(), None
+        if line.rstrip().endswith("](") or re.fullmatch(r" {0,3}\[[^\]]+\]:[ \t]*", line):
+            held = (n, line.rstrip())
+            continue
+        yield from line_targets(n, line)
+    if held:  # the file ends on an opener: its line's other links still count
+        yield from line_targets(*held)
+
+
+def line_targets(n, line):
+    m = re.match(r" {0,3}\[[^\]]+\]:[ \t]*(<[^>]*>|\S+)", line)
+    for target in [m.group(1).strip("<>")] if m else inline_targets(line):
+        yield n, re.sub(r"\\([!-/:-@\[-`{-~])", r"\1", target)
+
+
+def link_problems(texts, names):
+    """Links in `texts` (Markdown files by repository path) that lead to no file in `names` (every
+    file's exact repository path, so a link GitHub would miss by letter case is caught) or to no
+    heading in that file."""
+    dirs = {"."} | {posixpath.dirname(name) for name in names}
+    for name in list(dirs):
+        while name not in ("", "."):
+            name = posixpath.dirname(name)
+            dirs.add(name or ".")
+    bad, anchors = [], {}
+    for name, text in texts.items():
+        for n, target in markdown_links(text):
+            if re.match(r"[A-Za-z][A-Za-z0-9+.-]*:|//", target):
+                continue  # a web or mail link
+            path, _, frag = target.partition("#")
+            path = path.partition("?")[0]
+            path, frag = urllib.parse.unquote(path), urllib.parse.unquote(frag)
+            if path.startswith("/"):
+                dest = posixpath.normpath(path.lstrip("/"))  # GitHub reads these from the repository's root
+            else:
+                dest = posixpath.normpath(posixpath.join(posixpath.dirname(name), path)) if path else name
+            if dest not in names and dest.rstrip("/") not in dirs:
+                bad.append(f"{name}:{n} {target} (no such file)")
+            elif frag and dest.endswith(".md"):
+                if dest not in anchors:
+                    anchors[dest] = heading_anchors(texts.get(dest, ""))
+                if frag in anchors[dest]:
+                    continue
+                bad.append(f"{name}:{n} {target} (no such heading)")
+    return bad
+
+
+def check_links():
+    """Every relative link and #anchor in the Markdown files leads somewhere, checked on every run:
+    the README's sections moved to docs/ in 0.23.0, and a moved heading breaks links silently.
+    Paths come from git, exactly as GitHub will see them: with --range, the files at its end;
+    otherwise the working tree's tracked and untracked files that aren't ignored."""
+    head = RANGE.split("..")[1] if RANGE else None
+    args = ["ls-tree", "-r", "--name-only", "-z", head] if head else \
+        ["ls-files", "--cached", "--others", "--exclude-standard", "-z"]
+    done = subprocess.run(["git", "-C", ROOT, *args], capture_output=True, text=True, encoding="utf-8")
+    if done.returncode:
+        report(False, "every link between the Markdown files leads somewhere",
+               f"git {args[0]} failed: {done.stderr.strip()}")
+        return
+    names = {n for n in done.stdout.split("\0") if n and (head or os.path.isfile(os.path.join(ROOT, n)))}
+    texts = {}
+    for name in sorted(n for n in names if n.endswith(".md")):
+        if head:
+            shown = subprocess.run(["git", "-C", ROOT, "show", f"{head}:{name}"], capture_output=True,
+                                   text=True, encoding="utf-8")
+            if shown.returncode:
+                report(False, "every link between the Markdown files leads somewhere",
+                       f"git show {head}:{name} failed: {shown.stderr.strip()}")
+                return
+            texts[name] = shown.stdout
+        else:
+            texts[name] = read(name)
+    bad = link_problems(texts, names)
+    report(not bad, "every link between the Markdown files leads somewhere", "; ".join(bad))
+
+
 def static():
     files = changed_files()
     print(f"{len(files)} changed file(s){' in ' + RANGE if RANGE else ''}: {', '.join(files) or 'none'}")
@@ -526,6 +691,7 @@ def static():
     check_tex(files)
     check_versions(files)
     check_boundaries()
+    check_links()
 
 
 # ---------------------------------------------------------------- live checks
@@ -612,7 +778,7 @@ def check_consultant(client):
     token = time.strftime("verify-%Y%m%d-%H%M%S-") + os.urandom(3).hex()
     title = f"nouez {token}"
     codex, agy = installed_clis()
-    text, err = client.call("StartConsultant", timeout=180, cwd=ROOT, new=True, watch=False, title=title,
+    text, err = client.call("StartConsultant", timeout=180, cwd=ROOT, new=True, title=title,
                             instructions="You are a test. Answer in one word.")
     if not codex and not agy:  # Claude Code only: no consultant, and a plain message saying so
         report(err and "No consultant CLI is installed" in text,
@@ -745,7 +911,7 @@ def check_sessions(client):
 
 
 EXPECTED_TOOLS = {"StartConsultant", "ListConsultants", "SendConsultantMessage", "GetConsultantReply",
-                  "GetConsultantHistory", "WatchConsultant", "StopConsultant", "ConsultantBudget",
+                  "GetConsultantHistory", "StopConsultant", "ConsultantBudget",
                   "OpenClaudeSession", "ListClaudeSessions", "CloseClaudeSession", "ListProjects",
                   "OpenStatusScreen"}
 
@@ -909,7 +1075,7 @@ def check_setup(label, codex, agy):
 
             def start(**args):
                 """(text, err, provider): provider is "Codex" or "Antigravity" for a start with an id."""
-                text, err = client.call("StartConsultant", timeout=240, cwd=cwd, new=True, watch=False,
+                text, err = client.call("StartConsultant", timeout=240, cwd=cwd, new=True,
                                         title=f"nouez verify {label}", **args)
                 match = re.search(r"^\s*id: (\S+)", text, re.M)
                 model = re.search(r"^\s*model: .*\((.+)\)\s*$", text, re.M)
