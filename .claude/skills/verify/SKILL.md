@@ -30,7 +30,8 @@ Never weaken a check, skip a test or add a retry to make a step pass.
 4. **Live checks:** nouez from this working copy, against the real Codex daemon:
    `python -I .claude/skills/verify/verify.py live`
    It runs `server.py doctor`, the MCP handshake and tools/list, then starts a new read-only
-   consultant, gets a one-word reply, reads its history and stops it.
+   consultant, gets a one-word reply, reads its history and stops it. Then, for each installed CLI,
+   a new consultant is asked outright to create a file, and the file must not appear.
 
    When the change touches OpenClaudeSession, ListClaudeSessions, CloseClaudeSession or the
    `claude` helper, add `--sessions`. That opens a Claude Code window named `nouez-verify` in this

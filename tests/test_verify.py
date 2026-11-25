@@ -300,5 +300,23 @@ class LinkTest(unittest.TestCase):
         self.assertEqual(verify.heading_anchors("## [My guide][ref]\n\n[ref]: x.md\n"), {"my-guide"})
 
 
+
+class RulesPageTest(unittest.TestCase):
+    PAGE = ("| Rule | Holds by | Change it with | Test |\n|---|---|---|---|\n"
+            "| A | Code | `NOUEZ_NO_A=1` | `a_case`, `b_case` (wording) |\n")
+    TESTS = "class T:\n    def test_a_case(self):\n        pass\n    def test_b_case(self):\n        pass\n"
+
+    def test_a_complete_page_passes(self):
+        self.assertEqual(verify.rules_problems('os.environ.get("NOUEZ_NO_A")', self.PAGE, self.TESTS), [])
+
+    def test_a_setting_missing_from_the_page_fails(self):
+        self.assertEqual(len(verify.rules_problems('get("NOUEZ_NO_A") get("NOUEZ_NO_B")', self.PAGE, self.TESTS)), 1)
+
+    def test_variables_nouez_sets_for_itself_are_not_settings(self):
+        self.assertEqual(verify.rules_problems('env["NOUEZ_DISPATCHER"]', self.PAGE, self.TESTS), [])
+
+    def test_a_test_that_doesnt_exist_fails(self):
+        self.assertEqual(len(verify.rules_problems("", self.PAGE, "    def test_a_case(self):\n")), 1)
+
 if __name__ == "__main__":
     unittest.main()

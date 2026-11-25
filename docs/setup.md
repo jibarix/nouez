@@ -1,6 +1,6 @@
 # Setup
 
-Part of [nouez's documentation](../README.md#documentation).
+Part of [nouez's documentation](../README.md#documentation). Every setting nouez reads is listed in [Rules](rules.md).
 
 Run each command in a terminal. Where a path appears, use the absolute path to your copy of nouez, in quotes if it contains a space. On macOS and Linux, use `python3` wherever this says `python` if `python` isn't on your `PATH`. First check that `python --version` prints 3.9 or later. On Windows, if it opens the Microsoft Store or prints nothing, install Python from python.org (or use `py -3` wherever this says `python`). Run the commands outside any virtual environment, unless you mean nouez to run on that environment's Python.
 
@@ -77,7 +77,9 @@ Instead of editing the file, you can approve the waiter the first time Claude Co
 python "/absolute/path/to/nouez/server.py" doctor
 ```
 
-It reports Claude Code's side (Python, `claude`, the waiter's rules, terminal windows), then the phone dispatcher (its folder, rules and trust, whether it starts at sign-in and is connected), and then each consultant CLI: whether it is installed, signed in and answering. A CLI you didn't install is a note, not a problem; doctor exits with 1 only when something installed doesn't work. Then run `claude mcp list`, or `/mcp` inside Claude Code: you should see `consultants` connected. Sessions that were already open keep the old server until you reconnect it there: `/mcp`, then reconnect `consultants`. Do the same after updating nouez (see [nouez updates](#nouez-updates)).
+It reports Claude Code's side (Python, `claude`, the waiter's rules, the status line and prompt hook that let nouez act on Claude Code's own usage, terminal windows), then the phone dispatcher (its folder, rules and trust, whether it starts at sign-in and is connected), and then each consultant CLI: whether it is installed, signed in and answering. A CLI you didn't install is a note, not a problem; doctor exits with 1 only when something installed doesn't work. Then run `claude mcp list`, or `/mcp` inside Claude Code: you should see `consultants` connected. Sessions that were already open keep the old server until you reconnect it there: `/mcp`, then reconnect `consultants`. Do the same after updating nouez (see [nouez updates](#nouez-updates)).
+
+**7. Let nouez see Claude Code's usage (recommended).** Claude Code gives its usage only to the status line, so without one nouez can't tell when to hand work out to spare it. Doctor prints the two entries to add to `settings.json`, with your own Python and paths: a status line and a prompt hook. See [Claude Code's usage](consultants.md) for what each does, and how to keep a status line script you already have.
 
 ## nouez updates
 

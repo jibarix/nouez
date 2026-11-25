@@ -65,7 +65,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.25.0 |
+| nouez | 0.26.0 |
 | Claude Code | 2.1.332 |
 | Codex CLI | 0.170.0 |
 | Codex app-server daemon | 0.172.0 |
@@ -185,6 +185,7 @@ Claude also consults without being asked, while the subscription has room: a rev
 | [Tools](docs/tools.md) | Every tool and its arguments, and how Claude waits for a reply |
 | [Troubleshooting](docs/troubleshooting.md) | `doctor`, and what to do about each message |
 | [How it works](docs/how-it-works.md) | How nouez talks to Codex and Claude Code, and every file it keeps and for how long |
+| [Rules](docs/rules.md) | Every rule nouez applies: whether its code enforces it or only tells Claude, the setting that changes it, and its test |
 | [Limitations](docs/limitations.md) | What nouez can't do, and what it relies on that may change |
 | [Architecture](docs/architecture.pdf) | The design in detail (PDF) |
 | [SECURITY.md](SECURITY.md) | Reporting a vulnerability; what nouez sends where, keeps and runs |
@@ -208,7 +209,7 @@ python -m unittest discover tests
 - Every Claude Code session with this server enabled can send messages into **any** Codex session on the machine, and those messages run with that session's permissions. With `--scope user`, that's every project you open in Claude Code. Claude messages a session you opened only when you ask.
 - Consultants nouez starts are read-only and never ask for approvals, so the read-only sandbox (Codex) or the deny rules (Antigravity) are their only limit. They can read anything that allows, which typically includes files outside `cwd`.
 - `CloseClaudeSession` can end **any** Claude Code session running under your account, including ones you started yourself; only its caller is refused. Work in progress in that session is lost; the transcript is kept.
-- Trusting a folder lets its Claude Code settings, hooks and MCP servers run. `OpenClaudeSession` records trust only after Claude has received that folder's report, with the files unchanged since (or for a new, empty folder the same call made); nouez can't see whether the report reached you. It changes only that setting in `~/.claude.json`, after a dated backup, but a Claude Code session saving that file in the same instant could still lose a setting. `NOUEZ_NO_TRUST_WRITE=1` turns trust writing off.
+- Trusting a folder lets its Claude Code settings, hooks and MCP servers run. `OpenClaudeSession` records trust only after Claude has received that folder's report, with the files unchanged since (or for a new, empty folder the same call made); nouez can't see whether the report reached you. It changes only that setting in `~/.claude.json`, after a dated backup, but a Claude Code session saving that file in the same instant could still lose a setting. `NOUEZ_ASK_TRUST=1` asks you in Claude Code's own prompt before each recording, and `NOUEZ_NO_TRUST_WRITE=1` turns trust writing off.
 - The phone dispatcher, once installed, runs `claude remote-control` from your sign-in on: anyone signed in to your claude.ai account can start a session in its folder, and through nouez's tools open, resume and close Claude Code sessions in your projects, and record trust in a folder after its report. `setup` adds allow rules for those eight tools only; rules already in the folder's settings, and your user settings, still apply. It opens no port; the computer connects out to Anthropic. `dispatcher uninstall` stops it.
 - The `nouez` tag is a guard against mistakes, not a security boundary: any local program that can reach the Codex daemon can set it.
 

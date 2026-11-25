@@ -22,6 +22,8 @@ Command line
                                          waiter run without asking
   server.py doctor                       check Claude Code's side and each consultant CLI
   server.py statusline [--quiet]         Claude Code's status line: saves its usage for nouez
+  server.py hook                         Claude Code's UserPromptSubmit hook: when it is busy, a
+                                         line on handing work to a consultant
   server.py top                          the status screen: usage and consultations
 
 Transport to Codex: `codex app-server proxy` relays stdio to the daemon's control
@@ -67,10 +69,19 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.25.0"
+SERVER_VERSION = "0.26.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
-PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
+PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
+MODERN_VERSIONS = ("2026-07-28",)  # stateless: each request names its version in _meta
+META_VERSION = "io.modelcontextprotocol/protocolVersion"
+META_CAPS = "io.modelcontextprotocol/clientCapabilities"
+META_CLIENT = "io.modelcontextprotocol/clientInfo"
+META_SERVER = "io.modelcontextprotocol/serverInfo"
+META_LOG_LEVEL = "io.modelcontextprotocol/logLevel"
+# The keys a 2026-07-28 client puts in a request's _meta. Other keys under the same prefix belong to
+# earlier versions too (2025-11-25's io.modelcontextprotocol/related-task), so they mark nothing.
+MODERN_META_KEYS = (META_VERSION, META_CAPS, META_CLIENT, META_LOG_LEVEL)
 POLL_SECONDS = 1.5
 CONTINUATION_GRACE = 15  # seconds to wait for Codex to carry on an interrupted turn (a restarted daemon took 8s)
 MAX_FRAME_BYTES = 64 * 1024 * 1024
@@ -109,7 +120,10 @@ _release_check = {"running": False, "started": None}  # the background lookup: o
 _cancel_events = {}  # MCP request id -> Event set by notifications/cancelled
 _cancel_guard = threading.Lock()
 _client_caps = {}  # capabilities Claude Code advertised in initialize
+_client_info = {}  # the clientInfo initialize gave: {"name": "claude-code", "version": ...}
+_request = threading.local()  # .client: the clientInfo the request being handled carries in _meta
 _client_roots = None  # Claude Code's workspace folders (roots/list), or None until fetched
+_initialized = threading.Event()  # set by a legacy initialize: before it, only 2026-07-28 requests run
 _trust_reports = {}  # trust folder (_trust_norm) -> (checkout, folder, fingerprint) of the report OpenClaudeSession last gave
 _on_reply = threading.local()  # .pending: what a tool call keeps only once its response is sent
 _client_requests = {}  # id of a request we sent to Claude Code -> [Event, response]
@@ -131,6 +145,23 @@ class DaemonDown(BridgeError):
 
 class Cancelled(Exception):
     pass
+
+
+class InputRequired(Exception):
+    """MCP 2026-07-28: the call needs the user's answer first. dispatch answers it with
+    resultType "input_required" and these fields; the client asks the user and sends the call again."""
+
+    def __init__(self, fields):
+        super().__init__("input required")
+        self.fields = fields
+
+
+class ProtocolError(Exception):
+    """A JSON-RPC error for the request being handled, rather than a tool result (2026-07-28)."""
+
+    def __init__(self, code, message, data=None):
+        super().__init__(message)
+        self.error = {"code": code, "message": message, **({"data": data} if data is not None else {})}
 
 
 def check_cancel(cancel):
@@ -883,12 +914,13 @@ def replies_folder(create=False):
 
 
 def prune_replies(days=REPLY_FILE_DAYS):
-    """Delete the saved replies not changed for `days` days: files with nouez's own names only,
-    never links. Best effort; run when the server starts and before each save."""
-    try:
-        prune_files(replies_folder(), REPLY_FILE, time.time() - days * 86400)
-    except OSError:
-        pass
+    """Delete the saved replies and review chains not changed for `days` days: files with nouez's
+    own names only, never links. Best effort; run when the server starts and before each save."""
+    for folder, names in (("replies", REPLY_FILE), ("review-rounds", REVIEW_CHAIN_FILE)):
+        try:
+            prune_files(cache_folder(folder), names, time.time() - days * 86400)
+        except OSError:
+            pass
 
 
 def cap_reply(turn_id, reply, limit=MAX_REPLY_CHARS):
@@ -998,6 +1030,10 @@ def allow_rules():
 
 def read_later(thread_id, turn_id):
     """What to do about a reply that isn't ready: leave the caller free, and have the reply wake it."""
+    if not background_waiter():
+        return ("Don't wait for the reply. Tell the user the consultation is under way and carry on with "
+                f"other work; read the reply later with GetConsultantReply (turn_id {turn_id}), "
+                "with wait=\"done\" only if the user asks you to wait for it.")
     return ("Don't wait for the reply. To be woken when it is ready, run this as a background command "
             "(in Claude Code: the Bash or PowerShell tool with run_in_background); it exits with the reply when the "
             f"turn ends:\n{waiter_command(thread_id, turn_id)}\nThen tell the user the consultation is "
@@ -3212,6 +3248,83 @@ TRUST_WRITE_OFF = ("Not recording trust: NOUEZ_NO_TRUST_WRITE=1 is set, so nouez
                    "computer (open_untrusted=true opens the session for that).")
 
 
+ASK_SECONDS = 600  # how long a prompt nouez shows through the client waits for the user's answer
+
+
+def ask_trust():
+    """NOUEZ_ASK_TRUST=1: the user approves each recording of trust in the client's own prompt."""
+    return os.environ.get("NOUEZ_ASK_TRUST", "").strip() == "1"
+
+
+def ask_user_session():
+    """NOUEZ_ASK_USER_SESSION=1: the user approves each message to a Codex session they opened."""
+    return os.environ.get("NOUEZ_ASK_USER_SESSION", "").strip() == "1"
+
+
+def no_user_sessions():
+    """NOUEZ_NO_USER_SESSIONS=1: nouez never sends to a Codex session the user opened."""
+    return os.environ.get("NOUEZ_NO_USER_SESSIONS", "").strip() == "1"
+
+
+ASK_KEY = "nouez-approval"  # the one input a 2026-07-28 call asks for
+_asked = {}  # requestState -> (question, call, deadline): prompts sent a 2026-07-28 client, each answered once
+_asked_guard = threading.Lock()
+
+
+def modern_answer(question):
+    """A 2026-07-28 client's answer to `question`: the retried call's inputResponses, taken only with
+    a requestState nouez issued for this same question in this same call (the tool and every argument,
+    so nothing the prompt doesn't show can change), once and before ASK_SECONDS pass. Otherwise raises
+    InputRequired, which sends the prompt with a new requestState."""
+    state = getattr(_request, "input_state", None)
+    call = getattr(_request, "call", None)
+    now = time.monotonic()
+    with _asked_guard:
+        for old in [k for k, (_, _, deadline) in _asked.items() if deadline < now]:
+            del _asked[old]
+        asked = _asked.pop(state, None) if isinstance(state, str) else None
+        responses = getattr(_request, "input_responses", None)
+        if asked and asked[:2] == (question, call) and call and isinstance(responses, dict) and ASK_KEY in responses:
+            return responses[ASK_KEY]
+        state = uuid.uuid4().hex
+        _asked[state] = (question, call, now + ASK_SECONDS)
+    raise InputRequired({"inputRequests": {ASK_KEY: {"method": "elicitation/create", "params": {
+        "mode": "form", "message": question, "requestedSchema": {"type": "object", "properties": {}}}}},
+        "requestState": state})
+
+
+def user_approves(question, setting, cancel=None):
+    """Ask the user `question` in the client's own prompt (MCP elicitation), outside the model, so
+    the model can't answer it: True when they accept. Each answer approves one call only. Raises
+    BridgeError when the client can't show a prompt, or the user declines or doesn't answer; for a
+    2026-07-28 client, InputRequired until the call comes back with the answer."""
+    asks = client_caps().get("elicitation")
+    if not (isinstance(asks, dict) and (not asks or "form" in asks)):  # {} is form, from before modes
+        if getattr(_request, "modern", False):
+            raise ProtocolError(-32021, "Missing required client capability", {
+                "requiredCapabilities": {"elicitation": {"form": {}}}})
+        raise BridgeError(f"{setting}=1 asks you in Claude Code's own prompt first, and this client can't show "
+                          "one (it doesn't support MCP elicitation forms). Nothing was done. Update the client, "
+                          f"or unset {setting}.")
+    check_cancel(cancel)
+    if getattr(_request, "modern", False):
+        result = modern_answer(question)
+    else:
+        result = client_request("elicitation/create", {
+            "message": question, "requestedSchema": {"type": "object", "properties": {}}}, timeout=ASK_SECONDS)
+    check_cancel(cancel)
+    action = result.get("action") if isinstance(result, dict) else None
+    if action != "accept":
+        raise BridgeError("The user " + ("declined" if action == "decline" else "didn't answer")
+                          + f" nouez's prompt ({setting}=1). Nothing was done.")
+    return True
+
+
+def report_tag(fingerprint):
+    """With NOUEZ_ASK_TRUST=1, the report's id, which the prompt before trust names too."""
+    return f"\n\n(report {fingerprint[:12]}: nouez's prompt names this id)" if ask_trust() else ""
+
+
 def trust_write_off(env=None):
     """Whether the user turned off nouez's recording of trust (NOUEZ_NO_TRUST_WRITE=1)."""
     value = (os.environ if env is None else env).get("NOUEZ_NO_TRUST_WRITE", "").strip().lower()
@@ -3959,9 +4072,17 @@ def open_claude_session(args, cancel=None, progress=None):
         # Checked before anything is created, and so claude can never read the name as an option.
         raise BridgeError(f"name {given!r} isn't usable: use letters, digits, spaces, '.', '_' and '-', "
                           "starting with a letter or digit, up to 64 characters. Nothing was opened.")
-    created = False
+    created = approved = False
     if flag(args, "trust") and trust_write_off() and not os.path.isdir(cwd):
         raise BridgeError(TRUST_WRITE_OFF)  # before a folder is made for nothing
+    if flag(args, "create") and flag(args, "trust") and ask_trust() and not os.path.exists(cwd) \
+            and os.path.isdir(os.path.dirname(cwd)) and not git_root(os.path.dirname(cwd)):
+        # A new folder outside git, trusted on its own: asked before it is made, so a decline (or a
+        # 2026-07-28 prompt the user never answers) leaves nothing behind.
+        user_approves(f"Create {cwd} and record that you trust it? It is a new, empty folder with no project "
+                      "settings yet; trusting it lets settings added there later run without Claude Code asking "
+                      "first. This approves this one time only.", "NOUEZ_ASK_TRUST", cancel)
+        approved = True
     if flag(args, "create") and not os.path.exists(cwd):
         parent = os.path.dirname(cwd)
         if not os.path.isdir(parent):
@@ -4032,7 +4153,15 @@ def open_claude_session(args, cancel=None, progress=None):
                 "report in this conversation" + (", and its settings have changed since the last one" if changed
                                                  else "") + ". Show the user the report below and ask whether "
                 "they trust the folder: trusting it lets all of this run. Only if they say yes, call "
-                "OpenClaudeSession again with trust=true."]) + "\n\n" + report)
+                "OpenClaudeSession again with trust=true."]) + "\n\n" + report + report_tag(fingerprint))
+        if ask_trust() and not (approved and made_here):  # a folder this call made was asked about first
+            user_approves(f"Record that you trust {key}? Its project settings then run without Claude Code "
+                          f"asking first, as the report Claude showed you lists (report {fingerprint[:12]}). "
+                          "This approves this one time only.", "NOUEZ_ASK_TRUST", cancel)
+            _, again, complete = config_review(folders)
+            if not complete or again != fingerprint:
+                raise BridgeError("The folder's settings changed while nouez's prompt was open, so nothing was "
+                                  "recorded. Call OpenClaudeSession again without trust for the new report.")
         recorded, backup = trust_folder(cwd, expect=key)
         if backup:
             notes.append(f"Recorded the user's trust in {recorded} in Claude Code's settings "
@@ -4062,7 +4191,8 @@ def open_claude_session(args, cancel=None, progress=None):
             ask = ("nouez is set never to record trust (NOUEZ_NO_TRUST_WRITE=1). Show the user the report below; "
                    "they can answer Claude Code's own trust question on the computer, and open_untrusted=true "
                    "opens the session for that.")
-        return with_login_warning(" ".join(notes + [why, ask]) + "\n\n" + report)
+        return with_login_warning(" ".join(notes + [why, ask]) + "\n\n" + report
+                                  + (report_tag(fingerprint) if complete else ""))
     asks = []
     if trusted and key:
         if inherited:
@@ -4706,6 +4836,10 @@ def start_consultant(args, cancel=None, progress=None):
         raise BridgeError("Codex isn't installed: `codex` isn't on PATH."
                           + (" Antigravity is: pass provider antigravity, or leave provider out."
                              if agy_command() else " `server.py doctor` checks the setup."))
+    if args.get("effort") not in (None, ""):
+        raise BridgeError("effort applies to a new Antigravity consultant only. For a Codex consultant, pass "
+                          "effort with SendConsultantMessage (or leave both out for nouez's pick). "
+                          "Nothing was started.")
     # Consultants audit, validate and research; they never edit. No terminal is attached to
     # answer approval prompts, so never ask; the read-only sandbox is the limit.
     params = {"cwd": cwd, "sandbox": SANDBOX, "approvalPolicy": "never", "threadSource": BRIDGE_SOURCE}
@@ -4745,7 +4879,7 @@ def start_consultant(args, cancel=None, progress=None):
     user_note = (f"\nThe user's own Codex sessions in this repo were not used (they keep the user's "
                  f"permissions). Message one only if the user asks you to, with "
                  f"allow_user_session=true:\n{format_threads(users)}"
-                 if users else "")
+                 if users and not no_user_sessions() else "")
     if not existing:
         return (
             f"Started {name}\n"
@@ -5069,7 +5203,9 @@ def revision(cwd, take=True, inline_limit=None, base=None):
     if not dirty and against == commit:
         if base is not None:
             line += "; nothing to review"
-        return line + ask, b"", ""
+        # Clean at this very commit: HEAD read again after the status, so a commit made between the two
+        # reads isn't taken for a clean tree at the one named.
+        return line + ask, b"", (REVISION_CLEAN + commit if git_head(top) == commit else "")
     if not take:
         return line + ask, b"", ""
     left_out = LeftOut()
@@ -5103,9 +5239,175 @@ def revision(cwd, take=True, inline_limit=None, base=None):
             f"{subject} and that sha256 in your answer.]\n"), patch, digest
 
 
+REVISION_CLEAN = "clean:"  # revision()'s digest, before the commit, when git showed nothing to diff there
+
+
+def patch_digest(digest):
+    """The digest of a diff revision() took, or None when it took none."""
+    return digest if digest and not digest.startswith(REVISION_CLEAN) else None
+
+
+def clean_commit(digest):
+    """The commit revision() found clean, with nothing uncommitted and nothing to diff, or None."""
+    return (digest[len(REVISION_CLEAN):] or None) if (digest or "").startswith(REVISION_CLEAN) else None
+
+
+NOT_BLIND = ("{name} has had messages already, so its opinion wouldn't be blind. Nothing was sent. Start a "
+             "new one with StartConsultant (the other provider, new=true) and send to that.")
+
+
+def second_opinion(args, to):
+    """For second_opinion_of: (the first brief of that consultant's review chain, args with the
+    revision it named). The second opinion goes to a consultant of the other provider that has no
+    turns yet (checked when sending), with only that brief: neither Claude's findings nor the first
+    consultant's reach it."""
+    original = args.get("second_opinion_of")
+    if not isinstance(original, str):
+        raise BridgeError("second_opinion_of must be the name of the consultant whose review this is a second opinion on.")
+    if args.get("message") or args.get("owner_words"):
+        raise BridgeError("second_opinion_of sends the first brief of that review as it was, so the second "
+                          "opinion stays blind: leave out message and owner_words. Nothing was sent.")
+    first = agy_resolve(original)
+    if first:
+        fid, fname, fprovider = first["id"], first["name"], "antigravity"
+        recent = agy_turns(fid, 10)
+    else:
+        with contextlib.closing(CodexClient()) as client:
+            thread = resolve(client, original)
+            recent = list_turns(client, thread["id"], 10)
+        fid, fname, fprovider = thread["id"], short_name(thread), "codex"
+    provider = "antigravity" if agy_resolve(to) else "codex"
+    if provider == fprovider:
+        other = "codex" if fprovider == "antigravity" else "antigravity"
+        raise BridgeError(f"{fname} is a {PROVIDER_TITLES[fprovider]} consultant, and a second opinion comes "
+                          f"from the other provider: StartConsultant with provider=\"{other}\" and new=true, then "
+                          "send to that one. Nothing was sent.")
+    yourself = "Nothing was sent. Send the original brief and the work yourself, without the findings."
+    chain = review_chain(fid)
+    if not chain or not chain.get("brief"):
+        raise BridgeError(f"nouez has no first brief of a consultation by {fname} (it keeps one from a review, "
+                          f"re-check, bug hunt or plan critique, up to {REVIEW_BRIEF_CHARS:,} characters, for "
+                          f"{REPLY_FILE_DAYS} days). {yourself}")
+    if chain.get("steered"):
+        raise BridgeError(f"{fname}'s consultation had another message added to it while it ran, so the first "
+                          f"brief nouez kept isn't all it was asked. {yourself}")
+    last = chain_reply(chain, recent)
+    if not last or last.get("id") != recent[0].get("id"):
+        raise BridgeError(f"{fname}'s latest consultation isn't the one whose first brief nouez kept: it has "
+                          f"had another message since, or nouez can't find that one. {yourself}")
+    if chain.get("revision"):
+        if provider == "antigravity" and not flag(args, "attach_diff"):
+            raise BridgeError("That review named a revision, and an Antigravity consultant runs no git: send "
+                              "again with attach_diff=true to put the diff in the message (its text goes to "
+                              "Google). Nothing was sent.")
+        args = {**args, "revision": True, **({"base": chain["base"]} if chain.get("base") else {}),
+                "_work": {k: chain.get(k) for k in ("repo", "patch", "head", "clean")}}
+    return chain["brief"], args
+
+
+def read_patch(digest):
+    """(the diff nouez saved under `digest`, its path), or None when it is gone or isn't that diff."""
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{16}", digest):
+        return None
+    path = os.path.join(cache_folder(PATCH_FOLDER), f"{digest}.patch")
+    try:
+        if not regular_file(path):
+            return None
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+        with os.fdopen(fd, "rb") as f:
+            patch = f.read(PATCH_TOTAL_BYTES + 1)
+    except OSError:
+        return None
+    return (patch, path) if hashlib.sha256(patch).hexdigest()[:16] == digest else None
+
+
+def revision_for(args, cwd, take=True, inline_limit=None):
+    """revision() for a send: taken now; for a blind second opinion, the diff its first brief was sent
+    with, in the same repository, refused when that can't be had, so it reviews the same work."""
+    work = args.get("_work")
+    if not work:
+        return revision(cwd, take=take, inline_limit=inline_limit, base=args.get("base"))
+    other = ("so a second opinion now would review other work than the first one did. Nothing was sent. Send "
+             "the original brief and the work yourself, without the findings.")
+    here = (git_root(cwd) or os.path.abspath(cwd)) if cwd else None
+    if not here or not work.get("repo") or not same_folder(here, work["repo"]):
+        raise BridgeError(f"This consultant works in {here or 'an unknown folder'}, and the first review was of "
+                          f"{work.get('repo') or 'a folder nouez no longer knows'}, " + other)
+    digest = work.get("patch")
+    if not digest:  # the first review had no diff: only a clean commit can be had again, unchanged
+        if not work.get("clean"):
+            raise BridgeError("The first review was sent without a diff of its uncommitted changes (or outside "
+                              "git), so nouez can't show the same work again, " + other)
+        found = revision(cwd, take=take, inline_limit=inline_limit, base=args.get("base"))
+        if clean_commit(found[2]) != work["clean"]:
+            raise BridgeError("The work has changed since the first review (a new commit, or changes not "
+                              "committed), " + other)
+        return found
+    saved = read_patch(digest)
+    if not saved:
+        raise BridgeError(f"nouez no longer has the diff the first review was sent with (sha256 {digest}), " + other)
+    patch, path = saved
+    size = f"{len(diff_blocks(patch))} file(s), {max(1, round(len(patch) / 1024))} KB"
+    if inline_limit is not None:
+        try:
+            patch.decode("utf-8")
+        except UnicodeDecodeError:
+            raise BridgeError("The diff the first review was sent with has bytes that aren't UTF-8, so it can't "
+                              "go in a message. Nothing was sent.")
+        if len(patch) > inline_limit:
+            raise BridgeError(f"The diff the first review was sent with ({size}) is too large to put in a "
+                              "message. Nothing was sent.")
+    where = "is in this message, above the bridge header" if inline_limit is not None else f"is saved as {path}"
+    base = f", base {args['base']!r}" if args.get("base") else ""
+    return (f"[Revision: commit {(work.get('head') or '')[:7]}{base}; the diff the first review was sent with "
+            f"{where} (sha256 {digest}, {size}). Review that diff rather than the working tree, which may have "
+            "changed since, and name that sha256 in your answer.]\n"), (patch if take else b""), digest
+
+
+NAMED_SECONDS = 1800  # how long a provider the user named in ConsultantBudget holds for the send's pick
+_named = {}  # kind -> (provider the user named, monotonic deadline), from the latest ConsultantBudget
+_named_guard = threading.Lock()
+
+
+def named_provider(kind, provider):
+    """Whether the user named `provider` for this kind of consultation in a recent ConsultantBudget."""
+    with _named_guard:
+        named = _named.get(kind)
+    return bool(named) and named[0] == provider and named[1] > time.monotonic()
+
+
+def send_route(kind, provider, client=None, now=None):
+    """The model and effort nouez picks for a send that names neither: ConsultantBudget's suggestion
+    for `kind` within the addressed consultant's provider, as {"provider", "model", "effort", "why",
+    "notes"}; None for kind other, when none has room, or when the usage can't be read. When the
+    latest ConsultantBudget for this kind had the user name this provider ("ask Gemini"), the pick
+    keeps to what that named, as the suggestion did."""
+    if kind in (None, "other"):
+        return None
+    only = provider if named_provider(kind, provider) else None
+    now = now or time.time()
+    state = {"claude": {}, provider: {}}
+    try:
+        claude_budget(now, state=state["claude"])
+        if provider == "codex":
+            codex_budget(client, now, state["codex"])
+        elif not agy_budget(now, state=state["antigravity"]):
+            return None
+    except Exception as e:  # the route is a convenience: the send goes ahead without it
+        log("route at send:", repr(e))
+        return None
+    pick = suggest_consultant(kind, state, now, only)
+    return pick if "none" not in pick and pick["provider"] == provider else None
+
+
 def send_consultant_message(args, cancel=None, progress=None):
+    args = {k: v for k, v in args.items() if k != "_work"}  # only second_opinion sets it, never a caller
     to = target(args)
-    message = args.get("message") or ""
+    blind = args.get("second_opinion_of") not in (None, "")
+    if blind:
+        message, args = second_opinion(args, to)
+    else:
+        message = args.get("message") or ""
     if not message:
         raise BridgeError("`message` is required.")
     timeout = wait_seconds(args, SEND_WAIT_SECONDS)
@@ -5130,7 +5432,13 @@ def send_consultant_message(args, cancel=None, progress=None):
             raise BridgeError("base requires revision=true. Nothing was sent.")
         if not isinstance(args["base"], str):
             raise BridgeError("base must be a string naming a branch, tag or commit id.")
+    if flag(args, "attach_diff") and not want_revision:
+        raise BridgeError("attach_diff requires revision=true: it puts the revision's diff in the message. "
+                          "Nothing was sent.")
     kind, reason = kind_and_reason(args)
+    if not kind:
+        raise BridgeError(f"`kind` is required: one of {', '.join(CONSULT_KINDS)} (other when none fits). "
+                          "Nothing was sent.")
     if owner_words:
         message = (f"The user's own words, as they typed them:\n<<<\n{owner_words}\n>>>\n\n"
                    f"The rest of this message is {sender}'s.\n\n{message}")
@@ -5148,16 +5456,49 @@ def send_consultant_message(args, cancel=None, progress=None):
                 "user's own permissions and may be able to edit files. Nothing was sent. Only if the "
                 "user asked you to message this session, send again with allow_user_session=true; "
                 "otherwise use StartConsultant.")
-        stamp, _, digest = (revision(thread.get("cwd"), base=args.get("base"))
-                            if want_revision else ("", b"", ""))
-        text = f"[Message from {sender} via the consultants bridge]\n{stamp}\n{message}"
+        if not is_bridge(thread) and no_user_sessions():
+            raise BridgeError(f"{name} is a Codex session the user opened, and nouez is set never to message "
+                              "one (NOUEZ_NO_USER_SESSIONS=1). Nothing was sent. Use StartConsultant.")
+        # Taken before any question, so an approval covers the very diff that is sent: one taken after
+        # the user said yes could hold edits made while the question was open.
+        stamp, _, digest = revision_for(args, thread.get("cwd")) if want_revision else ("", b"", "")
+        if not is_bridge(thread):
+            if ask_user_session():
+                if want_revision and not digest:
+                    # Without a saved diff or a clean commit, the stamp says "review the working tree",
+                    # which can change between the user's yes and the retried call.
+                    raise BridgeError(f"nouez couldn't take a diff it could name for this revision "
+                                      f"({stamp.strip()}), so your approval couldn't cover the work sent. "
+                                      "Nothing was sent. Send without revision, with the diff in the "
+                                      "message, or once the cause above is fixed.")
+                preview = " ".join(message.split())
+                extra = (["the revision named below"] if want_revision else []) + \
+                    [f"{k} {v}" for k, v in overrides.items()]
+                more = (f"... ({len(preview) - 500:,} more characters not shown)" if len(preview) > 500 else "")
+                user_approves(f"Send this message from {sender} to {name} (session {tid}), a Codex session you "
+                              "opened? It has your own permissions and may edit files. This approves this one "
+                              "message" + (f", sent with {' and '.join(extra)}" if extra else "") + ".\n\n"
+                              + (f"{stamp.strip()}\n\n" if stamp else "")
+                              + preview[:500] + more, "NOUEZ_ASK_USER_SESSION", cancel)
+        routed = None
+        if not overrides and is_bridge(thread):
+            # Neither named: the kind's suggestion, as ConsultantBudget gives it, within Codex.
+            routed = send_route(kind, "codex", client)
+            if routed:
+                overrides = {k: routed[k] for k in ("model", "effort") if routed[k]}
+                settings = ", ".join(f"{k} {v}" for k, v in overrides.items())
+        text =f"[Message from {sender} via the consultants bridge]\n{stamp}\n{message}"
         with send_lock(tid), codex_lock(tid):
             # Last point a cancellation can still stop the message from being delivered.
             check_cancel(cancel)
             fresh_thread(client, thread)  # a stop in another session may have come first
             ensure_loaded(client, thread)
             current = latest_turn(client, tid)
+            if blind and current:
+                raise BridgeError(NOT_BLIND.format(name=name))
             busy = bool(current) and current.get("status") == "inProgress"
+            if busy and routed:
+                overrides = {}  # nouez's own pick never stops a steer: the running turn keeps its own
             if busy:
                 # The values the running turn already has change nothing (ConsultantBudget's suggestion
                 # is passed with every message), so they don't stop a steer.
@@ -5192,11 +5533,31 @@ def send_consultant_message(args, cancel=None, progress=None):
                     f"(GetConsultantReply with turn_id {current['id']}), then send again: a new turn runs "
                     "read-only.")
             elif busy:
-                # Session is mid-turn: steer the running turn instead of queueing a new one.
-                client.request("turn/steer", {"threadId": tid, "expectedTurnId": current["id"], "input": [{"type": "text", "text": text}]})
+                # Session is mid-turn: steer the running turn instead of queueing a new one. A review
+                # round is marked steered first, so its brief is never sent as a second opinion's whole
+                # question once it has had more added.
+                before = steered_review_round(tid, current["id"])
+                if before is False:
+                    raise BridgeError(f"{name} is working on a turn that may be a review round, and nouez "
+                                      "couldn't record that a message was added to it. Nothing was sent. Wait "
+                                      f"for its reply (GetConsultantReply with turn_id {current['id']}), then "
+                                      "send again.")
+                try:
+                    client.request("turn/steer", {"threadId": tid, "expectedTurnId": current["id"], "input": [{"type": "text", "text": text}]})
+                except BridgeError as e:
+                    # Refused outright (not a lost connection or a timeout, after which the message may
+                    # have arrived), so nothing was added: the round's brief is still all it was asked.
+                    if before and str(e).startswith("turn/steer failed:"):
+                        try:
+                            write_json_atomic(review_chain_path(tid, create=True), before)
+                        except OSError:
+                            pass
+                    raise
                 turn_id, mode = current["id"], "steered into the running turn"
                 _delivered.setdefault(turn_id, set()).add(text)
             else:
+                recent = list_turns(client, tid, 20) if kind in REVIEW_ROUND_KINDS else []
+                chain = next_review_round(tid, name, thread.get("cwd"), kind, recent)
                 # Codex keeps a turn's model and effort for the session's later turns too.
                 # A consultant is read-only on every turn, even if its permissions were changed in the
                 # user's own terminal; Codex keeps these for later turns. A user's own session keeps its settings.
@@ -5206,10 +5567,14 @@ def send_consultant_message(args, cancel=None, progress=None):
                 turn_id, mode = started["turn"]["id"], "started a new turn"
                 _bridge_turns.add(turn_id)
                 _delivered.setdefault(turn_id, set()).add(text)
+                save_review_round(tid, chain, turn_id, message, args, cwd=thread.get("cwd"), digest=digest)
                 if overrides:
                     mode += f" on {settings}, which the consultant keeps for later messages until changed"
+                    if routed:
+                        mode += f" (nouez's pick for a {kind}: {routed['why'][0]}; pass model or effort to choose)"
                 else:
                     mode += running_on(thread, " on ")
+                mode += round_mode(chain)
                 # turns/list lags turn/start. Hold the lock until the turn is listed, or a
                 # concurrent send would see the session idle and its turn/start would
                 # interrupt this one.
@@ -5228,7 +5593,8 @@ def send_consultant_message(args, cancel=None, progress=None):
                 "model": overrides.get("model") or was["model"], "effort": overrides.get("effort") or was["effort"],
                 "changed": sorted(k for k, v in overrides.items() if v != was[k]) or None,
                 "kind": kind, "reason": reason, "chars": len(message), "owner_words": bool(owner_words) or None,
-                "base": args.get("base"), "patch": digest or None, "user_session": not is_bridge(thread) or None, "usage": usage_snapshot(client)})
+                "routed": bool(routed and overrides) or None,
+                "base": args.get("base"), "patch": patch_digest(digest), "user_session": not is_bridge(thread) or None, "usage": usage_snapshot(client)})
         if not timeout:
             return f"Delivered to {name} ({mode}, turn {turn_id}). {read_later(tid, turn_id)}"
         try:
@@ -5240,13 +5606,14 @@ def send_consultant_message(args, cancel=None, progress=None):
                               f"failed: {e} Don't send the message again; read the reply with "
                               f"GetConsultantReply (turn_id {turn_id}).") from None
         if done:
-            record_reply(tid, name, turn)
+            note = record_reply(tid, name, turn)
             now_on = running_on(thread)
+            picked = f", nouez's pick for a {kind}" if routed else ""
             changed = (f"\n\n(This message was already in turn {current['id']}, so it wasn't sent again"
                        + (f", and the turn kept its {' and '.join(overrides)}" if overrides else "") + ".)"
-                       if repeat else f"\n\n({name} now runs on {settings} until changed.)" if overrides
+                       if repeat else f"\n\n({name} now runs on {settings} until changed{picked}.)" if overrides
                        else f"\n\n({name} runs on {now_on}.)" if now_on else "")
-            return format_turn(name, turn) + changed
+            return format_turn(name, turn) + changed + note
         return still_working(
             name, turn_id, turn,
             f"Delivered ({mode}), but no reply within {timeout:.0f}s. Don't send the message again. "
@@ -5261,11 +5628,15 @@ def carried_note(asked, turn):
 
 
 def still_working_reply(name, thread_id, turn):
-    """GetConsultantReply's answer for a turn that hasn't ended: its output so far and the waiter."""
+    """GetConsultantReply's answer for a turn that hasn't ended: its output so far, and the waiter for
+    a client that can run it (as read_later)."""
+    later = (f"Check again later with turn_id {turn['id']}; pass wait=\"done\" only if the user wants you to "
+             "wait for it.")
+    if not background_waiter():
+        return still_working(name, turn["id"], turn, later)
     return still_working(name, turn["id"], turn,
                          f"To be woken when it is ready, run in the background:\n"
-                         f"{waiter_command(thread_id, turn['id'])}\nOr check again later with turn_id "
-                         f"{turn['id']}; pass wait=\"done\" only if the user wants you to wait for it.")
+                         f"{waiter_command(thread_id, turn['id'])}\nOr c{later[1:]}")
 
 
 def reply_part(name, turn, offset, note=""):
@@ -5308,10 +5679,10 @@ def get_consultant_reply(args, cancel=None, progress=None):
             if not done:
                 return carried_note(asked, turn) + still_working_reply(name, tid, turn)
         carried = carried_note(asked, turn)
-        record_reply(tid, name, turn)
+        note = record_reply(tid, name, turn)
         if offset:
             return reply_part(name, turn, offset, carried)
-        out = carried + format_turn(name, turn)
+        out = carried + format_turn(name, turn) + note
         latest = latest_turn(client, tid)
         if turn["status"] == "interrupted" and latest and latest["id"] != turn["id"]:
             out += (f"\nA later turn exists ({latest['id']}, {latest['status']}). If your message "
@@ -5862,19 +6233,22 @@ CONSULT_PICKS = {
 }
 CONSULT_NOTES = {
     "review": "Ask for every finding in the first round; later rounds that only check named fixes are re-checks. "
-              "After three rounds of changes on the same work, show the user the open points.",
+              "nouez counts the rounds and says when to show the user the open points.",
     "re-check": "When new work comes up for review, send the review's model and effort again.",
-    "bug-hunt": "Give it the failing command, its output and what you have ruled out.",
+    "bug-hunt": "Give it the failing command, its output and what you have ruled out. For a hard problem whose fix "
+                "is small, ask it to draft the fix as a unified diff in its reply; check it, then apply it with "
+                "git apply.",
     "plan-critique": "In the brief, ask it first to say whether any premise, assumption or framing is wrong.",
-    "research": "Ask for a short answer with its sources.",
+    "research": "Also for reading many files or long logs, and audits. Ask for a short answer with its sources.",
     "fact-check": "Ask for its sources, and check the ones you will rely on.",
 }
 # The subjects where Artificial Analysis's scores put Gemini 4 Neon ahead of every Codex model.
 NEON_SUBJECTS = "finance, legal, medicine, economics or strategy"
 SECOND_OPINION = ("When you and the consultant disagree on a finding, ask the other provider blind: "
-                  "StartConsultant with its provider and new=true, the original brief and the work but "
-                  "not the finding, which it sees only after its own verdict. A decision costly to undo "
-                  "(a release, a migration, deleting data, a security setting) goes to both at once.")
+                  "StartConsultant with its provider and new=true, then SendConsultantMessage with "
+                  "second_opinion_of set to the first consultant, which sends the review's original brief "
+                  "without the findings; show it the finding only after its own verdict. A decision costly "
+                  "to undo (a release, a migration, deleting data, a security setting) goes to both at once.")
 EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 # Usage that would go unused: a week under 60% at its reset, with the reset this close.
 SPARE_DAYS = 3
@@ -5882,6 +6256,13 @@ SPARE_DAYS = 3
 # every option is good enough. Not reviews, bug hunts or plan critiques: a Claude model on
 # Antigravity shares the author's blind spots, and the first choices there are much stronger.
 SPEND_FIRST_KINDS = ("research", "quick-check")
+# Among those, a subscription at least this many points further behind an even pace through its week
+# than the first choice takes the work.
+BEHIND_MARGIN = 15
+# The kinds that start a week that begins on first use while Claude Code is busy: research, which
+# Antigravity's Claude and GPT group does well (heavy reading).
+SEED_KINDS = ("research",)
+UNSTARTED_SLACK = 600  # a reset this close to a full week away counts as a week not yet started
 # The kinds that check Claude's own work: never a Claude model, which shares the author's blind spots,
 # even through the default model or a quota that is tight.
 INDEPENDENT_KINDS = ("review", "re-check", "bug-hunt", "plan-critique")
@@ -6028,6 +6409,26 @@ def week_resets(windows):
     return next((number(w[2]) for w in windows or () if w[0] and w[0] >= 7 * 86400 and number(w[2])), None)
 
 
+def behind_schedule(windows, now):
+    """How many points of its weekly window a subscription is behind an even pace: the share of the
+    week gone less the share used (40 for 10% used two days before a weekly reset). None without a
+    current weekly reading."""
+    for w in windows or ():
+        length, used, resets = w[0], number(w[1]), number(w[2])
+        at = min(number(w[3]) or now, now) if len(w) > 3 else now
+        if length and length >= 7 * 86400 and used is not None and resets and resets > now \
+                and now - at <= CLAUDE_USAGE_STALE:
+            return 100 * min(1, max(0, (length - (resets - now)) / length)) - used
+    return None
+
+
+def week_unstarted(windows, now):
+    """True when a weekly window is unused and its reset is a full week away: a week that starts on
+    first use (Antigravity's) and hasn't."""
+    return any(w[0] and w[0] >= 7 * 86400 and number(w[1]) == 0 and number(w[2])
+               and number(w[2]) - now >= w[0] - UNSTARTED_SLACK for w in windows or ())
+
+
 def provider_windows(provider, model, st):
     if provider == "codex":
         return st.get("windows")
@@ -6071,7 +6472,8 @@ def suggest_consultant(kind, state, now, only=None):
             notes.append("A reused Antigravity consultant switches to this model for the message and keeps "
                          "its conversation.")
         options.append({"provider": provider, "model": got[0], "effort": got[1], "why": [why], "notes": notes,
-                        "outlook": outlook, "title": quota_title(provider, got[0]), "resets": week_resets(windows)})
+                        "outlook": outlook, "title": quota_title(provider, got[0]), "resets": week_resets(windows),
+                        "behind": behind_schedule(windows, now), "unstarted": week_unstarted(windows, now)})
     if not options:
         return {"none": "; ".join(blocked) if blocked else "no consultant CLI is installed"}
     best = options[0]
@@ -6094,6 +6496,17 @@ def suggest_consultant(kind, state, now, only=None):
             and soonest is not best:
         # Usage that would go unused goes first, the week that resets soonest first.
         best = {**soonest, "why": soonest["why"] + [first]}
+    elif kind in SEED_KINDS and best["outlook"][0] != "tight" and claude_pace(state.get("claude"), now)[0] \
+            in ("busy", "tight") and (seed := next((o for o in others if o["unstarted"]), None)):
+        # A week that starts on first use slips with each idle day: start it while Claude Code is busy.
+        best = {**seed, "why": seed["why"] + [first, f"{seed['title']} hasn't started its week, and starting it "
+                                              "now keeps its weeks from slipping while Claude Code is busy"]}
+    elif kind in SPEND_FIRST_KINDS and best["outlook"][0] in ("ok", "spare", "unknown") and (ahead := max(
+            (o for o in calm if o["behind"] is not None), key=lambda o: o["behind"], default=None)) \
+            and ahead["behind"] - (best["behind"] or 0) >= BEHIND_MARGIN:
+        # Interchangeable work goes to the subscription furthest behind its schedule.
+        best = {**ahead, "why": ahead["why"] + [first, f"{ahead['title']} is {ahead['behind']:.0f} points behind "
+                                                "an even pace through its week"]}
     else:
         best = {**best, "why": list(best["why"])}
     outlook, title = best["outlook"], best["title"]
@@ -6114,22 +6527,72 @@ def suggest_consultant(kind, state, now, only=None):
     return best
 
 
+# What to hand to a consultant at each Claude Code pace: the goal is Claude Code's own weekly usage
+# as low as the other subscriptions allow. Under 70% bulky work, past 70% everything that can go
+# out, past 90% everything but what only Claude can do here.
+HAND_OUT = {
+    "ok": "Hand bulky read-only work (reading many files or long logs, audits, research across sources) to a "
+          "consultant, for a short reply.",
+    "busy": "Hand everything read-only that can go out (reviews, bug hunts, research, reading many files, audits, "
+            "checks) to a consultant, for short replies; keep writing code and edits here.",
+    "tight": "Hand out everything except what only Claude can do here (writing code, edits, the browser, the "
+             "user's sign-ins), put off optional work, and tell the user.",
+}
+HAND_OUT_LOCAL = "Do it yourself when that takes seconds."
+
+
+def claude_pace(claude_state, now):
+    """(where Claude Code's usage stands for handing work out: "ok", "busy", "tight" or "unknown",
+    the text on it: "on pace for about 84% of its week", a window used up...)."""
+    state, pct = usage_outlook((claude_state or {}).get("windows"), now)
+    if state == "unknown":
+        return ("unknown", "its usage isn't known")
+    if state == "blocked":
+        return ("tight", pct)  # why: a window used up, or running out before its reset
+    at = f"on pace for about {pct:.0f}% of its week" if pct is not None else "has room"
+    return ("ok" if state == "spare" else state, at)
+
+
 def claude_outlook(claude_state, now):
     """One line on what Claude Code's own usage means for handing work to a consultant."""
-    state, pct = usage_outlook((claude_state or {}).get("windows"), now)
-    if state == "blocked":
-        at = pct  # why: a window used up, or running out before its reset
-    else:
-        at = f"on pace for about {pct:.0f}% of its week" if pct is not None else "has room"
+    state, at = claude_pace(claude_state, now)
     if state == "unknown":
         return "Claude Code: its usage isn't known, so consult at the usual points."
-    if state in ("blocked", "tight"):
-        return (f"Claude Code: {at}. Hand every read-only job that saves real work (reviews, research, long "
-                "reading) to a consultant, put off optional work, and tell the user.")
-    if state == "busy":
-        return (f"Claude Code: {at}. Hand read-only work that saves real effort (reviews, research, long "
-                "reading) to a consultant, asking for short replies.")
-    return f"Claude Code: {at}."
+    return f"Claude Code: {at}. {HAND_OUT[state]} {HAND_OUT_LOCAL}"
+
+
+def hook_text(now, path=None):
+    """What `server.py hook` adds to each prompt: the hand-out line when Claude Code's saved usage,
+    read within CLAUDE_USAGE_STALE, is on pace past 70% of its week or a window runs out; "" otherwise."""
+    if auto_consult_off():
+        return ""
+    state = {}
+    claude_budget(now, path, state)
+    fresh = [w for w in state["windows"] if now - w[3] <= CLAUDE_USAGE_STALE]
+    pace, at = claude_pace({"windows": fresh}, now)
+    if pace not in ("busy", "tight"):
+        return ""
+    return (f"nouez: Claude Code is {at}. Before doing this prompt's work yourself: {HAND_OUT[pace]} "
+            f"{HAND_OUT_LOCAL} Call ConsultantBudget with the kind first.")
+
+
+def run_hook(argv):
+    """`server.py hook`: Claude Code's UserPromptSubmit hook. Reads only nouez's saved usage file
+    (never starts Codex or agy), prints the hand-out line or nothing, and always exits 0."""
+    try:
+        sys.stdin.buffer.read(1 << 20)  # the prompt: not needed, read so the writer never blocks
+    except (OSError, AttributeError, ValueError):
+        pass
+    try:
+        text = hook_text(time.time())
+    except Exception:  # a hook must never break a prompt
+        text = ""
+    if text:
+        try:
+            print(text)
+        except Exception:
+            pass
+    return 0
 
 
 def call_text(pick):
@@ -6181,7 +6644,8 @@ def suggestion_lines(kind, state, now, only=None):
                     "antigravity", neon[0], state["antigravity"]), now)[0] != "blocked":
             lines.append(f"  For {NEON_SUBJECTS}, Gemini 4 Neon scores best (Artificial Analysis by subject): "
                          + call_text({"provider": "antigravity", "model": neon[0], "effort": neon[1]}) + ".")
-    lines.append("  A reused consultant keeps the model and effort it last had, so pass these with the message."
+    lines.append("  SendConsultantMessage with the kind and no model or effort applies this pick itself, within the "
+                 "consultant's provider; a model or effort you pass wins and stays for later messages."
                  + ("" if kind else " Pass kind for one kind, with its notes."))
     return lines
 
@@ -6193,7 +6657,11 @@ def consultant_budget(args, cancel=None, progress=None):
         raise BridgeError(f"`kind` must be one of {', '.join(CONSULT_KINDS)}.")
     if only is not None and only not in PROVIDERS:
         raise BridgeError(f"`provider` must be one of {', '.join(PROVIDERS)}.")
-    out = [f"Consultation budget, {time.strftime('%a %b %d %H:%M', time.localtime(now))}:", ""]
+    if kind and only:  # the send's own pick for this kind keeps to what the user named ("ask Gemini")
+        with _named_guard:  # until it runs out or the user names another; a lookup without one keeps it
+            _named[kind] = (only, time.monotonic() + NAMED_SECONDS)
+    head = [f"Consultation budget, {time.strftime('%a %b %d %H:%M', time.localtime(now))}:", ""]
+    out = list(head)
     state = {"claude": {}}
     if not codex_installed():
         out.append("Codex: not installed.")
@@ -6206,7 +6674,8 @@ def consultant_budget(args, cancel=None, progress=None):
             out.append(f"Codex: usage unavailable ({e}).")
     out.append("")
     out += claude_budget(now, state=state["claude"])
-    out += login_lines(now)
+    logins = login_lines(now)
+    out += logins
     out.append("")
     state["antigravity"] = {}
     agy = agy_budget(now, state=state["antigravity"])
@@ -6215,11 +6684,20 @@ def consultant_budget(args, cancel=None, progress=None):
     else:
         state["antigravity"] = None
     check_cancel(cancel)
-    cache, note = aa_scores(now, refresh=flag(args, "refresh"))
-    out += aa_lines(cache, note, now)
+    # With a kind, only what to do: the suggestion, Claude Code's outlook and the notes. The windows
+    # and the scores on request.
+    brief = kind is not None and not flag(args, "details") and not flag(args, "refresh")
+    if brief:
+        warning = [line.strip() for line in logins if not line.startswith("  - ")]
+        out = head + warning + ([""] if warning else [])
+    else:
+        cache, note = aa_scores(now, refresh=flag(args, "refresh"))
+        out += aa_lines(cache, note, now)
     if only:
         state = {p: v for p, v in state.items() if p in (only, "claude")}
     out += ([""] if out[-1] else []) + suggestion_lines(kind, state, now, only)
+    if brief:
+        out.append("  details=true shows each subscription's windows, the models and the benchmark scores.")
     return "\n".join(out)
 
 
@@ -6254,6 +6732,8 @@ def record_usage(event, path=None, now=None):
         return
     try:
         path = path or usage_log_file()
+        client = client_info().get("name")
+        event = {**({"client": str(client)[:100]} if client and "client" not in event else {}), **event}
         line = json.dumps({"ts": round(now or time.time(), 3), **event}, ensure_ascii=False) + "\n"
         # One lock for every nouez server, held from the rename check to the end of the append, so
         # no line goes to a file another server is renaming or deleting.
@@ -6432,24 +6912,28 @@ VERDICTS = (  # read from a whole first line without an explicit verdict; the fi
     ("yes", re.compile(r"\b(go|ready|approved?|lgtm|ship it)\b|^\W*yes\b|^\W*ok(ay)?\W*$", re.I)),
 )
 UNFINISHED = ("failed", "interrupted")
+VERDICT_LINES = 5  # the first non-empty lines of a reply a "Verdict:" line is looked for in
 
 
 def verdict_of(reply, status="completed"):
     """yes, changes, no or incomplete, from a reply's first non-empty line, or None when it gives no
     verdict. A line starting "Verdict: ..." is read from the word after the label, so a caveat later
-    ("Verdict: yes. I couldn't run the tests") doesn't change it. A turn that failed or was
-    interrupted is incomplete, whatever its text says."""
+    ("Verdict: yes. I couldn't run the tests") doesn't change it. When the first line gives none
+    ("Reviewed commit abc."), a labelled line among the next VERDICT_LINES - 1 is read. A turn that
+    failed or was interrupted is incomplete, whatever its text says."""
     if status in UNFINISHED:
         return "incomplete"
-    first = next((line for line in (reply or "").splitlines() if line.strip()), "")[:300]
-    label = VERDICT_LABEL.match(first)
-    if label:
-        for name, pattern in EXPLICIT_VERDICTS:
-            if pattern.match(first, label.end()):
-                return name
-    for name, pattern in VERDICTS:
-        if pattern.search(first):
-            return name
+    lines = [line[:300] for line in (reply or "").splitlines() if line.strip()][:VERDICT_LINES]
+    for n, line in enumerate(lines):
+        label = VERDICT_LABEL.match(line)
+        if label:
+            for name, pattern in EXPLICIT_VERDICTS:
+                if pattern.match(line, label.end()):
+                    return name
+        if n == 0:
+            for name, pattern in VERDICTS:
+                if pattern.search(line):
+                    return name
     return None
 
 
@@ -6460,15 +6944,156 @@ def logged_verdict(reply):
 
 
 def record_reply(thread_id, name, turn, path=None):
-    """Log how a finished turn came out (the TUI keeps one line per turn)."""
+    """Log how a finished turn came out (the TUI keeps one line per turn). Returns the note on the
+    review rounds to add to the reply shown (see round_note), or ""."""
     if not isinstance(turn, dict) or turn.get("status") in (None, "inProgress"):
-        return
+        return ""
     reply = turn_reply(turn)
+    verdict = verdict_of(reply, turn.get("status"))
     record_usage({"event": "reply", "consultant": name, "thread": thread_id, "turn": turn.get("id"),
                   "status": turn.get("status"), "ms": number(turn.get("durationMs")),
-                  "chars": len(reply), "verdict": verdict_of(reply, turn.get("status")),
+                  "chars": len(reply), "verdict": verdict,
                   **({"provider": turn["provider"]} if turn.get("provider") else {}),
                   **({"tokens": turn["usage"]} if isinstance(turn.get("usage"), dict) else {})}, path)
+    return round_note(thread_id, turn.get("id"), verdict)
+
+
+# --- Review rounds ----------------------------------------------------------------
+# A review and the re-checks after it are one chain of rounds on the same work. nouez counts them
+# per consultant, so that after REVIEW_ROUNDS rounds still asking for changes the user sees the
+# open points, and keeps the chain's first brief for a blind second opinion (second_opinion_of).
+
+REVIEW_ROUND_KINDS = ("review", "re-check")
+BRIEF_KINDS = REVIEW_ROUND_KINDS + ("bug-hunt", "plan-critique")  # second_opinion_of takes these briefs
+REVIEW_ROUNDS = 3          # rounds of changes on the same work before the user sees the open points
+REVIEW_CHAIN_HOURS = 24    # a round sent longer than this after the last one starts a new chain
+REVIEW_BRIEF_CHARS = 200_000  # a longer first brief isn't kept, so it can't go to a second opinion
+REVIEW_CHAIN_FILE = re.compile(r"chain-[0-9A-Za-z_-]+\.(json|[0-9A-Za-z_]+\.tmp)")  # nouez's names only
+
+
+def review_rounds_stop():
+    """NOUEZ_REVIEW_ROUNDS_STOP=1: a round past REVIEW_ROUNDS is refused, not only advised against."""
+    return os.environ.get("NOUEZ_REVIEW_ROUNDS_STOP", "").strip() == "1"
+
+
+def review_chain_path(consultant_id, create=False):
+    return os.path.join(cache_folder("review-rounds", create=create),
+                        "chain-" + re.sub(r"[^0-9A-Za-z-]", "_", consultant_id) + ".json")
+
+
+def review_chain(consultant_id):
+    """The consultant's latest review chain, or None."""
+    try:
+        return read_json_file(review_chain_path(consultant_id))
+    except OSError:
+        return None
+
+
+def git_head(cwd):
+    """The commit HEAD names in the repository at cwd, or None."""
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    found, _ = git_bytes(REVISION_GIT + ["-C", cwd, "rev-parse", "--verify", "--quiet", "HEAD"], 10)
+    head = (found or b"").strip().decode("ascii", "replace")
+    return head if re.fullmatch(r"[0-9a-f]{40,64}", head) else None
+
+
+def next_review_round(consultant_id, name, cwd, kind, recent, now=None):
+    """The chain a consultation about to be sent belongs to, with its round counted, or None for a
+    kind whose brief isn't kept. A review or re-check continues the consultant's review chain while
+    HEAD is the same, the reply to the chain's own last round (`recent`: the consultant's latest
+    turns, newest first; an unread reply counts too, other consultations in between don't) isn't a
+    yes, and the last round is under REVIEW_CHAIN_HOURS old; otherwise, or when that reply isn't
+    among them, so its verdict is unknown, it starts a new one. A bug
+    hunt or plan critique starts one of its own, kept for its brief and never counted. Raises
+    BridgeError for a round past REVIEW_ROUNDS when NOUEZ_REVIEW_ROUNDS_STOP=1."""
+    if kind not in BRIEF_KINDS:
+        return None
+    now = now or time.time()
+    head = git_head(cwd)
+    if kind not in REVIEW_ROUND_KINDS:
+        return {"kind": kind, "turns": [], "head": head, "rounds": 1}
+    chain = review_chain(consultant_id)
+    if chain and chain.get("kind") not in REVIEW_ROUND_KINDS:
+        chain = None
+    last = chain_reply(chain, recent)
+    approved = bool(last) and last.get("status") not in (None, "inProgress") and \
+        verdict_of(turn_reply(last), last.get("status")) == "yes"
+    going = bool(last) and chain.get("head") == head and not approved and \
+        now - (number(chain.get("at")) or 0) < REVIEW_CHAIN_HOURS * 3600
+    rounds = int(number(chain.get("rounds")) or 0) + 1 if going else 1
+    if rounds > REVIEW_ROUNDS and review_rounds_stop():
+        raise BridgeError(
+            f"This would be round {rounds} of review on the same work with {name}, and the last "
+            f"{REVIEW_ROUNDS} didn't end in an OK verdict. Nothing was sent (NOUEZ_REVIEW_ROUNDS_STOP=1). "
+            "Show the user the open points and let them decide. A new commit, or an OK verdict, starts a "
+            "new chain.")
+    return {**(chain if going else {"kind": kind, "turns": []}), "head": head, "rounds": rounds}
+
+
+def chain_reply(chain, recent):
+    """The turn in `recent` that answers the chain's last round (where Codex carried it on, if it
+    did), or None when the chain has none or it isn't among them."""
+    last = ((chain or {}).get("turns") or [None])[-1]
+    found = next((t for t in recent or () if t.get("id") == last), None) if last else None
+    return follow_chain(recent, found) if found else None
+
+
+def save_review_round(consultant_id, chain, turn_id, brief, args, now=None, cwd=None, digest=""):
+    """Record a round sent: its turn, and for a first round the brief and the work it was about:
+    how it was named, the repository, and the diff sent with it (`digest`), if any."""
+    if not chain:
+        return
+    chain = {**chain, "turns": (chain.get("turns") or [])[-9:] + [turn_id], "at": round(now or time.time(), 3)}
+    if chain["rounds"] == 1:
+        chain.update(brief=brief if len(brief) <= REVIEW_BRIEF_CHARS else None,
+                     revision=flag(args, "revision"), base=args.get("base"), patch=patch_digest(digest),
+                     clean=clean_commit(digest),
+                     repo=(git_root(cwd) or os.path.abspath(cwd)) if cwd else None)
+    try:
+        write_json_atomic(review_chain_path(consultant_id, create=True), chain)
+    except OSError:
+        pass  # a count lost is only a note not given
+
+
+def steered_review_round(consultant_id, turn_id):
+    """Mark the consultant's chain before a message is steered into its last round's turn. Returns the
+    chain as it was, to put back if the steer is refused; None when there was nothing to mark; False
+    when a chain that is there couldn't be read or marked, so the steer isn't sent."""
+    path = review_chain_path(consultant_id, create=True)
+    if not os.path.lexists(path):
+        return None
+    chain = read_json_file(path)  # there but unreadable now: a round it can't rule out, so no steer
+    if chain is None:
+        return False
+    if (chain.get("turns") or [None])[-1] != turn_id or chain.get("steered"):
+        return None
+    try:
+        return chain if write_json_atomic(path, {**chain, "steered": True}) else False
+    except OSError:
+        return False
+
+
+def round_mode(chain):
+    """For a send's result: a round past REVIEW_ROUNDS, said so; otherwise ""."""
+    if not chain or chain["rounds"] <= REVIEW_ROUNDS:
+        return ""
+    return (f"; round {chain['rounds']} of review on the same work, past the {REVIEW_ROUNDS} after which "
+            "the user should see the open points")
+
+
+def round_note(consultant_id, turn_id, verdict):
+    """For the reply to the latest round of a chain at REVIEW_ROUNDS or past, still asking for
+    changes: the note that says to show the user the open points. Otherwise ""."""
+    chain = review_chain(consultant_id)
+    if not chain or (chain.get("turns") or [None])[-1] != turn_id or verdict not in ("changes", "no"):
+        return ""
+    rounds = int(number(chain.get("rounds")) or 0)
+    if rounds < REVIEW_ROUNDS:
+        return ""
+    return (f"\n\n(nouez: this is round {rounds} of review on the same work, and it still asks for changes. "
+            f"Show the user the open points now and let them decide, rather than sending another round"
+            + ("; another is refused." if review_rounds_stop() else ".") + ")")
 
 
 # --- Status screen: `server.py top` ---------------------------------------------
@@ -7166,12 +7791,28 @@ def agy_command(env=None):
     return None
 
 
+AGY_USAGE_CACHE = 90  # seconds a quota reading is reused: agy takes seconds to answer, and each send reads it
+_agy_usage = {"at": 0.0, "agy": None, "value": None}
+
+
 def read_agy_usage():
     """Antigravity's quota from `agy -p /usage` (a read-only command that runs no model turn), as
-    {"groups": [...]}; {"error": ...} if agy didn't answer; None if agy isn't installed."""
+    {"groups": [...]}; {"error": ...} if agy didn't answer; None if agy isn't installed. A reading
+    is reused for AGY_USAGE_CACHE seconds; a failed one isn't."""
     agy = agy_command()
     if not agy:
         return None
+    with _agy_guard:
+        if _agy_usage["agy"] == agy and 0 <= time.time() - _agy_usage["at"] < AGY_USAGE_CACHE:
+            return _agy_usage["value"]
+    got = _read_agy_usage(agy)
+    if "groups" in got:
+        with _agy_guard:
+            _agy_usage.update(at=time.time(), agy=agy, value=got)
+    return got
+
+
+def _read_agy_usage(agy):
     try:
         done = subprocess.run([agy, "-p", "/usage", "--output-format", "json", "--settings", json.dumps(AGY_READ_ONLY)],
                               capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -7217,6 +7858,8 @@ AGY_PREAMBLE = ("You are a read-only consultant, asked by another AI agent throu
                 "You can read files, search and read web pages; writing or editing files, running "
                 "commands and MCP tools are denied by the user's settings, so don't try them. Don't "
                 "schedule tasks or start background work: the turn ends when you reply. Answer in your reply.")
+AGY_REMINDER = ("[nouez: you are still a read-only consultant. Don't write files, run commands, schedule tasks "
+                "or start background work; answer in your reply.]")
 _agy_models = {"at": 0, "ids": None}
 _agy_guard = threading.Lock()
 
@@ -7835,9 +8478,16 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
     """SendConsultantMessage for an Antigravity consultant."""
     cid, name = rec["id"], rec["name"]
     override = args.get("model") or args.get("effort")
-    known = agy_models() if override else None  # can take seconds, so read before taking the lock
-    stamp, patch, digest = (revision(rec.get("cwd"), take=flag(args, "attach_diff"),
-                                     inline_limit=AGY_PATCH_BYTES, base=args.get("base"))
+    routed = None if override else send_route(kind, "antigravity")
+    if routed:  # neither named: the kind's suggestion, as ConsultantBudget gives it, within Antigravity
+        args = {**args, "model": routed["model"], "effort": routed["effort"]}
+        override = True
+    # Work that checks Claude's own (an independent kind, or a diff) never runs on a Claude model.
+    independent = kind in INDEPENDENT_KINDS or flag(args, "revision")
+    known = (agy_models() if override or (independent and (rec.get("model") or "").startswith("claude-"))
+             else None)  # can take seconds, so read before taking the lock
+    stamp, patch, digest = (revision_for(args, rec.get("cwd"), take=flag(args, "attach_diff"),
+                                         inline_limit=AGY_PATCH_BYTES)
                             if flag(args, "revision") else ("", b"", ""))
     shown = f"[Message from {sender} via the consultants bridge]\n{stamp}\n{message}"
     # An Antigravity consultant runs no commands and may not be able to read nouez's folder, so the
@@ -7854,6 +8504,24 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
         model = rec.get("model") or f"{AGY_MODEL}-{AGY_EFFORT}"
         if override:
             model = agy_model_id(model, args.get("model"), args.get("effort"), known)
+        if not args.get("model") and named_provider(kind, "antigravity") and not model.startswith("gemini-"):
+            raise BridgeError(
+                f"The user named Gemini for this {kind}, and {name} is on {model}, with no Gemini model that "
+                "has room to move it to. Nothing was sent. Tell the user, or pass a Gemini model they accept.")
+        switched = ""
+        if independent and model.startswith("claude-"):
+            what = f"a {kind}" if kind in INDEPENDENT_KINDS else "a message with revision=true"
+            pick = next((p for p in CONSULT_PICKS.get(kind, ()) if p[0] == "antigravity" and p[1]
+                         and not p[1].startswith("claude-")), None)
+            if args.get("model") or not pick:
+                raise BridgeError(
+                    f"{model} is a Claude model, and {what} goes to a model of another family: a Claude "
+                    f"model shares the blind spots of the Claude that wrote the work. Nothing was sent. "
+                    f"Pass model={pick[1] if pick else AGY_MODEL}, or the model ConsultantBudget suggests.")
+            was = model
+            model = agy_model_id(model, pick[1], args.get("effort") or pick[2], known)
+            switched = (f" ({name} was on {was}, a Claude model, which shares the blind spots of the Claude "
+                        f"that wrote the work, so this {kind} runs on {model} instead.)")
         current = agy_turns(cid, 1)
         if current and current[0]["status"] == "inProgress":
             raise BridgeError(
@@ -7861,12 +8529,17 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
                 f"message while it runs; nothing was sent. Read that turn's reply first (GetConsultantReply "
                 f"with turn_id {current[0]['id']}, or its waiter), then send again.")
         conversation = agy_conversation(cid)
-        text = attached + shown
+        if args.get("second_opinion_of") not in (None, "") and (conversation or current):
+            raise BridgeError(NOT_BLIND.format(name=name))
+        text = f"{AGY_REMINDER}\n\n{attached}{shown}"  # the rules again every turn: a long conversation drifts
         if not conversation:
             standing = (f"Standing instructions for this consultation:\n<<<\n{rec['instructions']}\n>>>\n\n"
                         if rec.get("instructions") else "")
             text = f"{AGY_PREAMBLE}\n\n{standing}{attached}{shown}"
+        chain = next_review_round(cid, name, rec.get("cwd"), kind,
+                                  agy_turns(cid, 20) if kind in REVIEW_ROUND_KINDS else [])
         turn_id = agy_start_turn(rec, text, model, conversation, shown)
+        save_review_round(cid, chain, turn_id, message, args, cwd=rec.get("cwd"), digest=digest)
         rec_before = rec
         changed, kept = model != rec.get("model"), True
         if changed:
@@ -7877,7 +8550,9 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
                 kept = False  # the turn runs all the same: say so rather than hide its id
     mode = f"started a new turn on {model}" + (
         "" if not changed else ", which the consultant keeps for later messages until changed" if kept
-        else f", but nouez couldn't save it as {name}'s model, so later messages use the one it had")
+        else f", but nouez couldn't save it as {name}'s model, so later messages use the one it had") + (
+        f" (nouez's pick for a {kind}: {routed['why'][0]}; pass model or effort to choose)" if routed else ""
+    ) + round_mode(chain)
     if not usage_log_off():
         event = {"event": "send", "consultant": name, "thread": cid, "turn": turn_id, "provider": "antigravity",
                  "project": os.path.basename(os.path.normpath(rec.get("cwd") or "")) or None, "mode": "new",
@@ -7885,7 +8560,10 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
                  "changed": [k for k, f in (("model", agy_base), ("effort", agy_level))
                              if f(model) != f(rec_before.get("model") or "")] or None if changed else None,
                  "kind": kind, "reason": reason, "chars": len(message), "owner_words": bool(owner_words) or None,
-                 "base": args.get("base"), "patch": digest or None}
+                 "routed": bool(routed) or None, "base": args.get("base"), "patch": patch_digest(digest)}
+        client = client_info().get("name")  # read here: log_send runs on a thread of its own
+        if client:
+            event["client"] = str(client)[:100]
         sent_at = time.time()
 
         def log_send():  # agy's quota takes a few seconds to read: don't hold the reply for it
@@ -7896,16 +8574,17 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
             record_usage({**event, "usage": snap}, now=sent_at)
         threading.Thread(target=log_send, daemon=True).start()
     if not timeout:
-        return f"Delivered to {name} ({mode}, turn {turn_id}). {read_later(cid, turn_id)}"
+        return f"Delivered to {name} ({mode}, turn {turn_id}).{switched} {read_later(cid, turn_id)}"
     done, turn = agy_wait(cid, turn_id, timeout, cancel, progress_reporter(progress, name))
     if done:
-        record_reply(cid, name, turn)
-        return format_turn(name, turn) + (
-            f"\n\n({name} runs on {model}.)" if kept else
+        note = record_reply(cid, name, turn)
+        picked = f", nouez's pick for a {kind}" if routed else ""
+        return format_turn(name, turn) + note + (
+            f"\n\n({name} runs on {model}{picked}.)" if kept else
             f"\n\n(This turn ran on {model}, but nouez couldn't save it as {name}'s model, so later "
-            "messages use the one it had.)")
+            "messages use the one it had.)") + (f"\n{switched.strip()}" if switched else "")
     return still_working(name, turn_id, turn,
-                         f"Delivered ({mode}), but no reply within {timeout:.0f}s. Don't send the message "
+                         f"Delivered ({mode}).{switched} But no reply within {timeout:.0f}s. Don't send the message "
                          f"again. {read_later(cid, turn_id)}")
 
 
@@ -7941,8 +8620,8 @@ def get_agy_reply(rec, args, timeout, offset, cancel, progress):
             done, turn = agy_wait(cid, turn["id"], timeout, cancel, progress_reporter(progress, name))
         if not done:
             return still_working_reply(name, cid, turn)
-    record_reply(cid, name, turn)
-    return reply_part(name, turn, offset) if offset else format_turn(name, turn)
+    note = record_reply(cid, name, turn)
+    return reply_part(name, turn, offset) if offset else format_turn(name, turn) + note
 
 
 def agy_history(rec, limit):
@@ -8084,9 +8763,9 @@ def print_unfinished(name, thread_id, turn_id, turn, stall, **advice):
 
 def print_finished(name, thread_id, whose, turn_id, turn):
     """The waiter's report of an ended turn, reply included; `whose` names the thread for the reader."""
-    record_reply(thread_id, name, turn)
+    note = record_reply(thread_id, name, turn)
     print(f"The consultant's turn has ended ({whose}, turn {turn_id}).\n")
-    print(format_turn(name, turn, WAITER_REPLY_CHARS))
+    print(format_turn(name, turn, WAITER_REPLY_CHARS) + note)
 
 
 def run_agy_waiter(rec, turn_id):
@@ -8099,7 +8778,8 @@ def run_agy_waiter(rec, turn_id):
     try:
         done, turn = agy_wait(cid, turn_id, WAITER_SECONDS, None, on_poll=stall)
     except BridgeError as e:
-        print(f"Stopped waiting for turn {turn_id}: {e}")
+        print(f"Stopped waiting for turn {turn_id}: {e} {WAIT_ENDED} Read it later with GetConsultantReply "
+              f"(to {name}, turn_id {turn_id}).")
         return 1
     if not done:
         print_unfinished(name, cid, turn_id, turn, stall, antigravity=True)
@@ -9591,58 +10271,55 @@ def run_top(argv):
 
 INSTRUCTIONS_HEAD = (
     "Consultants are read-only second opinions on another model, run on the Codex CLI or Google's "
-    "Antigravity CLI (agy), whichever is installed. "
+    "Antigravity CLI (agy). "
 )
 # What a clone gets with no CLAUDE.md or skill of the user's: consulting at the points where a
 # second opinion pays, without being asked. Left out when no consultant CLI is installed, or with
-# NOUEZ_NO_AUTO_CONSULT=1. All of the instructions with it are 3,837 characters; 3,865 reached a new
-# Claude Code session whole (checked 2026-11-25). Claude Code's limit isn't documented, so keep them
-# about that size.
+# NOUEZ_NO_AUTO_CONSULT=1. Kept to about 1,000 characters with the rest: the moments to consult,
+# and what to call; how each tool works is in its description.
 AUTO_CONSULT = (
-    "Unless the user's own instructions say otherwise, also consult without being asked: before "
-    "committing a change to behavior, to several files or to anything risky (not typos, formatting "
-    "or one-line fixes), ask for a review of what you will commit (revision=true when that is all "
-    "your uncommitted work, else the staged diff in the message), and commit after its verdict; when "
-    "a failure's cause isn't obvious after a first look, ask for a bug hunt; and before acting on a "
-    "consequential plan, design, formula or rule of your own, ask for a critique: show the draft, say "
-    "a critique is under way, and give its verdict before building on it; and hand a consultant "
-    "research across sources instead of searching the web yourself, an audit or explanation "
-    "spanning many files, or a consequential claim a first check left uncertain, for a short answer. "
-    "Skip one, saying so, when ConsultantBudget says none has room. Keep writing code and "
-    "single lookups in this session. "
+    "Unless the user's own instructions say otherwise, also consult unasked:\n"
+    "- before committing a change to behavior, to several files or to anything risky: a review "
+    "(revision=true), then commit after its verdict;\n"
+    "- before the first edit built on a consequential plan, design, formula or rule of your own: a "
+    "critique; show the draft, and build on it only after the verdict;\n"
+    "- when a failure's cause isn't obvious after a first look: a bug hunt;\n"
+    "- for research across sources (instead of searching the web yourself), an audit spanning many "
+    "files, or a consequential claim still uncertain: hand it out, for a short answer.\n"
+    "Not for changes that leave behavior alone, whatever their size, or single lookups. Work that "
+    "needs the verdict waits for it; other work goes on. Skip one, saying so, when ConsultantBudget "
+    "says none has room.\n"
 )
 INSTRUCTIONS = (
-    "Consult whenever the user asks for a consultant (\"ask Codex\", \"ask Gemini\", a second "
-    "opinion) or the user's own instructions (such as their CLAUDE.md or a skill) call for one. For "
-    "each consultation, call StartConsultant with cwd set to your working "
-    "directory, even if you don't remember one being open (earlier context may have been compacted). "
-    "It reuses a consultant it started earlier in this repo, keeping its context, or starts a new "
-    "read-only one; it never picks a Codex session the user opened. Without provider it uses Codex "
-    "when it is installed, otherwise Antigravity, and says which; pass provider=\"antigravity\" for "
-    "Antigravity when Codex is installed too, when the user asks for it or ConsultantBudget suggests "
-    "it. If neither CLI is installed, consultations are off and the Claude Code session tools "
-    "still work. Talk to a consultant with SendConsultantMessage, passing the name StartConsultant "
-    "returns as `to`. Pass new=true only when the user asks for a separate consultant, or for a "
-    "blind second opinion as ConsultantBudget describes. Message a "
-    "Codex session the user opened only when the user asks you to, with allow_user_session=true. "
-    "A Codex consultant can read files and run read-only commands; an Antigravity one can read files "
-    "but runs no commands, so put the diff, test output or command results it needs in the message. "
-    "SendConsultantMessage returns about 5 seconds after delivery, usually before the reply is ready; "
-    "replies often take minutes. Do not wait for one. Instead run the waiter command the result gives "
-    "as a background command (in Claude Code: the Bash or PowerShell tool with run_in_background), "
-    "tell the user the consultation is under way, and carry on with other work or end your turn so "
-    "the user can keep working. The waiter exits with the reply when the turn ends, which wakes you; "
-    "then act on the reply or report it. Without background commands, read the reply with "
-    "GetConsultantReply and the returned turn_id when the user asks or when you next need it. Pass "
-    "wait=\"done\" only if the user asks you to wait for the reply. A result that says 'still "
-    "working' is not a reply, even if it shows output so far: never treat it as done. An Antigravity "
-    "consultant takes one message at a time, so wait for its reply before the next. Before each "
-    "consultation, call ConsultantBudget with its kind (and provider, if the user named one): from "
-    "the usage left on each subscription and public benchmarks, it suggests the provider for "
-    "StartConsultant and the model and effort for SendConsultantMessage. Use them unless the user "
-    "named others or the user's own instructions route otherwise. A model or effort change keeps the "
-    "consultant's context and stays for later messages, so pass the suggested values with each message."
+    "Consult whenever the user asks (\"ask Codex\", \"ask Gemini\", a second opinion) or the user's own "
+    "instructions call for one. Each time: call ConsultantBudget with its kind; StartConsultant "
+    "with cwd set to your working directory and the provider it suggests; then SendConsultantMessage "
+    "with the kind, which applies the suggested model and effort. Use the suggestion unless the user "
+    "named others or the user's own instructions route otherwise. Don't wait for the reply, and never "
+    "take a 'still working' result for one: the send's result says how to get it."
 )
+# Only Claude Code is known to run background commands that wake it when they exit: the waiter is
+# offered to it, and to a client that doesn't say who it is; others read replies with GetConsultantReply.
+CLAUDE_CODE_CLIENT = "claude-code"
+
+
+def client_info():
+    """Who sent the request being handled: its own _meta clientInfo, else (legacy only) the one
+    initialize gave. A 2026-07-28 request never inherits the handshake's."""
+    if getattr(_request, "modern", False):
+        return _request.client or {}
+    return getattr(_request, "client", None) or _client_info
+
+
+def client_caps():
+    """The client's capabilities: a 2026-07-28 request's own, in its _meta, never the handshake's."""
+    return (getattr(_request, "caps", None) or {}) if getattr(_request, "modern", False) else _client_caps
+
+
+def background_waiter():
+    """Whether to offer the shell waiter: to Claude Code, and to a client that didn't say who it is."""
+    name = client_info().get("name")
+    return not isinstance(name, str) or name.strip().lower() == CLAUDE_CODE_CLIENT
 
 
 def auto_consult_off(env=None):
@@ -9664,7 +10341,8 @@ def wait_schema(default):
             "description": (f"How long to wait for the reply: a number of seconds (0 = don't wait), or "
                             f"\"done\" to wait until the turn ends, up to 4 hours. Default {default}. "
                             "If the turn is still running when the wait ends, the result shows its "
-                            "output so far, which is not the reply.")}
+                            "output so far, which is not the reply. Pass \"done\" only if the user "
+                            "asks you to wait.")}
 EXACT_TO_SCHEMA = {"type": "string", "description": "Consultant name or full thread id (exact match only)."}
 
 TOOLS = [
@@ -9672,7 +10350,8 @@ TOOLS = [
         "name": "StartConsultant",
         "description": (
             "Get a consultant for a repo: reuse one that StartConsultant started there earlier "
-            "(keeping its context), or start a new one. Call it whenever you need a consultant. "
+            "(keeping its context), or start a new one. Call it for each consultation, with cwd, even if "
+            "you don't remember one being open (earlier context may have been compacted). "
             "Without provider it uses Codex when the codex CLI is installed, otherwise Antigravity "
             "(agy), and says which; if neither is installed it says so, and the Claude Code session "
             "tools still work. Consultants never edit anything and never ask for approvals. A Codex "
@@ -9693,7 +10372,7 @@ TOOLS = [
                 "instructions": {"type": "string", "description": "Standing instructions for a new consultant's role. Ignored when an existing consultant is reused."},
                 "new": {"type": "boolean", "description": "Start a new session even though a consultant already works in this repo. Default false. Use only when the user asked for a separate consultant, or for a blind second opinion as ConsultantBudget describes."},
                 "provider": {"type": "string", "enum": list(PROVIDERS), "description": "Which CLI the consultant runs on: codex, or antigravity for Google's Antigravity CLI (agy) and its models, such as gemini-4-neon. Default: codex when it is installed, otherwise antigravity. An Antigravity consultant is read-only by agy's deny rules (no file writes or edits, commands or MCP tools) and takes one message at a time. Reuse looks only among consultants of the same provider. When both are installed, pass antigravity when the user asks for it or ConsultantBudget suggests it."},
-                "effort": {"type": "string", "description": "Antigravity only: the model level for a new consultant, such as low, medium, high or xhigh. Default high."},
+                "effort": {"type": "string", "description": "Antigravity only: the model level for a new consultant, such as low, medium, high or xhigh. Default high. Refused for a Codex consultant: pass its effort with SendConsultantMessage."},
             },
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False},
@@ -9743,20 +10422,21 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "to": TO_SCHEMA,
-                "message": {"type": "string", "description": "The message to send."},
+                "message": {"type": "string", "description": "The message to send. Required, except with second_opinion_of."},
+                "second_opinion_of": {"type": "string", "description": "Instead of a message: the name of a consultant of the other provider whose review this is a blind second opinion on. nouez sends the first brief of that review as it was (and the same revision), so neither your findings nor the first consultant's reach this one; it must have had no messages yet (StartConsultant with new=true)."},
                 "from": {"type": "string", "description": "Sender label shown to the consultant, e.g. your session name. Default 'Claude Code'."},
                 "owner_words": {"type": "string", "description": "Optional: text the user typed, quoted exactly as they wrote it (never a summary). The consultant sees it in its own block, marked as the user's words, apart from your message."},
-                "revision": {"type": "boolean", "description": "Optional: add a line with the consultant's repository commit, branch and number of uncommitted paths, and ask it to name that revision in its answer. With uncommitted changes, nouez also takes their diff (tracked changes and untracked files, leaving out binary files, untracked files over 256 KB and untracked files whose path looks like a secret), saves it in its cache folder under its SHA-256 and asks the consultant to review that diff. An Antigravity consultant gets only the line, unless attach_diff is true. Default false."},
+                "revision": {"type": "boolean", "description": "Optional: add a line with the consultant's repository commit, branch and number of uncommitted paths, and ask it to name that revision in its answer. With uncommitted changes, nouez also takes their diff (tracked changes and untracked files, leaving out binary files, untracked files over 256 KB and untracked files whose path looks like a secret), saves it in its cache folder under its SHA-256 and asks the consultant to review that diff. An Antigravity consultant gets only the line, unless attach_diff is true. Use it for a review when the uncommitted work is all you will commit; otherwise put the staged diff in the message. Default false."},
                 "base": {"type": "string", "description": "With revision=true, review the working tree against the merge base of HEAD and this local branch, tag or commit id. Includes committed and uncommitted changes."},
-                "attach_diff": {"type": "boolean", "description": "Optional, Antigravity consultants with revision=true only: put the revision diff nouez takes in the message, so the consultant reviews exactly that. Its text goes to Google, deleted lines and untracked files included. Default false."},
-                "model": {"type": "string", "description": "Model id for this message and later ones: Codex, e.g. gpt-6-astra; Antigravity, e.g. gemini-4-neon. Default: unchanged. Pass the model ConsultantBudget suggests, or the one the user asked for."},
-                "effort": {"type": "string", "description": "Reasoning effort (Codex) or model level (Antigravity) for this message and later ones, such as low, medium, high or xhigh; which levels exist depends on the model. Default: unchanged. Pass the effort ConsultantBudget suggests, or the one the user asked for."},
-                "kind": {"type": "string", "enum": list(CONSULT_KINDS), "description": "Optional: what kind of consultation this is, for the user's usage log (nouez/usage-log.jsonl on this computer). Default: not recorded."},
+                "attach_diff": {"type": "boolean", "description": "Optional, Antigravity consultants only, and refused without revision=true: put the revision diff nouez takes in the message, so the consultant reviews exactly that. Its text goes to Google, deleted lines and untracked files included. Default false."},
+                "model": {"type": "string", "maxLength": 200, "description": "Model id for this message and later ones: Codex, e.g. gpt-6-astra; Antigravity, e.g. gemini-4-neon. Default: with neither model nor effort, nouez's pick for the kind (ConsultantBudget's suggestion, within this consultant's provider; for kind other, unchanged). Pass one only when the user asked for it or ConsultantBudget suggests another provider's."},
+                "effort": {"type": "string", "maxLength": 200, "description": "Reasoning effort (Codex) or model level (Antigravity) for this message and later ones, such as low, medium, high or xhigh; which levels exist depends on the model. Default: as for model. Pass one only when the user asked for it."},
+                "kind": {"type": "string", "enum": list(CONSULT_KINDS), "description": "What kind of consultation this is (other when none fits), also recorded in the user's usage log (nouez/usage-log.jsonl on this computer). Reviews, re-checks, bug hunts, plan critiques and any message with revision=true never run on a Claude model: an Antigravity consultant on one is moved to the suggested Gemini model, or refused when a Claude model is passed."},
                 "reason": {"type": "string", "description": f"Optional: one line on why this consultant, model and effort, for the same log (up to {REASON_CHARS} characters). Never the message itself."},
                 "wait": wait_schema(SEND_WAIT_SECONDS),
                 "allow_user_session": {"type": "boolean", "description": "Allow sending to a Codex session the user opened (not started by StartConsultant). Default false. Set it only when the user asked you to message that session."},
             },
-            "required": ["to", "message"],
+            "required": ["to", "kind"],
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False},
     },
@@ -9950,7 +10630,7 @@ TOOLS = [
             "Choose a consultant: call it before each consultation, with its kind. It suggests the "
             "provider for StartConsultant and the model and effort for SendConsultantMessage, from "
             "the CLIs installed, the models they list, the usage left on each subscription and "
-            "public benchmarks, and says when none has room. It also shows that usage: the Codex "
+            "public benchmarks, and says when none has room. Without a kind, or with details, it also shows that usage: the Codex "
             "subscription, Claude Code's own and Antigravity's quota groups, each window with its "
             "reset time and where the current pace lands; the Codex and Antigravity models and "
             "their effort levels; and Artificial Analysis Intelligence Index scores for OpenAI, "
@@ -9962,7 +10642,8 @@ TOOLS = [
             "properties": {
                 "kind": {"type": "string", "enum": list(CONSULT_KINDS), "description": "The kind of consultation, for one suggestion with its notes. Default: one line for each kind."},
                 "provider": {"type": "string", "enum": list(PROVIDERS), "description": "Only when the user named a provider (\"ask Codex\", \"ask Gemini\"): suggest a model and effort on that one."},
-                "refresh": {"type": "boolean", "description": "Fetch the model scores again now if the saved ones are over an hour old. Default false; pass true only when the user asks for fresh scores."},
+                "details": {"type": "boolean", "description": "With a kind, also show each subscription's usage windows, the models and the benchmark scores. Default false: with a kind, only the suggestion and its notes."},
+                "refresh": {"type": "boolean", "description": "Fetch the model scores again now if the saved ones are over an hour old, and show them. Default false; pass true only when the user asks for fresh scores."},
             },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
@@ -10062,6 +10743,10 @@ def refresh_roots():
 
 
 def client_roots():
+    if getattr(_request, "modern", False):
+        # A 2026-07-28 client isn't asked for roots, and the folder it started nouez in may hold other
+        # projects too: outside git, consultants are looked for in the folder the call names.
+        return []
     if _client_roots is None and "roots" in _client_caps:
         refresh_roots()
     return _client_roots or []
@@ -10081,7 +10766,24 @@ def handle(msg, cancel):
             respond(msg["id"], error={"code": -32603, "message": f"Internal error: {e!r}"})
 
 
+def forget_cancel(msg_id, cancel):
+    """Drop a request's cancellation once it is answered, unless a newer request reusing the id
+    has registered its own."""
+    if valid_id(msg_id):
+        with _cancel_guard:
+            if _cancel_events.get(msg_id) is cancel:
+                del _cancel_events[msg_id]
+
+
 def dispatch(msg, cancel):
+    try:
+        answer_request(msg, cancel)
+    finally:  # what this request said about itself goes with it, and so does its cancellation
+        _request.__dict__.clear()
+        forget_cancel(msg.get("id"), cancel)
+
+
+def answer_request(msg, cancel):
     method, msg_id, params = msg.get("method"), msg.get("id"), msg.get("params")
     params = {} if params is None else params
     if not isinstance(params, dict):
@@ -10092,10 +10794,64 @@ def dispatch(msg, cancel):
         if method in ("notifications/initialized", "notifications/roots/list_changed") and "roots" in _client_caps:
             refresh_roots()
         return
-    if method == "initialize":
+    meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+    # MCP 2026-07-28: each request says its version, capabilities and client in _meta, with no
+    # handshake; it gets nothing a legacy initialize set up (capabilities, roots, client). Any of the
+    # keys that version puts there makes it one: a request with some of them is refused, never run
+    # under the legacy rules.
+    modern = any(k in meta for k in MODERN_META_KEYS)
+    info = meta.get(META_CLIENT)
+    _request.modern = modern
+    _request.client = info if isinstance(info, dict) else ({} if modern else None)
+    _request.caps = meta.get(META_CAPS) if modern else None
+    _request.input_state = params.get("requestState") if modern else None
+    _request.input_responses = params.get("inputResponses") if modern else None
+    if modern:
+        version = meta.get(META_VERSION)
+        if not isinstance(version, str):
+            invalid_params(msg_id, f"params._meta must carry {META_VERSION}: a string.")
+            return
+        if version not in MODERN_VERSIONS:
+            respond(msg_id, error={"code": -32022, "message": "Unsupported protocol version", "data": {
+                "supported": list(MODERN_VERSIONS + PROTOCOL_VERSIONS), "requested": version}})
+            return
+        if not isinstance(meta.get(META_CAPS), dict):
+            invalid_params(msg_id, f"params._meta must carry {META_CAPS}: an object, {{}} for none.")
+            return
+        if method in ("initialize", "ping"):
+            respond(msg_id, error={"code": -32601, "message": f"Method not found: {method} isn't part of {version}"})
+            return
+
+    def answer(result, listing=False):
+        if modern:  # every modern result says it is complete and names the server
+            result = {"resultType": "complete", **result, **({"ttlMs": 0, "cacheScope": "private"} if listing else {}),
+                      "_meta": {META_SERVER: {"name": SERVER_NAME, "version": SERVER_VERSION}}}
+        respond(msg_id, result)
+    # server/discover is 2026-07-28's own: without its _meta it gets that version's -32602, below.
+    if not modern and method not in ("initialize", "ping", "server/discover") and not _initialized.is_set():
+        # A legacy client says who it is and what it can do in initialize first; nothing runs without that.
+        respond(msg_id, error={"code": -32600, "message": f"Send initialize first, or give each request "
+                                                          f"params._meta with {META_VERSION} and {META_CAPS}."})
+        return
+    if method == "server/discover":
+        if not modern:
+            invalid_params(msg_id, f"server/discover needs params._meta with {META_VERSION} and {META_CAPS}.")
+            return
+        answer({"supportedVersions": list(MODERN_VERSIONS + PROTOCOL_VERSIONS), "capabilities": {"tools": {}},
+                "instructions": server_instructions()}, listing=True)
+        start_release_check()
+        start_pane_cleanup()
+        login_state()
+    elif method == "initialize":
         caps = params.get("capabilities")
         _client_caps.update(caps if isinstance(caps, dict) else {})
+        info = params.get("clientInfo")
+        if isinstance(info, dict):
+            _client_info.clear()
+            _client_info.update({k: str(info[k])[:100] for k in ("name", "version") if k in info})
+            log("client:", _client_info)
         requested = params.get("protocolVersion")
+        _initialized.set()
         respond(msg_id, {
             "protocolVersion": requested if requested in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
             "capabilities": {"tools": {}},
@@ -10108,7 +10864,7 @@ def dispatch(msg, cancel):
     elif method == "ping":
         respond(msg_id, {})
     elif method == "tools/list":
-        respond(msg_id, {"tools": TOOLS})
+        answer({"tools": TOOLS}, listing=True)
     elif method == "tools/call":
         handler = HANDLERS.get(params.get("name"))
         if not handler:
@@ -10120,10 +10876,18 @@ def dispatch(msg, cancel):
             invalid_params(msg_id, "arguments must be an object.")
             return
         _on_reply.pending = pending = []
+        need = refused = None
+        if modern:  # what an approval asked in this call is bound to: the tool and every argument
+            _request.call = hashlib.sha256(json.dumps([params.get("name"), arguments], sort_keys=True,
+                                                      default=repr).encode("utf-8", "surrogatepass")).hexdigest()
         try:
             text, is_error = handler(arguments, cancel, progress_for(params, cancel)), False
         except Cancelled:
             return  # the client cancelled the request and expects no response
+        except InputRequired as e:  # only on a 2026-07-28 request: the client asks, then calls again
+            need, text, is_error = e.fields, "", False
+        except ProtocolError as e:
+            refused, text, is_error = e.error, "", True
         except BridgeError as e:
             text, is_error = str(e), True
         except Exception as e:  # keep the server alive on unexpected failures
@@ -10131,20 +10895,25 @@ def dispatch(msg, cancel):
             text, is_error = f"Unexpected error: {e!r}", True
         finally:
             _on_reply.pending = None
-            with _cancel_guard:  # once the id is gone, no cancellation can arrive for it
-                _cancel_events.pop(msg_id, None)
-        if is_error:  # the result the call meant to send, with what it kept, isn't the one sent
+            forget_cancel(msg_id, cancel)  # once the id is gone, no cancellation can arrive for it
+        if is_error or need:  # the result the call meant to send, with what it kept, isn't the one sent
             pending.clear()
-        if not is_error and params.get("name") in DISPATCHER_TOOLS and in_dispatcher():
+        if not is_error and not need and params.get("name") in DISPATCHER_TOOLS and in_dispatcher():
             notice = safe_nouez_update_notice(pending)
             text = f"{text}\n\n{notice}" if notice else text
             start_release_check(again_after=3600)  # the dispatcher's server runs for days
-        if not cancel.is_set():
-            respond(msg_id, {"content": [{"type": "text", "text": text}], "isError": is_error})
+        if refused and not cancel.is_set():
+            respond(msg_id, error=refused)
+        elif not cancel.is_set():
+            answer({"resultType": "input_required", **need} if need else
+                   {"content": [{"type": "text", "text": text}], "isError": is_error})
             for keep in pending:  # only once the response is written: a failed write raises first
                 keep()
     else:
         respond(msg_id, error={"code": -32601, "message": f"Method not found: {method}"})
+
+
+WAIT_ENDED = "The wait ended, not the consultant's turn: it may still be running, and this is no reply."
 
 
 def run_waiter(thread_id, turn_id):
@@ -10175,8 +10944,8 @@ def run_waiter(thread_id, turn_id):
                 thread = resolve(client, thread_id, exact_only=True)
                 tid, name = thread["id"], short_name(thread)
                 stall.activity = codex_activity(thread.get("path"))
-                failures = 0
                 turns = list_turns(client, tid, REPLY_LOOKBACK)
+                failures = 0  # only once the turns were read: a daemon that connects and then fails counts
                 turn = next((t for t in turns if t.get("id") == turn_id), None)
                 if not turn:
                     print(f"{name} has no turn {turn_id} among its {REPLY_LOOKBACK} most recent turns.")
@@ -10196,8 +10965,8 @@ def run_waiter(thread_id, turn_id):
             dropped = True
             left = deadline - time.monotonic()
             if failures > WAITER_RETRIES or left <= 0:
-                print(f"Stopped waiting for turn {turn_id}: {e} Read the reply with GetConsultantReply "
-                      f"(to {thread_id}, turn_id {turn_id}).")
+                print(f"Stopped waiting for turn {turn_id}: {e} {WAIT_ENDED} Read it later with "
+                      f"GetConsultantReply (to {thread_id}, turn_id {turn_id}).")
                 return 1
             time.sleep(min(10, left))
             continue
@@ -11605,6 +12374,25 @@ def add_missing_dispatcher_rules_locked(folder, out):
     return missing
 
 
+def dispatcher_md_note(folder):
+    """A note when the dispatcher folder's CLAUDE.md isn't the one this nouez writes: an older
+    nouez's, or edited. None when it is, or when it can't be read."""
+    path = os.path.join(folder, "CLAUDE.md")
+    try:
+        if not regular_file(path):
+            return None
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if text == DISPATCHER_CLAUDE_MD.replace("{projects}", os.path.dirname(folder)):  # read with any line ends
+        return None
+    return (f"{path} isn't the one this nouez writes: it may be from an older nouez, or edited. It is kept "
+            "as it is. For the current one, rename it (to CLAUDE.md.old, say), run `server.py dispatcher "
+            "setup` again, copy back any lines of your own, and run `dispatcher install` again to restart "
+            "the dispatcher.")
+
+
 def dispatcher_setup(folder, dry_run=False, out=print):
     """`server.py dispatcher setup`: make the dispatcher folder, its CLAUDE.md (only if it has none)
     and the allow rules for nouez's session tools in its .claude/settings.json (only those, the
@@ -11647,7 +12435,7 @@ def dispatcher_setup(folder, dry_run=False, out=print):
             if not dry_run:
                 os.mkdir(folder)
         if os.path.lexists(claude_md):
-            out(f"{claude_md} is already there; it is kept as it is.")
+            out(dispatcher_md_note(folder) or f"{claude_md} is already there; it is kept as it is.")
         else:
             out(f"{act} write {claude_md}: the dispatcher's instructions (projects in {projects}).")
             if not dry_run:
@@ -12631,6 +13419,9 @@ def dispatcher_report(say):
         return
     say(True if ready else None, f"dispatcher folder {folder}" + ("" if ready else ": it has no CLAUDE.md; run "
                                                                        "`server.py dispatcher setup`"))
+    note = ready and dispatcher_md_note(folder)
+    if note:
+        say(None, note)
     try:
         with SettingsFolder(folder) as settings:
             allow = (read_settings_for_edit(settings)[0].get("permissions") or {}).get("allow") or []
@@ -12717,6 +13508,53 @@ def run_dispatcher(argv):
     return dispatcher_status_text()
 
 
+USAGE_SETUP_DAYS = 7  # doctor: a status line that saved nothing for this long isn't passing the usage on
+
+
+def usage_command(sub):
+    """The command for Claude Code's settings that runs `server.py <sub>` with this Python."""
+    # Quoted only when needed: a hook may run in PowerShell, which prints a quoted first word instead
+    # of running it, as well as in a POSIX shell.
+    # So the Python is named bare when PATH finds this one under that name: "C:/Program Files/..."
+    # needs quotes.
+    paths = [os.path.abspath(p).replace("\\", "/") for p in (sys.executable, __file__)]
+    for name in ("python3", "python"):
+        found = shutil.which(name)
+        try:
+            if found and os.path.samefile(found, sys.executable):
+                paths[0] = name
+                break
+        except OSError:
+            pass
+    return " ".join(f'"{p}"' if re.search(r"[\s'\"&;|<>()$`]", p) else p for p in paths) + f" {sub}"
+
+
+def usage_setup_report(settings):
+    """doctor's lines on what passes Claude Code's usage to nouez (the status line) and what acts on
+    it before Claude starts work (the UserPromptSubmit hook), with the settings to add for each."""
+    saved = read_json_file(os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE))
+    saved = number(saved.get("saved")) if isinstance(saved, dict) else None
+    fresh = saved is not None and time.time() - saved < USAGE_SETUP_DAYS * 86400
+    lines = [(True, f"a status line passes Claude Code's usage to nouez (saved {span_text(time.time() - saved)} "
+                    "ago)") if fresh else
+             (None, f"no status line has passed Claude Code's usage to nouez in {USAGE_SETUP_DAYS} days, so its "
+                    "pace isn't known. Add to the "
+                    "settings (or pass the input on from your own script, docs/consultants.md):\n    "
+                    + json.dumps({"statusLine": {"type": "command", "command": usage_command("statusline")}}))]
+    hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
+    groups = hooks.get("UserPromptSubmit") if isinstance(hooks.get("UserPromptSubmit"), list) else []
+    commands = [h.get("command") for group in groups if isinstance(group, dict)
+                for h in group.get("hooks") or [] if isinstance(h, dict)]
+    hooked = any(isinstance(c, str) and "server.py" in c and c.rstrip().rstrip('"').endswith("hook")
+                 for c in commands)
+    lines.append((True, "the prompt hook says when to hand work out while Claude Code is busy") if hooked else
+                 (None, "no prompt hook says when to hand work out while Claude Code is busy. Add to the "
+                        "settings' hooks (beside any others):\n    " + json.dumps(
+                            {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": usage_command("hook"),
+                                                              "timeout": 5}]}]})))
+    return lines
+
+
 def run_doctor():
     """`server.py doctor`: check what nouez needs and say what to fix. Reads only; connecting may
     start the Codex daemon, as any consultation would, and asking agy for its quota runs no model
@@ -12745,12 +13583,13 @@ def run_doctor():
     settings = os.path.join(claude_config_dir(), "settings.json")
     try:
         with open(settings, encoding="utf-8-sig") as f:
-            allow = ((json.load(f) or {}).get("permissions") or {}).get("allow") or []
+            data = json.load(f) or {}
+        allow = (data.get("permissions") or {}).get("allow") or []
     except FileNotFoundError:
-        allow = []
+        data, allow = {}, []
         print(f"    (there is no {settings} yet: create it with the rules below)")
     except (OSError, ValueError, AttributeError) as e:
-        allow = None
+        data, allow = None, None
         say(None, f"couldn't read {settings} ({e}), so the waiter's allow rules weren't checked; "
                   "`server.py allow-rule` prints them.")
     if allow is not None and not allow_rules():
@@ -12763,6 +13602,9 @@ def run_doctor():
                       "permissions.allow:\n    " + ",\n    ".join(json.dumps(r) for r in missing))
         else:
             say(True, f"{settings} allows the waiter command without asking")
+    if isinstance(data, dict):
+        for ok, text in usage_setup_report(data):
+            say(ok, text)
     if os.name == "nt":
         wt = which("wt")
         say(True if wt else None, "Windows Terminal is installed: Claude Code sessions and the status screen "
@@ -12942,6 +13784,9 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["statusline"]:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.exit(run_statusline(sys.argv[2:]))
+    if sys.argv[1:] == ["hook"]:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.exit(run_hook(sys.argv[2:]))
     if sys.argv[1:] == ["allow-rule"]:
         if not allow_rules():
             print(NO_ALLOW_RULE)

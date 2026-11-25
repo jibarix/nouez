@@ -683,6 +683,35 @@ def check_links():
     report(not bad, "every link between the Markdown files leads somewhere", "; ".join(bad))
 
 
+# Variables nouez sets for its own processes, not settings a user changes.
+INTERNAL_VARIABLES = {"NOUEZ_DISPATCHER", "NOUEZ_STATUS_SCREEN"}
+
+
+def rules_problems(server, rules, tests):
+    """What docs/rules.md misses or names wrongly: a NOUEZ_* setting server.py reads that the page
+    doesn't name, and a test the page names (in backticks, in its Test column) that tests/test_protocol.py
+    doesn't define."""
+    bad = []
+    for name in sorted(set(re.findall(r"""["'](NOUEZ_[A-Z0-9_]+)["']""", server)) - INTERNAL_VARIABLES):
+        if name not in rules:
+            bad.append(f"{name} (a setting server.py reads) is not on docs/rules.md")
+    defined = set(re.findall(r"^\s+def test_(\w+)\(", tests, re.M))
+    for line in rules.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 4 or not line.lstrip().startswith("|"):
+            continue
+        for name in re.findall(r"`([a-z0-9_]+)`", cells[-1]):
+            if name not in defined:
+                bad.append(f"docs/rules.md names the test {name}, which tests/test_protocol.py doesn't define")
+    return bad
+
+
+def check_rules():
+    """docs/rules.md lists every setting and only tests that exist, checked on every run."""
+    bad = rules_problems(read("server.py"), read("docs/rules.md"), read("tests/test_protocol.py"))
+    report(not bad, "docs/rules.md names every setting, and only tests that exist", "; ".join(bad))
+
+
 def static():
     files = changed_files()
     print(f"{len(files)} changed file(s){' in ' + RANGE if RANGE else ''}: {', '.join(files) or 'none'}")
@@ -692,6 +721,7 @@ def static():
     check_versions(files)
     check_boundaries()
     check_links()
+    check_rules()
 
 
 # ---------------------------------------------------------------- live checks
@@ -791,7 +821,7 @@ def check_consultant(client):
         if not report(not err and bool(thread) and (codex or "so this is an Antigravity consultant" in text),
                       f"StartConsultant starts a new {provider} consultant", "" if thread else short(text)):
             return
-        text, err = client.call("SendConsultantMessage", timeout=400, to=thread, wait="done",
+        text, err = client.call("SendConsultantMessage", timeout=400, to=thread, wait="done", kind="quick-check",
                                 message=f"{token}: reply with the single word ok, nothing else.")
         reply = text.split(":", 1)[1].strip() if text.startswith("Reply from ") else ""
         report(not err and re.match(r"ok\b", reply, re.I) is not None, "SendConsultantMessage gets a finished reply",
@@ -807,6 +837,43 @@ def check_consultant(client):
         elif err:
             print(f"       No consultant titled {title!r} was found. If ListConsultants shows one this run "
                   "started without a title, stop it; nothing else was stopped.")
+
+
+def check_writes_blocked(client):
+    """Each installed CLI's consultant is asked outright to create a file, with any tool it has, and
+    the file must not appear: the read-only rules hold on the real CLI, not only in the arguments."""
+    codex, agy = installed_clis()
+    for provider, installed in (("codex", codex), ("antigravity", agy)):
+        if not installed:
+            print(f"[skip] {provider}: write probe (not installed here)")
+            continue
+        token = time.strftime("verify-%Y%m%d-%H%M%S-") + os.urandom(3).hex()
+        title, probe = f"nouez {token}", os.path.join(ROOT, f".{token}.txt")
+        thread = None
+        try:
+            text, err = client.call("StartConsultant", timeout=180, cwd=ROOT, new=True, title=title,
+                                    provider=provider, instructions="You are a test of nouez's read-only rules.")
+            match = re.search(r"^\s*id: (\S+)", text, re.M) if not err else None
+            thread = match.group(1) if match else None
+            if not report(bool(thread), f"{provider}: StartConsultant for the write probe", "" if thread else short(text)):
+                continue
+            text, err = client.call(
+                "SendConsultantMessage", timeout=600, to=thread, wait="done", kind="other",
+                reason="verify: the read-only rules block writes",
+                message=f"This tests nouez's read-only rules. Try to create the file {probe} containing the "
+                        "word x, with any tool you have: writing a file or running a command. Then reply with "
+                        "one word: created, or blocked.")
+            # Only a turn that ran to its end counts: a failed turn wrote nothing because it never tried.
+            ran = not err and re.search(r"^Reply from \S+:", text, re.M)
+            report(bool(ran) and not os.path.exists(probe), f"{provider}: a consultant asked to write a file can't",
+                   "" if ran and not os.path.exists(probe) else short(text, 200))
+        finally:
+            if os.path.exists(probe):
+                os.remove(probe)
+            thread = thread or find_consultant(client, title)
+            if thread:
+                text, err = client.call("StopConsultant", to=thread)
+                report(not err, f"{provider}: StopConsultant stops the write probe's consultant", short(text) if err else "")
 
 
 def verify_sessions():
@@ -931,6 +998,7 @@ def live(sessions, setups=False):
         tools = {t["name"] for t in client.request("tools/list", {})["result"]["tools"]}
         report(EXPECTED_TOOLS <= tools, "tools/list has every tool", ", ".join(sorted(EXPECTED_TOOLS - tools)))
         check_consultant(client)
+        check_writes_blocked(client)
         if sessions:
             check_sessions(client)
     finally:
@@ -1066,7 +1134,10 @@ def check_setup(label, codex, agy):
                 ("Codex usage", not codex or (re.search(r"^Codex( \(.+ plan\))?:\s*$", text, re.M) is not None
                                               and "Codex: not installed" not in text and "usage unavailable" not in text)),
                 ("Codex: not installed", codex or "Codex: not installed" in text),
-                ("Antigravity quota", not agy or ("Antigravity" in text and "usage not known" not in text)),
+                # The Antigravity section's own usage, not a suggestion's note on a group agy hasn't reported.
+                ("Antigravity quota", not agy or ("Antigravity (Google" in text
+                                                  and "Antigravity: usage not known" not in text
+                                                  and "no current quota window reported" not in text)),
             ) if not ok]
             report(not err and not quota, f"{label}: ConsultantBudget shows each installed CLI's usage",
                    ("missing: " + ", ".join(quota) + ". " if quota else "") + (short(text, 300) if err or quota else ""))

@@ -35,6 +35,10 @@ def setUpModule():
     real = server.codex_installed
     server.codex_installed = lambda: True
     unittest.addModuleCleanup(setattr, server, "codex_installed", real)
+    # Tests that send a legacy request through dispatch take the handshake as done, as a client's
+    # would be; the test of requests before it uses an Event of its own.
+    server._initialized.set()
+    unittest.addModuleCleanup(server._initialized.clear)
 
 # Tests never write to the user's usage log; the log's own tests turn it back on for a temp file.
 os.environ["NOUEZ_NO_USAGE_LOG"] = "1"
@@ -143,6 +147,12 @@ class ProtocolTest(unittest.TestCase):
     def assert_alive(self):
         self.assertEqual(self.server.request("alive", "ping"), {"jsonrpc": "2.0", "id": "alive", "result": {}})
 
+    def handshake(self):
+        """A legacy client's initialize, which every request but ping needs before it (Codex round 2)."""
+        reply = self.server.request("init", "initialize", {"protocolVersion": server.PROTOCOL_VERSIONS[0],
+                                                           "capabilities": {}})
+        self.assertIn("result", reply)
+
     def test_negotiates_supported_version(self):
         for requested in server.PROTOCOL_VERSIONS:
             reply = self.server.request(1, "initialize", {"protocolVersion": requested, "capabilities": {}})
@@ -153,7 +163,208 @@ class ProtocolTest(unittest.TestCase):
         text = reply["result"]["instructions"]
         self.assertIn("call ConsultantBudget with its kind", text)
         self.assertIn("unless the user named others or the user's own instructions route otherwise", text)
-        self.assertIn("pass the suggested values with each message", text)
+        self.assertIn("which applies the suggested model and effort", text)
+        self.assertIn("never take a 'still working' result for one", text)
+        self.assertLess(len(text), 1500)  # the moments to consult and what to call; the rest is in the tools
+
+    def test_only_claude_code_is_offered_the_background_waiter(self):
+        # A client that says it is another program reads replies with GetConsultantReply; Claude Code,
+        # and a client that doesn't say, get the waiter command. The client is recorded in the usage log.
+        self.addCleanup(server._client_info.clear)
+        for name, waiter in (("claude-code", True), ("Claude-Code", True), (None, True), ("other-host", False)):
+            with self.subTest(name=name):
+                server._client_info.clear()
+                if name:
+                    server._client_info["name"] = name
+                text = server.read_later("thread-1", "turn-1")
+                self.assertEqual(" wait thread-1 turn-1" in text, waiter)
+                self.assertIn("GetConsultantReply (turn_id turn-1)", text)
+        # Codex finding 9: GetConsultantReply on a turn still running gives the same advice.
+        turn = {"id": "turn-1", "status": "inProgress", "items": [agent("so far", "commentary")]}
+        for name, waiter in (("claude-code", True), ("other-host", False)):
+            with self.subTest(polling=name):
+                server._client_info.clear()
+                server._client_info["name"] = name
+                text = server.still_working_reply("c", "thread-1", turn)
+                self.assertEqual(" wait thread-1 turn-1" in text, waiter)
+                self.assertIn("heck again later with turn_id turn-1", text)
+        # A request's own _meta clientInfo wins over the handshake's.
+        server._client_info.clear()
+        server._client_info.update(name="claude-code")
+        server._request.client = {"name": "other-host"}
+        self.addCleanup(setattr, server._request, "client", None)
+        self.assertFalse(server.background_waiter())
+        log = os.path.join(tempfile.mkdtemp(), "usage-log.jsonl")
+        self.addCleanup(shutil.rmtree, os.path.dirname(log))
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": ""}):
+            server.record_usage({"event": "send"}, path=log)
+        with open(log, encoding="utf-8") as f:
+            self.assertEqual(json.loads(f.readline())["client"], "other-host")
+
+    def test_initialize_records_the_client(self):
+        self.addCleanup(server._client_info.clear)
+        sent = []
+        with mock.patch.object(server, "respond", lambda i, result=None, error=None: sent.append(result)), \
+                mock.patch.object(server, "start_release_check", lambda *a, **k: None), \
+                mock.patch.object(server, "start_pane_cleanup", lambda: None), \
+                mock.patch.object(server, "login_state", lambda *a, **k: None):
+            server.dispatch({"id": 1, "method": "initialize", "params": {
+                "protocolVersion": server.PROTOCOL_VERSIONS[0], "capabilities": {},
+                "clientInfo": {"name": "other-host", "version": "1.0", "extra": "x"}}}, threading.Event())
+        self.assertEqual(server._client_info, {"name": "other-host", "version": "1.0"})
+        self.assertFalse(server.background_waiter())
+        self.assertIn("never take a 'still working' result", sent[0]["instructions"])
+
+    def test_mcp_2026_07_28_requests_alongside_the_handshake(self):
+        # A request with the 2026-07-28 _meta is handled on its own: discovery, results marked
+        # complete with the server named, no legacy capabilities, roots or client inherited.
+        self.addCleanup(server._client_info.clear)
+        self.addCleanup(server._client_caps.clear)
+        sent = []
+        modern = {server.META_VERSION: "2026-07-28", server.META_CAPS: {}}
+
+        def call(method, params=None, msg_id=1):
+            sent.clear()
+            server.dispatch({"id": msg_id, "method": method, "params": params or {}}, threading.Event())
+            return sent[-1]
+        with mock.patch.object(server, "respond", lambda i, result=None, error=None: sent.append((result, error))), \
+                mock.patch.object(server, "start_release_check", lambda *a, **k: None), \
+                mock.patch.object(server, "start_pane_cleanup", lambda: None), \
+                mock.patch.object(server, "login_state", lambda *a, **k: None):
+            server._client_caps.update({"roots": {}, "elicitation": {}})
+            server._client_info.update({"name": "claude-code"})
+            result, error = call("server/discover", {"_meta": modern})
+            self.assertIsNone(error)
+            self.assertEqual(result["resultType"], "complete")
+            self.assertEqual(result["supportedVersions"][0], "2026-07-28")
+            self.assertIn("2025-11-25", result["supportedVersions"])
+            self.assertEqual((result["ttlMs"], result["cacheScope"]), (0, "private"))
+            self.assertEqual(result["_meta"][server.META_SERVER]["name"], "nouez")
+            self.assertIn("Consult whenever the user asks", result["instructions"])
+            result, error = call("tools/list", {"_meta": modern})
+            self.assertEqual((result["resultType"], result["ttlMs"]), ("complete", 0))
+            self.assertEqual(result["tools"], server.TOOLS)
+            # The legacy path is unchanged: no resultType, and initialize never offers 2026-07-28.
+            self.assertNotIn("resultType", call("tools/list")[0])
+            self.assertEqual(call("initialize", {"protocolVersion": "2026-07-28"})[0]["protocolVersion"],
+                             server.PROTOCOL_VERSIONS[0])
+            # Errors: an unsupported version, missing capabilities, discovery without _meta, gone methods.
+            result, error = call("tools/list", {"_meta": {server.META_VERSION: "2099-01-01", server.META_CAPS: {}}})
+            self.assertEqual(error["code"], -32022)
+            self.assertEqual(error["data"]["requested"], "2099-01-01")
+            self.assertIn("2026-07-28", error["data"]["supported"])
+            self.assertEqual(call("tools/list", {"_meta": {server.META_VERSION: "2026-07-28"}})[1]["code"], -32602)
+            # Any of its keys makes a request a 2026-07-28 one: with the version missing or not a
+            # string it is refused, never run under the legacy rules.
+            for meta in ({server.META_CAPS: {}}, {server.META_CLIENT: {"name": "x"}},
+                         {server.META_VERSION: 20260728, server.META_CAPS: {}}):
+                with self.subTest(meta=meta):
+                    self.assertEqual(call("tools/list", {"_meta": meta})[1]["code"], -32602)
+            registered = server._cancel_events["refused-1"] = threading.Event()  # as route registers a tools/call
+            server.dispatch({"id": "refused-1", "method": "tools/call", "params": {
+                "name": "Probe", "_meta": {server.META_CAPS: {}}}}, registered)
+            self.assertEqual(sent[-1][1]["code"], -32602)
+            self.assertNotIn("refused-1", server._cancel_events)  # released though no tool ran
+            self.assertEqual(call("server/discover")[1]["code"], -32602)
+            for gone in ("ping", "initialize"):
+                self.assertEqual(call(gone, {"_meta": modern})[1]["code"], -32601)
+            # A tools/call: complete, and nothing inherited from the handshake.
+            seen = {}
+
+            def probe(args, cancel, progress):
+                seen.update(client=server.client_info(), caps=server.client_caps(), roots=server.client_roots(),
+                            waiter=server.background_waiter())
+                return "done"
+            with mock.patch.dict(server.HANDLERS, {"Probe": probe}), \
+                    mock.patch.object(server, "refresh_roots", lambda: self.fail("no roots/list")):
+                result, error = call("tools/call", {"name": "Probe", "_meta": dict(
+                    modern, **{server.META_CLIENT: {"name": "other-host", "version": "2"}})})
+                self.assertEqual(result["resultType"], "complete")
+                self.assertEqual(result["content"][0]["text"], "done")
+                # Never the handshake's roots, nor the folder it started nouez in, which may hold
+                # other projects (Codex round 2, finding 6).
+                self.assertEqual(seen, {"client": {"name": "other-host", "version": "2"}, "caps": {},
+                                        "roots": [], "waiter": False})
+                call("tools/call", {"name": "Probe", "_meta": modern})
+                self.assertEqual(seen["client"], {})  # not the handshake's claude-code
+                self.assertTrue(seen["waiter"])  # a client that doesn't say who it is
+            # An approval: the prompt goes back as input_required, and only the retry that echoes its
+            # requestState, once, for the same question, is taken as the answer.
+            def ask(args, cancel, progress):
+                server.user_approves(args.get("q", "Send it?"), "NOUEZ_ASK_USER_SESSION", cancel)
+                return "approved"
+            asking = dict(modern, **{server.META_CAPS: {"elicitation": {}}})
+            with mock.patch.dict(server.HANDLERS, {"Ask": ask}), \
+                    mock.patch.object(server, "client_request", lambda *a, **k: self.fail("no server requests")):
+                # A client that can't show a form (no elicitation in its own _meta, or URL mode only)
+                # gets the capability error, not a prompt it can't show.
+                for caps in ({}, {"elicitation": {"url": {}}}, {"elicitation": None}):
+                    with self.subTest(caps=caps):
+                        result, error = call("tools/call", {"name": "Ask", "_meta": dict(modern, **{
+                            server.META_CAPS: caps})})
+                        self.assertIsNone(result)
+                        self.assertEqual(error["code"], -32021)
+                        self.assertEqual(error["data"]["requiredCapabilities"], {"elicitation": {"form": {}}})
+                result, _ = call("tools/call", {"name": "Ask", "_meta": dict(modern, **{
+                    server.META_CAPS: {"elicitation": {"form": {}}}})})
+                self.assertEqual(result["resultType"], "input_required")
+                result, _ = call("tools/call", {"name": "Ask", "_meta": asking})
+                self.assertEqual(result["resultType"], "input_required")
+                prompt = result["inputRequests"][server.ASK_KEY]
+                self.assertEqual((prompt["method"], prompt["params"]["message"]), ("elicitation/create", "Send it?"))
+                state = result["requestState"]
+                yes = {server.ASK_KEY: {"action": "accept", "content": {}}}
+                # A made-up state, the right one for another question, or for the same question in a
+                # call with any other argument (one the prompt doesn't show), gets a new prompt, not a yes.
+                for retry in ({"requestState": "made-up", "inputResponses": yes},
+                              {"requestState": state, "inputResponses": yes, "arguments": {"extra": "x"}},
+                              {"requestState": state, "inputResponses": yes, "arguments": {"q": "Other?"}}):
+                    result, _ = call("tools/call", {"name": "Ask", "_meta": asking, **retry})
+                    self.assertEqual(result["resultType"], "input_required")
+                state = result["requestState"]
+                result, _ = call("tools/call", {"name": "Ask", "_meta": asking, "arguments": {"q": "Other?"},
+                                                "requestState": state, "inputResponses": yes})
+                self.assertEqual((result["resultType"], result["content"][0]["text"]), ("complete", "approved"))
+                result, _ = call("tools/call", {"name": "Ask", "_meta": asking, "arguments": {"q": "Other?"},
+                                                "requestState": state, "inputResponses": yes})
+                self.assertEqual(result["resultType"], "input_required")  # each answer is taken once
+                result, _ = call("tools/call", {"name": "Ask", "_meta": asking, "requestState": result["requestState"],
+                                                "arguments": {"q": "Other?"}, "inputResponses": {
+                                                    server.ASK_KEY: {"action": "decline"}}})
+                self.assertTrue(result["isError"])
+                self.assertIn("declined", result["content"][0]["text"])
+
+    def test_mcp_2026_07_28_over_stdio(self):
+        # Neon N5: the whole exchange through server.py's own stdin and stdout, with no handshake:
+        # discovery, the tools, an approval asked as input_required and declined, the capability error.
+        plain = tempfile.mkdtemp(prefix="nouez-test-stdio-")
+        self.addCleanup(shutil.rmtree, plain, True)
+        new = os.path.join(plain, "fresh")
+        proc = Server(env={**os.environ, "NOUEZ_NO_UPDATE_CHECK": "1", "NOUEZ_ASK_TRUST": "1"})
+        self.addCleanup(proc.close)
+        meta = {server.META_VERSION: "2026-07-28", server.META_CLIENT: {"name": "claude-code", "version": "2"},
+                server.META_CAPS: {"elicitation": {"form": {}, "url": {}}}}
+        result = proc.request("d", "server/discover", {"_meta": meta})["result"]
+        self.assertEqual((result["resultType"], result["supportedVersions"][0]), ("complete", "2026-07-28"))
+        result = proc.request("l", "tools/list", {"_meta": meta})["result"]
+        self.assertIn("OpenClaudeSession", [t["name"] for t in result["tools"]])
+        call = {"name": "OpenClaudeSession", "arguments": {"cwd": new, "create": True, "trust": True}, "_meta": meta}
+        asked = proc.request("c1", "tools/call", call)["result"]
+        self.assertEqual(asked["resultType"], "input_required")
+        prompt = asked["inputRequests"][server.ASK_KEY]
+        self.assertEqual(prompt["params"]["mode"], "form")
+        self.assertEqual(prompt["params"]["requestedSchema"], {"type": "object", "properties": {}})
+        self.assertFalse(os.path.exists(new))
+        reply = proc.request("c2", "tools/call", {**call, "requestState": asked["requestState"],
+                                                   "inputResponses": {server.ASK_KEY: {"action": "decline"}}})
+        self.assertTrue(reply["result"]["isError"])
+        self.assertIn("declined", reply["result"]["content"][0]["text"])
+        self.assertFalse(os.path.exists(new))
+        no_form = {**meta, server.META_CAPS: {"elicitation": {"url": {}}}}
+        error = proc.request("c3", "tools/call", {**call, "_meta": no_form})["error"]
+        self.assertEqual((error["code"], error["data"]), (-32021, {"requiredCapabilities": {"elicitation": {"form": {}}}}))
+        self.assertFalse(os.path.exists(new))
+        self.assertEqual(proc.request("p", "ping", {"_meta": meta})["error"]["code"], -32601)
 
     def test_instructions_consult_unasked_only_with_a_consultant_cli(self):
         # A clone with no CLAUDE.md or skill still gets reviews, bug hunts and critiques unasked;
@@ -161,7 +372,10 @@ class ProtocolTest(unittest.TestCase):
         for codex, agy, off, auto in ((True, None, "", True), (False, "agy", "", True), (False, None, "", False),
                                       (True, "agy", "1", False), (True, None, "0", True)):
             env = {"NOUEZ_NO_AUTO_CONSULT": off}  # set every time, so the caller's own value can't leak in
-            with self.subTest(codex=codex, agy=agy, env=env),                     mock.patch.object(server, "codex_installed", lambda: codex),                     mock.patch.object(server, "agy_command", lambda env=None: agy),                     mock.patch.dict(os.environ, env):
+            with self.subTest(codex=codex, agy=agy, env=env), \
+                    mock.patch.object(server, "codex_installed", lambda: codex), \
+                    mock.patch.object(server, "agy_command", lambda env=None: agy), \
+                    mock.patch.dict(os.environ, env):
                 text = server.server_instructions()
                 self.assertEqual(server.AUTO_CONSULT in text, auto)
                 self.assertTrue(text.startswith(server.INSTRUCTIONS_HEAD))
@@ -221,23 +435,28 @@ class ProtocolTest(unittest.TestCase):
         self.assert_alive()
 
     def test_non_object_arguments_get_invalid_params(self):
+        self.handshake()
         reply = self.server.request(3, "tools/call", {"name": "ListConsultants", "arguments": ["x"]})
         self.assertEqual(reply["error"]["code"], -32602)
 
     def test_unknown_tool(self):
+        self.handshake()
         reply = self.server.request(4, "tools/call", {"name": "Nope", "arguments": {}})
         self.assertEqual(reply["error"]["code"], -32602)
 
     def test_unknown_method(self):
+        self.handshake()
         self.assertEqual(self.server.request(5, "nope/nope")["error"]["code"], -32601)
 
     def test_negative_wait_is_a_tool_error(self):
+        self.handshake()
         reply = self.server.request(6, "tools/call", {"name": "SendConsultantMessage", "arguments": {
             "to": "x", "message": "hi", "wait": -5}})
         self.assertTrue(reply["result"]["isError"])
         self.assertIn("0 or more", reply["result"]["content"][0]["text"])
 
     def test_wait_schema_takes_seconds_or_done(self):
+        self.handshake()
         tools = {t["name"]: t for t in self.server.request(11, "tools/list")["result"]["tools"]}
         for name in ("SendConsultantMessage", "GetConsultantReply"):
             props = tools[name]["inputSchema"]["properties"]
@@ -245,12 +464,14 @@ class ProtocolTest(unittest.TestCase):
             self.assertFalse({"until_done", "timeout_seconds"} & set(props))
 
     def test_tools_list_schemas_are_objects(self):
+        self.handshake()
         tools = self.server.request(7, "tools/list")["result"]["tools"]
         self.assertEqual({t["name"] for t in tools}, set(server.HANDLERS))
         for tool in tools:
             self.assertEqual(tool["inputSchema"]["type"], "object")
 
     def test_annotations(self):
+        self.handshake()
         tools = {t["name"]: t["annotations"] for t in self.server.request(8, "tools/list")["result"]["tools"]}
         read_only = {name for name, a in tools.items() if a.get("readOnlyHint")}
         self.assertEqual(read_only, {"ListConsultants", "GetConsultantReply", "GetConsultantHistory", "ListClaudeSessions",
@@ -266,6 +487,7 @@ class ProtocolTest(unittest.TestCase):
         self.assert_alive()
 
     def test_empty_array_params_are_invalid(self):
+        self.handshake()
         self.assertEqual(self.server.request(9, "ping", [])["error"]["code"], -32602)
         reply = self.server.request(10, "tools/call", {"name": "ListConsultants", "arguments": []})
         self.assertEqual(reply["error"]["code"], -32602)
@@ -862,7 +1084,8 @@ class NouezUpdateTest(unittest.TestCase):
             threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
             base = f"http://127.0.0.1:{first.server_address[1]}"
-            with mock.patch.object(server, "RELEASES_URL", base + "/away"),                  mock.patch.object(server, "AA_MODELS_URL", base + "/here"):
+            with mock.patch.object(server, "RELEASES_URL", base + "/away"), \
+                 mock.patch.object(server, "AA_MODELS_URL", base + "/here"):
                 with self.assertRaises(urllib.error.HTTPError):
                     server.fetch_json(base + "/away", {"x-api-key": "k-secret"}, 5, 1000)
                 self.assertEqual(got, [])  # the other server never heard from nouez
@@ -1455,7 +1678,7 @@ class HandlerTest(unittest.TestCase):
         with mock.patch.object(server, "resolve", lambda client, to, **kw: dict(c)), \
                 mock.patch.object(server, "read_thread", lambda client, tid: None):
             for call in (lambda: server.stop_consultant({"to": c["id"]}),
-                         lambda: server.send_consultant_message({"to": c["id"], "message": "hi"})):
+                         lambda: server.send_consultant_message({"kind": "other", "to": c["id"], "message": "hi"})):
                 with self.assertRaisesRegex(server.BridgeError, "Couldn't read .* again"):
                     call()
         self.assertFalse({"turn/interrupt", "thread/archive", "turn/start", "turn/steer"} & set(daemon.calls))
@@ -1471,7 +1694,7 @@ class HandlerTest(unittest.TestCase):
         daemon.threads[c["id"]]["path"] = "/home/u/.codex/archived_sessions/rollout.jsonl"
         with mock.patch.object(server, "resolve", lambda client, to, **kw: dict(c)), \
                 self.assertRaisesRegex(server.BridgeError, "was stopped"):
-            server.send_consultant_message({"to": c["id"], "message": "hi"})
+            server.send_consultant_message({"kind": "other", "to": c["id"], "message": "hi"})
         self.assertNotIn("turn/start", daemon.calls)
 
     def test_start_never_reuses_a_user_session(self):
@@ -1521,7 +1744,7 @@ class HandlerTest(unittest.TestCase):
     def test_send_timeout_shows_output_so_far(self):
         thread = self.consultant("idle01")
         self.use(FakeDaemon([thread]))
-        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0.01})
+        out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "wait": 0.01})
         self.assertIn("still working on turn turn-new; this is not a reply", out)
         self.assertIn("Don't send the message again", out)
         self.assertIn("Don't wait for the reply", out)
@@ -1531,7 +1754,7 @@ class HandlerTest(unittest.TestCase):
     def test_wait_zero_returns_after_delivery(self):
         thread = self.consultant("idle02")
         daemon = self.use(FakeDaemon([thread]))
-        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0})
+        out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "wait": 0})
         self.assertTrue(out.startswith("Delivered to "))
         self.assertIn("Don't wait for the reply", out)
         self.assertIn("GetConsultantReply (turn_id turn-new)", out)
@@ -1541,7 +1764,7 @@ class HandlerTest(unittest.TestCase):
         thread = self.consultant("tune01")
         daemon = self.use(FakeDaemon([thread]))
         out = server.send_consultant_message(
-            {"to": thread["id"], "message": "hi", "wait": 0, "model": "gpt-6-astra", "effort": "xhigh"})
+            {"kind": "other", "to": thread["id"], "message": "hi", "wait": 0, "model": "gpt-6-astra", "effort": "xhigh"})
         self.assertEqual(daemon.started["model"], "gpt-6-astra")
         self.assertEqual(daemon.started["effort"], "xhigh")
         self.assertIn("on model gpt-6-astra, effort xhigh", out)
@@ -1552,7 +1775,7 @@ class HandlerTest(unittest.TestCase):
     def test_a_quick_reply_still_says_the_setting_changed(self):
         thread = self.consultant("tune05")
         self.use(FakeDaemon([thread], answer="the answer"))
-        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "effort": "xhigh"})
+        out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "effort": "xhigh"})
         self.assertIn("the answer", out)
         self.assertIn("now runs on effort xhigh until changed", out)
 
@@ -1560,23 +1783,50 @@ class HandlerTest(unittest.TestCase):
         thread = self.consultant("tune06")
         for model in ("gpt-oss:20b", "org/model-1", "gpt-6-astra"):
             daemon = self.use(FakeDaemon([thread]))
-            server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0, "model": model})
+            server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "wait": 0, "model": model})
             self.assertEqual(daemon.started["model"], model)
 
     def test_without_model_or_effort_the_turn_keeps_its_settings(self):
         thread = self.consultant("tune02")
         daemon = self.use(FakeDaemon([thread]))
-        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0, "effort": ""})
+        out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "wait": 0, "effort": ""})
         self.assertNotIn("model", daemon.started)
         self.assertNotIn("effort", daemon.started)
         self.assertNotIn("until changed", out)
+
+    def test_a_send_without_model_or_effort_takes_nouezs_pick(self):
+        """0.26.0: nouez applies the kind's suggestion itself; a named model or effort wins, a user's
+        own session is never routed, and a busy consultant is steered without it."""
+        pick = {"provider": "codex", "model": "gpt-6.2-astra", "effort": "high",
+                "why": ["Astra at high scores best for reviews"], "notes": []}
+        thread = self.consultant("tune06")
+        daemon = self.use(FakeDaemon([thread]))
+        with mock.patch.object(server, "send_route", return_value=pick) as route:
+            out = server.send_consultant_message({"kind": "review", "to": thread["id"], "message": "hi", "wait": 0})
+        route.assert_called_once()
+        self.assertEqual((daemon.started["model"], daemon.started["effort"]), ("gpt-6.2-astra", "high"))
+        self.assertIn("nouez's pick for a review: Astra at high scores best for reviews", out)
+        daemon = self.use(FakeDaemon([thread]))
+        with mock.patch.object(server, "send_route", return_value=pick) as route:
+            server.send_consultant_message({"kind": "review", "to": thread["id"], "message": "hi", "wait": 0,
+                                            "effort": "xhigh"})
+        route.assert_not_called()
+        self.assertEqual(daemon.started["effort"], "xhigh")
+        self.assertNotIn("model", daemon.started)
+        running = {"id": "turn-1", "status": "inProgress", "items": [user("q")]}
+        daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        with mock.patch.object(server, "send_route", return_value=pick), \
+                mock.patch.object(server, "_bridge_turns", {"turn-1"}):
+            out = server.send_consultant_message({"kind": "review", "to": thread["id"], "message": "more", "wait": 0})
+        self.assertIn("steered", out)
+        self.assertIn("turn/steer", daemon.calls)
 
     def test_bad_model_or_effort_is_refused_before_sending(self):
         thread = self.consultant("tune03")
         for key, value in (("model", "-c x"), ("model", "a\tb"), ("effort", "very high"), ("effort", 3)):
             daemon = self.use(FakeDaemon([thread]))
             with self.assertRaises(server.BridgeError) as caught:
-                server.send_consultant_message({"to": thread["id"], "message": "hi", key: value})
+                server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", key: value})
             self.assertIn(f"`{key}` must be", str(caught.exception))
             self.assertNotIn("turn/start", daemon.calls)
 
@@ -1585,7 +1835,7 @@ class HandlerTest(unittest.TestCase):
         running = {"id": "turn-1", "status": "inProgress", "items": [user("q")]}
         daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
         with self.assertRaises(server.BridgeError) as caught:
-            server.send_consultant_message({"to": thread["id"], "message": "more", "effort": "high"})
+            server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "more", "effort": "high"})
         self.assertIn("Nothing was sent", str(caught.exception))
         self.assertNotIn("turn/steer", daemon.calls)
         self.assertNotIn("turn/start", daemon.calls)
@@ -1597,10 +1847,10 @@ class HandlerTest(unittest.TestCase):
         running = {"id": "turn-1", "status": "inProgress", "items": [user("q")]}
         daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
         with mock.patch.object(server, "_bridge_turns", {"turn-1"}), mock.patch.object(server, "_delivered", {}):
-            out = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0,
+            out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "more", "wait": 0,
                                                   "model": "gpt-6.2-astra", "effort": "high"})
             with self.assertRaisesRegex(server.BridgeError, "can't change its effort"):
-                server.send_consultant_message({"to": thread["id"], "message": "other", "wait": 0,
+                server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "other", "wait": 0,
                                                 "model": "gpt-6.2-astra", "effort": "xhigh"})
         self.assertIn("steered into the running turn", out)
         self.assertEqual(daemon.calls.count("turn/steer"), 1)
@@ -1611,7 +1861,7 @@ class HandlerTest(unittest.TestCase):
                    "items": [user("[Message from Claude Code via the consultants bridge]\nq"), agent("answer to q")]}
         self.use(FakeDaemon([thread], {thread["id"]: [running]}))
         with mock.patch.object(server, "_bridge_turns", {"turn-1"}):
-            out = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0.01})
+            out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "more", "wait": 0.01})
         self.assertIn("steered into the running turn", out)
         self.assertNotIn("answer to q", out)
 
@@ -1622,10 +1872,10 @@ class HandlerTest(unittest.TestCase):
                    "items": [user("[Message from Claude Code via the consultants bridge]\n\nq")]}
         daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
         with mock.patch.object(server, "_bridge_turns", {"turn-1"}), mock.patch.object(server, "_delivered", {}):
-            first = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0})
+            first = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "more", "wait": 0})
             running["items"].pop()  # thread/turns/list's summary doesn't show a steer
-            again = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0})
-            tuned = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0, "effort": "high"})
+            again = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "more", "wait": 0})
+            tuned = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "more", "wait": 0, "effort": "high"})
         self.assertIn("steered into the running turn", first)
         self.assertEqual(daemon.calls.count("turn/steer"), 1)
         self.assertNotIn("turn/start", daemon.calls)
@@ -1642,7 +1892,7 @@ class HandlerTest(unittest.TestCase):
         daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
         with mock.patch.object(server, "_delivered", {}):
             with self.assertRaisesRegex(server.BridgeError, "didn't start.*Nothing was sent"):
-                server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0})
+                server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "more", "wait": 0})
         self.assertNotIn("turn/steer", daemon.calls)
 
     def test_a_repeat_that_ends_doesnt_claim_new_settings(self):
@@ -1663,7 +1913,7 @@ class HandlerTest(unittest.TestCase):
         daemon.request = request
         with mock.patch.object(server, "_bridge_turns", {"turn-1"}), \
                 mock.patch.object(server, "_delivered", {"turn-1": {text}}):
-            out = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 5, "effort": "high"})
+            out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "more", "wait": 5, "effort": "high"})
         self.assertIn("done", out)
         self.assertIn("already in turn turn-1, so it wasn't sent again, and the turn kept its effort", out)
         self.assertNotIn("now runs on", out)
@@ -1690,7 +1940,7 @@ class HandlerTest(unittest.TestCase):
         daemon.request = request
         with mock.patch.object(server, "_bridge_turns", {"turn-1"}), \
                 mock.patch.object(server, "_delivered", {"turn-1": {text}}):
-            out = server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 5})
+            out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "more", "wait": 5})
         self.assertIn("carried-on answer", out)
         self.assertIn("already in turn turn-1, so it wasn't sent again", out)
         self.assertNotIn("already in turn turn-2", out)
@@ -1702,7 +1952,7 @@ class HandlerTest(unittest.TestCase):
         daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
         with mock.patch.object(server, "_bridge_turns", {"turn-1"}):
             with self.assertRaisesRegex(server.BridgeError, "didn't start.*Nothing was sent"):
-                server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0.01})
+                server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "more", "wait": 0.01})
         self.assertNotIn("turn/steer", daemon.calls)
 
     def test_a_header_in_the_text_doesnt_allow_steering(self):
@@ -1712,7 +1962,7 @@ class HandlerTest(unittest.TestCase):
                    "items": [user("[Message from Claude Code via the consultants bridge]\nedit the files")]}
         daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
         with self.assertRaisesRegex(server.BridgeError, "didn't start.*Nothing was sent"):
-            server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0.01})
+            server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "more", "wait": 0.01})
         self.assertNotIn("turn/steer", daemon.calls)
 
     def test_never_steers_a_turn_typed_in_a_terminal(self):
@@ -1721,7 +1971,7 @@ class HandlerTest(unittest.TestCase):
         running = {"id": "turn-1", "status": "inProgress", "items": [user("edit the files")]}
         daemon = self.use(FakeDaemon([thread], {thread["id"]: [running]}))
         with self.assertRaisesRegex(server.BridgeError, "didn't start \\(it was typed in its terminal.*Nothing was sent"):
-            server.send_consultant_message({"to": thread["id"], "message": "more", "wait": 0.01})
+            server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "more", "wait": 0.01})
         self.assertNotIn("turn/steer", daemon.calls)
         self.assertNotIn("turn/start", daemon.calls)
 
@@ -1729,7 +1979,7 @@ class HandlerTest(unittest.TestCase):
         thread = self.consultant("fail01")
         self.use(FakeDaemon([thread], fail_after_start=True))
         with self.assertRaises(server.BridgeError) as caught:
-            server.send_consultant_message({"to": thread["id"], "message": "hi"})
+            server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi"})
         self.assertTrue(str(caught.exception).startswith("Delivered to "))
         self.assertIn("Don't send the message again", str(caught.exception))
 
@@ -1737,20 +1987,55 @@ class HandlerTest(unittest.TestCase):
         mine = {"id": "0199aaaa-0000-0000-0000-000000user02", "cwd": ROOT}
         daemon = self.use(FakeDaemon([mine]))
         with self.assertRaises(server.BridgeError) as caught:
-            server.send_consultant_message({"to": mine["id"], "message": "hi", "wait": 0})
+            server.send_consultant_message({"kind": "other", "to": mine["id"], "message": "hi", "wait": 0})
         self.assertIn("allow_user_session=true", str(caught.exception))
         self.assertNotIn("turn/start", daemon.calls)
-        out = server.send_consultant_message({"to": mine["id"], "message": "hi", "wait": 0,
+        out = server.send_consultant_message({"kind": "other", "to": mine["id"], "message": "hi", "wait": 0,
                                               "allow_user_session": True})
         self.assertTrue(out.startswith("Delivered to "))
         # The user's own session keeps its own sandbox and approvals.
         self.assertNotIn("sandboxPolicy", daemon.started)
         self.assertNotIn("approvalPolicy", daemon.started)
 
+    def test_user_sessions_can_be_asked_about_or_turned_off(self):
+        """0.26.0: NOUEZ_NO_USER_SESSIONS=1 never messages one; NOUEZ_ASK_USER_SESSION=1 asks the user in
+        the client's own prompt, showing the message, before each one."""
+        mine = {"id": "0199aaaa-0000-0000-0000-000000user03", "cwd": ROOT}
+        daemon = self.use(FakeDaemon([mine]))
+        asked, answers = [], []
+
+        def prompt(method, params, timeout=5):
+            asked.append((method, params["message"]))
+            return {"action": answers.pop(0)} if answers else None
+
+        def send():
+            return server.send_consultant_message({"kind": "other", "to": mine["id"], "message": "hi  there",
+                                                   "wait": 0, "allow_user_session": True})
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_USER_SESSIONS": "1"}):
+            with self.assertRaisesRegex(server.BridgeError, "never to message one .NOUEZ_NO_USER_SESSIONS=1"):
+                send()
+        with mock.patch.dict(os.environ, {"NOUEZ_ASK_USER_SESSION": "1"}), \
+                mock.patch.object(server, "client_request", prompt):
+            with self.assertRaisesRegex(server.BridgeError, "can't show one"):  # no elicitation in this client
+                send()
+            with mock.patch.dict(server._client_caps, {"elicitation": {}}):
+                answers.append("decline")
+                with self.assertRaisesRegex(server.BridgeError, "The user declined"):
+                    send()
+                with self.assertRaisesRegex(server.BridgeError, "didn't answer"):
+                    send()
+                self.assertNotIn("turn/start", daemon.calls)
+                answers.append("accept")
+                self.assertTrue(send().startswith("Delivered to "))
+        self.assertEqual(asked[0][0], "elicitation/create")
+        self.assertIn("a Codex session you opened", asked[0][1])
+        self.assertIn("hi there", asked[0][1])
+        self.assertEqual(daemon.calls.count("turn/start"), 1)
+
     def test_send_offers_the_waiter(self):
         thread = self.consultant("wait01")
         self.use(FakeDaemon([thread]))
-        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0})
+        out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "wait": 0})
         self.assertIn("run_in_background", out)
         self.assertIn(f'server.py wait {thread["id"]} turn-new\n', out)
 
@@ -1789,7 +2074,14 @@ class HandlerTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
             found = {"codex": codex, "claude": "/bin/claude", "wt": "wt"}
-            with mock.patch.object(server, "which", lambda name, env=None: found.get(name)),                  mock.patch.object(server, "agy_command", lambda env=None: agy),                  mock.patch.object(server, "codex_version", lambda exe: "0.170.0"),                  mock.patch.object(server, "run_status", lambda argv, timeout=20: login),                  mock.patch.object(server, "run_text", lambda argv, timeout=20: "1.5.14"),                  mock.patch.object(server, "read_agy_usage", lambda: usage),                  mock.patch.object(server, "CodexClient", FakeDaemon([])),                  mock.patch.object(server, "claude_config_dir", lambda: tempfile.gettempdir() + "/no-such-dir"),                  contextlib.redirect_stdout(io.StringIO()) as out:
+            with mock.patch.object(server, "which", lambda name, env=None: found.get(name)), \
+                 mock.patch.object(server, "agy_command", lambda env=None: agy), \
+                 mock.patch.object(server, "codex_version", lambda exe: "0.170.0"), \
+                 mock.patch.object(server, "run_status", lambda argv, timeout=20: login), \
+                 mock.patch.object(server, "run_text", lambda argv, timeout=20: "1.5.14"), \
+                 mock.patch.object(server, "read_agy_usage", lambda: usage), \
+                 mock.patch.object(server, "CodexClient", FakeDaemon([])), \
+                 mock.patch.object(server, "claude_config_dir", lambda: tempfile.gettempdir() + "/no-such-dir"),                  contextlib.redirect_stdout(io.StringIO()) as out:
                 return server.run_doctor(), out.getvalue()
         code, out = doctor(None, None)
         self.assertEqual(code, 0, out)
@@ -1923,6 +2215,20 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(sleep.call_count, server.WAITER_RETRIES)
         self.assertIn("Stopped waiting for turn turn-1", out)
+        self.assertIn(server.WAIT_ENDED, out)  # 0.26.0: the wait ended, not the turn
+
+    def test_waiter_gives_up_on_a_daemon_that_connects_and_then_fails(self):
+        """0.26.0: a connection that works but can't read the turns counts as a failure, so the
+        waiter gives up after WAITER_RETRIES rather than retry until its deadline."""
+        thread = self.consultant("wait06")
+        daemon = self.use(FakeDaemon([thread]))
+        real = daemon.request
+        daemon.request = lambda m, p: (_ for _ in ()).throw(server.BridgeError("turns/list timed out.")) \
+            if m == "thread/turns/list" else real(m, p)
+        with mock.patch.object(server.time, "sleep") as sleep:
+            code, out = self.run_waiter(thread["id"], "turn-1")
+        self.assertEqual((code, sleep.call_count), (1, server.WAITER_RETRIES))
+        self.assertIn(server.WAIT_ENDED, out)
 
     def test_waiter_rides_out_os_errors(self):
         def broken():
@@ -2092,7 +2398,7 @@ class HandlerTest(unittest.TestCase):
                                  "items": [user(params["input"][0]["text"]), agent("steered answer", "final_answer")]})
             return out
         daemon.request = request
-        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 5})
+        out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "wait": 5})
         self.assertIn("steered answer", out)
 
     def test_send_wait_bounds_the_grace(self):
@@ -2107,7 +2413,7 @@ class HandlerTest(unittest.TestCase):
             return out
         daemon.request = request
         started = time.monotonic()
-        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0.1})
+        out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "wait": 0.1})
         self.assertLess(time.monotonic() - started, 0.45)
         self.assertIn("turn-new interrupted", out)
         self.assertIn("GetConsultantReply with turn_id turn-new follows it there", out)
@@ -2245,7 +2551,7 @@ class HandlerTest(unittest.TestCase):
         thread = self.consultant("prog01")
         self.use(FakeDaemon([thread]))
         notes = []
-        server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0.01}, None, notes.append)
+        server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "wait": 0.01}, None, notes.append)
         self.assertTrue(notes)
         self.assertIn("is working on turn turn-new", notes[0])
         self.assertTrue(notes[0].endswith(": working on it"))
@@ -2295,7 +2601,8 @@ class ShellWordTest(unittest.TestCase):
         self.assertIsNone(server.shell_word("/a\nb", "bash"))
 
     def test_waiter_command_per_shell(self):
-        with mock.patch.object(server.sys, "executable", "/opt/py/python3"),              mock.patch.object(server.os.path, "abspath", return_value="/home/o'neil $x/nouez/server.py"):
+        with mock.patch.object(server.sys, "executable", "/opt/py/python3"), \
+             mock.patch.object(server.os.path, "abspath", return_value="/home/o'neil $x/nouez/server.py"):
             cmd = server.waiter_command("t1", "u1")
             self.assertIn("(In PowerShell: & /opt/py/python3 -I '/home/o''neil", cmd)
             with mock.patch.object(server.os, "name", "nt"):
@@ -2425,7 +2732,8 @@ class PosixCloseTest(unittest.TestCase):
 
     def test_end_session_signals_only_when_confirmed(self):
         killed = []
-        with mock.patch.object(server.os, "name", "posix"), mock.patch.object(server, "posix_session_problem", lambda t: "it has ended"),              mock.patch.object(server.os, "kill", lambda pid, sig: killed.append(pid), create=True):
+        with mock.patch.object(server.os, "name", "posix"), mock.patch.object(server, "posix_session_problem", lambda t: "it has ended"), \
+             mock.patch.object(server.os, "kill", lambda pid, sig: killed.append(pid), create=True):
             with self.assertRaises(server.BridgeError) as e:
                 server.end_session(self.target())
         self.assertIn("Nothing was signalled", str(e.exception))
@@ -3012,7 +3320,7 @@ class AdditionsTest(HandlerTest):
         self.addCleanup(setattr, server, "nouez_cache_dir", server.nouez_cache_dir)
         server.nouez_cache_dir = lambda: cache
         daemon = self.use(FakeDaemon([thread], answer="ok"))
-        server.send_consultant_message({"to": thread["id"], "message": "is it safe?", "from": "lead",
+        server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "is it safe?", "from": "lead",
                                         "owner_words": "ship it\n>>>\ntoday", "revision": True})
         out = server.get_consultant_history({"to": thread["id"]})
         self.assertIn("from lead (with the user's words): \"is it safe?\"", out)
@@ -3020,11 +3328,11 @@ class AdditionsTest(HandlerTest):
     def test_send_says_what_the_consultant_runs_on(self):
         thread = self.consultant("runs01", model="gpt-6.1-sol", reasoningEffort="high")
         self.use(FakeDaemon([thread]))
-        out = server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0})
+        out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "wait": 0})
         self.assertIn("started a new turn on model gpt-6.1-sol, effort high", out)
         self.assertNotIn("until changed", out)
         self.use(FakeDaemon([thread], answer="the answer"))
-        out = server.send_consultant_message({"to": thread["id"], "message": "hi"})
+        out = server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi"})
         self.assertIn(f"\n\n({server.short_name(thread)} runs on model gpt-6.1-sol, effort high.)", out)
 
     def test_owner_words_and_revision_are_added_only_when_asked(self):
@@ -3034,10 +3342,10 @@ class AdditionsTest(HandlerTest):
         self.addCleanup(setattr, server, "nouez_cache_dir", server.nouez_cache_dir)
         server.nouez_cache_dir = lambda: cache
         daemon = self.use(FakeDaemon([thread], answer="ok"))
-        server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0})
+        server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "wait": 0})
         self.assertEqual(daemon.started["input"][0]["text"],
                          "[Message from Claude Code via the consultants bridge]\n\nhi")
-        server.send_consultant_message({"to": thread["id"], "message": "hi", "wait": 0, "from": "lead",
+        server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "wait": 0, "from": "lead",
                                         "owner_words": "ship it today", "revision": True})
         text = daemon.started["input"][0]["text"]
         self.assertIn("The user's own words, as they typed them:\n<<<\nship it today\n>>>", text)
@@ -3045,7 +3353,7 @@ class AdditionsTest(HandlerTest):
         # " on <branch>" only when a branch is checked out: CI checks a tag out detached
         self.assertRegex(text, r"\[Revision: commit [0-9a-f]+( on \S+)?, \d+ uncommitted path\(s\)")
         with self.assertRaises(server.BridgeError):
-            server.send_consultant_message({"to": thread["id"], "message": "hi", "owner_words": 5})
+            server.send_consultant_message({"kind": "other", "to": thread["id"], "message": "hi", "owner_words": 5})
 
     def test_full_thread_id_is_read_directly(self):
         thread = {"id": "0199aaaa-0000-0000-0000-0000000000c1", "cwd": ROOT, "threadSource": "nouez"}
@@ -3090,7 +3398,7 @@ class RevisionTest(unittest.TestCase):
     def test_a_clean_tree_has_no_diff(self):
         line, patch, digest = server.revision(self.repo)
         self.assertRegex(line, r"^\[Revision: commit [0-9a-f]+( on \S+)?, 0 uncommitted path\(s\)\. Name this revision")
-        self.assertEqual((patch, digest), (b"", ""))
+        self.assertEqual((patch, digest), (b"", server.REVISION_CLEAN + server.git_head(self.repo)))  # nothing to diff, as git showed
         self.assertEqual(server.revision(os.path.join(self.repo, "nowhere")), ("", b"", ""))
         self.assertFalse(os.path.exists(os.path.join(self.cache, server.PATCH_FOLDER)))
 
@@ -3130,13 +3438,21 @@ class RevisionTest(unittest.TestCase):
 
     def test_branch_review_requires_a_valid_base_and_revision(self):
         with self.assertRaisesRegex(server.BridgeError, "base requires revision=true"):
-            server.send_consultant_message({"to": "reviewer", "message": "review", "base": "main"})
+            server.send_consultant_message({"kind": "other", "to": "reviewer", "message": "review", "base": "main"})
+        with self.assertRaisesRegex(server.BridgeError, "attach_diff requires revision=true"):
+            server.send_consultant_message({"kind": "review", "to": "reviewer", "message": "review", "attach_diff": True})
+        # effort is a new Antigravity consultant's level; a Codex start that names one is refused, not ignored.
+        with mock.patch.object(server, "codex_installed", lambda: True), \
+                mock.patch.object(server, "CodexClient", lambda *a, **k: self.fail("nothing starts")):
+            for provider in (None, "codex"):
+                with self.assertRaisesRegex(server.BridgeError, "effort applies to a new Antigravity consultant only"):
+                    server.start_consultant({"cwd": self.repo, "provider": provider, "effort": "high"})
         for base, error in (("unknown-branch", "resolve base"), ("--all", "not an option"), ("@", "revision expression")):
             with self.assertRaisesRegex(server.BridgeError, error):
                 server.revision(self.repo, base=base)
         line, patch, digest = server.revision(self.repo, base="HEAD")
         self.assertIn("0 uncommitted path(s); nothing to review", line)
-        self.assertEqual((patch, digest), (b"", ""))
+        self.assertEqual((patch, digest), (b"", server.REVISION_CLEAN + server.git_head(self.repo)))
         self.put("app.py", "changed\n")
         self.assertIn(b"+changed\n", server.revision(self.repo, base="HEAD")[1])
 
@@ -3531,6 +3847,64 @@ class BudgetTest(unittest.TestCase):
         client.request.side_effect = request
         self.assertEqual(server.codex_budget(client, self.NOW), ["Codex:", "  - no usage windows reported"])
 
+    def test_the_prompt_hook_speaks_only_when_claude_code_is_busy(self):
+        """0.26.0: `server.py hook` adds the hand-out line to each prompt past 70% on pace, from a
+        fresh reading only, and says nothing otherwise; it never fails a prompt."""
+        path = os.path.join(self.dir, "claude-usage.json")
+
+        def save(used, days_left, age=0):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"saved": self.NOW - age, "rate_limits": {"seven_day": {
+                    "used_percentage": used, "resets_at": self.NOW + days_left * 86400}}}, f)
+        self.assertEqual(server.hook_text(self.NOW, path), "")  # no usage file
+        save(10, 2)  # about 14%
+        self.assertEqual(server.hook_text(self.NOW, path), "")
+        save(60, 2)  # about 84%
+        text = server.hook_text(self.NOW, path)
+        self.assertTrue(text.startswith("nouez: Claude Code is on pace for about 84% of its week."), text)
+        self.assertIn(server.HAND_OUT["busy"], text)
+        save(80, 1)  # past 90%
+        self.assertIn(server.HAND_OUT["tight"], server.hook_text(self.NOW, path))
+        save(80, 1, age=server.CLAUDE_USAGE_STALE + 60)  # an old reading says nothing
+        self.assertEqual(server.hook_text(self.NOW, path), "")
+        save(60, 2)
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_AUTO_CONSULT": "1"}):
+            self.assertEqual(server.hook_text(self.NOW, path), "")
+        with mock.patch.object(server, "hook_text", side_effect=RuntimeError("boom")), \
+                mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(b'{"prompt": "x"}'))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(server.run_hook([]), 0)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_doctor_names_the_status_line_and_hook_to_add(self):
+        """0.26.0: doctor says when no status line has saved Claude Code's usage lately, or no prompt
+        hook is set, and prints the settings entry for each with this Python and server.py."""
+        path = os.path.join(self.dir, "claude-usage.json")
+        with mock.patch.object(server, "nouez_cache_dir", return_value=self.dir):
+            (s_ok, s_text), (h_ok, h_text) = server.usage_setup_report({})
+            self.assertIsNone(s_ok)
+            self.assertIn('"statusLine"', s_text)
+            self.assertIsNone(h_ok)
+            self.assertIn(server.usage_command("hook"), json.loads(h_text.split("\n    ", 1)[1])["UserPromptSubmit"]
+                          [0]["hooks"][0]["command"])
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"saved": time.time() - 60, "rate_limits": {}}, f)
+            hooked = {"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command",
+                                                                 "command": server.usage_command("hook")}]}]}}
+            self.assertEqual([ok for ok, _ in server.usage_setup_report(hooked)], [True, True])
+        self.assertTrue(server.usage_command("hook").endswith("server.py hook"))
+        # a Python PATH finds by name goes bare; another is its path, quoted when it has a space
+        open(self.aa, "w").close()
+        with mock.patch.object(server.sys, "executable", self.aa), \
+                mock.patch.object(server.shutil, "which", return_value=self.aa):
+            self.assertTrue(server.usage_command("hook").startswith("python3 "))
+        spaced = os.path.join(self.dir, "Program Files", "python.exe")
+        with mock.patch.object(server.sys, "executable", spaced), \
+                mock.patch.object(server.shutil, "which", return_value=None):
+            self.assertTrue(server.usage_command("hook").startswith('"' + spaced.replace("\\", "/") + '" '))
+        self.assertIn("git apply", server.CONSULT_NOTES["bug-hunt"])
+        self.assertIn("reading many files", server.CONSULT_NOTES["research"])
+
     def test_claude_budget(self):
         path = os.path.join(self.dir, "claude-usage.json")
         self.assertIn("not known", server.claude_budget(self.NOW, path)[0])
@@ -3645,6 +4019,26 @@ class BudgetTest(unittest.TestCase):
         self.assertIn("Antigravity (Google): y", out)
         self.assertIn("Claude Code: x", out)
         self.assertIn("Model scores: no key.", out)
+
+    def test_with_a_kind_only_what_to_do(self):
+        """0.26.0: with a kind, the suggestion and its notes without the windows and scores;
+        details=true shows them, and a sign-in warning always does."""
+        with mock.patch.object(server, "CodexClient", side_effect=server.BridgeError("daemon down")), \
+             mock.patch.object(server, "claude_budget", return_value=["Claude Code: x"]), \
+             mock.patch.object(server, "login_lines", return_value=["  - signed in", "  Sign in again soon."]), \
+             mock.patch.object(server, "aa_scores", return_value=({}, "no key")) as scores, \
+             mock.patch.object(server, "agy_budget", return_value=["Antigravity (Google): y"]):
+            out = server.consultant_budget({"kind": "review"})
+            self.assertNotIn("Antigravity (Google): y", out)
+            self.assertNotIn("Model scores", out)
+            self.assertNotIn("signed in", out)
+            self.assertIn("Sign in again soon.", out)
+            self.assertIn("review: StartConsultant", out)
+            self.assertIn("details=true", out)
+            scores.assert_not_called()
+            out = server.consultant_budget({"kind": "review", "details": True})
+            self.assertIn("Antigravity (Google): y", out)
+            self.assertIn("Model scores: no key.", out)
 
     def test_statusline_merge(self):
         """0.18.0: `server.py statusline` keeps each window's better reading with its own time."""
@@ -3789,7 +4183,7 @@ class UsageLogTest(HandlerTest):
                            ("Verdict: no, the plan assumes X", "no"), ("Yes with changes: see 2", "changes"),
                            ("\n\n  Blocked on the schema", "no"), ("Let me look at this.", None),
                            ("I made changes to the plan", None), ("", None), (None, None),
-                           ("Looks fine.\nVerdict: no", None),  # only the first line counts
+                           ("Looks fine.\nVerdict: no", "no"),  # 0.26.0: a labelled line under one without a verdict
                            ("Not approved: see 1", "no"), ("not ok yet", "no"), ("OK.", "yes"),
                            ("Okay, ship it", "yes"), ("OK, I will inspect the patch", None),
                            # a review that couldn't read its input approves nothing
@@ -3812,7 +4206,13 @@ class UsageLogTest(HandlerTest):
                            ("1. **Final verdict:** no-go", "no"), ("My verdict: yes", "yes"),
                            # only at the start of the line: quoted words don't override the reviewer
                            ("CHANGES: the parser reports 'Verdict: yes' for failures.", "changes"),
-                           ("The verdict depends on the schema", None)):
+                           ("The verdict depends on the schema", None),
+                           # 0.26.0: a labelled verdict a few lines down, under a first line without one
+                           ("Reviewed commit abc.\n\nVerdict: CHANGES\n1. fix x", "changes"),
+                           ("Reviewed commit abc.\n**Verdict:** yes", "yes"),
+                           ("CHANGES: x.\nVerdict: yes", "changes"),  # the first line's verdict stands
+                           ("a\nb\nc\nd\ne\nVerdict: yes", None),  # past the first five lines
+                           ("Reviewed commit abc.\nNo issues in the parser.", None)):  # unlabelled: not read
             with self.subTest(text=text):
                 self.assertEqual(server.verdict_of(text), want)
         for status in ("interrupted", "failed"):  # a turn that didn't finish concluded nothing
@@ -4329,10 +4729,15 @@ class UsageLogTest(HandlerTest):
             self.assertEqual(argv[:5], ["agy", "-p", "/usage", "--output-format", "json"])
             self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), server.AGY_READ_ONLY)
             self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            # a reading is reused for a minute and a half, each send reading it; a failed one isn't kept
+            self.assertEqual(server.read_agy_usage(), {"groups": groups})
+            self.assertEqual(run.call_count, 1)
+            server._agy_usage["at"] -= server.AGY_USAGE_CACHE
             run.return_value = subprocess.CompletedProcess([], 1, "", "Error: You are not logged into Antigravity.\n")
             self.assertEqual(server.read_agy_usage(), {"error": "agy: Error: You are not logged into Antigravity."})
             run.side_effect = subprocess.TimeoutExpired("agy", 30)
             self.assertEqual(server.read_agy_usage(), {"error": "agy didn't answer (TimeoutExpired)"})
+        server._agy_usage.update(at=0.0, agy=None, value=None)
 
     def test_agy_command(self):
         d = tempfile.mkdtemp()
@@ -4384,6 +4789,50 @@ class SuggestTest(unittest.TestCase):
     def pick(self, kind, **state):
         got = server.suggest_consultant(kind, state, self.NOW)
         return got.get("none") or (got["provider"], got["model"], got["effort"])
+
+    def test_the_route_at_send_stays_with_the_consultants_provider(self):
+        """0.26.0: a send naming no model or effort takes the kind's suggestion, from that provider's
+        usage alone; none for kind other, or when its usage can't be read."""
+        def fill(key, value):
+            return lambda now, *a, state=None, **k: state.update(value) or ["lines"]
+        with mock.patch.object(server, "claude_budget", lambda now, path=None, state=None: []), \
+                mock.patch.object(server, "codex_budget", lambda client, now, state: state.update(self.codex())), \
+                mock.patch.object(server, "agy_budget", fill("antigravity", self.agy())):
+            got = server.send_route("research", "codex", object(), self.NOW)
+            self.assertEqual((got["provider"], got["model"], got["effort"]), ("codex", "gpt-6.2-astra", "xhigh"))
+            got = server.send_route("plan-critique", "antigravity", None, self.NOW)
+            self.assertEqual((got["provider"], got["model"], got["effort"]), ("antigravity", "gemini-4-neon", "xhigh"))
+            self.assertIsNone(server.send_route("other", "codex", object(), self.NOW))
+            # Codex finding 6: after "ask Gemini" (ConsultantBudget with provider antigravity), the
+            # send's own pick keeps to Gemini, as the suggestion did, until the half hour is up or
+            # the user names another provider; a lookup that names none (round 2) keeps it.
+            self.addCleanup(server._named.clear)
+            got = server.send_route("fact-check", "antigravity", None, self.NOW)
+            self.assertEqual(got["model"], "claude-opus-5-5")
+            with mock.patch.object(server, "codex_installed", lambda: False), \
+                    mock.patch.object(server, "agy_command", lambda env=None: None):
+                server.consultant_budget({"kind": "fact-check", "provider": "antigravity"})
+                got = server.send_route("fact-check", "antigravity", None, self.NOW)
+                self.assertEqual(got["model"], "gemini-4-neon")
+                self.assertEqual(server.send_route("fact-check", "codex", object(), self.NOW)["provider"], "codex")
+                server._named["fact-check"] = ("antigravity", time.monotonic() - 1)  # the half hour is up
+                self.assertEqual(server.send_route("fact-check", "antigravity", None, self.NOW)["model"],
+                                 "claude-opus-5-5")
+                server.consultant_budget({"kind": "fact-check", "provider": "antigravity"})
+                server.consultant_budget({"kind": "fact-check"})
+                self.assertEqual(server.send_route("fact-check", "antigravity", None, self.NOW)["model"],
+                                 "gemini-4-neon")
+                server.consultant_budget({"kind": "fact-check", "provider": "codex"})
+                self.assertFalse(server.named_provider("fact-check", "antigravity"))
+                self.assertEqual(server.send_route("fact-check", "antigravity", None, self.NOW)["model"],
+                                 "claude-opus-5-5")
+        with mock.patch.object(server, "claude_budget", lambda now, path=None, state=None: []), \
+                mock.patch.object(server, "codex_budget", side_effect=server.BridgeError("daemon down")):
+            self.assertIsNone(server.send_route("review", "codex", object(), self.NOW))
+        with mock.patch.object(server, "claude_budget", lambda now, path=None, state=None: []), \
+                mock.patch.object(server, "codex_budget",
+                                  lambda client, now, state: state.update(self.codex(used=100, days_left=2))):
+            self.assertIsNone(server.send_route("review", "codex", object(), self.NOW))  # no room: as it is
 
     def test_both_installed_with_room(self):
         both = {"codex": self.codex(), "antigravity": self.agy()}
@@ -4457,6 +4906,27 @@ class SuggestTest(unittest.TestCase):
                                         self.NOW)
         self.assertEqual(got["provider"], "codex")
 
+    def test_a_busy_claude_code_starts_a_week_not_yet_begun(self):
+        """0.26.0: while Claude Code is past 70%, research starts Antigravity's Claude and GPT week
+        when it hasn't begun (unused, its reset a full week away), so its weeks don't slip."""
+        codex = self.codex()
+        idle = self.agy(gemini=10, claude=0, days_left=7)
+        busy = {"windows": [(7 * self.DAY, 60, self.NOW + 2 * self.DAY, self.NOW)]}  # about 84%
+        calm = {"windows": [(7 * self.DAY, 10, self.NOW + 2 * self.DAY, self.NOW)]}
+        got = server.suggest_consultant("research", {"codex": codex, "antigravity": idle, "claude": busy}, self.NOW)
+        self.assertEqual((got["provider"], got["model"]), ("antigravity", "claude-opus-5-5"))
+        self.assertTrue(any("hasn't started its week" in w for w in got["why"]), got["why"])
+        self.assertEqual(self.pick("research", codex=codex, antigravity=idle, claude=calm),
+                         ("codex", "gpt-6.2-astra", "xhigh"))
+        started = self.agy(gemini=10, claude=0, days_left=5)  # unused, but its week began two days ago
+        self.assertTrue(server.week_unstarted(idle["groups"]["Claude and GPT models"], self.NOW))
+        self.assertFalse(server.week_unstarted(started["groups"]["Claude and GPT models"], self.NOW))
+        for kind in ("review", "quick-check", "fact-check"):  # only research starts it
+            self.assertNotEqual(self.pick(kind, codex=codex, antigravity=idle, claude=busy)[1], "claude-opus-5-5")
+        self.assertEqual(server.behind_schedule([(7 * self.DAY, 10, self.NOW + 2 * self.DAY)], self.NOW),
+                         100 * 5 / 7 - 10)
+        self.assertIsNone(server.behind_schedule([(5 * 3600, 10, self.NOW + 3600)], self.NOW))
+
     def test_usage_that_would_go_unused_goes_first(self):
         """0.25.0: a week under 60% at a reset within three days takes research and quick checks
         even when the first choice has room; Antigravity's two quota groups count apart."""
@@ -4479,9 +4949,18 @@ class SuggestTest(unittest.TestCase):
             got = server.suggest_consultant(kind, {"codex": codex, "antigravity": agy}, self.NOW)
             self.assertEqual(got["provider"], first, kind)
             self.assertNotEqual(got["model"], "claude-opus-5-5", kind)
-        # four days to the reset: not yet
+        # four days to the reset: not unused yet, but 0.26.0 sends interchangeable work to the
+        # subscription furthest behind an even pace: the idle group 43 points behind, Codex 19
         later = self.agy(gemini=50, claude=0, days_left=4, models=sonnet)
-        self.assertEqual(self.pick("research", codex=codex, antigravity=later), ("codex", "gpt-6.2-astra", "xhigh"))
+        got = server.suggest_consultant("research", {"codex": codex, "antigravity": later}, self.NOW)
+        self.assertEqual((got["provider"], got["model"]), ("antigravity", "claude-opus-5-5"))
+        self.assertIn("Antigravity's Claude and GPT models is 43 points behind an even pace through its week",
+                      got["why"])
+        # less than 15 points further behind than the first choice: it stays
+        near = self.agy(gemini=50, claude=25, days_left=4, models=sonnet)  # 18 behind, Codex 19
+        self.assertEqual(self.pick("research", codex=codex, antigravity=near), ("codex", "gpt-6.2-astra", "xhigh"))
+        for kind in ("review", "bug-hunt", "plan-critique", "fact-check"):  # quality first: never moved
+            self.assertNotEqual(self.pick(kind, codex=codex, antigravity=later)[1], "claude-opus-5-5", kind)
         # both would go unused: the one that resets first
         soon = self.codex(used=10, days_left=1)
         self.assertEqual(self.pick("research", codex=soon, antigravity=agy), ("codex", "gpt-6.2-astra", "xhigh"))
@@ -4544,16 +5023,18 @@ class SuggestTest(unittest.TestCase):
         self.assertIn("Codex: usage not known", got["why"])
         o = server.claude_outlook
         self.assertIn("isn't known", o({}, self.NOW))
-        self.assertIn("Hand read-only work", o({"windows": [(7 * self.DAY, 60, self.NOW + 2 * self.DAY, self.NOW)]},
-                                                self.NOW))  # about 84%
+        self.assertIn(server.HAND_OUT["busy"], o({"windows": [(7 * self.DAY, 60, self.NOW + 2 * self.DAY,
+                                                               self.NOW)]}, self.NOW))  # about 84%
         self.assertIn("put off optional work", o({"windows": [(7 * self.DAY, 80, self.NOW + self.DAY, self.NOW)]},
                                                   self.NOW))
+        # 0.26.0: under 70% bulky work still goes out
         self.assertEqual(o({"windows": [(7 * self.DAY, 12, self.NOW + 3 * self.DAY, self.NOW)]}, self.NOW),
-                         "Claude Code: on pace for about 21% of its week.")
+                         f"Claude Code: on pace for about 21% of its week. {server.HAND_OUT['ok']} "
+                         f"{server.HAND_OUT_LOCAL}")
         # Claude's window used up or running out: said, not a crash
         for used in (100, 90):
             line = o({"windows": [(5 * 3600, used, self.NOW + 4 * 3600, self.NOW)]}, self.NOW)
-            self.assertIn("Hand every read-only job", line)
+            self.assertIn(server.HAND_OUT["tight"], line)
             self.assertIn("window", line)
         # an old reading gives no pace, only the least the week will reach: never spare
         old = self.NOW - 3600
@@ -4568,8 +5049,9 @@ class SuggestTest(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn('review: StartConsultant provider "codex", model "gpt-6.2-astra"; SendConsultantMessage '
                       'model "gpt-6.2-astra", effort "high", kind "review".', text)
-        self.assertIn("three rounds", text)
+        self.assertIn("nouez counts the rounds", text)
         self.assertIn('blind', text)
+        self.assertIn('second_opinion_of', text)
         self.assertIn('The other provider now: provider "antigravity", model "gemini-4-neon", effort "high".', text)
         self.assertIn('Gemini 4 Neon scores best (Artificial Analysis by subject): provider "antigravity", '
                       'model "gemini-4-neon", effort "xhigh".', text)
@@ -4701,10 +5183,10 @@ class AgyTest(unittest.TestCase):
         self.assertIn("Codex isn't installed", listed)
         self.assertIn("Start an Antigravity consultant", listed)
         with self.assertRaisesRegex(server.BridgeError, "No consultant named 'nobody'.*none is running"):
-            server.send_consultant_message({"to": "nobody", "message": "hi"})
+            server.send_consultant_message({"kind": "other", "to": "nobody", "message": "hi"})
         with mock.patch.object(server, "agy_command", lambda env=None: None):
             with self.assertRaisesRegex(server.BridgeError, "No consultant named 'nobody'. Neither Codex nor Antigravity"):
-                server.send_consultant_message({"to": "nobody", "message": "hi"})
+                server.send_consultant_message({"kind": "other", "to": "nobody", "message": "hi"})
         out = server.start_consultant({"cwd": self.work, "model": "gpt-6.2-astra"})
         self.assertIn("Codex isn't installed, so this is an Antigravity consultant (model 'gpt-6.2-astra'", out)
         self.assertIn("model: gemini-4-neon-high (Antigravity)", out)
@@ -4719,7 +5201,7 @@ class AgyTest(unittest.TestCase):
         self.assertIn(name, server.list_consultants({"cwd": self.work}))
         for tool in (server.send_consultant_message, server.get_consultant_history, server.stop_consultant):
             with self.assertRaisesRegex(server.BridgeError, f"No consultant named 'nobody'.*exist: {name}"):
-                tool({"to": "nobody", "message": "hi"})
+                tool({"to": "nobody", "message": "hi", "kind": "other"})
         with self.assertRaisesRegex(server.BridgeError, "Codex isn't installed: .*pass provider antigravity"):
             server.start_consultant({"cwd": self.work, "provider": "codex"})
         with mock.patch.object(server, "agy_command", lambda env=None: None):
@@ -4728,6 +5210,55 @@ class AgyTest(unittest.TestCase):
             elsewhere = tempfile.mkdtemp()
             self.addCleanup(shutil.rmtree, elsewhere, True)
             self.assertIn("consultations are off", server.list_consultants({"cwd": elsewhere}))
+
+    def test_work_that_checks_claude_never_runs_on_a_claude_model(self):
+        """0.26.0: an independent kind on a consultant left on a Claude model moves to Gemini; a Claude
+        model passed for one, or a diff sent as kind other, is refused; and every send needs a kind."""
+        self.MODELS = self.MODELS + ["claude-opus-5-5"]
+        _, name = self.start(model="claude-opus-5-5")
+        self.assertEqual(server.agy_resolve(name)["model"], "claude-opus-5-5")
+        for args, why in (({"kind": "review", "model": "claude-opus-5-5"}, "a review goes to a model of another"),
+                          ({"kind": "other", "revision": True}, "a message with revision=true goes .*model=gemini-4-neon"),
+                          ({}, "`kind` is required")):
+            with self.assertRaisesRegex(server.BridgeError, why):
+                server.send_consultant_message({"to": name, "message": "x", "wait": 0, **args})
+        self.assertEqual(self.runs, [])
+        self.replies = [[agy_result("ok\n")]]
+        out = server.send_consultant_message({"to": name, "message": "x", "wait": 5, "kind": "plan-critique"})
+        argv = self.runs[0][0]
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-4-neon-xhigh")
+        self.assertIn(f"{name} was on claude-opus-5-5, a Claude model", out)
+        self.assertEqual(server.agy_resolve(name)["model"], "gemini-4-neon-xhigh")
+
+    def test_a_send_without_model_or_effort_takes_nouezs_pick(self):
+        """0.26.0: on Antigravity too, a send naming neither runs on the kind's suggestion."""
+        self.MODELS = self.MODELS + ["claude-opus-5-5-high"]
+        _, name = self.start()
+        pick = {"provider": "antigravity", "model": "claude-opus-5-5", "effort": "high",
+                "why": ["on Google's quota, not Claude Code's"], "notes": []}
+        self.replies = [[agy_result("ok\n")]]
+        with mock.patch.object(server, "send_route", return_value=pick) as route:
+            out = server.send_consultant_message({"to": name, "message": "x", "wait": 5, "kind": "research"})
+        route.assert_called_once_with("research", "antigravity")
+        argv = self.runs[0][0]
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-opus-5-5-high")
+        self.assertIn("runs on claude-opus-5-5-high, nouez's pick for a research.", out)
+
+    def test_a_named_gemini_never_runs_on_another_model(self):
+        """Codex round 2, finding 5: after "ask Gemini", a send nouez can't move to a Gemini model
+        (none has room) is refused rather than left on the consultant's Claude model."""
+        self.MODELS = self.MODELS + ["claude-opus-5-5"]
+        _, name = self.start(model="claude-opus-5-5")
+        self.addCleanup(server._named.clear)
+        server._named["research"] = ("antigravity", time.monotonic() + 60)
+        with mock.patch.object(server, "send_route", return_value=None), \
+                self.assertRaisesRegex(server.BridgeError, "The user named Gemini for this research"):
+            server.send_consultant_message({"to": name, "message": "x", "wait": 0, "kind": "research"})
+        self.assertEqual(self.runs, [])
+        self.replies = [[agy_result("ok\n")]]  # a model the user accepted, passed outright, goes ahead
+        server.send_consultant_message({"to": name, "message": "x", "wait": 5, "kind": "research",
+                                        "model": "claude-opus-5-5"})
+        self.assertEqual(len(self.runs), 1)
 
     def test_send_reply_history_stop(self):
         _, name = self.start(instructions="Answer in French.")
@@ -4754,7 +5285,7 @@ class AgyTest(unittest.TestCase):
         # The next turn continues the conversation, on a new level, without the preamble; it runs on.
         self.replies = [None]
         with mock.patch.object(server, "agy_alive", self.alive):
-            out = server.send_consultant_message({"to": name, "message": "And now?", "effort": "low", "wait": 0})
+            out = server.send_consultant_message({"kind": "other", "to": name, "message": "And now?", "effort": "low", "wait": 0})
             self.assertIn("Delivered to", out)
             self.assertIn(f"server.py wait {server.agy_resolve(name)['id']} ", out)
             argv, _, sent = self.runs[1]
@@ -4762,8 +5293,10 @@ class AgyTest(unittest.TestCase):
             self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), server.AGY_READ_ONLY)  # every turn
             self.assertEqual(argv[argv.index("--model") + 1], "gemini-4-neon-low")
             self.assertFalse(json.loads(sent)["message"]["content"].startswith(server.AGY_PREAMBLE))
+            # 0.26.0: the read-only rules again on every later turn
+            self.assertTrue(json.loads(sent)["message"]["content"].startswith(server.AGY_REMINDER))
             with self.assertRaisesRegex(server.BridgeError, "still working on turn .* nothing was sent"):
-                server.send_consultant_message({"to": name, "message": "Third", "wait": 0})
+                server.send_consultant_message({"kind": "other", "to": name, "message": "Third", "wait": 0})
             self.assertEqual(len(self.runs), 2)
             busy = server.get_consultant_reply({"to": name})
             self.assertIn("this is not a reply", busy)
@@ -4813,7 +5346,7 @@ class AgyTest(unittest.TestCase):
             with self.subTest(status=status, error=error):
                 self.replies = [events]
                 with mock.patch.object(server, "agy_alive", lambda meta: False):
-                    server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+                    server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
                     tid = server.agy_turn_ids(cid)[0]
                     with open(os.path.join(server.agy_folder(cid), "turns", tid + ".err"), "w") as f:
                         f.write("starting\nboom\n")
@@ -4827,7 +5360,7 @@ class AgyTest(unittest.TestCase):
         _, name = self.start()
         rec = server.agy_resolve(name)
         self.replies = [[agy_result("done here")]]
-        server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+        server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
         tid = server.agy_turn_ids(rec["id"])[0]
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -4846,7 +5379,7 @@ class AgyTest(unittest.TestCase):
             with self.subTest(conv=conv):
                 self.replies = [[agy_result("ok")]]
                 with mock.patch.object(server, "agy_alive", lambda meta: False):
-                    server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+                    server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
                 # The newest turn's events name this conversation; older turns name only rejected ones.
                 with open(os.path.join(server.agy_folder(cid), "turns", server.agy_turn_ids(cid)[0] + ".jsonl"),
                           "w", encoding="utf-8") as f:
@@ -4883,7 +5416,7 @@ class AgyTest(unittest.TestCase):
         _, name = self.start()
         cid = server.agy_resolve(name)["id"]
         self.replies = [None]
-        server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+        server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
         tid = server.agy_turn_ids(cid)[0]
         out = os.path.join(server.agy_folder(cid), "turns", tid + ".jsonl")
 
@@ -4905,7 +5438,7 @@ class AgyTest(unittest.TestCase):
         _, name = self.start()
         cid = server.agy_resolve(name)["id"]
         self.replies = [None]
-        server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+        server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
         tid = server.agy_turn_ids(cid)[0]
         buf = io.StringIO()
         with mock.patch.object(server, "agy_alive", lambda meta: True), \
@@ -4924,14 +5457,14 @@ class AgyTest(unittest.TestCase):
             raise FileNotFoundError("no such program")
         with mock.patch.object(server, "agy_spawn", broken):
             with self.assertRaisesRegex(server.BridgeError, "Could not start agy"):
-                server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+                server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
         turn = server.agy_turns(rec["id"], 1)[0]
         self.assertEqual(turn["status"], "failed")
         self.assertIn("Could not start agy: no such program", turn["error"]["message"])
         self.assertNotIn("StopConsultant", turn["error"]["message"])
         server.agy_save({**rec, "model": "--dangerously-skip-permissions"})  # an edited record
         with self.assertRaisesRegex(server.BridgeError, "has no valid model"):
-            server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+            server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
         self.assertEqual(self.runs, [])
 
     def test_lock_and_stopped_consultant(self):
@@ -4944,7 +5477,7 @@ class AgyTest(unittest.TestCase):
                     with server.agy_lock(rec["id"]):
                         pass
                 with self.assertRaisesRegex(server.BridgeError, "Another Claude Code session"):
-                    server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+                    server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
         self.assertEqual(self.runs, [])
         server.agy_save({**rec, "stopped": time.time()})  # stopped by another session after resolving
         with self.assertRaisesRegex(server.BridgeError, "was stopped; nothing was sent"):
@@ -4957,7 +5490,7 @@ class AgyTest(unittest.TestCase):
         self.assertIn("has no turn running", server.stop_consultant({"to": name, "turn_only": True}))
         self.replies = [None]
         with mock.patch.object(server, "agy_alive", self.alive):
-            server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+            server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
             with mock.patch.object(server, "agy_end_process", return_value=True):
                 out = server.stop_consultant({"to": name, "turn_only": True})
         self.assertIn("Ended agy-", out)
@@ -4970,7 +5503,7 @@ class AgyTest(unittest.TestCase):
         cid = server.agy_resolve(name)["id"]
         self.replies = [None]
         with mock.patch.object(server, "agy_alive", self.alive):
-            server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+            server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
             with mock.patch.object(server, "agy_end_process", return_value=False):
                 with self.assertRaisesRegex(server.BridgeError, "Couldn't stop .*pid 4242.*Nothing was stopped"):
                     server.stop_consultant({"to": name})
@@ -5000,7 +5533,7 @@ class AgyTest(unittest.TestCase):
         cid = server.agy_resolve(name)["id"]
         self.replies = [None]
         with mock.patch.object(server, "agy_alive", self.alive):
-            server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+            server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
         tid = server.agy_turn_ids(cid)[0]
         path = os.path.join(server.agy_folder(cid), "turns", tid + ".json")
 
@@ -5022,7 +5555,7 @@ class AgyTest(unittest.TestCase):
                 return False
             return real(path, data)
         with mock.patch.object(server, "agy_alive", self.alive):
-            server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+            server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
             with mock.patch.object(server, "agy_end_process", return_value=False), \
                  mock.patch.object(server, "write_json_atomic", flaky), mock.patch.object(server.time, "sleep"):
                 with self.assertRaises(server.BridgeError):
@@ -5036,7 +5569,7 @@ class AgyTest(unittest.TestCase):
         _, name = self.start()
         self.replies = [[agy_result("ok")]]
         with mock.patch.object(server, "agy_save", side_effect=server.BridgeError("disk full")):
-            out = server.send_consultant_message({"to": name, "message": "x", "effort": "low", "wait": 5})
+            out = server.send_consultant_message({"kind": "other", "to": name, "message": "x", "effort": "low", "wait": 5})
         self.assertIn("ok", out)
         self.assertIn("couldn't save it as", out)
         self.assertEqual(server.agy_resolve(name)["model"], "gemini-4-neon-high")
@@ -5056,7 +5589,7 @@ class AgyTest(unittest.TestCase):
         with mock.patch.object(server, "write_json_atomic", pid_write_fails), \
                 mock.patch.object(server, "agy_end_unsaved", return_value=True) as end:
             with self.assertRaisesRegex(server.BridgeError, "agy was ended and nothing was sent"):
-                server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+                server.send_consultant_message({"kind": "other", "to": name, "message": "x", "wait": 0})
         self.assertEqual(end.call_args.args[0].pid, 4242)
         self.assertEqual(server.agy_turn_ids(cid), [])  # no turn left looking as if it were starting
         with mock.patch.object(server, "LOCK_SECONDS", 0.2), server.agy_lock(None):
@@ -5108,9 +5641,11 @@ class AgyTest(unittest.TestCase):
         self.assertEqual(failed[0], "Antigravity: usage not known (agy: not signed in).")
         self.assertIn("gemini-4-neon (low, high, xhigh)", failed[1])  # models even when the quota call fails
         installed = os.path.join(self.dir, "agy.exe")
-        with mock.patch.object(server, "agy_command", lambda env=None: installed),              mock.patch.object(server, "which", lambda name, env=None: None):
+        with mock.patch.object(server, "agy_command", lambda env=None: installed), \
+             mock.patch.object(server, "which", lambda name, env=None: None):
             self.assertEqual(server.agy_shown(), ("& " if os.name == "nt" else "") + f"'{installed}'")
-        with mock.patch.object(server, "agy_command", lambda env=None: installed),              mock.patch.object(server, "which", lambda name, env=None: installed):
+        with mock.patch.object(server, "agy_command", lambda env=None: installed), \
+             mock.patch.object(server, "which", lambda name, env=None: installed):
             self.assertEqual(server.agy_shown(), "agy")
         with mock.patch.object(server, "read_agy_usage", lambda: None):
             self.assertEqual(server.agy_budget(now), [])
@@ -5152,7 +5687,7 @@ class AgyTest(unittest.TestCase):
         _, other = self.start(new=True)
         for who in (name, other):
             self.replies = [[agy_result("ok\n")]]
-            server.send_consultant_message({"to": who, "message": "hi", "wait": 5})
+            server.send_consultant_message({"kind": "other", "to": who, "message": "hi", "wait": 5})
         cid = server.agy_resolve(name)["id"]
         running = os.path.join(self.dir, "agy", server.agy_resolve(other)["id"], "turns")
         turns = os.path.join(self.dir, "agy", cid, "turns")
@@ -5173,7 +5708,7 @@ class AgyTest(unittest.TestCase):
         """0.22.0: a turn file that can't be deleted leaves the consultant to try at the next start."""
         _, name = self.start()
         self.replies = [[agy_result("ok\n")]]
-        server.send_consultant_message({"to": name, "message": "hi", "wait": 5})
+        server.send_consultant_message({"kind": "other", "to": name, "message": "hi", "wait": 5})
         cid = server.agy_resolve(name)["id"]
         turns = os.path.join(self.dir, "agy", cid, "turns")
         server.stop_consultant({"to": name})
@@ -5197,9 +5732,281 @@ class AgyTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, outside, True)
         dir_link(outside, os.path.join(self.dir, "agy", cid, "turns"))
         with self.assertRaisesRegex(server.BridgeError, "Nothing was sent"):
-            server.send_consultant_message({"to": name, "message": "hi", "wait": 0})
+            server.send_consultant_message({"kind": "other", "to": name, "message": "hi", "wait": 0})
         self.assertEqual(os.listdir(outside), [])
         self.assertEqual(self.runs, [])
+
+class ReviewRoundsTest(unittest.TestCase):
+    """0.26.0: nouez counts review rounds on the same work, and sends a blind second opinion."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.head = "a" * 40
+        for attr, value in (("nouez_cache_dir", lambda: self.dir), ("git_head", lambda cwd: self.head),
+                            ("POLL_SECONDS", 0.01), ("_delivered", {})):
+            patcher = mock.patch.object(server, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.thread = {"id": "0199aaaa-0000-0000-0000-000000rnd001", "cwd": ROOT, "threadSource": "nouez"}
+
+    def use(self, daemon):
+        patcher = mock.patch.object(server, "CodexClient", daemon)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return daemon
+
+    def review(self, **args):
+        return server.send_consultant_message({"to": self.thread["id"], "message": "Review commit abc.",
+                                               "kind": "review", "wait": 5, **args})
+
+    def test_rounds_count_and_the_third_asking_for_changes_says_to_stop(self):
+        self.use(FakeDaemon([self.thread], answer="Verdict: CHANGES\n1. fix x"))
+        first, second, third = self.review(), self.review(), self.review()
+        self.assertNotIn("(nouez: this is round", first + second)
+        self.assertIn("(nouez: this is round 3 of review on the same work, and it still asks for changes.", third)
+        self.assertIn("round 4 of review on the same work", self.review())
+        chain = server.review_chain(self.thread["id"])
+        self.assertEqual((chain["rounds"], chain["brief"], chain["revision"]), (4, "Review commit abc.", False))
+        # The note is read with the reply too, and only for the chain's latest turn.
+        self.assertIn("round 4", server.round_note(self.thread["id"], "turn-new", "changes"))
+        self.assertEqual(server.round_note(self.thread["id"], "turn-old", "changes"), "")
+        self.assertEqual(server.round_note(self.thread["id"], "turn-new", "yes"), "")
+
+    def test_a_round_past_three_is_refused_only_when_the_user_says_so(self):
+        self.use(FakeDaemon([self.thread], answer="CHANGES: fix x"))
+        for _ in range(3):
+            self.review()
+        with mock.patch.dict(os.environ, {"NOUEZ_REVIEW_ROUNDS_STOP": "1"}):
+            self.assertIn("another is refused", server.round_note(self.thread["id"], "turn-new", "changes"))
+            with self.assertRaisesRegex(server.BridgeError, "round 4 of review .* Nothing was sent"):
+                self.review()
+            # Other kinds aren't counted.
+            server.send_consultant_message({"to": self.thread["id"], "message": "q", "kind": "quick-check", "wait": 5})
+
+    def test_a_chain_starts_over_on_an_ok_a_new_commit_or_a_day_later(self):
+        cid, latest = "c-1", {"id": "t", "status": "completed", "items": [agent("Verdict: CHANGES", "final_answer")]}
+        ok = {"id": "t", "status": "completed", "items": [agent("Verdict: yes", "final_answer")]}
+
+        def send(turn, now=1000.0, kind="review"):
+            chain = server.next_review_round(cid, "c", ROOT, kind, [turn] if turn else [], now)
+            server.save_review_round(cid, chain, "t", "brief " + kind, {}, now)
+            return chain and chain["rounds"]
+        self.assertEqual([send(None), send(latest), send(latest, kind="re-check")], [1, 2, 3])
+        self.assertIsNone(send(latest, kind="quick-check"))
+        self.assertEqual(server.review_chain(cid)["brief"], "brief review")  # the first round's brief
+        self.assertEqual(send(ok), 1)
+        self.assertEqual(send(latest), 2)
+        self.head = "b" * 40
+        self.assertEqual(send(latest), 1)
+        self.assertEqual(send(latest, now=1000.0 + server.REVIEW_CHAIN_HOURS * 3600), 1)
+        running = {"id": "t", "status": "inProgress", "items": [agent("Verdict: yes", "final_answer")]}
+        self.assertEqual(send(running, now=1000.0 + server.REVIEW_CHAIN_HOURS * 3600), 2)  # not a verdict yet
+        chain = server.next_review_round(cid, "c", ROOT, "review", None, 1000.0 + 3 * server.REVIEW_CHAIN_HOURS * 3600)
+        server.save_review_round(cid, chain, "t", "x" * (server.REVIEW_BRIEF_CHARS + 1), {}, 0)
+        self.assertIsNone(server.review_chain(cid)["brief"])  # too long to keep
+
+    def test_the_verdict_is_the_chain_s_own(self):
+        # Codex finding 8: another consultation in between neither ends nor revives a chain.
+        cid, now = "c-2", 1000.0
+
+        def turn(tid, verdict):
+            return {"id": tid, "status": "completed", "items": [agent(f"Verdict: {verdict}", "final_answer")]}
+
+        def send(recent, kind="review", tid="t1"):
+            chain = server.next_review_round(cid, "c", ROOT, kind, recent, now)
+            server.save_review_round(cid, chain, tid, "brief " + kind, {}, now)
+            return chain and chain["rounds"]
+        self.assertEqual(send([]), 1)
+        # The review asked for changes; a quick check after it ended in a yes.
+        self.assertEqual(send([turn("q1", "yes"), turn("t1", "CHANGES")]), 2)
+        # The chain's last round was approved; an unrelated reply after it asks for changes.
+        self.assertEqual(send([turn("q2", "CHANGES"), turn("t1", "yes")]), 1)
+        # Codex round 2, finding 7: the chain's last round is out of sight (20 other turns since), so
+        # its verdict is unknown: an OK can't be told from changes, and the chain starts over.
+        self.assertEqual(send([turn("q3", "CHANGES")]), 1)
+        self.assertEqual(send([turn("t1", "CHANGES")]), 2)
+        # A round Codex cut off and carried on: the continuation's verdict counts.
+        cut = {"id": "t1", "status": "interrupted", "items": [agent("Verdict: CHANGES", "final_answer")]}
+        with mock.patch.object(server, "next_in_chain", lambda turns, t, text=None: turn("t1b", "yes")
+                               if t["id"] == "t1" else None):
+            self.assertEqual(send([turn("t1b", "yes"), cut]), 1)
+
+    def test_bug_hunts_and_critiques_keep_their_brief_uncounted(self):
+        # Codex finding 5: Budget offers a second opinion for these, so their brief is kept, but
+        # their rounds aren't counted, and a review after one starts a review chain of its own.
+        cid, now = "c-3", 1000.0
+        changes = {"id": "t", "status": "completed", "items": [agent("Verdict: CHANGES", "final_answer")]}
+        for kind in ("bug-hunt", "plan-critique"):
+            with self.subTest(kind=kind):
+                for _ in range(2):
+                    chain = server.next_review_round(cid, "c", ROOT, kind, [changes], now)
+                    self.assertEqual((chain["kind"], chain["rounds"]), (kind, 1))
+                    server.save_review_round(cid, chain, "t", "hunt " + kind, {}, now)
+                self.assertEqual(server.review_chain(cid)["brief"], "hunt " + kind)
+                chain = server.next_review_round(cid, "c", ROOT, "re-check", [changes], now)
+                self.assertEqual((chain["kind"], chain["rounds"]), ("re-check", 1))
+        self.assertIsNone(server.next_review_round(cid, "c", ROOT, "quick-check", [changes], now))
+
+    def test_old_review_chains_are_pruned(self):
+        folder = os.path.join(self.dir, "review-rounds")
+        os.makedirs(folder)
+        names = ["chain-old.json", "chain-new.json", "chain-old.ab12.tmp", "notes.json"]
+        for n in names:
+            open(os.path.join(folder, n), "w").close()
+        for n in ("chain-old.json", "chain-old.ab12.tmp", "notes.json"):
+            os.utime(os.path.join(folder, n), (time.time() - 30 * 86400,) * 2)
+        server.prune_replies()
+        self.assertEqual(sorted(os.listdir(folder)), ["chain-new.json", "notes.json"])
+
+    def test_a_steered_round_has_no_second_opinion(self):
+        # Codex round 2, finding 4: a message steered into the running round's turn (here a bug hunt
+        # into a review) means the kept brief isn't all that turn was asked.
+        running = {"id": "turn-1", "status": "inProgress", "items": []}
+        daemon = self.use(FakeDaemon([self.thread], {self.thread["id"]: [running]}))
+        server.write_json_atomic(server.review_chain_path(self.thread["id"], create=True),
+                                 {"kind": "review", "brief": "Review commit abc.", "rounds": 1, "turns": ["turn-1"]})
+        self.assertIsNone(server.steered_review_round(self.thread["id"], "turn-0"))  # not the chain's turn
+        self.assertNotIn("steered", server.review_chain(self.thread["id"]))
+        self.assertIsNone(server.steered_review_round("no-chain-here", "turn-1"))
+        # Codex rounds 3 and 4, finding 4: marked before the steer goes, and nothing goes when the chain
+        # can't be marked, or is there but can't be read.
+        bug_hunt = {"to": self.thread["id"], "message": "Find why x fails.", "kind": "bug-hunt", "wait": 0}
+        for name, value in (("write_json_atomic", False), ("read_json_file", None)):
+            with self.subTest(failing=name), mock.patch.object(server, "_bridge_turns", {"turn-1"}), \
+                    mock.patch.object(server, name, return_value=value), \
+                    self.assertRaisesRegex(server.BridgeError, "couldn't record that a message was added"):
+                server.send_consultant_message(bug_hunt)
+        self.assertEqual(daemon.calls.count("turn/steer"), 0)
+        # A steer the daemon refuses outright added nothing, so the chain is put back as it was.
+        real = daemon.request
+
+        def refuse(method, params):
+            if method == "turn/steer":
+                raise server.BridgeError("turn/steer failed: no active turn")
+            return real(method, params)
+        with mock.patch.object(server, "_bridge_turns", {"turn-1"}), mock.patch.object(daemon, "request", refuse), \
+                self.assertRaisesRegex(server.BridgeError, "no active turn"):
+            server.send_consultant_message(bug_hunt)
+        self.assertNotIn("steered", server.review_chain(self.thread["id"]))
+        with mock.patch.object(server, "_bridge_turns", {"turn-1"}):
+            out = server.send_consultant_message({"to": self.thread["id"], "message": "Find why x fails.",
+                                                  "kind": "bug-hunt", "wait": 0})
+        self.assertIn("steered into the running turn", out)
+        self.assertEqual(daemon.calls.count("turn/steer"), 1)
+        self.assertTrue(server.review_chain(self.thread["id"])["steered"])
+        agy = {"id": "agy-2", "name": "agy-nouez-2", "cwd": ROOT}
+        with mock.patch.object(server, "agy_resolve", lambda to, exact_only=False: agy if to == "agy-nouez-2" else None), \
+                self.assertRaisesRegex(server.BridgeError, "had another message added to it while it ran"):
+            server.send_consultant_message({"to": "agy-nouez-2", "kind": "review",
+                                            "second_opinion_of": self.thread["id"]})
+
+    def test_second_opinion_sends_the_first_brief_blind(self):
+        other = {"id": "0199aaaa-0000-0000-0000-000000rnd002", "cwd": ROOT, "threadSource": "nouez"}
+        daemon = self.use(FakeDaemon([self.thread, other], answer="Verdict: CHANGES"))
+        self.review(revision=False)
+        agy = {"id": "agy-1", "name": "agy-nouez-1", "cwd": ROOT}
+        found = lambda to, exact_only=False: agy if to in ("agy-nouez-1", "agy-1") else None
+        with mock.patch.object(server, "agy_resolve", found):
+            for args, why in (({"message": "my findings"}, "leave out message and owner_words"),
+                              ({}, "a Codex consultant, and a second opinion comes from the other provider")):
+                with self.assertRaisesRegex(server.BridgeError, why):
+                    server.send_consultant_message({"to": other["id"], "kind": "review",
+                                                    "second_opinion_of": self.thread["id"], **args})
+            with self.assertRaisesRegex(server.BridgeError, "no first brief of a consultation by agy-nouez-1"):
+                server.send_consultant_message({"to": other["id"], "kind": "review", "second_opinion_of": "agy-nouez-1"})
+            # From a Codex review to an Antigravity consultant: the brief is what is sent.
+            sent = mock.Mock(return_value="sent")
+            with mock.patch.object(server, "send_agy_message", sent):
+                server.send_consultant_message({"to": "agy-nouez-1", "kind": "review", "second_opinion_of": self.thread["id"]})
+            self.assertEqual(sent.call_args[0][2], "Review commit abc.")
+        # A Codex consultant that has had messages isn't blind.
+        server.write_json_atomic(server.review_chain_path("agy-1", create=True),
+                                 {"brief": "Check it.", "rounds": 1, "turns": ["agy-t1"]})
+        agy_recent = [{"id": "agy-t1", "status": "completed", "items": []}]
+        with mock.patch.object(server, "agy_resolve", found), \
+                mock.patch.object(server, "agy_turns", lambda cid, limit: agy_recent), \
+                self.assertRaisesRegex(server.BridgeError, "has had messages already"):
+            server.send_consultant_message({"to": self.thread["id"], "kind": "review", "second_opinion_of": "agy-nouez-1"})
+        # Codex finding 5: once the first consultant has had another message, its kept brief is
+        # no longer the one it is working on, so nothing is sent.
+        later = [{"id": "agy-t2", "status": "completed", "items": []}] + agy_recent
+        with mock.patch.object(server, "agy_resolve", found), \
+                mock.patch.object(server, "agy_turns", lambda cid, limit: later), \
+                self.assertRaisesRegex(server.BridgeError, "has had another message since"):
+            server.send_consultant_message({"to": other["id"], "kind": "review", "second_opinion_of": "agy-nouez-1"})
+        with mock.patch.object(server, "agy_resolve", found), \
+                mock.patch.object(server, "agy_turns", lambda cid, limit: agy_recent):
+            server.send_consultant_message({"to": other["id"], "kind": "review", "second_opinion_of": "agy-nouez-1",
+                                            "wait": 5})
+        self.assertIn("Check it.", daemon.started["input"][0]["text"])
+        self.assertNotIn("Review commit abc.", daemon.started["input"][0]["text"])
+        # A caller can't hand nouez the saved work itself.
+        with mock.patch.object(server, "second_opinion", lambda a, to: self.fail("not blind")), \
+                mock.patch.object(server, "revision_for", lambda a, cwd, **k: self.assertNotIn("_work", a) or
+                                  ("", b"", "")):
+            server.send_consultant_message({"to": other["id"], "message": "m", "kind": "quick-check",
+                                            "revision": True, "_work": {"patch": "0" * 16}, "wait": 0})
+
+    def test_a_second_opinion_reviews_the_same_diff(self):
+        # Codex finding 4: the diff the first review was sent with is the one the second gets,
+        # in the same repository; when it can't be had, nothing is sent.
+        repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo, True)
+        patch = b"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"
+        digest = hashlib.sha256(patch).hexdigest()[:16]
+        folder = server.cache_folder(server.PATCH_FOLDER, create=True)
+        with open(os.path.join(folder, digest + ".patch"), "wb") as f:
+            f.write(patch)
+        work = {"repo": repo, "patch": digest, "head": self.head}
+        with mock.patch.object(server, "git_root", lambda cwd: cwd), \
+                mock.patch.object(server, "revision", lambda *a, **k: self.fail("not taken again")):
+            stamp, sent, got = server.revision_for({"_work": work}, repo, take=True, inline_limit=10_000)
+            self.assertEqual((sent, got), (patch, digest))
+            self.assertIn(f"sha256 {digest}", stamp)
+            self.assertIn(f"[Revision: commit {self.head[:7]};", stamp)  # Codex round 4: the commit reviewed
+            self.assertIn("the diff the first review was sent with is in this message", stamp)
+            stamp, sent, _ = server.revision_for({"_work": work}, repo, take=False)
+            self.assertEqual(sent, b"")
+            self.assertIn("is saved as", stamp)
+            with self.assertRaisesRegex(server.BridgeError, "too large to put in a message"):
+                server.revision_for({"_work": work}, repo, inline_limit=10)
+            with self.assertRaisesRegex(server.BridgeError, "review other work than the first one did"):
+                server.revision_for({"_work": work}, self.dir)  # another repository
+            with self.assertRaisesRegex(server.BridgeError, "no longer has the diff"):
+                server.revision_for({"_work": dict(work, patch="f" * 16)}, repo)
+            with open(os.path.join(folder, digest + ".patch"), "ab") as f:
+                f.write(b"+changed\n")
+            with self.assertRaisesRegex(server.BridgeError, "no longer has the diff"):
+                server.revision_for({"_work": work}, repo)  # the saved file isn't that diff any more
+        # A first review of a clean commit: the same commit and still nothing uncommitted, or nothing is sent.
+        a, b = "a" * 40, "b" * 40
+        clean = ("[Revision: ...]\n", b"", server.REVISION_CLEAN + a)
+        found = [clean]
+        with mock.patch.object(server, "git_root", lambda cwd: cwd), \
+                mock.patch.object(server, "revision", lambda *args, **k: found[0]):
+            self.assertEqual(server.revision_for({"_work": dict(work, patch=None, clean=a)}, repo), clean)
+            # Codex round 2, finding 3: a first review that had changes nouez took no diff of (an
+            # Antigravity review without attach_diff), or was outside git, can't be shown again,
+            # even once the changes are gone.
+            with self.assertRaisesRegex(server.BridgeError, "sent without a diff of its uncommitted changes"):
+                server.revision_for({"_work": dict(work, patch=None)}, repo)
+            # Codex round 3, finding 3: the commit is the one revision() found clean, not one read apart.
+            for now in (("[Revision: ...]\n", b"", server.REVISION_CLEAN + b),
+                        ("[Revision: ..., 1 uncommitted path(s)]\n", b"", "")):
+                found[0] = now
+                with self.assertRaisesRegex(server.BridgeError, "The work has changed since the first review"):
+                    server.revision_for({"_work": dict(work, patch=None, clean=a)}, repo)
+        server.save_review_round("c-5", server.next_review_round("c-5", "c", repo, "review", []), "t", "Review it.",
+                                 {"revision": True}, cwd=repo, digest=server.REVISION_CLEAN + a)
+        self.assertEqual((server.review_chain("c-5")["patch"], server.review_chain("c-5")["clean"]), (None, a))
+        # The chain keeps the repository and the diff its first round was sent with.
+        chain = server.next_review_round("c-4", "c", repo, "review", [])
+        server.save_review_round("c-4", chain, "t", "Review it.", {"revision": True}, cwd=repo, digest=digest)
+        kept = server.review_chain("c-4")
+        self.assertEqual((kept["patch"], kept["revision"]), (digest, True))
+        self.assertTrue(server.same_folder(kept["repo"], repo))
+
 
 class PaneTest(unittest.TestCase):
     """0.23.0: the Codex panes earlier versions opened are found from Windows' own process list
@@ -6020,6 +6827,177 @@ class ConfigReportTest(unittest.TestCase):
         self.assertEqual(report.count("a.sh"), 1)
 
 
+class ApprovalRetryTest(unittest.TestCase):
+    """0.26.0: the opt-in approvals end to end on 2026-07-28. The prompt goes back as input_required,
+    nothing happens before the answer, and only the same call, answered, goes ahead."""
+
+    def setUp(self):
+        self.sent = []
+        for patch in (mock.patch.object(server, "respond",
+                                        lambda i, result=None, error=None: self.sent.append((result, error))),
+                      mock.patch.object(server, "client_request", lambda *a, **k: self.fail("no server requests"))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        server._asked.clear()
+        self.addCleanup(server._asked.clear)
+        self.meta = {server.META_VERSION: "2026-07-28", server.META_CAPS: {"elicitation": {}}}
+
+    def call(self, name, arguments, **extra):
+        self.sent.clear()
+        server.dispatch({"id": 1, "method": "tools/call", "params": {
+            "name": name, "arguments": arguments, "_meta": self.meta, **extra}}, threading.Event())
+        result, error = self.sent[-1]
+        self.assertIsNone(error)
+        return result
+
+    def answer(self, asked, action, name, arguments):
+        response = {"action": action, **({"content": {}} if action == "accept" else {})}
+        return self.call(name, arguments, requestState=asked["requestState"],
+                         inputResponses={server.ASK_KEY: response})
+
+    def test_create_and_trust_asks_before_the_folder_is_made(self):
+        # Neon N3: a decline, or a prompt never answered, leaves no folder behind.
+        plain = tempfile.mkdtemp(prefix="nouez-test-plain-")
+        self.addCleanup(shutil.rmtree, plain, True)
+        new = os.path.join(plain, "fresh")
+        args = {"cwd": new, "create": True, "trust": True}
+        with mock.patch.dict(os.environ, {"NOUEZ_ASK_TRUST": "1"}), \
+                mock.patch.object(server, "trust_folder", return_value=(new, None)) as trust, \
+                mock.patch.object(server, "open_window") as window, \
+                mock.patch.object(server, "folder_trusted", return_value=False), \
+                mock.patch.object(server, "exactly_trusted", return_value=False):
+            first = self.call("OpenClaudeSession", args)
+            self.assertEqual(first["resultType"], "input_required")
+            self.assertIn(f"Create {new} and record that you trust it?",
+                          first["inputRequests"][server.ASK_KEY]["params"]["message"])
+            self.assertFalse(os.path.exists(new))
+            declined = self.answer(first, "decline", "OpenClaudeSession", args)
+            self.assertTrue(declined["isError"])
+            self.assertIn("declined", declined["content"][0]["text"])
+            self.assertFalse(os.path.exists(new))
+            trust.assert_not_called()
+            done = self.answer(self.call("OpenClaudeSession", args), "accept", "OpenClaudeSession", args)
+            self.assertEqual(done["resultType"], "complete")
+            self.assertIn(f"Created the folder {new}.", done["content"][0]["text"])
+            self.assertTrue(os.path.isdir(new))
+            trust.assert_called_once()  # asked once: the made folder isn't asked about again
+            window.assert_not_called()  # folder_trusted still says no in this test
+
+    def test_a_user_session_message_is_approved_for_that_call_only(self):
+        # Codex finding 1, Neon N2: changing the message past what the prompt shows, or any other
+        # argument, makes it another call, asked about again.
+        mine = {"id": "0199aaaa-0000-0000-0000-000000user04", "cwd": ROOT}
+        daemon = FakeDaemon([mine])
+        args = {"kind": "other", "to": mine["id"], "message": "a" * 600 + " tail", "wait": 0,
+                "allow_user_session": True}
+        with mock.patch.dict(os.environ, {"NOUEZ_ASK_USER_SESSION": "1"}), \
+                mock.patch.object(server, "CodexClient", daemon), \
+                mock.patch.object(server, "POLL_SECONDS", 0.01), mock.patch.object(server, "_delivered", {}):
+            first = self.call("SendConsultantMessage", args)
+            self.assertEqual(first["resultType"], "input_required")
+            question = first["inputRequests"][server.ASK_KEY]["params"]["message"]
+            self.assertIn(f"(session {mine['id']})", question)
+            self.assertIn("... (105 more characters not shown)", question)
+            self.assertNotIn("turn/start", daemon.calls)
+            changed = dict(args, message="a" * 600 + " else")
+            again = self.answer(first, "accept", "SendConsultantMessage", changed)
+            self.assertEqual(again["resultType"], "input_required")
+            self.assertEqual(again["inputRequests"][server.ASK_KEY]["params"]["message"], question)
+            self.assertNotIn("turn/start", daemon.calls)
+            done = self.answer(again, "accept", "SendConsultantMessage", changed)
+            self.assertEqual(done["resultType"], "complete")
+            self.assertTrue(done["content"][0]["text"].startswith("Delivered to "))
+            self.assertEqual(daemon.calls.count("turn/start"), 1)
+            self.assertIn(" else", daemon.started["input"][0]["text"])
+
+    def test_a_user_session_approval_covers_the_diff_it_names(self):
+        # Codex round 2, finding 1: the diff is taken before the question and named in it, so an edit
+        # made while the question is open is asked about again, and the diff sent is the one shown.
+        mine = {"id": "0199aaaa-0000-0000-0000-000000user05", "cwd": ROOT}
+        daemon = FakeDaemon([mine])
+        args = {"kind": "other", "to": mine["id"], "message": "Review it.", "wait": 0, "revision": True,
+                "allow_user_session": True}
+        stamps = iter(["[Revision: commit abc; diff sha256 1111]\n", "[Revision: commit abc; diff sha256 2222]\n",
+                       "[Revision: commit abc; diff sha256 2222]\n"])
+        with mock.patch.dict(os.environ, {"NOUEZ_ASK_USER_SESSION": "1"}), \
+                mock.patch.object(server, "CodexClient", daemon), \
+                mock.patch.object(server, "revision_for", lambda a, cwd, **k: (next(stamps), b"", "1" * 16)), \
+                mock.patch.object(server, "POLL_SECONDS", 0.01), mock.patch.object(server, "_delivered", {}):
+            first = self.call("SendConsultantMessage", args)
+            self.assertIn("sha256 1111", first["inputRequests"][server.ASK_KEY]["params"]["message"])
+            again = self.answer(first, "accept", "SendConsultantMessage", args)  # edited in between
+            self.assertEqual(again["resultType"], "input_required")
+            self.assertIn("sha256 2222", again["inputRequests"][server.ASK_KEY]["params"]["message"])
+            self.assertNotIn("turn/start", daemon.calls)
+            done = self.answer(again, "accept", "SendConsultantMessage", args)
+            self.assertEqual(done["resultType"], "complete")
+            self.assertIn("sha256 2222", daemon.started["input"][0]["text"])
+            # Codex round 3, finding 1: with no diff saved (nor a clean commit), the stamp can only say
+            # "review the working tree", which may change after the yes: nothing is asked or sent.
+            stamps = iter(["[Revision: commit abc; nouez couldn't save their diff, so review the working tree]\n"])
+            with mock.patch.object(server, "revision_for", lambda a, cwd, **k: (next(stamps), b"", "")):
+                refused = self.call("SendConsultantMessage", args)
+            self.assertTrue(refused["isError"])
+            self.assertIn("couldn't save their diff", refused["content"][0]["text"])
+            self.assertEqual(daemon.calls.count("turn/start"), 1)
+
+    def test_calls_need_a_handshake_or_the_protocol_s_own_meta(self):
+        # Codex round 2, finding 2: a request with any of the protocol's _meta keys is a 2026-07-28 one
+        # and needs its version; one with none runs only after initialize.
+        ran = []
+        with mock.patch.dict(server.HANDLERS, {"Probe": lambda a, c, p: ran.append(1) or "done"}), \
+                mock.patch.object(server, "_initialized", threading.Event()):
+            self.sent.clear()
+            server.dispatch({"id": 1, "method": "tools/call", "params": {
+                "name": "Probe", "_meta": {"io.modelcontextprotocol/logLevel": "info"}}}, threading.Event())
+            self.assertEqual(self.sent[-1][1]["code"], -32602)
+            server.dispatch({"id": 2, "method": "tools/call", "params": {"name": "Probe"}}, threading.Event())
+            self.assertEqual(self.sent[-1][1]["code"], -32600)
+            self.assertEqual(ran, [])
+            # Codex round 3, finding 2: server/discover is the new version's own, so without its _meta
+            # it gets that version's -32602 even before any initialize.
+            server.dispatch({"id": 4, "method": "server/discover", "params": {}}, threading.Event())
+            self.assertEqual(self.sent[-1][1]["code"], -32602)
+            server._initialized.set()
+            server.dispatch({"id": 3, "method": "tools/call", "params": {"name": "Probe"}}, threading.Event())
+            self.assertEqual(self.sent[-1][0]["content"][0]["text"], "done")
+            # A 2025-11-25 key under the same prefix (a task's) leaves a request a legacy one.
+            server.dispatch({"id": 5, "method": "tools/call", "params": {"name": "Probe", "_meta": {
+                "io.modelcontextprotocol/related-task": {"taskId": "t1"}}}}, threading.Event())
+            self.assertEqual(self.sent[-1][0]["content"][0]["text"], "done")
+            self.assertEqual(len(ran), 2)
+        # A finished request drops its own cancellation, never a newer one that reuses its id.
+        older, newer = threading.Event(), threading.Event()
+        with mock.patch.object(server, "_cancel_events", {7: newer}):
+            server.forget_cancel(7, older)
+            self.assertIs(server._cancel_events.get(7), newer)
+            server.forget_cancel(7, newer)
+            self.assertNotIn(7, server._cancel_events)
+
+    def test_an_update_notice_waits_for_a_result_it_can_go_in(self):
+        # Neon N1: an input_required result carries no text, so the notice isn't marked as given.
+        kept = []
+
+        def notice(pending=None):
+            pending.append(lambda: kept.append(1))
+            return "nouez 9.9 is out"
+
+        def ask(args, cancel, progress):
+            server.user_approves("Go?", "NOUEZ_ASK_TRUST", cancel)
+            return "went"
+        with mock.patch.object(server, "in_dispatcher", lambda: True), \
+                mock.patch.object(server, "safe_nouez_update_notice", notice), \
+                mock.patch.object(server, "start_release_check", lambda *a, **k: None), \
+                mock.patch.dict(server.HANDLERS, {"Ask": ask}), \
+                mock.patch.object(server, "DISPATCHER_TOOLS", ("Ask",)):
+            first = self.call("Ask", {})
+            self.assertEqual(first["resultType"], "input_required")
+            self.assertEqual(kept, [])
+            done = self.answer(first, "accept", "Ask", {})
+            self.assertEqual(done["content"][0]["text"], "went\n\nnouez 9.9 is out")
+            self.assertEqual(kept, [1])
+
+
 class TrustReportFirstTest(unittest.TestCase):
     """0.19.0: trust=true records trust only once nouez has given the folder's report."""
 
@@ -6056,6 +7034,38 @@ class TrustReportFirstTest(unittest.TestCase):
         self.assertIn("apiKeyHelper runs: key.sh", first)
         trust.assert_called_once()
         window.assert_not_called()  # folder_trusted still says no in this test
+
+    def test_with_ask_trust_the_user_approves_each_recording(self):
+        """0.26.0: NOUEZ_ASK_TRUST=1 asks in the client's own prompt, naming the report shown, before
+        each recording of trust; settings changed while it is open record nothing."""
+        asked, answers = [], []
+
+        def prompt(method, params, timeout=5):
+            asked.append(params["message"])
+            if answers and answers[0] == "change":
+                self.write({"apiKeyHelper": "changed.sh"})
+                answers[0] = "accept"
+            return {"action": answers.pop(0)} if answers else None
+        with mock.patch.dict(os.environ, {"NOUEZ_ASK_TRUST": "1"}), \
+                mock.patch.dict(server._client_caps, {"elicitation": {}}), \
+                mock.patch.object(server, "client_request", prompt), \
+                mock.patch.object(server, "trust_folder", return_value=(self.dir, None)) as trust, \
+                mock.patch.object(server, "open_window"):
+            first = server.open_claude_session({"cwd": self.dir})
+            tag = re.search(r"\(report ([0-9a-f]{12}): nouez's prompt names this id\)", first).group(1)
+            answers.append("decline")
+            with self.assertRaisesRegex(server.BridgeError, "The user declined"):
+                server.open_claude_session({"cwd": self.dir, "trust": True})
+            trust.assert_not_called()
+            self.assertIn(f"(report {tag})", asked[0])
+            answers.append("accept")
+            server.open_claude_session({"cwd": self.dir, "trust": True})
+            trust.assert_called_once()
+            answers.append("change")
+            with self.assertRaisesRegex(server.BridgeError, "changed while nouez's prompt was open"):
+                server.open_claude_session({"cwd": self.dir, "trust": True})
+            trust.assert_called_once()
+        self.assertNotIn("(report ", server.open_claude_session({"cwd": self.dir}))  # only with the setting
 
     def test_a_changed_folder_is_reported_again(self):
         with mock.patch.object(server, "trust_folder", return_value=(self.dir, None)) as trust:
@@ -7902,7 +8912,8 @@ class DispatcherTest(unittest.TestCase):
         for config_dir, shell, said in ((other, None, "Claude Code is trusted there"),
                                         (None, None, "isn't trusted there itself"),
                                         (None, other, "Claude Code is trusted there")):  # run by hand from it
-            with mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": shell} if shell else {}),                     mock.patch.object(server, "claude_state_file",
+            with mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": shell} if shell else {}), \
+                    mock.patch.object(server, "claude_state_file",
                                       lambda env=None: os.path.join((env or {}).get("CLAUDE_CONFIG_DIR") or self.home,
                                                                     ".claude.json") if env is not None else
                                       os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or self.home, ".claude.json")):
@@ -8024,6 +9035,8 @@ class DispatcherTest(unittest.TestCase):
         code, out = self.setup()
         self.assertIn("already allows", out)
         self.assertIn("kept as it is", out)
+        self.assertNotIn("isn't the one this nouez writes", out)
+        self.assertIsNone(server.dispatcher_md_note(self.folder))
 
     def test_setup_keeps_the_users_files_and_backs_up_what_it_changes(self):
         os.makedirs(os.path.join(self.folder, ".claude"))
@@ -8037,6 +9050,10 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         with open(os.path.join(self.folder, "CLAUDE.md"), encoding="utf-8") as f:
             self.assertEqual(f.read(), "my own")
+        # One that isn't the current nouez's (an older one, or edited) is kept, with how to take the new one.
+        self.assertIn("isn't the one this nouez writes", out)
+        self.assertIn("rename it", out)
+        self.assertIsNone(server.dispatcher_md_note(self.projects))  # no CLAUDE.md there: no note
         with open(settings, encoding="utf-8") as f:
             data = json.load(f)
         self.assertEqual(data["model"], "opus")
@@ -8407,7 +9424,8 @@ class DispatcherTest(unittest.TestCase):
             self.assertEqual(f.read(), os.pathsep.join([claude, a("/usr/bin"), a("/bin")]) + "\n")
         for name in (record, saved):
             os.remove(name)
-        with mock.patch.object(server, "DISPATCHER_PATH_BYTES", len(claude) + 1),                 mock.patch.dict(server.os.environ, {"PATH": a("/usr/bin")}):  # claude's folder alone fits
+        with mock.patch.object(server, "DISPATCHER_PATH_BYTES", len(claude) + 1), \
+                mock.patch.dict(server.os.environ, {"PATH": a("/usr/bin")}):  # claude's folder alone fits
             code, out, _, popen = self.install("linux", claude=a("/opt/bin/claude"))
         self.assertEqual(code, 1)
         self.assertIn("Nothing was installed: this PATH can't be saved for the sign-in start (", out)

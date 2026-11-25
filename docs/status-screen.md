@@ -12,6 +12,8 @@ nouez notes each consultation in `nouez/usage-log.jsonl` in your cache folder (`
 
 Events of Antigravity consultants carry `provider: "antigravity"`, and their sends also record Antigravity's quota at that moment.
 
+An event recorded while a client's request is handled carries `client`: the name the program connected to nouez gives itself, such as `claude-code`, as the program reports it.
+
 It never holds the text of a message or reply; `reason` is Claude's one sentence on its choice, so it shouldn't quote anything sensitive. Each month, or sooner past 20 MB, it is renamed with the date and a new one starts. A renamed log is deleted a year after it was last written, and the oldest go first while they add up to more than 100 MB, so the status screen's "all" period covers what the kept logs hold, about a year. Set `NOUEZ_NO_USAGE_LOG=1` in nouez's environment to turn it off; that stops only this log, and an Antigravity consultant still keeps its turns in `nouez/agy/` (see [Files nouez keeps](how-it-works.md#files-nouez-keeps)).
 
 To see it, with the usage of each subscription, run in a terminal:

@@ -86,8 +86,8 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.25.0\\[0.3em]\large Architecture and message reference}
-\date{November 24, 2026}
+\title{\textbf{nouez} 0.26.0\\[0.3em]\large Architecture and message reference}
+\date{November 25, 2026}
 \author{}
 
 \begin{document}
@@ -104,8 +104,8 @@ the operating system, and its two web requests: to GitHub, which looks for a new
 and to Artificial Analysis, for model scores. The daemon also sends notifications and its own requests, which nouez
 discards and this document leaves out. Message shapes are as captured in runs of nouez 0.12.4,
 unless a section names a later version, with Claude Code
-2.1.295 and Codex app-server daemon 0.162.0; client behaviour described here (the discovery
-probe, progress tokens, the 120-second move to the background) was observed in those runs and is
+2.1.295 and Codex app-server daemon 0.162.0 (2.1.332 for the 2026-07-28 startup); client behaviour
+described here (the discovery probe, progress tokens, the 120-second move to the background) was observed in those runs and is
 not something nouez controls. Ids are invented, long objects are trimmed to the fields nouez
 reads, and quoted error texts marked as excerpts are shortened.
 \end{abstract}
@@ -257,38 +257,81 @@ response unless it was cancelled: if \code{dispatch()} raises, it answers
 
 \subsection{Startup}
 
-Claude Code 2.1.295 first probes the 2026-07-28 protocol with \code{server/discover}. nouez is a
-legacy-lifecycle server, so it answers \code{-32601}, and Claude Code falls back to the
-\code{initialize} handshake with protocol 2025-11-25.
+Claude Code 2.1.332 first probes the 2026-07-28 protocol with \code{server/discover}. nouez
+answers it, so Claude Code stays on 2026-07-28: there is no handshake, and every request carries
+its version, capabilities and client in \code{\_meta}. nouez handles each such request on its own
+and never sends that client a request, so it doesn't ask for roots: tools take \code{cwd}, which
+defaults to the folder it started nouez in, and outside git a call's consultants are looked for in
+the folder the call names, never in a workspace above it.
 
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[x=1cm,y=0.72cm]
-  \lifelines{0/Claude Code/cc, 8/nouez/nz}{10.4}
-  \msg{1.2}{0}{8}{server/discover}
-  \ret{2.0}{8}{0}{error -32601 Method not found}
-  \side{2.0}{8}{fall back to the legacy lifecycle}
-  \msg{3.0}{0}{8}{initialize (protocolVersion 2025-11-25)}
-  \ret{3.8}{8}{0}{result: version, capabilities, instructions}
-  \msg{4.8}{0}{8}{notifications/initialized}
-  \side{4.8}{8}{client advertised \code{roots}:}
-  \msg{5.6}{8}{0}{roots/list (id "nouez-1")}
-  \ret{6.4}{0}{8}{result: roots [file:///C:/...]}
-  \side{6.4}{8}{cached; used to default \code{cwd}}
-  \msg{7.6}{0}{8}{tools/list}
-  \ret{8.4}{8}{0}{result: nine tools with input schemas}
-  \msg{9.6}{0}{8}{tools/call ...}
-  \side{9.6}{8}{see Section~\ref{sec:tools}}
+  \lifelines{0/Claude Code/cc, 8/nouez/nz}{6.4}
+  \msg{1.2}{0}{8}{server/discover (\_meta: version, client, capabilities)}
+  \ret{2.0}{8}{0}{result: supportedVersions, capabilities, instructions}
+  \msg{3.2}{0}{8}{tools/list (the same \_meta)}
+  \ret{4.0}{8}{0}{result: the tools, resultType complete}
+  \msg{5.2}{0}{8}{tools/call ...}
+  \side{5.2}{8}{see Section~\ref{sec:tools}}
 \end{tikzpicture}
-\caption{MCP startup.}
+\caption{MCP startup on 2026-07-28.}
 \end{figure}
 
-\begin{wire}[Claude Code $\rightarrow$ nouez: discovery probe]
-{"jsonrpc": "2.0", "id": 0, "method": "server/discover", "params": {}}
+\begin{wire}[Claude Code $\rightarrow$ nouez: discovery]
+{"jsonrpc": "2.0", "id": "server-discover-probe-1", "method": "server/discover", "params": {"_meta": {
+  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+  "io.modelcontextprotocol/clientInfo": {"name": "claude-code", "version": "2.1.332", ...},
+  "io.modelcontextprotocol/clientCapabilities": {"roots": {"listChanged": true},
+    "elicitation": {"form": {}, "url": {}}}}}}
 \end{wire}
 \begin{wire}[nouez $\rightarrow$ Claude Code]
-{"jsonrpc": "2.0", "id": 0, "error": {"code": -32601, "message": "Method not found: server/discover"}}
+{"jsonrpc": "2.0", "id": "server-discover-probe-1", "result": {"resultType": "complete",
+  "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
+  "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
+  "ttlMs": 0, "cacheScope": "private",
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.26.0"}}}}
 \end{wire}
+
+Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
+\code{tools/list} adds \code{ttlMs} and \code{cacheScope}. A request whose version nouez doesn't
+know gets \code{-32022} with \code{data.supported} and \code{data.requested}; one without
+\code{clientCapabilities}, or carrying any of these \code{\_meta} keys without a version string,
+gets \code{-32602}, so it never runs under the handshake's rules; \code{ping} and
+\code{initialize} carrying the 2026-07-28 \code{\_meta} get \code{-32601}. An opt-in approval
+(\code{NOUEZ\_ASK\_TRUST}, \code{NOUEZ\_ASK\_USER\_SESSION}) goes back as
+\code{"resultType": "input\_required"}, with an \code{elicitation/create} request under
+\code{inputRequests} and a single-use \code{requestState}. Claude Code shows the prompt and sends
+the call again with \code{inputResponses}; nouez takes the answer only with a
+\code{requestState} it issued for the same question and the same call (a SHA-256 of the tool's
+name and all its arguments), once, within 10 minutes, and otherwise asks again. A client whose
+\code{clientCapabilities} show no form elicitation (none at all, or \code{url} only) gets
+\code{-32021} with \code{data.requiredCapabilities} instead of a prompt it can't show.
+
+\subsection{Startup with the handshake}
+
+A client that sends \code{initialize} first, such as a Claude Code from before 2026-07-28, gets the
+legacy lifecycle, which lasts for the process. A request without the 2026-07-28 \code{\_meta} that
+comes before any \code{initialize}, other than \code{ping}, gets \code{-32600}, so a client that
+skips the handshake never runs under its rules.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[x=1cm,y=0.72cm]
+  \lifelines{0/Claude Code/cc, 8/nouez/nz}{8.4}
+  \msg{1.0}{0}{8}{initialize (protocolVersion 2025-11-25)}
+  \ret{1.8}{8}{0}{result: version, capabilities, instructions}
+  \msg{2.8}{0}{8}{notifications/initialized}
+  \side{2.8}{8}{client advertised \code{roots}:}
+  \msg{3.6}{8}{0}{roots/list (id "nouez-1")}
+  \ret{4.4}{0}{8}{result: roots [file:///C:/...]}
+  \side{4.4}{8}{cached; used to default \code{cwd}}
+  \msg{5.6}{0}{8}{tools/list}
+  \ret{6.4}{8}{0}{result: the tools with input schemas}
+  \msg{7.6}{0}{8}{tools/call ...}
+\end{tikzpicture}
+\caption{MCP startup with the handshake.}
+\end{figure}
 
 \begin{wire}[Claude Code $\rightarrow$ nouez: initialize]
 {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
