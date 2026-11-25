@@ -6,6 +6,22 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Stop a consultant's work without losing it: *"stop that review, the question changed"*. `StopConsultant` with `turn_only: true` ends the running turn, and the consultant keeps its context and takes the next message (Codex through `turn/interrupt`, Antigravity by ending the agy process nouez started). A plain `StopConsultant` of a Codex consultant now ends a turn still running before archiving the session, rather than leaving it working, and waits for a send to that consultant from another Claude Code session to finish first.
+- `ListClaudeSessions` with a project folder (`cwd`) also lists that folder's saved conversations, newest first, so from the phone you can pick an earlier one to resume, not only the latest. Each shows its last activity, id, whether it is open, and any custom title and git branch, never the prompts.
+- Ask the phone dispatcher “which reviews need me?”: `ListConsultants` now gives one line per consultant with its project, state, age, kind, verdict and title, never the messages. First come finished turns whose reply Claude hasn't fetched (“done, no reply logged”), changes, no or incomplete verdicts from the last day, and turns running for ten minutes. Run `dispatcher setup` again to allow `ListConsultants`.
+- Review a whole branch: `SendConsultantMessage` with `revision: true` and a `base` such as `main` takes one diff from the branch's merge base with that base to the working tree, so commits on the branch and uncommitted work are both reviewed. Before, a branch with everything committed sent no diff. The base must be known locally; nouez never fetches, and the revision line names both commit ids.
+
+### Changed
+
+- Claude consults without being asked, with no `CLAUDE.md` lines or skill needed: a review of what it will commit before committing a change to behavior, several files or anything risky (not typos, formatting or one-line fixes), committing after the verdict; a bug hunt when a failure's cause isn't obvious after a first look; and a critique of a consequential plan, design, formula or rule of its own before building on it, whose verdict it shows. It first checks `ConsultantBudget` and skips one, saying so, when that subscription is used up or would run out before its reset. Until now it consulted only when asked or told to by your own instructions; those still override the default. Set `NOUEZ_NO_AUTO_CONSULT=1` to turn it off (with a Codex API key, each consultation costs money). It is off when no consultant CLI is installed.
+- Automatic window arranging on Windows is off by default. Ask Claude to turn it on. An existing `auto: true` setting stays on. You can still ask Claude to arrange the windows once.
+
+### Fixed
+
+- A stopped Codex consultant could still be reached by its full id, though the guide says it is out of reach until unarchived. nouez now refuses it and says how to bring it back.
+
 ## [0.23.0] - 2026-11-24
 
 Phone first, and fewer windows. nouez now keeps the computer reachable from the Claude phone app: `server.py dispatcher` sets up a Remote Control server, the dispatcher, in a folder of its own, starts it at each sign-in and starts it again when it ends, so the app can open, resume and close Claude Code sessions in any project without anyone at the computer. The README now starts from that: the phone is where you work, the computer is the server. Set it up with Setup step 3 (`dispatcher setup`, one interactive run, `dispatcher install`).

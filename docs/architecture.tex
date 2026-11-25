@@ -655,6 +655,7 @@ thread/resume & \code{threadId}, \code{excludeTurns: true} & -- & SendConsultant
 thread/turns/list\textsuperscript{*} & \code{threadId}, \code{limit}, \code{sortDirection: "desc"} & \code{data}: turns, with items & send, wait, reply, history, the consultations page \\
 turn/start & \code{threadId}, \code{input}, \code{sandboxPolicy}, \code{approvalPolicy}\textsuperscript{\dag}, opt.\ \code{model}, \code{effort} & \code{turn.id} & send to an idle session \\
 turn/steer & \code{threadId}, \code{expectedTurnId}, \code{input} & \code{turnId} (not read) & send to a busy session \\
+turn/interrupt & \code{threadId}, \code{turnId} & -- (\code{\{\}}) & StopConsultant, a turn still running \\
 thread/archive & \code{threadId} & -- & StopConsultant \\
 account/rateLimits/read & -- & \code{rateLimits}, \code{rateLimitResetCredits} & ConsultantBudget \\
 model/list & \code{\{\}} & \code{data}: models & ConsultantBudget \\
@@ -867,22 +868,11 @@ nouez 0.13.0 is out; this server is 0.12.4. What changed: https://github.com/jib
   "arguments": {"cwd": "C:\\Users\\you\\Projects\\nouez"}}}
 \end{wire}
 \begin{plain}[Result text]
-2 Codex session(s) in C:\Users\you\Projects\nouez:
-- codex-nouez-4d9f17
-    id: 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17
-    cwd: C:\Users\you\Projects\nouez
-    model: gpt-5.6-sol (openai)
-    status: busy
-    started by: StartConsultant
-- codex-nouez-77c2e0
-    id: 01a1e8a0-1c3d-7f02-8e44-90b1d577c2e0
-    cwd: C:\Users\you\Projects\nouez
-    model: gpt-6-astra (openai)
-    status: idle
-    started by: user
+- working | 2m | review | C:\Users\you\Projects\nouez | codex-nouez-4d9f17 | gpt-5.6-sol | 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17
+- user session | idle | C:\Users\you\Projects\nouez | codex-nouez-77c2e0 | gpt-6-astra | 01a1e8a0-1c3d-7f02-8e44-90b1d577c2e0 | Release notes
 \end{plain}
 \begin{plain}[Result text: nothing found]
-No Codex sessions in C:\Users\you\Projects\nouez. Start one with StartConsultant, or open Codex in a terminal.
+No consultants in C:\Users\you\Projects\nouez. Start one with StartConsultant, or open Codex in a terminal.
 \end{plain}
 
 % -----------------------------------------------------------------------------
@@ -1277,15 +1267,18 @@ No problems found.
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[x=0.92cm,y=0.7cm]
-  \lifelines{0/Claude Code/cc, 5/nouez/nz, 10.5/Codex daemon/cx}{5.6}
+  \lifelines{0/Claude Code/cc, 5/nouez/nz, 10.5/Codex daemon/cx}{7.2}
   \msg{1.2}{0}{5}{tools/call StopConsultant}
   \msg{2.1}{5}{10.5}{connect; find session (exact only)}
   \side{2.8}{5}{refuse if \code{threadSource} isn't \code{"nouez"}}
-  \msg{3.6}{5}{10.5}{thread/archive}
-  \ret{4.7}{5}{0}{"Stopped ... (archived)."}
+  \msg{3.6}{5}{10.5}{thread/turns/list (newest turn)}
+  \msg{4.5}{5}{10.5}{turn/interrupt, if it runs; poll until it ends}
+  \msg{5.4}{5}{10.5}{thread/archive (not with \code{turn\_only})}
+  \ret{6.3}{5}{0}{"Stopped ... (archived)."}
 \end{tikzpicture}
-\caption{StopConsultant. Archiving is reversible: \code{codex unarchive <id>}. A
-\code{codex resume} the user opened on the session stays open.}
+\caption{StopConsultant. A turn still running is ended first, with \code{turn/interrupt}; with
+\code{turn\_only} that is all, and the consultant takes the next message. Archiving is reversible:
+\code{codex unarchive <id>}. A \code{codex resume} the user opened on the session stays open.}
 \end{figure}
 
 \begin{wire}[Request]
@@ -2105,7 +2098,7 @@ The read-back catches the second; the backups are there for the first.
 \label{sec:arrange}
 
 On Windows, nouez puts the Windows Terminal windows it opened in a grid that fills one screen, and
-arranges them again as they open, close or are moved. Those are the Claude Code sessions from
+arranges them again as they open, close or are moved if automatic arranging is on. Those are the Claude Code sessions from
 \code{OpenClaudeSession} and the status screens from \code{OpenStatusScreen}. It never moves another window:
 not a terminal the user opened, nor one Claude Code runs in.
 Everything below uses \code{ctypes} and the Win32 API; on macOS and Linux nothing is recorded or
@@ -2139,7 +2132,7 @@ and the file itself again, so none is reached through a link (Section~\ref{sec:u
 
 \subsubsection*{The arranger}
 
-Writing an entry wakes the arranger, \code{server.py arrange}, starting it if none runs (its
+Writing an entry wakes the arranger, \code{server.py arrange}, starting it if automatic arranging is on and none runs (its
 mutex, below, tells whether one does: the wake event can outlive the arranger while another process
 holds it open). It is a process of its own, outside the helper's job object when Windows allows, so it outlives the window
 that started it. One runs per user session: it holds the named mutex
@@ -2221,8 +2214,8 @@ with integer division from the area's edges, so neighbouring boxes share their e
 area exactly; a window counts as in its box within the 12-pixel tolerance, so real windows can
 leave or overlap a few pixels.
 
-\code{auto} lives in \code{arrange.json} in nouez's cache folder; it is on unless set to
-\code{false}.
+\code{auto} lives in \code{arrange.json} in nouez's cache folder; automatic arranging is off unless the file contains
+\code{auto: true}.
 
 % -----------------------------------------------------------------------------
 \subsection{The phone dispatcher}

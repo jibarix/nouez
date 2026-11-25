@@ -44,6 +44,9 @@ os.environ["NOUEZ_NO_LOGIN_CHECK"] = "1"
 # Tests never see the user's own Antigravity consultants; AgyTest points this at its own folder.
 _AGY_EMPTY = tempfile.mkdtemp(prefix="nouez-test-agy-")
 server.agy_root = lambda: os.path.join(_AGY_EMPTY, "agy")
+# Nor nouez's Codex lock files.
+_CODEX_LOCKS = tempfile.mkdtemp(prefix="nouez-test-codex-locks-")
+server.codex_lock_folder = lambda create=False: _CODEX_LOCKS
 
 server.CONNECT_SECONDS = 0  # OpenClaudeSession tests look for the new session once, not for 15 s
 
@@ -150,6 +153,22 @@ class ProtocolTest(unittest.TestCase):
         text = reply["result"]["instructions"]
         self.assertIn("only when the user asks or the user's own instructions", text)
         self.assertIn("send the usual values again", text)
+
+    def test_instructions_consult_unasked_only_with_a_consultant_cli(self):
+        # A clone with no CLAUDE.md or skill still gets reviews, bug hunts and critiques unasked;
+        # without a consultant CLI, or with NOUEZ_NO_AUTO_CONSULT=1, that part is left out.
+        for codex, agy, off, auto in ((True, None, "", True), (False, "agy", "", True), (False, None, "", False),
+                                      (True, "agy", "1", False), (True, None, "0", True)):
+            env = {"NOUEZ_NO_AUTO_CONSULT": off}  # set every time, so the caller's own value can't leak in
+            with self.subTest(codex=codex, agy=agy, env=env),                     mock.patch.object(server, "codex_installed", lambda: codex),                     mock.patch.object(server, "agy_command", lambda env=None: agy),                     mock.patch.dict(os.environ, env):
+                text = server.server_instructions()
+                self.assertEqual(server.AUTO_CONSULT in text, auto)
+                self.assertTrue(text.startswith(server.INSTRUCTIONS_HEAD))
+                self.assertTrue(text.endswith(server.INSTRUCTIONS))
+                self.assertIn("Consult whenever the user asks", text)
+        self.assertIn("revision=true", server.AUTO_CONSULT)
+        self.assertIn("own instructions say otherwise", server.AUTO_CONSULT)
+        self.assertIn("ConsultantBudget", server.AUTO_CONSULT)
 
     def test_initialize_with_the_release_check_on(self):
         # The check runs, but a cached failed lookup from just now keeps it off the network.
@@ -1180,6 +1199,8 @@ class FakeDaemon:
         if method == "thread/loaded/list":
             return {"data": list(self.threads)}
         if method == "thread/read":
+            if params["threadId"] not in self.threads:
+                raise server.BridgeError(f"thread not found: {params['threadId']}")
             return {"thread": dict(self.threads[params["threadId"]])}
         if method == "thread/list":
             return {"data": []}
@@ -1205,6 +1226,14 @@ class FakeDaemon:
             running = self.turns[params["threadId"]][0]
             running["items"].append(user(params["input"][0]["text"]))
             return {"turnId": running["id"]}
+        if method == "turn/interrupt":
+            for turn in self.turns.get(params["threadId"], []):
+                if turn["id"] == params["turnId"]:
+                    turn["status"] = "interrupted"
+            return {}
+        if method == "thread/archive":
+            self.archived = params["threadId"]
+            return {}
         raise AssertionError(method)
 
 
@@ -1218,6 +1247,145 @@ class HandlerTest(unittest.TestCase):
 
     def consultant(self, tag, **extra):
         return {"id": f"0199aaaa-0000-0000-0000-000000{tag}", "cwd": ROOT, "threadSource": "nouez", **extra}
+
+    def test_stop_ends_a_running_turn(self):
+        # Checked live 2026-11-25: turn/interrupt returns {}, the turn reads "interrupted" within a
+        # second, Codex doesn't carry it on, and the next message gets a reply.
+        c = self.consultant("st0001")
+        running = {"id": "turn-run", "status": "inProgress", "items": [user("q")]}
+        daemon = self.use(FakeDaemon([c], {c["id"]: [running]}))
+        out = server.stop_consultant({"to": c["id"], "turn_only": True})
+        self.assertIn(f"Ended {server.short_name(c)}'s running turn (turn-run)", out)
+        self.assertEqual(running["status"], "interrupted")
+        self.assertNotIn("thread/archive", daemon.calls)
+        self.assertIn("has no turn running", server.stop_consultant({"to": c["id"], "turn_only": True}))
+        running["status"] = "inProgress"  # a full stop ends the turn before archiving
+        out = server.stop_consultant({"to": c["id"]})
+        self.assertIn(f"Stopped {server.short_name(c)} (archived). Ended its running turn.", out)
+        self.assertEqual((running["status"], daemon.archived), ("interrupted", c["id"]))
+        self.assertLess(daemon.calls.index("turn/interrupt"), daemon.calls.index("thread/archive"))
+
+    def test_an_interrupt_that_doesnt_take(self):
+        c = self.consultant("st0002")
+        daemon = self.use(FakeDaemon([c], {c["id"]: [{"id": "turn-run", "status": "inProgress", "items": []}]}))
+        real = daemon.request
+        daemon.request = lambda method, params: {} if method == "turn/interrupt" else real(method, params)
+        with mock.patch.object(server, "INTERRUPT_SECONDS", 0.2), \
+                self.assertRaisesRegex(server.BridgeError, "couldn't confirm it ended"):
+            server.stop_consultant({"to": c["id"]})
+        self.assertNotIn("thread/archive", daemon.calls)
+
+    def test_a_turn_that_finishes_as_it_is_stopped(self):
+        # Codex refuses to interrupt a turn that has just finished; the stop goes on.
+        c = self.consultant("st0003")
+        running = {"id": "turn-run", "status": "inProgress", "items": []}
+        daemon = self.use(FakeDaemon([c], {c["id"]: [running]}))
+        real = daemon.request
+
+        def finishing(method, params):
+            if method == "turn/interrupt":
+                running["status"] = "completed"
+                raise server.BridgeError("no active turn to interrupt")
+            return real(method, params)
+        daemon.request = finishing
+        self.assertIn("finished by itself", server.stop_consultant({"to": c["id"], "turn_only": True}))
+        running["status"] = "inProgress"
+        out = server.stop_consultant({"to": c["id"]})
+        self.assertIn("(archived). Its turn had just finished.", out)
+        self.assertEqual(daemon.archived, c["id"])
+        # A refusal while the turn still runs is reported, and nothing is archived.
+        running["status"], daemon.archived = "inProgress", None
+        daemon.request = lambda m, p: (_ for _ in ()).throw(server.BridgeError("refused")) \
+            if m == "turn/interrupt" else real(m, p)
+        with self.assertRaisesRegex(server.BridgeError, "refused"):
+            server.stop_consultant({"to": c["id"]})
+        self.assertIsNone(daemon.archived)
+
+    def test_the_interrupted_turn_is_followed_by_its_id(self):
+        # A newer turn of other work doesn't hide the ended one, and is left running; a continuation
+        # that carries the ended turn on (no message, rootTurnId naming it) is ended too.
+        c = self.consultant("st0004")
+        running = {"id": "turn-run", "status": "inProgress", "items": [user("q")]}
+        daemon = self.use(FakeDaemon([c], {c["id"]: [running]}))
+        real = daemon.request
+        other = {"id": "turn-other", "status": "inProgress", "items": [user("someone else")]}
+
+        def with_other(method, params):
+            out = real(method, params)
+            if method == "turn/interrupt" and params["turnId"] == "turn-run":
+                daemon.turns[c["id"]].insert(0, other)
+            return out
+        daemon.request = with_other
+        self.assertIn("Ended", server.stop_consultant({"to": c["id"], "turn_only": True}))
+        self.assertEqual(other["status"], "inProgress")
+        carried = {"id": "turn-carried", "status": "inProgress", "rootTurnId": "turn-run2", "items": []}
+        running2 = {"id": "turn-run2", "status": "inProgress", "items": [user("q2")]}
+        daemon.turns[c["id"]] = [running2]
+
+        def with_continuation(method, params):
+            out = real(method, params)
+            if method == "turn/interrupt" and params["turnId"] == "turn-run2":
+                daemon.turns[c["id"]].insert(0, carried)
+            return out
+        daemon.request = with_continuation
+        server.stop_consultant({"to": c["id"], "turn_only": True})
+        self.assertEqual((running2["status"], carried["status"]), ("interrupted", "interrupted"))
+        # Followed hop by hop: an interrupted continuation that was itself carried on.
+        a = {"id": "turn-a", "status": "inProgress", "items": [user("q3")]}
+        b = {"id": "turn-b", "status": "interrupted", "rootTurnId": "turn-a", "items": []}
+        last = {"id": "turn-c", "status": "inProgress", "rootTurnId": "turn-a", "items": []}
+        daemon.turns[c["id"]] = [a]
+
+        def chained(method, params):
+            out = real(method, params)
+            if method == "turn/interrupt" and params["turnId"] == "turn-a":
+                daemon.turns[c["id"]][:0] = [last, b]
+            return out
+        daemon.request = chained
+        server.stop_consultant({"to": c["id"], "turn_only": True})
+        self.assertEqual(last["status"], "interrupted")
+
+    def test_a_stop_checks_before_each_interrupt(self):
+        c = self.consultant("st0006")
+        running = {"id": "turn-run", "status": "inProgress", "items": []}
+        daemon = self.use(FakeDaemon([c], {c["id"]: [running]}))
+        cancel, real = threading.Event(), daemon.request
+
+        def cancelling(method, params):
+            if method == "thread/turns/list":
+                cancel.set()  # cancelled while the turn is looked up
+            return real(method, params)
+        daemon.request = cancelling
+        with self.assertRaises(server.Cancelled):
+            server.stop_consultant({"to": c["id"]}, cancel=cancel)
+        self.assertNotIn("turn/interrupt", daemon.calls)
+        self.assertEqual(running["status"], "inProgress")
+
+    def test_a_consultant_that_cant_be_read_again_is_left_alone(self):
+        c = self.consultant("st0007")
+        running = {"id": "turn-run", "status": "inProgress", "items": []}
+        daemon = self.use(FakeDaemon([c], {c["id"]: [running]}))
+        with mock.patch.object(server, "resolve", lambda client, to, **kw: dict(c)), \
+                mock.patch.object(server, "read_thread", lambda client, tid: None):
+            for call in (lambda: server.stop_consultant({"to": c["id"]}),
+                         lambda: server.send_consultant_message({"to": c["id"], "message": "hi"})):
+                with self.assertRaisesRegex(server.BridgeError, "Couldn't read .* again"):
+                    call()
+        self.assertFalse({"turn/interrupt", "thread/archive", "turn/start", "turn/steer"} & set(daemon.calls))
+
+    def test_a_stop_waits_for_a_send_in_another_session(self):
+        c = self.consultant("st0005")
+        daemon = self.use(FakeDaemon([c], {c["id"]: []}))
+        with mock.patch.object(server, "LOCK_SECONDS", 0.2), server.codex_lock(c["id"]), \
+                self.assertRaisesRegex(server.BridgeError, "Another Claude Code session"):
+            server.stop_consultant({"to": c["id"]})
+        self.assertNotIn("thread/archive", daemon.calls)
+        # And a send after a stop that came first is refused rather than reviving the consultant.
+        daemon.threads[c["id"]]["path"] = "/home/u/.codex/archived_sessions/rollout.jsonl"
+        with mock.patch.object(server, "resolve", lambda client, to, **kw: dict(c)), \
+                self.assertRaisesRegex(server.BridgeError, "was stopped"):
+            server.send_consultant_message({"to": c["id"], "message": "hi"})
+        self.assertNotIn("turn/start", daemon.calls)
 
     def test_start_never_reuses_a_user_session(self):
         mine = {"id": "0199aaaa-0000-0000-0000-000000user01", "cwd": ROOT}
@@ -2345,6 +2513,104 @@ class OpenClaudeSessionTests(unittest.TestCase):
         os.remove(path)
         return spec, out
 
+    def test_transcript_labels_read_only_complete_records_at_the_edges(self):
+        edge, cap = 256, 96
+
+        def title(text):
+            return json.dumps({"type": "custom-title", "customTitle": text}).encode()
+
+        head = title("old") + b"\r\n"
+        middle = b"x" * (8 * edge)
+        # The tail starts at a valid-looking object, but it is part of an oversized line.
+        branch = b'{"gitBranch":"wrong"}\n'
+        tail = branch + b" " * (edge - len(branch) - len(title("latest")) - 1) + b"\n" + title("latest")
+
+        class BoundedStream(io.BytesIO):
+            total = 0
+
+            def readline(self, size=-1):
+                if not 0 < size <= cap + 1:
+                    raise AssertionError(f"unbounded line read: {size}")
+                data = super().readline(size)
+                self.total += len(data)
+                return data
+
+        stream = BoundedStream(head + middle + tail)
+        with mock.patch.object(server, "TRANSCRIPT_EDGE_BYTES", edge), \
+                mock.patch.object(server, "TRANSCRIPT_LINE_BYTES", cap), \
+                mock.patch("builtins.open", return_value=stream):
+            self.assertEqual(server.transcript_labels("unused", None), ("latest", ""))
+        self.assertEqual(stream.total, 2 * edge)
+        stop = mock.Mock()
+        stop.is_set.side_effect = [False, False, True]
+        with self.assertRaises(server.Cancelled):
+            list(server.transcript_lines(io.BytesIO(head + middle), stop))
+
+    def test_transcript_folder_unknown_when_an_earlier_record_is_unreadable(self):
+        # /work/a-b and /work/a_b share a transcript folder: a later record's folder isn't the
+        # conversation's when the one before it was left out for its size or couldn't be parsed.
+        self.assertEqual(server.transcript_folder("/work/a-b"), server.transcript_folder("/work/a_b"))
+        big = json.dumps({"cwd": "/work/a-b", "pad": "x" * 200}).encode() + b"\n"
+        later = json.dumps({"cwd": "/work/a_b"}).encode() + b"\n"
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(server, "TRANSCRIPT_LINE_BYTES", 100):
+            for name, data, cwd in (("ok", b'{"type":"summary"}\n' + later, "/work/a_b"),
+                                    ("big", big + later, None), ("bad", b'{"cwd": "/work/a-b"\n' + later, None),
+                                    ("damaged", b'{"c\xffwd": "/work/a-b"}\n' + later, None)):
+                path = os.path.join(d, name)
+                with open(path, "wb") as f:
+                    f.write(data)
+                with self.subTest(name):
+                    self.assertEqual(server.transcript_cwd(path), cwd)
+                    self.assertEqual(server.ran_here(path, "/work/a_b"), bool(cwd))
+
+    def test_list_saved_conversations(self):
+        ids = [f"aaaaaaaa-0000-0000-0000-{i:012d}" for i in range(13)]
+        busy = dict(self.session("busy", 41), session_id=ids[11].upper())
+        with tempfile.TemporaryDirectory() as config, \
+                mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": config}), \
+                mock.patch.object(server, "claude_sessions", return_value=[busy]), \
+                mock.patch.object(server, "own_claude_pids", return_value=set()), \
+                mock.patch.object(server, "with_login_warning", side_effect=lambda text: text):
+            cwd = os.path.join(config, "a-b")
+            os.mkdir(cwd)
+            folder = server.transcript_folder(cwd)
+            os.makedirs(folder)
+            for i, sid in enumerate(ids):
+                path = os.path.join(folder, sid + ".jsonl")
+                ran_in = os.path.join(config, "a_b") if i == 12 else cwd
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(json.dumps({"cwd": ran_in, "message": "private prompt"}) + "\n")
+                    if i == 11:
+                        for title in ("Old title", "New\ntitle --token synthetic-credential"):
+                            f.write(json.dumps({"type": "custom-title", "customTitle": title}) + "\n")
+                        f.write(json.dumps({"gitBranch": "topic"}) + "\n")
+                os.utime(path, (1000 + i, 1000 + i))
+            broken = "ffffffff-0000-0000-0000-000000000000"
+            with open(os.path.join(folder, broken + ".jsonl"), "wb") as f:
+                f.write(b"[" * 3000 + b"0" + b"]" * 3000 + b"\n")
+            running = server.list_claude_sessions({})
+            self.assertIn("busy (pid 41)", running)
+            self.assertNotIn("Saved conversations", running)
+            out = server.list_claude_sessions({"cwd": cwd})
+            self.assertTrue(out.startswith(running))
+            self.assertIn(f"{server.mtime_text(1011)} | {ids[11]} | open | title: New title --token *** | branch: topic", out)
+            self.assertIn(f"{ids[10]} | not open", out)
+            self.assertLess(out.index(ids[11]), out.index(ids[10]))
+            self.assertIn(ids[2], out)
+            for hidden in (ids[1], ids[12], broken, "private prompt", "Old title", "synthetic-credential"):
+                self.assertNotIn(hidden, out)
+            self.assertNotIn(ids[10], server.list_claude_sessions({"cwd": cwd, "limit": 1}))
+            self.assertIn("No saved conversations", server.list_claude_sessions({"cwd": config}))
+            two = server.list_claude_sessions({"cwd": cwd, "limit": 2.0})
+            self.assertIn(ids[10], two)
+            self.assertNotIn(ids[9], two)
+            for bad in (0, 51, 2.5, True, "2"):
+                with self.assertRaises(server.BridgeError):
+                    server.list_claude_sessions({"cwd": cwd, "limit": bad})
+            for args in ({"cwd": "relative"}, {"limit": 3}):
+                with self.assertRaises(server.BridgeError):
+                    server.list_claude_sessions(args)
+
     def test_resume_finds_the_conversation(self):
         old, new = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
         with tempfile.TemporaryDirectory() as config:
@@ -2725,6 +2991,52 @@ class RevisionTest(unittest.TestCase):
         self.assertEqual((patch, digest), (b"", ""))
         self.assertEqual(server.revision(os.path.join(self.repo, "nowhere")), ("", b"", ""))
         self.assertFalse(os.path.exists(os.path.join(self.cache, server.PATCH_FOLDER)))
+
+    def test_branch_diff_uses_the_common_ancestor(self):
+        ancestor = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-qb", "base-side")
+        self.put("base-only", "upstream\n")
+        self.git("add", "base-only")
+        self.git("commit", "-qm", "upstream change")
+        self.git("tag", "-a", "release", "-m", "base tag")
+        tip = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-qb", "topic", ancestor)
+        self.put("app.py", "a = 3\n")
+        self.git("commit", "-qam", "topic change")
+        head = self.git("rev-parse", "HEAD").strip()
+
+        for base in (ancestor, "base-side", "release", tip):
+            with self.subTest(base=base):
+                line, patch, digest = server.revision(self.repo, base=base)
+                self.assertIn(f"base {base!r}, merge base {ancestor} to HEAD {head} on topic", line)
+                self.assertIn("0 uncommitted path(s)", line)
+                self.assertIn("this range and that sha256", line)
+                self.assertIn(b"+a = 3\n", patch)
+                self.assertNotIn(b"base-only", patch)
+                self.assertEqual(digest, hashlib.sha256(patch).hexdigest()[:16])
+        self.put("notes", "uncommitted\n")
+        line, patch, digest = server.revision(self.repo, base="base-side", inline_limit=100_000)
+        self.assertIn("1 uncommitted path(s)", line)
+        self.assertIn("is in this message", line)
+        self.assertIn(b"+a = 3\n", patch)
+        self.assertIn(b"+uncommitted\n", patch)
+        with open(self.saved(digest), "rb") as f:
+            self.assertEqual(f.read(), patch)
+        line, patch, digest = server.revision(self.repo, base="base-side", take=False)
+        self.assertIn(ancestor, line)
+        self.assertEqual((patch, digest), (b"", ""))
+
+    def test_branch_review_requires_a_valid_base_and_revision(self):
+        with self.assertRaisesRegex(server.BridgeError, "base requires revision=true"):
+            server.send_consultant_message({"to": "reviewer", "message": "review", "base": "main"})
+        for base, error in (("unknown-branch", "resolve base"), ("--all", "not an option"), ("@", "revision expression")):
+            with self.assertRaisesRegex(server.BridgeError, error):
+                server.revision(self.repo, base=base)
+        line, patch, digest = server.revision(self.repo, base="HEAD")
+        self.assertIn("0 uncommitted path(s); nothing to review", line)
+        self.assertEqual((patch, digest), (b"", ""))
+        self.put("app.py", "changed\n")
+        self.assertIn(b"+changed\n", server.revision(self.repo, base="HEAD")[1])
 
     def test_the_diff_is_taken_once_and_applies(self):
         self.put("app.py", "a = 1\nb = 3\n")
@@ -3960,7 +4272,7 @@ class AgyTest(unittest.TestCase):
         for name, value in (("nouez_cache_dir", lambda: self.dir), ("agy_root", lambda: os.path.join(self.dir, "agy")),
                             ("agy_command", lambda env=None: "agy"), ("agy_models", lambda env=None, now=None: self.MODELS),
                             ("agy_spawn", self.spawn), ("POLL_SECONDS", 0.01), ("CodexClient", FakeDaemon([])), ("read_agy_usage", lambda: None),
-                            ("revision", lambda cwd, take=True, inline_limit=None: ("[Revision: commit abc. Name this revision in your answer.]\n",
+                            ("revision", lambda cwd, take=True, inline_limit=None, base=None: ("[Revision: commit abc. Name this revision in your answer.]\n",
                                                                        b"--- a/x\n+++ b/x\n" if take else b"", "d1g3st" if take else ""))):
             patcher = mock.patch.object(server, name, value)
             patcher.start()
@@ -4026,7 +4338,7 @@ class AgyTest(unittest.TestCase):
         _, other = self.start(new=True)
         self.assertNotEqual(other, name)
         listed = server.list_consultants({"cwd": self.work})
-        self.assertIn("2 Antigravity consultant(s)", listed)
+        self.assertEqual(sum(line.startswith("- ") for line in listed.splitlines()), 2)
         self.assertIn(name, listed)
         self.assertEqual([e["provider"] for e in self.events() if e["event"] == "start"], ["antigravity"] * 2)
         with mock.patch.object(server, "agy_command", lambda env=None: None):
@@ -4111,7 +4423,7 @@ class AgyTest(unittest.TestCase):
             self.assertEqual(len(self.runs), 2)
             busy = server.get_consultant_reply({"to": name})
             self.assertIn("this is not a reply", busy)
-            self.assertIn("status: busy", server.list_consultants({}))
+            self.assertIn("working", server.list_consultants({}))
             history = server.get_consultant_history({"to": name})
             self.assertRegex(history, r"\[inProgress, .*\] from Claude Code: \"And now\?\"")
             self.assertRegex(history, r"\[completed, .*took 7s\] from Claude Code \(with the user's words\): "
@@ -4282,7 +4594,7 @@ class AgyTest(unittest.TestCase):
         """0.15.1: one lock per consultant across nouez servers; a send re-reads the consultant under it."""
         _, name = self.start()
         rec = server.agy_resolve(name)
-        with mock.patch.object(server, "AGY_LOCK_SECONDS", 0.3):
+        with mock.patch.object(server, "LOCK_SECONDS", 0.3):
             with server.agy_lock(rec["id"]):
                 with self.assertRaisesRegex(server.BridgeError, "Another Claude Code session"):
                     with server.agy_lock(rec["id"]):
@@ -4294,6 +4606,20 @@ class AgyTest(unittest.TestCase):
         with self.assertRaisesRegex(server.BridgeError, "was stopped; nothing was sent"):
             server.send_agy_message(rec, {}, "x", "Claude Code", None, 0, None, None, None, None)
         self.assertEqual(self.runs, [])
+
+    def test_stopping_only_the_turn_keeps_the_consultant(self):
+        _, name = self.start()
+        cid = server.agy_resolve(name)["id"]
+        self.assertIn("has no turn running", server.stop_consultant({"to": name, "turn_only": True}))
+        self.replies = [None]
+        with mock.patch.object(server, "agy_alive", self.alive):
+            server.send_consultant_message({"to": name, "message": "x", "wait": 0})
+            with mock.patch.object(server, "agy_end_process", return_value=True):
+                out = server.stop_consultant({"to": name, "turn_only": True})
+        self.assertIn("Ended agy-", out)
+        self.assertIn("takes the next message", out)
+        self.assertFalse(server.agy_resolve(name).get("stopped"))  # still there for the next message
+        self.assertEqual(server.agy_turns(cid, 1)[0]["status"], "interrupted")
 
     def test_failed_stop_changes_nothing(self):
         _, name = self.start()
@@ -4389,7 +4715,7 @@ class AgyTest(unittest.TestCase):
                 server.send_consultant_message({"to": name, "message": "x", "wait": 0})
         self.assertEqual(end.call_args.args[0].pid, 4242)
         self.assertEqual(server.agy_turn_ids(cid), [])  # no turn left looking as if it were starting
-        with mock.patch.object(server, "AGY_LOCK_SECONDS", 0.2), server.agy_lock(None):
+        with mock.patch.object(server, "LOCK_SECONDS", 0.2), server.agy_lock(None):
             with self.assertRaisesRegex(server.BridgeError, "starting an Antigravity consultant"):
                 self.start(new=True)
 
@@ -5615,7 +5941,12 @@ class ConsultationsPageTest(unittest.TestCase):
                   {"event": "send", "thread": busy["id"], "turn": "t2", "kind": "research", "ts": 3},
                   {"event": "send", "thread": rec["id"], "turn": "a2", "kind": "plan-critique", "ts": 4},
                   {"event": "reply", "thread": rec["id"], "turn": "a1", "status": "completed", "verdict": "yes", "ts": 5}]
-        rows = server.consultant_overview([mine, busy, users], [rec], events, {rec["id"]: None})
+        latest = {self.CODEX: {"id": "t1", "status": "completed"},
+                  busy["id"]: {"id": "t2", "status": "inProgress", "startedAt": time.time() - 700},
+                  rec["id"]: {"id": "a2", "status": "completed"}}
+        events.append({"event": "reply", "thread": self.CODEX, "turn": "older", "verdict": "yes"})
+        rows = server.consultant_overview([mine, busy, users], [rec], events, latest)
+        self.assertEqual([r["state"] for r in rows], ["long run", "idle", "done"])
         self.assertEqual([r["id"] for r in rows], [busy["id"], self.CODEX, rec["id"]])  # never the user's session
         self.assertTrue(rows[0]["busy"])
         self.assertEqual((rows[1]["kind"], rows[1]["verdict"]), ("review", "changes"))
@@ -5627,6 +5958,59 @@ class ConsultationsPageTest(unittest.TestCase):
         rows = server.consultant_overview([], [rec], [], {rec["id"]: running})
         self.assertTrue(rows[0]["busy"])
         self.assertEqual(rows[0]["updated"], 400)
+
+    def test_phone_list_puts_unread_before_idle_without_message_text(self):
+        idle = self.thread(self.CODEX, "/w/alpha")
+        review = self.thread(self.CODEX[:-4] + "beef", "/w/beta")
+        turn = {"id": "t", "status": "completed", "items": [server_agent("private reply")]}
+        idle["name"], review["name"] = "First", "Review title"
+        user = dict(idle, id="user", threadSource="cli", name="User title")
+        daemon = FakeDaemon([idle, review, user], {review["id"]: [turn]})
+        events = [{"event": "send", "thread": review["id"], "turn": "t", "kind": "review"}]
+        with mock.patch.object(server, "CodexClient", daemon), mock.patch.object(server, "codex_installed", return_value=True), \
+                mock.patch.object(server, "agy_consultants", return_value=[]), \
+                mock.patch.object(server, "read_usage_log", return_value=events), \
+                mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": ""}):
+            listed = server.list_consultants({})
+            self.assertTrue(listed.startswith("- done, no reply logged"))
+            self.assertIn("/w/beta", listed.splitlines()[0])
+            self.assertIn("Review title", listed.splitlines()[0])
+            self.assertIn("User title", listed.splitlines()[-1])
+            self.assertNotIn("private reply", listed)
+            now = time.time()
+            daemon.turns[idle["id"]] = [turn]
+            for thread, delta in ((idle, -1), (review, 1)):
+                events.append(dict(event="reply", thread=thread["id"], turn="t", verdict="changes",
+                                   ts=now-server.ATTENTION_SECONDS+delta))
+            with mock.patch.object(time, "time", return_value=now):
+                self.assertIn("Review title", server.list_consultants({}).splitlines()[0])
+            with mock.patch.object(server, "latest_turn", side_effect=[server.BridgeError("lost"), turn]):
+                listed = server.list_consultants({})
+                self.assertIn("- unknown", listed)
+                self.assertIn("- changes", listed)
+            with mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": "1"}), \
+                    mock.patch.object(server, "read_usage_log", side_effect=AssertionError("log is off")):
+                listed = server.list_consultants({})
+            self.assertNotIn("no reply logged", listed)
+            self.assertIn("Verdicts aren't tracked", listed)
+
+    def test_overview_inherits_only_an_actual_continuation(self):
+        thread = self.thread(self.CODEX, ROOT)
+        root = {"id": "root", "status": "interrupted"}
+        end = {"id": "end", "rootTurnId": "root", "status": "completed"}
+        send = {"thread": self.CODEX, "turn": "root", "event": "send", "kind": "review"}
+        for history, pending in (([end, root], True), ([end, {"id": "other"}, root], False)):
+            daemon = FakeDaemon([thread], {self.CODEX: history})
+            latest = server.codex_overview_turns(daemon, [thread])
+            row, = server.consultant_overview([thread], [], [send], latest)
+            self.assertEqual(row["pending"], pending)
+            self.assertEqual(row["kind"], "review" if pending else None)
+
+    def test_completed_agy_turn_before_send_log(self):
+        rec = {"id": "agy"}
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": ""}):
+            row, = server.consultant_overview([], [rec], [], {"agy": {"id": "t", "status": "completed"}})
+        self.assertTrue(row["pending"])
 
     def test_turn_text_is_plain_and_in_order(self):
         turn = {"status": "completed", "items": [
@@ -5684,17 +6068,44 @@ class ConsultationsPageTest(unittest.TestCase):
 
     def test_older_consultants_from_the_usage_log(self):
         old = self.CODEX[:-4] + "0010"
-        daemon = FakeDaemon([self.thread(self.CODEX, ROOT), self.thread(old, ROOT)], {})
-        events = [{"event": "send", "thread": old, "turn": "t"}, {"event": "send", "thread": "agy-x", "provider": "antigravity"},
+        stopped = self.CODEX[:-4] + "0012"  # StopConsultant archived it; thread/read still returns it
+        daemon = FakeDaemon([self.thread(self.CODEX, ROOT), self.thread(old, ROOT),
+                             dict(self.thread(stopped, ROOT), path=os.path.join("codex", "archived_sessions", "r.jsonl"))], {})
+        events = [{"event": "send", "thread": stopped, "turn": "t"},
+                  {"event": "send", "thread": old, "turn": "t"}, {"event": "send", "thread": "agy-x", "provider": "antigravity"},
                   {"event": "send", "thread": self.CODEX[:-4] + "0011", "user_session": True}]
-        self.assertEqual(server.logged_codex_threads(events), [old])
+        self.assertEqual(server.logged_codex_threads(events), [old, stopped])
         with mock.patch.object(server, "CodexClient", daemon), mock.patch.object(server, "read_usage_log", return_value=events), \
              mock.patch.object(server, "RECENT_SAVED_THREADS", 0), mock.patch.object(server, "loaded_ids", return_value=[]), \
-             mock.patch.object(server, "agy_consultants", return_value=[]):
+             mock.patch.object(server, "agy_consultants", return_value=[]), \
+             mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": ""}):
             feed = server.ConsultationFeed()
+            feed.show(None, True)
             feed._list()
+            self.assertEqual(server.resolve(daemon, server.short_name(daemon.threads[old]))["id"], old)
+            with self.assertRaises(server.BridgeError):
+                server.resolve(daemon, server.short_name(daemon.threads[stopped]))
+            with self.assertRaisesRegex(server.BridgeError, r"was stopped \(archived\).*codex unarchive"):
+                server.resolve(daemon, stopped)  # nor by its full id
+            # StartConsultant reuses the consultant the list shows, rather than starting a second one.
+            self.assertEqual([t["id"] for t in server.repo_consultants(daemon, ROOT)[1]], [old])
         self.assertEqual([r["id"] for r in feed.state()[0]], [old])  # past the recent list, still shown
         self.assertTrue(feed.state()[0][0]["command"].startswith(f"codex resume {old}"))
+
+    def test_a_name_shared_with_an_older_consultant(self):
+        # Names keep the id's last six characters: a recent consultant and a logged older one can
+        # share one, and a stop must not pick the recent one silently.
+        twin = "0199bbbb" + self.CODEX[8:]
+        daemon = FakeDaemon([self.thread(self.CODEX, ROOT), self.thread(twin, ROOT)], {})
+        name = server.short_name(daemon.threads[self.CODEX])
+        self.assertEqual(name, server.short_name(daemon.threads[twin]))
+        with mock.patch.object(server, "read_usage_log", return_value=[{"event": "send", "thread": twin, "turn": "t"}]), \
+             mock.patch.object(server, "RECENT_SAVED_THREADS", 0), \
+             mock.patch.object(server, "loaded_ids", return_value=[self.CODEX]), \
+             mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": ""}):
+            with self.assertRaisesRegex(server.BridgeError, "names more than one session"):
+                server.resolve(daemon, name, exact_only=True)
+            self.assertEqual(server.resolve(daemon, twin)["id"], twin)
 
     def test_feed_closing_while_it_connects(self):
         feed = server.ConsultationFeed(lambda: None)
@@ -5734,7 +6145,7 @@ class ConsultationsPageTest(unittest.TestCase):
 
     def rows(self, n):
         return [{"provider": "codex", "id": f"0199aaaa-0000-0000-0000-{i:012d}", "name": f"codex-p{i}-{i:06d}",
-                 "cwd": f"/w/p{i}", "model": "gpt-6.2-astra", "effort": "high", "busy": i == 0,
+                 "cwd": f"/w/p{i}", "model": "gpt-6.2-astra", "effort": "high", "busy": i == 0, "state": "working" if i == 0 else "idle",
                  "updated": 100 - i, "kind": None, "verdict": "yes" if i else None} for i in range(n)]
 
     def test_frame_fills_the_height_and_shows_the_selection(self):
@@ -5798,6 +6209,7 @@ class ConsultationsPageTest(unittest.TestCase):
         with mock.patch.object(server, "CodexClient", daemon), mock.patch.object(server, "read_usage_log", return_value=[]):
             feed = server.ConsultationFeed()
             feed._list()
+            self.assertNotIn("thread/turns/list", daemon.calls)
             key = ("codex", tid)
             feed.show(key, True)
             feed._read_turn(key)
@@ -5809,7 +6221,7 @@ class ConsultationsPageTest(unittest.TestCase):
             feed._list()
             feed._read_turn(key)  # ended: read once more, as the list now says
             feed._read_turn(key)
-            self.assertEqual(daemon.calls.count("thread/turns/list"), reads + 2)
+            self.assertEqual(daemon.calls.count("thread/turns/list"), reads + 3)
             self.assertEqual(feed.state()[1][1]["status"], "completed")
 
     def test_feed_survives_a_lost_daemon(self):
@@ -6275,9 +6687,9 @@ class ArrangeTest(unittest.TestCase):
     def test_cache_files_are_not_read_or_deleted_through_a_link(self):
         elsewhere = os.path.join(self.cache, "elsewhere.json")
         with open(elsewhere, "w", encoding="utf-8") as f:
-            json.dump({"auto": False}, f)
+            json.dump({"auto": True}, f)
         file_link(self, elsewhere, server.arrange_settings_file())
-        self.assertTrue(server.arrange_auto())  # the link isn't read
+        self.assertFalse(server.arrange_auto())  # the link isn't read
         os.makedirs(server.windows_folder(create=True), exist_ok=True)
         file_link(self, elsewhere, server.screen_file())
         server.remove_cache_file(server.screen_file())
@@ -6297,6 +6709,7 @@ class ArrangeTest(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "the arranger runs on Windows only")
     def test_arranger_hands_over_only_after_a_clean_end(self):
+        server.write_json_atomic(server.arrange_settings_file(), {"auto": True})
         tag = f"nouez-test-{os.getpid()}"
         for code in (0, 1, RuntimeError("no window")):
             arranger = mock.Mock()
@@ -6328,7 +6741,7 @@ class ArrangeTest(unittest.TestCase):
         for bad in (1, "yes"):
             with self.assertRaises(server.BridgeError):
                 server.arrange_windows({"auto": bad})
-        self.assertTrue(server.arrange_auto())
+        self.assertFalse(server.arrange_auto())
         with mock.patch.object(server, "wake_arranger") as wake:
             out = server.arrange_windows({"auto": False})
         wake.assert_called_once_with(start=False)
@@ -6337,6 +6750,12 @@ class ArrangeTest(unittest.TestCase):
         done = mock.Mock(stdout='{"windows": 3, "arranged": 2, "not_fitting": 1, "left": 0, "skipped": 0}\n')
         with mock.patch.object(server.subprocess, "run", return_value=done) as run, \
                 mock.patch.object(server, "wake_arranger") as wake:
+            out = server.arrange_windows({})
+            self.assertIn("Arranged 2 of the 3", out)
+            self.assertIn("is off", out)
+            wake.assert_not_called()
+            self.assertEqual(run.call_args[0][0][-2:], ["arrange", "--once"])
+            run.reset_mock()
             out = server.arrange_windows({"auto": True})
         self.assertEqual(run.call_args[0][0][-2:], ["arrange", "--once"])
         wake.assert_called_once_with()

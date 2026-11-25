@@ -12,10 +12,11 @@ Everything is on your computer, under your user account. The cache folder is `%L
 
 | File | What | Kept |
 |---|---|---|
-| `usage-log.jsonl` | One line per consultation event: model, effort, kind, reason, tokens; never message text. Off with `NOUEZ_NO_USAGE_LOG=1`. `usage-log.jsonl.lock` is held while it is renamed. | Renamed with the date each month or past 20 MB; a renamed log deleted a year after it was last written, or sooner past 100 MB in all |
+| `usage-log.jsonl` | One line per consultation event: model, effort, kind, reason, the `base` of a branch review, tokens; never message text. Off with `NOUEZ_NO_USAGE_LOG=1`. `usage-log.jsonl.lock` is held while it is renamed. | Renamed with the date each month or past 20 MB; a renamed log deleted a year after it was last written, or sooner past 100 MB in all |
+| `codex-locks/<thread id>.lock` | Empty; held while a server sends to or stops that Codex consultant, so a stop in one Claude Code session can't archive it as another starts a turn | Kept, since deleting one while another server opens it could let both hold it; each is empty |
 | `agy/<id>/` | Each Antigravity consultant: its record (`consultant.json`: folder, name, model, standing instructions, agy conversation id), and each turn's message and output (`turns/`) | Turns deleted 90 days after you stop the consultant; its record stays until you delete it |
 | `replies/reply-<turn id>.md` | The full text of a reply longer than 60,000 characters, or 20,000 when the waiter (`server.py wait`) prints it | 14 days |
-| `patches/<sha256>.patch` | The uncommitted diff a message with `revision: true` named, by the first 16 hex digits of its SHA-256 | 14 days |
+| `patches/<sha256>.patch` | The diff saved for `revision: true`, named by the first 16 hex digits of its SHA-256. With `base` it includes committed changes since the merge base and any uncommitted changes. Even a clean tree can produce a patch containing deleted lines. For an Antigravity review, `attach_diff: true` sends the patch text to Google | 14 days |
 | `claude-usage.json` | Claude Code's usage windows, written by `server.py statusline` | Replaced on each update |
 | `usage-weeks.json` | The weekly token counts `server.py top` read from Claude Code's and Codex's own files, so later runs read only what was added | Replaced on each run of `top` |
 | `claude-login.json` | The sign-in line from `claude auth status`, when it was read, the credentials file's time, Claude Code's config folder and the names of any sign-in variables set. Off with `NOUEZ_NO_LOGIN_CHECK=1`. | Replaced about hourly |

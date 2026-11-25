@@ -1,6 +1,6 @@
 ---
 name: consult
-description: Consult a second model through nouez (a Codex or Antigravity consultant) with the model and effort chosen by the kind of consultation, the consultants installed, and the usage left on each subscription. Use whenever you are about to ask a consultant for a review, a bug hunt, a plan critique, research or a fact check; before substantial read-only work that the user's own instructions (such as their CLAUDE.md) send to a consultant, without waiting to be asked; or when the user says "consult", "ask Codex", "ask Gemini" or "second opinion".
+description: Consult a second model through nouez (a Codex or Antigravity consultant) with the model and effort chosen by the kind of consultation, the consultants installed, and the usage left on each subscription. Use whenever you are about to ask a consultant for a review, a bug hunt, a plan critique, research or a fact check; without waiting to be asked, at the points nouez's server instructions or the user's own instructions (such as their CLAUDE.md) name; or when the user says "consult", "ask Codex", "ask Gemini" or "second opinion".
 ---
 
 # Consult with the right model
@@ -86,6 +86,8 @@ scores and your own experience decide which.
 
 ## Review loops
 
+- For a branch review, pass `revision: true` and the requested `base` to `SendConsultantMessage`.
+  With Antigravity, pass `attach_diff: true` to include the diff from the merge base to the working tree.
 - Ask for every finding in the first round ("list everything you would block on now").
 - Later rounds that only check named fixes are re-checks: use the re-check row.
 - After three rounds of changes on the same work, stop and show the user the open points.

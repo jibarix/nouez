@@ -36,7 +36,9 @@ The app talks only to Anthropic, and the computer connects out to Anthropic too:
 - **Claude Code's own sign-in must be current.** It lasts a set time, and renewing it needs the computer (`claude auth login`). nouez warns you from the phone a week ahead (see [the sign-in warning](docs/phone.md#a-new-claude-code-session-from-your-phone)).
 - **The first run of each part happens at the computer:** Claude Code's trust question in the dispatcher folder, and signing in to each CLI. After that, everything else can be done from the phone.
 
-The sessions the dispatcher opens run in terminal windows on the computer, so you can sit down and carry on in the same conversation there; nouez arranges them on Windows. https://claude.ai/code in a browser lists the same Remote Control sessions as the app.
+The sessions the dispatcher opens run in terminal windows on the computer, so you can sit down and carry on in the same conversation there. On Windows, ask Claude to arrange the windows once or turn on automatic arranging. It is off by default. Each box needs about 60 by 16 characters, so a 1920 by 1200 laptop screen at 150% scaling fits four; extra windows stay where they are.
+
+https://claude.ai/code in a browser lists the same Remote Control sessions as the app.
 
 ## Requirements
 
@@ -152,7 +154,7 @@ In the Claude app, start a new session and pick the computer, `dispatcher`. Then
 
 > Open the status screen on the computer, and arrange the windows.
 
-The dispatcher answers with nouez's tools: `ListProjects`, `OpenClaudeSession` (with `resume` or `create` when you ask), `ListClaudeSessions`, `CloseClaudeSession`, `ConsultantBudget`, `OpenStatusScreen` and `ArrangeWindows`. A session it opens shows up in the app's list a few seconds later, named after the project: tap it and work there. That session runs in the project's folder on the computer, with the project's own `CLAUDE.md`, settings and memory, so it builds, tests and commits there, and with nouez registered for every project it can consult as below. When a folder isn't trusted yet, the dispatcher shows you what its settings would run and asks before it records your answer. The details are in [A new Claude Code session from your phone](docs/phone.md#a-new-claude-code-session-from-your-phone).
+The dispatcher answers with nouez's tools: `ListProjects`, `OpenClaudeSession` (with `resume` or `create` when you ask), `ListClaudeSessions`, `CloseClaudeSession`, `ListConsultants`, `ConsultantBudget`, `OpenStatusScreen` and `ArrangeWindows`. A session it opens shows up in the app's list a few seconds later, named after the project: tap it and work there. That session runs in the project's folder on the computer, with the project's own `CLAUDE.md`, settings and memory, so it builds, tests and commits there, and with nouez registered for every project it can consult as below. When a folder isn't trusted yet, the dispatcher shows you what its settings would run and asks before it records your answer. The details are in [A new Claude Code session from your phone](docs/phone.md#a-new-claude-code-session-from-your-phone).
 
 ## Consultants
 
@@ -168,7 +170,9 @@ In any Claude Code session with nouez, from the phone or at the computer, ask fo
 
 > We're done. Stop the consultant.
 
-Claude starts a background consultant in the project (Codex if it is installed, otherwise Antigravity), or reuses the one already working there, sends it the question and gets the answer back as a tool result, without a second terminal to copy text into. A consultant Claude starts is always read-only: it never edits your files. [Consultants](docs/consultants.md) covers reusing one, your own Codex session, choosing a model and effort, briefs and verdicts, and Antigravity.
+Claude starts a background consultant in the project (Codex if it is installed, otherwise Antigravity), or reuses the one already working there, sends it the question and gets the answer back as a tool result, without a second terminal to copy text into. A consultant Claude starts is always read-only: it never edits your files.
+
+Claude also consults without being asked, while the subscription has room: a review before it commits a change to behavior, several files or anything risky, a bug hunt when a failure's cause isn't obvious, and a critique of a plan or design of its own before it builds on it. Your own `CLAUDE.md` can change that, and `NOUEZ_NO_AUTO_CONSULT=1` turns it off. [Consultants](docs/consultants.md) covers reusing one, your own Codex session, choosing a model and effort, briefs and verdicts, and Antigravity.
 
 ## Documentation
 
@@ -205,7 +209,7 @@ python -m unittest discover tests
 - Consultants nouez starts are read-only and never ask for approvals, so the read-only sandbox (Codex) or the deny rules (Antigravity) are their only limit. They can read anything that allows, which typically includes files outside `cwd`.
 - `CloseClaudeSession` can end **any** Claude Code session running under your account, including ones you started yourself; only its caller is refused. Work in progress in that session is lost; the transcript is kept.
 - Trusting a folder lets its Claude Code settings, hooks and MCP servers run. `OpenClaudeSession` records trust only after Claude has received that folder's report, with the files unchanged since (or for a new, empty folder the same call made); nouez can't see whether the report reached you. It changes only that setting in `~/.claude.json`, after a dated backup, but a Claude Code session saving that file in the same instant could still lose a setting. `NOUEZ_NO_TRUST_WRITE=1` turns trust writing off.
-- The phone dispatcher, once installed, runs `claude remote-control` from your sign-in on: anyone signed in to your claude.ai account can start a session in its folder, and through nouez's tools open, resume and close Claude Code sessions in your projects, and record trust in a folder after its report. `setup` adds allow rules for those seven tools only; rules already in the folder's settings, and your user settings, still apply. It opens no port; the computer connects out to Anthropic. `dispatcher uninstall` stops it.
+- The phone dispatcher, once installed, runs `claude remote-control` from your sign-in on: anyone signed in to your claude.ai account can start a session in its folder, and through nouez's tools open, resume and close Claude Code sessions in your projects, and record trust in a folder after its report. `setup` adds allow rules for those eight tools only; rules already in the folder's settings, and your user settings, still apply. It opens no port; the computer connects out to Anthropic. `dispatcher uninstall` stops it.
 - The `nouez` tag is a guard against mistakes, not a security boundary: any local program that can reach the Codex daemon can set it.
 
 ## Versioning
