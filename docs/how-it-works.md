@@ -14,7 +14,7 @@ Everything is on your computer, under your user account. The cache folder is `%L
 
 | File | What | Kept |
 |---|---|---|
-| `usage-log.jsonl` | One line per consultation event: model, effort, kind, reason, the `base` of a branch review, tokens; never message text. Off with `NOUEZ_NO_USAGE_LOG=1`. `usage-log.jsonl.lock` is held while it is renamed. | Renamed with the date each month or past 20 MB; a renamed log deleted a year after it was last written, or sooner past 100 MB in all |
+| `usage-log.jsonl` | One line per consultation event: model, effort, kind, reason, the `base` of a branch review, tokens, each subscription's usage at a send (share used, reset and reading time); never message text. Off with `NOUEZ_NO_USAGE_LOG=1`. `usage-log.jsonl.lock` is held while it is renamed. | Renamed with the date each month or past 20 MB; a renamed log deleted a year after it was last written, or sooner past 100 MB in all |
 | `codex-locks/<thread id>.lock` | Empty; held while a server sends to or stops that Codex consultant, so a stop in one Claude Code session can't archive it as another starts a turn | Kept, since deleting one while another server opens it could let both hold it; each is empty |
 | `agy/<id>/` | Each Antigravity consultant: its record (`consultant.json`: folder, name, model, standing instructions, agy conversation id), and each turn's message and output (`turns/`) | Turns deleted 90 days after you stop the consultant; its record stays until you delete it |
 | `replies/reply-<turn id>.md` | The full text of a reply longer than 60,000 characters, or 20,000 when the waiter (`server.py wait`) prints it | 14 days |

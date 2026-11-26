@@ -69,7 +69,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.28.1"
+SERVER_VERSION = "0.28.2"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -6103,7 +6103,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                 "changed": sorted(k for k, v in overrides.items() if v != was[k]) or None,
                 "kind": kind, "reason": reason, "chars": len(message), "owner_words": bool(owner_words) or None,
                 "routed": bool(routed and overrides) or None,
-                "base": args.get("base"), "patch": patch_digest(digest), "user_session": not is_bridge(thread) or None, "usage": usage_snapshot(client)})
+                "base": args.get("base"), "patch": patch_digest(digest), "user_session": not is_bridge(thread) or None, **usage_snapshot(client)})
         if not timeout:
             return f"Delivered to {name} ({mode}, turn {turn_id}). {read_later(tid, turn_id)}{quota}"
         try:
@@ -6345,22 +6345,30 @@ def window_label(length):
     return {5 * 3600: "5-hour", 86400: "daily", 7 * 86400: "weekly"}.get(length) or span_text(length)
 
 
+FIRST_DAY = 16 * 3600  # a weekly window's pace counts at least this long gone (see window_pace)
+
+
 def window_pace(used, resets_at, length, now):
     """Where a usage window is heading: ("used up", None), ("runs out", seconds until it does,
     before the reset), ("at reset", the percent the current rate reaches by the reset), or None
-    when too little of the window has gone to tell. Arguments as window_text has them, checked."""
+    when too little of the window has gone to tell. Arguments as window_text has them, checked.
+    In a week's first FIRST_DAY the rate is the use so far over FIRST_DAY, so a first morning's
+    work isn't projected through every night of the week; such a forecast has "first day" as a
+    third item."""
     if used >= 100:
         return ("used up", None)
     left = resets_at - now
     if not length or left >= length:
         return None
-    gone = (length - left) / length
-    if gone < 0.05:
+    gone = length - left
+    if gone < 0.05 * length:
         return None
-    rate = used / (length - left)  # percent per second so far
+    first = length >= 7 * 86400 and gone < FIRST_DAY
+    rate = used / (FIRST_DAY if first else gone)  # percent per second
+    tag = ("first day",) if first else ()
     if rate > 0 and (100 - used) / rate < left:
-        return ("runs out", (100 - used) / rate)
-    return ("at reset", used / gone)
+        return ("runs out", (100 - used) / rate) + tag
+    return ("at reset", used + rate * left) + tag
 
 
 def window_text(label, used, resets_at, length, now, sampled=None):
@@ -6384,6 +6392,8 @@ def window_text(label, used, resets_at, length, now, sampled=None):
         text += f"; at this rate it runs out in about {span_text(at + pace[1] - now)}, before the reset"
     elif pace:
         text += f"; at this rate about {pace[1]:.0f}% by the reset"
+    if pace and pace[2:]:
+        text += f" (a first-day estimate: the use so far spread over {FIRST_DAY // 3600} hours)"
     return text
 
 
@@ -6467,8 +6477,9 @@ def claude_quota(now, path=None):
 
 def agy_windows(live, now):
     """Antigravity's quota windows from read_agy_usage's {"groups": [...]}, each with its quota
-    group's name ("group": None when agy gave none). The percent used is rounded once, here, so
-    99.96 is used up for routing and the screen alike. Never changes `live`: it is agy's cache."""
+    group's name ("group": None when agy gave none), read when `live` says ("read_at", else now). The
+    percent used is rounded once, here, so 99.96 is used up for routing and the screen alike.
+    Never changes `live`: it is agy's cache."""
     windows = []
     groups = live.get("groups") if isinstance(live, dict) else None
     for g in groups if isinstance(groups, list) else []:
@@ -6483,7 +6494,8 @@ def agy_windows(live, now):
             length = AGY_WINDOWS.get(window) if isinstance(window, str) else None
             q = quota_window(str(window) if window else "usage",
                              window_label(length) if length else (str(window) if window else "usage"), length,
-                             round(100 * (1 - left), 1), iso_seconds(b.get("reset_time")), now, now, group=name)
+                             round(100 * (1 - left), 1), iso_seconds(b.get("reset_time")),
+                             live.get("read_at"), now, group=name)
             if q:
                 windows.append(q)
     return windows
@@ -6883,8 +6895,8 @@ def usage_outlook(windows, now):
 
 def pace_words(pct, basis):
     """A weekly percentage as words that follow "Codex is" or "Claude Code:"."""
-    if basis == "pace":
-        return f"on pace for about {pct:.0f}% of its week"
+    if basis in ("pace", "first day"):
+        return f"on pace for about {pct:.0f}% of its week" + (" (a first-day estimate)" if basis == "first day" else "")
     why = "an old reading" if basis == "old" else "too early in the week for a pace"
     return f"at {pct:.0f}% of its week or more ({why})"
 
@@ -6895,8 +6907,9 @@ def window_level(used, resets_at, length, now, sampled=None):
     numbers, or it has reset). {"level": "used up", "runs out" (before its reset, at this rate),
     "tight" (past 90%), "busy" (past 70%) or "fine"; "pct": what it is judged by: where the current
     rate lands at the reset, or, for a reading too old to project from or too early in the window,
-    the share used, the least it will reach; "basis": "pace", "old" or "early"; "out": seconds until
-    it runs out; "age": seconds since the reading}. A used-up reading counts however old it is."""
+    the share used, the least it will reach; "basis": "pace", "first day" (a pace from a week's
+    first FIRST_DAY, see window_pace), "old" or "early"; "out": seconds until it runs out; "age":
+    seconds since the reading}. A used-up reading counts however old it is."""
     used, resets_at, length = number(used), number(resets_at), number(length)
     if used is None or resets_at is None or resets_at <= now:
         return None
@@ -6907,8 +6920,8 @@ def window_level(used, resets_at, length, now, sampled=None):
         return {**judged, "level": "used up", "pct": 100.0}
     pace = None if old or not length else window_pace(used, resets_at, length, at)
     if pace and pace[0] == "runs out":
-        return {**judged, "level": "runs out", "out": at + pace[1] - now}
-    pct, basis = (pace[1], "pace") if pace else (used, "old" if old else "early")
+        return {**judged, "level": "runs out", "out": at + pace[1] - now, "basis": "first day" if pace[2:] else "pace"}
+    pct, basis = (pace[1], "first day" if pace[2:] else "pace") if pace else (used, "old" if old else "early")
     return {**judged, "level": "tight" if pct > 90 else "busy" if pct > 70 else "fine", "pct": pct, "basis": basis}
 
 
@@ -6919,7 +6932,7 @@ def usage_outlook_detail(windows, now):
     lands at its reset: "tight" past 90, "busy" past 70, "spare" under 60 with the reset within
     SPARE_DAYS (usage that would go unused), "ok" (percent or None); ("unknown", None, None) with
     no reading. basis says how the weekly percent was found: "pace", where the current rate lands
-    at the reset; "old", a reading too old to project from, or "early", too little of the week
+    at the reset, or "first day", the same from a week's first FIRST_DAY (see window_pace); "old", a reading too old to project from, or "early", too little of the week
     gone to tell, where it is the share used so far, the least the week will reach (never
     "spare", and "ok" with None); None without a weekly percent."""
     week, seen = None, False
@@ -6934,7 +6947,8 @@ def usage_outlook_detail(windows, now):
             return ("blocked", f"its {label} window is used up"
                     + (" (an old reading)" if judged["basis"] == "old" else ""), None)
         if judged["level"] == "runs out":
-            return ("blocked", f"its {label} window runs out before its reset at this rate", None)
+            return ("blocked", f"its {label} window runs out before its reset at this rate"
+                    + (" (a first-day estimate)" if judged["basis"] == "first day" else ""), None)
         if length and length >= 7 * 86400:
             week = (judged["pct"], number(w[2]), judged["basis"], judged["level"])
     if not seen:
@@ -6944,7 +6958,7 @@ def usage_outlook_detail(windows, now):
     pct, resets, basis, level = week
     if level in ("tight", "busy"):
         return (level, pct, basis)
-    if basis != "pace":
+    if basis not in ("pace", "first day"):
         return ("ok", None, None)
     if pct < 60 and resets - now < SPARE_DAYS * 86400:
         return ("spare", pct, basis)
@@ -7555,27 +7569,43 @@ def kind_and_reason(args):
     return kind or None, reason
 
 
-def usage_snapshot(client):
-    """The share used of each subscription window now, for the log: Codex from the daemon (if it
-    answers), Claude Code from the file its status line saves. Missing parts are left out."""
-    snap = {}
+def snapshot_add(fields, path, windows, key=lambda q: q["label"]):
+    """Log windows into usage_snapshot's fields under `path` (the provider, and for Antigravity
+    the quota group): the share used under "usage", and the same keys under "usage_meta" with when
+    the window resets and when it was read."""
+    for q in windows:
+        meta = {"resets_at": round(q["resets_at"]), "sampled": round(q["sampled"], 3)}
+        for part, value in (("usage", q["used"]), ("usage_meta", meta)):
+            d = fields[part]
+            for p in path:
+                d = d.setdefault(p, {})
+            d[key(q)] = value
+
+
+def usage_snapshot(client, agy=None):
+    """What a send logs of each subscription's windows now: {"usage": {provider: {window: share
+    used}}, "usage_meta": the same keys, each {"resets_at", "sampled": when it was read}}. Codex
+    from the daemon (if it answers), Claude Code from the file its status line saves, Antigravity
+    per quota group from `agy`, read_agy_usage's reading. Missing parts are left out."""
+    fields = {"usage": {}, "usage_meta": {}}
     try:
         limits = client.request("account/rateLimits/read", None)
         # The time after the answer, so a window that resets while the daemon answers is left out.
         codex = codex_windows(limits.get("rateLimits") if isinstance(limits, dict) else None, time.time())
         # A window of no known length is logged by its name, so the two can't share a key.
-        codex = {q["label"] if q["length"] else q["key"]: q["used"] for q in (codex or {}).get("windows", ())}
-        if codex:
-            snap["codex"] = codex
+        snapshot_add(fields, ("codex",), (codex or {}).get("windows", ()),
+                     lambda q: q["label"] if q["length"] else q["key"])
     except Exception:
         pass
     try:
-        claude = {q["label"]: q["used"] for q in claude_quota(time.time())["windows"]}
-        if claude:
-            snap["claude"] = claude
+        snapshot_add(fields, ("claude",), claude_quota(time.time())["windows"])
     except Exception:
         pass
-    return snap
+    if agy and agy.get("groups"):
+        for q in agy_windows(agy, time.time()):
+            if q["group"] is not None:
+                snapshot_add(fields, ("antigravity", AGY_GROUPS.get(q["group"], q["group"])), (q,))
+    return fields if fields["usage_meta"] else {"usage": {}}
 
 
 CANNOT = r"(could ?n[o'’]t|could not|can['’]t|can ?not|unable to|(was|were) ?n['’]t able to|(was|were) not able to)"
@@ -8286,9 +8316,13 @@ def window_state(used, resets_at, length, now, sampled=None):
         outlook = ("used up at the last reading" if judged["basis"] == "old" else "used up", "used up", "31", 3)
     elif level == "runs out":
         left = span_text(judged["out"])
-        outlook = (f"runs out in ~{left}", f"out ~{left}", "31", 2)
-    elif judged["basis"] == "pace":
-        outlook = (f"pace: ~{pct:.0f}% by the reset", f"~{pct:.0f}% pace", "33" if tight else "32", int(tight))
+        first = judged["basis"] == "first day"  # the card's 11 characters keep the label over the time
+        outlook = (f"runs out in ~{left}" + (" (first-day estimate)" if first else ""),
+                   "day 1: out" if first else f"out ~{left}", "31", 2)
+    elif judged["basis"] in ("pace", "first day"):
+        first = judged["basis"] == "first day"
+        outlook = (f"pace: ~{pct:.0f}% by the reset" + (" (first-day estimate)" if first else ""),
+                   f"~{pct:.0f}% " + ("day 1" if first else "pace"), "33" if tight else "32", int(tight))
     elif judged["basis"] == "old":  # the share used is the least the window reaches: judged by that
         outlook = (f"an old reading ({span_text(judged['age'])} old): at least {pct:.0f}% by the reset",
                    "old reading", "33" if tight else "32", int(tight))
@@ -8452,7 +8486,7 @@ def agy_group(now, agy_live):
     for q in agy_windows(agy_live, now):
         name = q["group"] if q["group"] is not None else "?"
         group["entries"].append((AGY_GROUPS.get(name, f"AG {name}")[3:][:13], q["label"],
-                                 window_state(q["used"], q["resets_at"], q["length"], now)))
+                                 window_state(q["used"], q["resets_at"], q["length"], now, q["sampled"])))
     return {**group, "empty": "no current quota window reported"}
 
 
@@ -8482,7 +8516,7 @@ _agy_usage = {"at": 0.0, "agy": None, "value": None, "reading": False}
 def read_agy_usage():
     """Antigravity's quota from `agy -p /usage` (a read-only command that runs no model turn), as
     {"groups": [...]}; {"error": ...} if agy didn't answer; None if agy isn't installed. A reading
-    is reused for AGY_USAGE_CACHE seconds; a failed one isn't."""
+    is reused for AGY_USAGE_CACHE seconds, with "read_at": when agy answered; a failed one isn't."""
     agy = agy_command()
     if not agy:
         return None
@@ -8491,6 +8525,7 @@ def read_agy_usage():
             return _agy_usage["value"]
     got = _read_agy_usage(agy)
     if "groups" in got:
+        got["read_at"] = time.time()
         with _agy_guard:
             _agy_usage.update(at=time.time(), agy=agy, value=got)
     return got
@@ -9288,11 +9323,7 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
         sent_at = time.time()
 
         def log_send():  # agy's quota takes a few seconds to read: don't hold the reply for it
-            snap = usage_snapshot(None)
-            agy = read_agy_usage()
-            if agy and agy.get("groups"):
-                snap["antigravity"] = agy_snapshot(agy["groups"])
-            record_usage({**event, "usage": snap}, now=sent_at)
+            record_usage({**event, **usage_snapshot(None, read_agy_usage())}, now=sent_at)
         threading.Thread(target=log_send, daemon=True).start()
     if not timeout:
         return f"Delivered to {name} ({mode}, turn {turn_id}).{switched} {read_later(cid, turn_id)}"
@@ -9307,15 +9338,6 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
     return still_working(name, turn_id, turn,
                          f"Delivered ({mode}).{switched} But no reply within {timeout:.0f}s. Don't send the message "
                          f"again. {read_later(cid, turn_id)}")
-
-
-def agy_snapshot(groups):
-    """Percent used per Antigravity quota group and window, for the usage log."""
-    snap = {}
-    for q in agy_windows({"groups": groups}, time.time()):
-        if q["group"] is not None:
-            snap.setdefault(AGY_GROUPS.get(q["group"], q["group"]), {})[q["label"]] = q["used"]
-    return snap
 
 
 def get_agy_reply(rec, args, timeout, offset, cancel, progress):
@@ -9520,8 +9542,8 @@ def agy_budget(now, agy_live=None, state=None):
     lines = []
     for q in agy_windows(live, now):
         if q["group"] is not None:
-            lines.append(f"  - {q['group']}: {window_text(q['label'], q['used'], q['resets_at'], q['length'], now)}")
-            state["groups"].setdefault(q["group"], []).append((q["length"], q["used"], q["resets_at"]))
+            lines.append(f"  - {q['group']}: {window_text(q['label'], q['used'], q['resets_at'], q['length'], now, q['sampled'])}")
+            state["groups"].setdefault(q["group"], []).append((q["length"], q["used"], q["resets_at"], q["sampled"]))
     head = ("Antigravity (Google; the Claude and GPT models group runs those models on Google's quota, "
             "not Claude Code's):")
     return [head] + (lines or ["  - no current quota window reported"]) + tail

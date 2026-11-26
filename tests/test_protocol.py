@@ -4244,6 +4244,55 @@ class BudgetTest(unittest.TestCase):
         for used, resets in ((None, self.NOW + 60), (True, self.NOW + 60), (5, self.NOW - 1), (5, float("nan"))):
             self.assertIsNone(server.window_text("weekly", used, resets, week, self.NOW))
 
+    def test_a_weeks_first_morning_isnt_projected_through_its_nights(self):
+        """0.28.2: in a week's first 16 hours its pace is the use so far over 16 hours, so a morning's
+        work isn't carried through every night of the week; from then on, the use over the time gone."""
+        week, h, now = 7 * 86400, 3600, self.NOW
+        # Lee, 7.8% after 12.5 h: busy at about 84%, not "runs out" (a straight line said about 105%)
+        resets = now + week - 12.5 * h
+        self.assertEqual(server.window_pace(7.8, resets, week, now)[::2], ("at reset", "first day"))
+        judged = server.window_level(7.8, resets, week, now)
+        self.assertEqual((judged["level"], round(judged["pct"]), judged["basis"]), ("busy", 84, "first day"))
+        self.assertEqual(server.usage_outlook_detail([(week, 7.8, resets)], now), ("busy", judged["pct"], "first day"))
+        self.assertIn("about 84% by the reset (a first-day estimate", server.window_text("weekly", 7.8, resets, week, now))
+        self.assertIn("(a first-day estimate)", server.pace_words(judged["pct"], judged["basis"]))
+        shown = server.window_state(7.8, resets, week, now)
+        self.assertEqual((shown["long"][-20:], shown["short"]), ("(first-day estimate)", "~84% day 1"))
+        # Dana, 30% a day from the reset: at hour 9 the first-day pace still runs out
+        resets = now + week - 9 * h
+        self.assertEqual(server.window_level(11.25, resets, week, now)["level"], "runs out")
+        shown = server.window_state(11.25, resets, week, now)
+        self.assertEqual((shown["long"], shown["short"]), ("runs out in ~5d 6h (first-day estimate)", "day 1: out"))
+        self.assertEqual(server.usage_outlook_detail([(week, 11.25, resets)], now)[1],
+                         "its weekly window runs out before its reset at this rate (a first-day estimate)")
+        # one pace from both sides of hour 16, and the plain pace after it
+        at16 = server.window_pace(8, now + week - 16 * h, week, now)[1]
+        self.assertAlmostEqual(at16, 8 * week / (16 * h))
+        self.assertEqual(len(server.window_pace(8, now + week - 17 * h, week, now)), 2)
+        # a 5-hour window keeps its straight line, and the first 5% of a week stays too early to tell
+        self.assertEqual(server.window_pace(50, now + 3 * h, 5 * h, now), ("runs out", 2 * h))
+        self.assertIsNone(server.window_pace(3, now + week - 8 * h, week, now))
+
+    def test_a_reused_antigravity_reading_keeps_when_agy_answered(self):
+        """0.28.2: a usage reading reused from agy's cache is logged as read when agy answered."""
+        live = {"read_at": self.NOW - 60, "groups": [{"name": "Gemini Models", "buckets": [
+            {"window": "weekly", "remaining_fraction": 0.9,
+             "reset_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW + 86400))}]}]}
+        (q,) = server.agy_windows(live, self.NOW)
+        self.assertEqual(q["sampled"], self.NOW - 60)
+        with mock.patch.object(server.time, "time", lambda: self.NOW):
+            meta = server.usage_snapshot(None, live)["usage_meta"]["antigravity"]
+        self.assertEqual(meta["AG Gemini"]["weekly"]["sampled"], self.NOW - 60)
+        # and routing and the screen judge it as of then: 7% 20 minutes into a 5-hour window runs out
+        five = {"read_at": self.NOW - 80, "groups": [{"name": "Gemini Models", "buckets": [
+            {"window": "5h", "remaining_fraction": 0.93, "reset_time": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - 80 + 4 * 3600 + 40 * 60))}]}]}
+        state = {}
+        server.agy_budget(self.NOW, five, state)
+        self.assertEqual(server.usage_outlook(state["groups"]["Gemini Models"], self.NOW)[0], "blocked")
+        (entry,) = server.agy_group(self.NOW, five)["entries"]
+        self.assertEqual(entry[2]["level"], "runs out")
+
     def test_one_reader_per_subscription(self):
         """0.26.4: routing, ConsultantBudget, the status screen and the usage log read each
         subscription's windows the one way, so they agree."""
@@ -4285,13 +4334,13 @@ class BudgetTest(unittest.TestCase):
         before = json.dumps(live)
         state = {}
         server.agy_budget(now, live, state)
-        self.assertEqual(state["groups"]["Gemini Models"], [(week, 100.0, now + 86400)])
+        self.assertEqual(state["groups"]["Gemini Models"], [(week, 100.0, now + 86400, now)])
         (entry,) = server.agy_group(now, live)["entries"]
         self.assertEqual((entry[2]["used"], entry[2]["rank"]), (100.0, 3))
         self.assertEqual(json.dumps(live), before)  # agy's cached answer is never changed
         # the usage log leaves out a window that has reset, for Antigravity as for the others
         with mock.patch.object(server.time, "time", lambda: now):
-            self.assertEqual(server.agy_snapshot(live["groups"]), {"AG Gemini": {"weekly": 100.0}})
+            self.assertEqual(server.usage_snapshot(None, live)["usage"]["antigravity"], {"AG Gemini": {"weekly": 100.0}})
         # Claude Code: each window keeps when it was observed; the file's own time is for doctor
         path = os.path.join(self.dir, "claude.json")
         with open(path, "w", encoding="utf-8") as f:
@@ -4759,6 +4808,10 @@ class UsageLogTest(HandlerTest):
         self.assertEqual((send["model"], send["effort"], send["changed"]), ("gpt-b", "high", ["model"]))
         self.assertEqual((send["kind"], send["reason"], send["mode"]), ("review", "diff before commit", "new"))
         self.assertEqual(send["usage"], {"codex": {"weekly": 12}, "claude": {"weekly": 41}})
+        # 0.28.2: and beside each share, when that window resets and when it was read
+        self.assertEqual(send["usage_meta"]["codex"]["weekly"]["resets_at"], round(later))
+        self.assertEqual(send["usage_meta"]["claude"]["weekly"]["resets_at"], round(later))
+        self.assertLessEqual(send["usage_meta"]["codex"]["weekly"]["sampled"], send["ts"] + 1)
         self.assertEqual(send["chars"], len("review this"))
         self.assertNotIn("review this", json.dumps(send))  # never the message itself
         self.assertEqual((reply["event"], reply["turn"], reply["verdict"]), ("reply", send["turn"], "changes"))
@@ -5248,13 +5301,16 @@ class UsageLogTest(HandlerTest):
         with mock.patch.object(server, "agy_command", return_value="agy"), \
                 mock.patch.object(server.subprocess, "run") as run:
             run.return_value = subprocess.CompletedProcess([], 0, "noise\n" + answer + "\n", "")
-            self.assertEqual(server.read_agy_usage(), {"groups": groups})
+            with mock.patch.object(server.time, "time", lambda: 1000.0):
+                self.assertEqual(server.read_agy_usage(), {"groups": groups, "read_at": 1000.0})
             argv = run.call_args.args[0]
             self.assertEqual(argv[:5], ["agy", "-p", "/usage", "--output-format", "json"])
             self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), server.AGY_READ_ONLY)
             self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
-            # a reading is reused for a minute and a half, each send reading it; a failed one isn't kept
-            self.assertEqual(server.read_agy_usage(), {"groups": groups})
+            # a reading is reused for a minute and a half, each send reading it, with when agy answered;
+            # a failed one isn't kept
+            with mock.patch.object(server.time, "time", lambda: 1060.0):
+                self.assertEqual(server.read_agy_usage(), {"groups": groups, "read_at": 1000.0})
             self.assertEqual(run.call_count, 1)
             server._agy_usage["at"] -= server.AGY_USAGE_CACHE
             run.return_value = subprocess.CompletedProcess([], 1, "", "Error: You are not logged into Antigravity.\n")
@@ -6404,7 +6460,7 @@ class AgyTest(unittest.TestCase):
             self.assertEqual(server.agy_shown(), "agy")
         with mock.patch.object(server, "read_agy_usage", lambda: None):
             self.assertEqual(server.agy_budget(now), [])
-        self.assertEqual(server.agy_snapshot(live["groups"]), {"AG Gemini": {"weekly": 25.0}})
+        self.assertEqual(server.usage_snapshot(None, live)["usage"]["antigravity"], {"AG Gemini": {"weekly": 25.0}})
 
         week = server.week_of(now)
         replies = [{"event": "reply", "ts": now, "turn": "t1", "provider": "antigravity", "tokens": {"output_tokens": 3000}},
@@ -7228,7 +7284,7 @@ class RoundTwoFixesTest(unittest.TestCase):
         client = mock.Mock(request=mock.Mock(side_effect=server.BridgeError("down")))
         with mock.patch.object(server, "nouez_cache_dir", lambda: root):
             snap = server.usage_snapshot(client)
-        self.assertEqual(snap.get("claude"), {server.window_label(7 * 86400): 40})
+        self.assertEqual(snap["usage"].get("claude"), {server.window_label(7 * 86400): 40})
 
     def test_usage_log_judges_resets_after_the_daemon_answers(self):
         """0.26.4: a Claude window that resets while the daemon answers is left out."""
@@ -7244,7 +7300,9 @@ class RoundTwoFixesTest(unittest.TestCase):
                                    "secondary": {"usedPercent": 30, "windowDurationMins": 300, "resetsAt": 500}}}
         with mock.patch.object(server, "nouez_cache_dir", lambda: root),                 mock.patch.object(server.time, "time", lambda: clock[0]):
             snap = server.usage_snapshot(mock.Mock(request=request))
-        self.assertEqual(snap, {"codex": {server.window_label(300 * 60): 30}})
+        five = server.window_label(300 * 60)
+        self.assertEqual(snap, {"usage": {"codex": {five: 30}},
+                                "usage_meta": {"codex": {five: {"resets_at": 500, "sampled": 102.0}}}})
 
 
 class SignInTest(unittest.TestCase):

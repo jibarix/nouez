@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.28.1\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.28.2\\[0.3em]\large Architecture and message reference}
 \date{November 26, 2026}
 \author{}
 
@@ -290,7 +290,7 @@ the folder the call names, never in a workspace above it.
   "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
   "ttlMs": 0, "cacheScope": "private",
-  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.28.1"}}}}
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.28.2"}}}}
 \end{wire}
 
 Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
@@ -1385,7 +1385,10 @@ nouez reads these fields:
 
 A window whose numbers are missing, or whose reset is past, is left out. The pace is the rate of
 use so far: the percentage used, divided by the time gone since the window started. It is shown
-once 5\% of the window has gone.
+once 5\% of the window has gone. In a week's first 16 hours the time gone counts as 16 hours, so a
+morning's use is spread over the night that follows it rather than projected through every night of
+the week (7.8\% after 12\,h 30\,min is about 84\% by the reset, where the time gone alone gives
+about 105\%); such a pace is called a first-day estimate wherever it is shown.
 
 Claude Code tells only its status line command how much of its usage windows is used
 (\code{rate\_limits.five\_hour} and \code{seven\_day}, each \code{used\_percentage} and
@@ -1509,7 +1512,10 @@ written, renamed or locked through a link.
   the two the message changed), \code{kind}, \code{reason}, \code{chars}, \code{owner\_words},
   \code{patch} (the digest of the diff that \code{revision} took), \code{user\_session}, and
   \code{usage}: each window's percentage used on Codex (from
-  \code{account/rateLimits/read}) and Claude Code (from \code{claude-usage.json}).
+  \code{account/rateLimits/read}), Claude Code (from \code{claude-usage.json}) and, for an
+  Antigravity consultant, each quota group, with \code{usage\_meta} holding the same keys, each
+  window's \code{resets\_at} and \code{sampled} (when it was read; for Antigravity, when \code{agy}
+  answered, even for an answer reused from its 90-second cache).
 \item \code{reply}: \code{consultant}, \code{thread}, \code{turn}, \code{status}, \code{ms},
   \code{chars} and \code{verdict}. It is written when a waiting send, the waiter or
   \code{GetConsultantReply} sees the turn end, so a turn can have more than one; readers keep one

@@ -6,6 +6,15 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.28.2] - 2026-11-26
+
+A truer forecast for a week's first hours, and usage-log readings that say which week they belong to. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
+
+### Changed
+
+- A week's pace in its first 16 hours is the use so far spread over 16 hours, so a morning's work is no longer projected through every night of the week. Gemini's week at 7.8% by the evening of the day it began was "runs out before the reset", which sent plan critiques to Astra and put a "may run out" note on every Gemini send; it is now on pace for about 84%, busy, and plan critiques go to Neon again. Such a pace is called a first-day estimate in `ConsultantBudget`, the prompt hook and the status screen. A steady heavy week still shows: 30% a day is running out from the ninth hour, as before
+- Each send in the usage log with any usage read has `usage_meta` beside `usage`: when each window resets and when it was read, so a later estimate from your own history can tell one week from the next. A reading Antigravity reused from its 90-second cache keeps the time agy answered, here and in its pace, rather than the time it was reused, in `ConsultantBudget`, routing and the status screen too
+
 ## [0.28.1] - 2026-11-26
 
 One judgment of each usage window everywhere nouez shows or uses one, and a send that is refused only when its quota said no turn can run. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
@@ -789,7 +798,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.2...HEAD
+[0.28.2]: https://github.com/jibarix/nouez/compare/v0.28.1...v0.28.2
 [0.28.1]: https://github.com/jibarix/nouez/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/jibarix/nouez/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/jibarix/nouez/compare/v0.26.4...v0.27.0
