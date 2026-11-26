@@ -65,7 +65,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.26.0 |
+| nouez | 0.26.1 |
 | Claude Code | 2.1.332 |
 | Codex CLI | 0.170.0 |
 | Codex app-server daemon | 0.172.0 |

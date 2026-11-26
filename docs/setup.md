@@ -35,7 +35,7 @@ It makes the folder (its parent must exist; `--folder` picks another), writes a 
 claude remote-control --name dispatcher --spawn same-dir
 ```
 
-Answer Claude Code's question about trusting the folder, and any question Remote Control asks the first time. Check that the Claude app lists the computer as `dispatcher`, then stop it with Ctrl+C. A server started at sign-in has no one to answer those questions, so this run is what lets it connect on its own. Last:
+Answer Claude Code's question about trusting the folder, and any question Remote Control asks the first time. Check that the Claude app lists the computer as `dispatcher`, then stop it with Ctrl+C. A server started at sign-in has no one to answer those questions, so this run is what lets it connect on its own. Don't use this run from the phone: it is plain Claude Code, without the trust limit nouez gives the dispatcher it starts ([Phone](phone.md)). Last:
 
 ```sh
 python "/absolute/path/to/nouez/server.py" dispatcher install

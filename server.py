@@ -69,7 +69,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.26.0"
+SERVER_VERSION = "0.26.1"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -1359,13 +1359,11 @@ def fetch_latest_release():
 
 def read_release_cache(path, now):
     """(fresh, latest) from the cache file. A successful lookup stays fresh for a day, a
-    failed one (latest None) for an hour; anything unreadable or odd is not fresh."""
+    failed one (latest None) for an hour; anything unreadable or odd, or a link, is not fresh."""
     try:
-        with open(path, encoding="utf-8") as f:
-            text = f.read(RELEASE_CACHE_BYTES + 1)
-        if len(text) > RELEASE_CACHE_BYTES:
+        cache = cache_json(path, RELEASE_CACHE_BYTES)  # a larger file is cut short, so no JSON
+        if cache is None:
             return False, None
-        cache = json.loads(text)
         checked, latest = cache["checked"], cache["latest"]
         if isinstance(checked, bool) or not isinstance(checked, (int, float)) or not math.isfinite(checked):
             return False, None
@@ -1377,9 +1375,15 @@ def read_release_cache(path, now):
         return False, None
 
 
+REPLACE_TRIES = 20  # write_json_atomic on Windows: 50 ms apart while a reader holds the file
+
+
 def write_json_atomic(path, value):
     """Write value as JSON through a temporary file of its own, so servers writing together
-    don't write into the same file; a failure leaves no temporary file behind. True if written."""
+    don't write into the same file; a failure leaves no temporary file behind. True if written.
+    On Windows a file another process has open for reading can't be replaced, so a replace refused
+    that way is tried again for up to a second: a reader holds it for moments, and the write may be
+    one that matters, such as the dispatcher's last state."""
     tmp = None
     try:
         checked_parent(path)
@@ -1387,7 +1391,14 @@ def write_json_atomic(path, value):
                                    dir=os.path.dirname(path))
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(value, f)
-        os.replace(tmp, path)
+        for attempt in range(REPLACE_TRIES):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == REPLACE_TRIES - 1:
+                    raise
+                time.sleep(0.05)
         tmp = None
         return True
     except (OSError, TypeError, ValueError):
@@ -2090,9 +2101,10 @@ CLAUDE_SESSION_VARS = frozenset((
     "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "AI_AGENT", "CLAUDE_CODE_CHILD_SESSION",
     "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_SSE_PORT", "NOUEZ_DISPATCHER",
+    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_SSE_PORT", "NOUEZ_DISPATCHER", "NOUEZ_DISPATCHER_PROJECTS",
 ))
 DISPATCHER_MARK = "NOUEZ_DISPATCHER"  # set for the dispatcher's claude, never passed on to a session it opens
+DISPATCHER_PROJECTS = "NOUEZ_DISPATCHER_PROJECTS"  # its projects folder, the only place it records trust
 
 
 def fresh_claude_env(env):
@@ -2290,14 +2302,14 @@ def arrange_settings_file():
     return os.path.join(nouez_cache_dir(), "arrange.json")
 
 
-def cache_json(path, limit=1024 * 1024):
+def cache_json(path, limit=1024 * 1024, encoding="utf-8"):
     """read_json_file for a file in nouez's cache folder, its folders and the file itself checked
     at the read, so none is read through a link (REVIEW.md item 13)."""
     try:
         checked_parent(path)
     except OSError:
         return None
-    return read_json_file(path, limit) if regular_file(path) else None
+    return read_json_file(path, limit, encoding)
 
 
 def remove_cache_file(path):
@@ -3404,9 +3416,7 @@ def trust_folder(path, expect=None):
         raise BridgeError(TRUST_WRITE_OFF)
     key, _ = trust_key(path)
     if key is None:
-        raise BridgeError("Not recording trust: nouez can't tell which folder Claude Code keeps the trust "
-                          "for here (the git layout is unusual). Nothing was changed; the user can answer "
-                          "the trust question on the computer.")
+        raise BridgeError(UNKNOWN_TRUST_KEY)
     if expect is not None and _trust_norm(key) != _trust_norm(expect):
         raise BridgeError(f"Not recording trust: the folder Claude Code would keep it for is now {key}, not "
                           f"{expect} as when the user was asked. Nothing was changed; call OpenClaudeSession "
@@ -3416,6 +3426,13 @@ def trust_folder(path, expect=None):
     if norm_key == home or os.path.dirname(norm_key) == norm_key or norm_key == _trust_norm(claude_config_dir()):
         raise BridgeError(f"Not trusting {key}: Claude Code doesn't record trust for the home folder, a "
                           "drive's root or its own folder, so choose a project folder.")
+    return _record_trust(key, True)
+
+
+def _record_trust(key, value):
+    """Set hasTrustDialogAccepted for `key` to `value` in Claude Code's state file, as trust_folder
+    describes; False takes back a record nouez has just made. Returns (name, backup or None)."""
+    norm_key = _trust_norm(key)
     state = claude_state_file()
     backup = None
     for attempt in range(3):
@@ -3431,12 +3448,13 @@ def trust_folder(path, expect=None):
         if not isinstance(projects, dict):
             raise BridgeError(f"{state} isn't laid out as expected (no projects table). Nothing was changed.")
         name = next((p for p in projects if _trust_norm(p) == norm_key), None)
-        if name is not None and isinstance(projects[name], dict) and projects[name].get("hasTrustDialogAccepted") is True:
+        on = name is not None and isinstance(projects[name], dict) and projects[name].get("hasTrustDialogAccepted") is True
+        if on == value:
             return name, backup
         if name is not None and not isinstance(projects[name], dict):
             raise BridgeError(f"{state} has an unexpected entry for {name}. Nothing was changed.")
         name = name or (key.replace("\\", "/") if os.name == "nt" else key)
-        projects.setdefault(name, {})["hasTrustDialogAccepted"] = True
+        projects.setdefault(name, {})["hasTrustDialogAccepted"] = value
         try:
             # allow_nan=False: a number too big for a float (1e400) must not come back as Infinity,
             # which isn't JSON; encode(): a lone surrogate escape can't be written as UTF-8.
@@ -3468,9 +3486,9 @@ def trust_folder(path, expect=None):
             time.sleep(0.2)
             continue
         time.sleep(0.5)  # then make sure no session wrote over it
-        if exactly_trusted(key):
+        if exactly_trusted(key) == value:
             return name, backup
-    raise BridgeError(f"Couldn't record the trust for {key}: {state} kept changing (other Claude Code "
+    raise BridgeError(f"Couldn't {'record' if value else 'take back'} the trust for {key}: {state} kept changing (other Claude Code "
                       f"sessions write it). Its last version before nouez's change is backed up in "
                       f"{backup or trust_backup_dir()}. Try again, or answer the trust question on the computer.")
 
@@ -4060,6 +4078,74 @@ def connection_note(before, cwd, cancel=None):
             "another session.")
 
 
+def dispatcher_trust_problem(folder, env=None):
+    """In a session of the phone dispatcher, why trust can't be recorded for `folder`: it isn't inside
+    the projects folder the dispatcher was set up in, or nouez can't tell which folder that is. None
+    outside the dispatcher, and for a folder inside it. Inside means spelled under the projects folder
+    exactly as it is set (or resolved), case included, with no link below it, and inside it with links
+    resolved too: so neither a link into the projects folder nor one out of it is inside, nor, on
+    Windows, a case-sensitive folder's `projects` beside its `Projects`."""
+    env = os.environ if env is None else env
+    if not in_dispatcher(env):
+        return None
+    projects = env.get(DISPATCHER_PROJECTS) or ""
+    if not rooted(projects):
+        return ("This is the phone dispatcher, which records trust only inside its projects folder, and nouez "
+                "can't tell which folder that is (`server.py dispatcher install` restarts the dispatcher with it).")
+
+    outside = (f"This is the phone dispatcher, which records trust only for a folder inside {projects}, spelled "
+               f"as it is there with no link below it, and {folder} isn't one.")
+    written = _exact_spelling(folder)
+    below = next((written[len(box):].lstrip(os.sep).split(os.sep)
+                  for box in {_exact_spelling(projects), _exact_spelling(os.path.realpath(projects))}
+                  if written.startswith(box.rstrip(os.sep) + os.sep)), None)
+    if not below or not inside_folder(os.path.realpath(folder), projects):
+        return outside
+    path = written[:len(written) - len(os.sep.join(below))]
+    for part in below:  # a link below the projects folder could be pointed elsewhere once trusted
+        path = os.path.join(path, part)
+        if is_link(path):
+            return outside
+    return None
+
+
+def _exact_spelling(path):
+    """`path` absolute, its case kept, and on Windows with an upper-case drive letter."""
+    path = os.path.abspath(path)
+    drive = os.path.splitdrive(path)[0]
+    return drive[:1].upper() + path[1:] if len(drive) == 2 else path
+
+
+def inside_folder(path, box):
+    """Whether one of the folders above `path` is the folder `box` itself, told apart as the file
+    system tells them (so on Windows, a case-sensitive folder's `projects` isn't its `Projects`)."""
+    try:
+        target = os.stat(box)
+    except (OSError, ValueError):
+        return False
+    path = os.path.abspath(path)
+    while True:
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        with contextlib.suppress(OSError, ValueError):
+            if os.path.samestat(os.stat(parent), target):
+                return True
+        path = parent
+
+
+UNKNOWN_TRUST_KEY = ("Not recording trust: nouez can't tell which folder Claude Code keeps the trust for "
+                     "here (the git layout is unusual). Nothing was changed; the user can answer the trust "
+                     "question on the computer.")
+
+
+def refuse_dispatcher_trust(folder):
+    problem = dispatcher_trust_problem(folder)
+    if problem:
+        raise BridgeError(f"Not recording trust: {problem} Nothing was changed; the user can answer Claude "
+                          "Code's trust question on the computer.")
+
+
 def open_claude_session(args, cancel=None, progress=None):
     cwd = args.get("cwd")
     if not isinstance(cwd, str) or not rooted(cwd):
@@ -4075,6 +4161,14 @@ def open_claude_session(args, cancel=None, progress=None):
     created = approved = False
     if flag(args, "trust") and trust_write_off() and not os.path.isdir(cwd):
         raise BridgeError(TRUST_WRITE_OFF)  # before a folder is made for nothing
+    if flag(args, "trust") and flag(args, "create") and not os.path.exists(cwd):  # before a folder is made
+        refuse_dispatcher_trust(cwd)
+        if os.path.isdir(os.path.dirname(cwd)):
+            parent_key, parent_in_git = trust_key(os.path.dirname(cwd))
+            if parent_in_git and not parent_key:  # refused later anyway: before the folder is made
+                raise BridgeError(UNKNOWN_TRUST_KEY)
+            if parent_in_git:  # a new folder in git is trusted with its repository
+                refuse_dispatcher_trust(parent_key)
     if flag(args, "create") and flag(args, "trust") and ask_trust() and not os.path.exists(cwd) \
             and os.path.isdir(os.path.dirname(cwd)) and not git_root(os.path.dirname(cwd)):
         # A new folder outside git, trusted on its own: asked before it is made, so a decline (or a
@@ -4134,9 +4228,9 @@ def open_claude_session(args, cancel=None, progress=None):
         if trust_write_off():
             raise BridgeError(TRUST_WRITE_OFF)
         if key is None:  # raised here, not by trust_folder, which would look the folder up again
-            raise BridgeError("Not recording trust: nouez can't tell which folder Claude Code keeps the trust "
-                              "for here (the git layout is unusual). Nothing was changed; the user can answer "
-                              "the trust question on the computer.")
+            raise BridgeError(UNKNOWN_TRUST_KEY)
+        refuse_dispatcher_trust(cwd)
+        refuse_dispatcher_trust(key)  # the folder trust is kept for: a worktree's main checkout
         report, fingerprint, complete = config_review(folders)
         if not complete:
             return with_login_warning(" ".join(notes + [f"Not trusted: {unread}"]) + "\n\n" + report)
@@ -4162,7 +4256,15 @@ def open_claude_session(args, cancel=None, progress=None):
             if not complete or again != fingerprint:
                 raise BridgeError("The folder's settings changed while nouez's prompt was open, so nothing was "
                                   "recorded. Call OpenClaudeSession again without trust for the new report.")
+        refuse_dispatcher_trust(cwd)  # again, as the folders stand after any prompt: a link may have moved
+        refuse_dispatcher_trust(key)
         recorded, backup = trust_folder(cwd, expect=key)
+        moved = backup and (dispatcher_trust_problem(cwd) or dispatcher_trust_problem(key))
+        if moved:  # a link put in while it was written: the record doesn't stay
+            _record_trust(recorded, False)
+            raise BridgeError(f"Not recording trust: {moved} That changed while nouez wrote the trust, so it was "
+                              f"taken back. Claude Code's settings as they were are backed up in {backup}. The user "
+                              "can answer Claude Code's trust question on the computer.")
         if backup:
             notes.append(f"Recorded the user's trust in {recorded} in Claude Code's settings "
                          f"({claude_state_file()}), as its trust dialog would. The file as it was is "
@@ -4191,6 +4293,10 @@ def open_claude_session(args, cancel=None, progress=None):
             ask = ("nouez is set never to record trust (NOUEZ_NO_TRUST_WRITE=1). Show the user the report below; "
                    "they can answer Claude Code's own trust question on the computer, and open_untrusted=true "
                    "opens the session for that.")
+        elif dispatcher_trust_problem(cwd) or (key and dispatcher_trust_problem(key)):
+            ask = ((dispatcher_trust_problem(cwd) or dispatcher_trust_problem(key)) + " So nouez won't record trust "
+                   "here: show the user the report below; they can answer Claude Code's own trust question on the "
+                   "computer, and open_untrusted=true opens the session for that.")
         return with_login_warning(" ".join(notes + [why, ask]) + "\n\n" + report
                                   + (report_tag(fingerprint) if complete else ""))
     asks = []
@@ -5806,6 +5912,7 @@ AA_CACHE_BYTES = 8 * 1024 * 1024
 AA_CREATORS = ("OpenAI", "Google", "Anthropic")  # makers of the models nouez consults or runs beside
 AA_SHOWN = 8  # top-scoring models shown per maker
 CLAUDE_USAGE_FILE = "claude-usage.json"  # written by the user's status line, see docs/consultants.md
+CLAUDE_USAGE_BYTES = 65536  # a larger saved usage file isn't read
 CLAUDE_USAGE_STALE = 30 * 60  # status line data older than this is flagged as old
 CLAUDE_WINDOWS = (("five_hour", 5 * 60 * 60), ("seven_day", 7 * 24 * 60 * 60))
 
@@ -6038,13 +6145,11 @@ def claude_budget(now, path=None, state=None):
     state = {} if state is None else state
     state["windows"] = []
     path = path or os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE)
-    try:
-        with open(path, encoding="utf-8-sig") as f:
-            saved = json.loads(f.read(65536))
-    except FileNotFoundError:
+    if not os.path.lexists(path):
         return ["Claude Code: not known. Its usage reaches nouez only through the status line; "
                 "see Choosing a consultant in nouez's docs/consultants.md."]
-    except (OSError, ValueError, RecursionError):
+    saved = cache_json(path, CLAUDE_USAGE_BYTES, "utf-8-sig")
+    if saved is None:
         return ["Claude Code: the saved usage file can't be read."]
     limits = saved.get("rate_limits") if isinstance(saved, dict) else None
     at = number(saved.get("saved")) if isinstance(saved, dict) else None
@@ -6107,13 +6212,8 @@ def fetch_aa_models(key):
 
 def read_aa_cache(path):
     """The saved Artificial Analysis list, or {} if there's none or it isn't readable."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            text = f.read(AA_CACHE_BYTES + 1)
-        cache = json.loads(text) if len(text) <= AA_CACHE_BYTES else None
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(cache, dict):
+    cache = cache_json(path, AA_CACHE_BYTES)
+    if cache is None:
         return {}
     models = cache.get("models")
     cache["models"] = [m for m in models if isinstance(m, dict) and isinstance(m.get("name"), str)] \
@@ -6869,8 +6969,8 @@ def usage_snapshot(client):
     except Exception:
         pass
     try:
-        with open(os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE), encoding="utf-8-sig") as f:
-            limits = json.loads(f.read(65536)).get("rate_limits")
+        limits = (cache_json(os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE), CLAUDE_USAGE_BYTES, "utf-8-sig")
+                  or {}).get("rate_limits")
         claude = {window_label(length): limits[key]["used_percentage"] for key, length in CLAUDE_WINDOWS
                   if isinstance(limits.get(key), dict) and number(limits[key].get("used_percentage")) is not None
                   and (number(limits[key].get("resets_at")) or 0) > time.time()}  # not one that has reset
@@ -7328,12 +7428,8 @@ def scan_usage(state, now, claude_root=None, codex_root=None):
 
 
 def read_scan_state(path):
-    try:
-        with open(path, encoding="utf-8") as f:
-            state = json.load(f)
-    except (OSError, ValueError):
-        return {"version": SCAN_STATE_VERSION}
-    if not isinstance(state, dict) or state.get("version") != SCAN_STATE_VERSION:
+    state = cache_json(path, None)
+    if state is None or state.get("version") != SCAN_STATE_VERSION:
         return {"version": SCAN_STATE_VERSION}
     return state
 
@@ -7667,11 +7763,7 @@ def subscription_groups(now, codex_live, codex_saved, claude_path=None, agy_live
         groups.append({"title": title if entries else "Codex", "entries": entries, "note": note, "short": short,
                        "empty": "usage not known: the daemon didn't answer and no recent session reports it"})
     path = claude_path or os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE)
-    try:
-        with open(path, encoding="utf-8-sig") as f:
-            saved = json.loads(f.read(65536))
-    except (OSError, ValueError, RecursionError):
-        saved = None
+    saved = cache_json(path, CLAUDE_USAGE_BYTES, "utf-8-sig")
     limits = saved.get("rate_limits") if isinstance(saved, dict) else None
     at = number(saved.get("saved")) if isinstance(saved, dict) else None
     entries, note, short = [], None, None
@@ -7872,10 +7964,17 @@ def agy_folder(cid):
     return os.path.join(agy_root(), cid)
 
 
-def read_json_file(path, limit=1024 * 1024):
+def read_json_file(path, limit=1024 * 1024, encoding="utf-8"):
+    """A JSON object from one of nouez's own files, or None: none there, unreadable, not an object,
+    over `limit` characters (None: no limit), or a link (REVIEW.md item 13)."""
     try:
-        with open(path, encoding="utf-8") as f:
-            value = json.loads(f.read(limit))
+        if not regular_file(path):
+            return None
+        with open(path, encoding=encoding) as f:
+            text = f.read() if limit is None else f.read(limit + 1)
+        if limit is not None and len(text) > limit:
+            return None
+        value = json.loads(text)
         return value if isinstance(value, dict) else None
     except (OSError, ValueError, RecursionError):
         return None
@@ -11226,15 +11325,17 @@ def path_with(folder, value):
     return os.pathsep.join(parts)
 
 
-def dispatcher_env(exe, config_dir=None, environ=None):
+def dispatcher_env(exe, config_dir=None, environ=None, projects=None):
     """The environment the dispatcher's claude runs in: this one without the variables that tie a
     process to a Claude Code session, with claude's folder on PATH (a sign-in start's PATH can
-    lack it, and OpenClaudeSession looks claude up there), and the Claude Code profile install
-    recorded, if any."""
+    lack it, and OpenClaudeSession looks claude up there), the Claude Code profile install
+    recorded, if any, and the projects folder, the only place its nouez records trust."""
     env = fresh_claude_env(os.environ if environ is None else environ)
     key = next((k for k in env if k.upper() == "PATH"), "PATH")
     env[key] = path_with(os.path.dirname(exe), env.get(key, ""))
     env[DISPATCHER_MARK] = "1"  # its sessions' nouez gives update notices there (in_dispatcher)
+    if projects:
+        env[DISPATCHER_PROJECTS] = projects
     if config_dir:
         env["CLAUDE_CONFIG_DIR"] = config_dir
     return env
@@ -11704,8 +11805,8 @@ def run_dispatcher_once(folder, stop, state, popen=subprocess.Popen, config_dir=
         add_missing_dispatcher_rules(folder, dispatcher_log)
     except Exception as e:  # an optional step: claude starts either way
         dispatcher_log(f"couldn't check the dispatcher's allow rules: {e}")
-    kwargs ={"cwd": folder, "env": dispatcher_env(exe, config_dir), "stdin": subprocess.DEVNULL,
-              "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+    kwargs = {"cwd": folder, "env": dispatcher_env(exe, config_dir, projects=os.path.dirname(folder)),
+              "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | 0x00000004  # CREATE_SUSPENDED
     else:
@@ -12480,7 +12581,8 @@ def dispatcher_setup(folder, dry_run=False, out=print):
             f"answer Claude Code's question about trusting the folder ({DISPATCHER_TRUST_NOTE}) and any "
             "question Remote Control asks, "
             "check that the Claude app lists the computer, then stop it with Ctrl+C. A server started at "
-            "sign-in has no one to answer them.")
+            "sign-in has no one to answer them. Don't use this run from the phone: it is plain Claude "
+            "Code, without the trust limit nouez gives the dispatcher it starts.")
     out(f"\n{'Then' if not trusted else 'Next'}: `server.py dispatcher install` starts it at sign-in.")
     return 0
 
@@ -13532,7 +13634,7 @@ def usage_command(sub):
 def usage_setup_report(settings):
     """doctor's lines on what passes Claude Code's usage to nouez (the status line) and what acts on
     it before Claude starts work (the UserPromptSubmit hook), with the settings to add for each."""
-    saved = read_json_file(os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE))
+    saved = cache_json(os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE), CLAUDE_USAGE_BYTES, "utf-8-sig")
     saved = number(saved.get("saved")) if isinstance(saved, dict) else None
     fresh = saved is not None and time.time() - saved < USAGE_SETUP_DAYS * 86400
     lines = [(True, f"a status line passes Claude Code's usage to nouez (saved {span_text(time.time() - saved)} "

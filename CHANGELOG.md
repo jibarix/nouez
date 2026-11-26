@@ -6,6 +6,26 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.26.1] - 2026-11-25
+
+The phone dispatcher's trust boundary now held by code, and the [rules](docs/rules.md) page made complete. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
+
+### Fixed
+
+- The phone dispatcher records trust only for a folder inside its projects folder, and for a git worktree only when its main checkout is inside it too. Until now only the dispatcher's instructions said so. The dispatcher passes the folder to its sessions' nouez, and a dispatcher started by an older nouez, which doesn't, records no trust from the phone until `dispatcher install` restarts it. Outside the dispatcher nothing changes.
+  - Inside means spelled under the projects folder exactly as it is set, case included, with no link below it, and inside it with links resolved too. So a link into the projects folder, one leading out of it, and one inside it that could later be pointed elsewhere aren't inside, nor, on Windows, a case-sensitive folder's `projects` beside its `Projects`.
+  - A new folder `create: true` would make in a repository is checked with that repository before it is made, so a refusal leaves nothing behind. The checks run again right before the write and right after it; if a link has taken the folder's place meanwhile, the trust just written is set back to false and the call refused.
+  - In the dispatcher, a folder it won't record trust for gets its report with that said, and `open_untrusted: true` to answer Claude Code's own question at the computer, rather than an offer of `trust: true`.
+  - `dispatcher setup` says the one-time `claude remote-control` run it asks for is plain Claude Code, without this limit, and is not for the phone.
+- On Windows, nouez's state files are written again for up to a second when another process is reading them, rather than the write being lost. The dispatcher's last state (stopped) could be lost this way.
+- A JSON file of nouez's own that is a link is no longer read: the latest-release cache, the Artificial Analysis scores, Claude Code's saved usage, `top`'s scan state and the consultants' records. A file over its size limit isn't read; before, one padded past it after a valid object was taken as valid.
+- `create: true` with `trust: true` in a repository whose trust folder nouez can't tell is refused before the folder is made, not after.
+
+### Changed
+
+- [Rules](docs/rules.md) lists the rules nouez's code already held that the page left out: what `revision` leaves out of a diff, `StopConsultant` leaving your own Codex sessions alone, messages added only to turns nouez started, programs never run from the project folder, trust never recorded for the home folder or a drive's root, the copies of Claude Code's state file, checks before a session is closed or resumed, secrets masked in trust reports, the cache folder's protections and the two sites nouez contacts. Rows that were wrong are corrected: reviews and plan critiques can move to another subscription when the first choice is tight or busy, the spare-week window is under three days, and `CloseClaudeSession`'s refusal to close its own session was tested all along. Rows now say where a rule stops: an effort that can't go one level down stays, a send with no pick keeps its settings, a PATH entry naming the project by its full path is used, a password passed as a plain argument isn't masked, and Windows doesn't check the cache folder's owner. New rows cover what a Codex session you opened may still do, what `attach_diff` sends to Google, diffs that never make git fetch, a conversation already open never resumed, the dispatcher's sign-in start and update rules, and the limits on waits and replies.
+- Tests check the values themselves where they compared a constant with itself: Codex's read-only sandbox and approval policy when a consultant starts, and each of Antigravity's deny rules. New tests cover `StopConsultant` refusing your own session, an approval answered after its 10 minutes, every wait that ends before the reply, each kind's advice reaching Claude by its own words, the dispatcher's own instructions, untracked files over 256 KB or past the 200th, the 100-turn reply lookup and a send with no pick.
+
 ## [0.26.0] - 2026-11-25
 
 Rules nouez's code holds rather than asks for, listed on one page; nouez applies its pick of model and effort at send; approvals you can turn on, asked in Claude Code's own prompt; instructions to Claude at less than half their length; and MCP 2026-07-28, which Claude Code now connects with. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version.
@@ -679,7 +699,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.26.1...HEAD
+[0.26.1]: https://github.com/jibarix/nouez/compare/v0.26.0...v0.26.1
 [0.26.0]: https://github.com/jibarix/nouez/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/jibarix/nouez/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/jibarix/nouez/compare/v0.23.0...v0.24.0

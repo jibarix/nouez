@@ -684,7 +684,7 @@ def check_links():
 
 
 # Variables nouez sets for its own processes, not settings a user changes.
-INTERNAL_VARIABLES = {"NOUEZ_DISPATCHER", "NOUEZ_STATUS_SCREEN"}
+INTERNAL_VARIABLES = {"NOUEZ_DISPATCHER", "NOUEZ_DISPATCHER_PROJECTS", "NOUEZ_STATUS_SCREEN"}
 
 
 def rules_problems(server, rules, tests):

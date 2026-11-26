@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.error
 from unittest import mock
@@ -384,6 +385,7 @@ class ProtocolTest(unittest.TestCase):
         self.assertIn("revision=true", server.AUTO_CONSULT)
         self.assertIn("own instructions say otherwise", server.AUTO_CONSULT)
         self.assertIn("ConsultantBudget", server.AUTO_CONSULT)
+        self.assertIn("Skip one, saying so, when ConsultantBudget says none has room", server.AUTO_CONSULT)
 
     def test_initialize_with_the_release_check_on(self):
         # The check runs, but a cached failed lookup from just now keeps it off the network.
@@ -972,6 +974,20 @@ class NouezUpdateTest(unittest.TestCase):
             with mock.patch.object(server, "fetch_latest_release", return_value=None):
                 self.assertIsNone(server.latest_release(now=1000))
 
+    def test_a_linked_cache_is_not_read(self):
+        """0.26.1: the release cache is read like nouez's other cache files, never through a link."""
+        os.makedirs(os.path.dirname(self.cache))
+        elsewhere = os.path.join(os.path.dirname(self.cache), "elsewhere.json")
+        with open(elsewhere, "w", encoding="utf-8") as f:
+            json.dump({"checked": 1000, "latest": "0.9.1"}, f)
+        self.assertEqual(server.read_release_cache(elsewhere, 1000), (True, "0.9.1"))
+        with open(elsewhere, "w", encoding="utf-8") as f:  # a valid object padded past the limit
+            f.write(json.dumps({"checked": 1000, "latest": "0.9.1"}).ljust(server.RELEASE_CACHE_BYTES) + "junk")
+        self.assertEqual(server.read_release_cache(elsewhere, 1000), (False, None))
+        self.assertIsNone(server.read_json_file(elsewhere, server.RELEASE_CACHE_BYTES))
+        file_link(self, elsewhere, self.cache)
+        self.assertEqual(server.read_release_cache(self.cache, 1000), (False, None))
+
     def test_save_failure_leaves_nothing_behind(self):
         os.makedirs(os.path.dirname(self.cache))
         with mock.patch.object(server.os, "replace", side_effect=OSError("locked")):
@@ -1289,6 +1305,27 @@ class TrustTest(unittest.TestCase):
         self.assertTrue(server.is_link(link))
         self.assertEqual(len([b for b in self.backups() if not server.is_link(os.path.join(folder, b))]), 1)
 
+    def test_trust_written_as_a_link_moves_in_is_taken_back(self):
+        """0.26.1: in the dispatcher, the folder is checked again right after the trust is written; if a
+        link has taken its place meanwhile, the record is set back to false and the call refused."""
+        outside = os.path.join(self.tmp, "outside")
+        os.mkdir(outside)
+        real = server.trust_folder
+
+        def swap_after(path, expect=None):
+            done = real(path, expect=expect)
+            os.rename(self.repo, os.path.join(self.projects, "moved"))
+            dir_link(outside, self.repo)
+            return done
+        with mock.patch.dict(server.os.environ, {"NOUEZ_DISPATCHER": "1", "NOUEZ_DISPATCHER_PROJECTS": self.projects}):
+            self.open({"cwd": self.repo})  # the report, then the yes
+            with mock.patch.object(server, "trust_folder", swap_after),                     self.assertRaisesRegex(server.BridgeError, "taken back.*backed up in"):
+                self.open({"cwd": self.repo, "trust": True})
+        data = self.read()
+        self.assertIs(data["projects"][self.slash(self.repo)]["hasTrustDialogAccepted"], False)
+        self.assertFalse(server.exactly_trusted(self.repo))
+        self.assertEqual((data["numStartups"], data["é"], data["projects"]["other"]), (3, "ü", {"allowedTools": ["x"]}))
+
     def test_the_user_can_turn_trust_writing_off(self):
         """0.22.0: with NOUEZ_NO_TRUST_WRITE=1, nouez never records trust, asked or not."""
         for value, off in (("", False), ("0", False), ("no", False), ("1", True), ("yes", True)):
@@ -1322,6 +1359,10 @@ class TrustTest(unittest.TestCase):
         wt = self.worktree(os.path.join(meta, "worktrees", "wt"), "../..")
         with self.assertRaisesRegex(server.BridgeError, "git layout is unusual"):
             server.trust_folder(wt)
+        made = os.path.join(wt, "new")  # 0.26.1: refused before create=true makes the folder
+        with self.assertRaisesRegex(server.BridgeError, "git layout is unusual"):
+            self.open({"cwd": made, "create": True, "trust": True})
+        self.assertFalse(os.path.exists(made))
         self.write([1, 2])
         with self.assertRaisesRegex(server.BridgeError, "Nothing was changed"):
             server.trust_folder(self.repo)
@@ -1486,6 +1527,22 @@ class PartialTest(unittest.TestCase):
         self.assertIn("Output so far", out)
         self.assertTrue(out.endswith("half"))
 
+    def test_every_wait_that_ends_early_says_the_turn_runs_on(self):
+        """0.26.1: GetConsultantReply on a running turn, with or without the waiter, and the waiter
+        out of time, say the turn is still working and isn't a reply (the sends' timeouts and the
+        waiters' stalls have their own tests)."""
+        turn = {"id": "t1", "status": "inProgress", "items": [user("q")]}
+        for waiter in (True, False):
+            with self.subTest(waiter=waiter), mock.patch.object(server, "background_waiter", lambda: waiter):
+                self.assertIn("still working on turn t1; this is not a reply",
+                              server.still_working_reply("c", "0199aaaa-0000-0000-0000-000000000001", turn))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            server.print_unfinished("c", "0199aaaa-0000-0000-0000-000000000001", "t1", turn,
+                                    types.SimpleNamespace(stalled=False, limit=600))
+        self.assertIn("still working on turn t1; this is not a reply", buf.getvalue())
+        self.assertIn("To keep waiting", buf.getvalue())
+
 
 class FakeDaemon:
     """A daemon with threads and turns, for the tool handlers. Pass it as CodexClient."""
@@ -1515,6 +1572,7 @@ class FakeDaemon:
         if method == "thread/list":
             return {"data": []}
         if method == "thread/start":
+            self.thread_started = params
             thread = {"id": "0199ffff-0000-0000-0000-000000new001", "threadSource": "nouez", **params}
             self.threads[thread["id"]] = thread
             return {"thread": thread}
@@ -1574,6 +1632,22 @@ class HandlerTest(unittest.TestCase):
         self.assertIn(f"Stopped {server.short_name(c)} (archived). Ended its running turn.", out)
         self.assertEqual((running["status"], daemon.archived), ("interrupted", c["id"]))
         self.assertLess(daemon.calls.index("turn/interrupt"), daemon.calls.index("thread/archive"))
+
+    def test_stop_never_touches_a_user_session(self):
+        """0.26.1: StopConsultant refuses a Codex session the user opened, running turn or not, and
+        neither interrupts nor archives it."""
+        mine = {"id": "0199aaaa-0000-0000-0000-000000user02", "cwd": ROOT}
+        idle = {"id": "0199aaaa-0000-0000-0000-000000user03", "cwd": ROOT}  # no turn running
+        running = {"id": "turn-user", "status": "inProgress", "items": [user("q")]}
+        done = {"id": "turn-done", "status": "completed", "items": [user("q"), agent("a", "final_answer")]}
+        daemon = self.use(FakeDaemon([mine, idle], {mine["id"]: [running], idle["id"]: [done]}))
+        for session in (mine, idle):
+            for turn_only in (True, False):
+                with self.subTest(session=session["id"], turn_only=turn_only), \
+                        self.assertRaisesRegex(server.BridgeError, "was not started by StartConsultant"):
+                    server.stop_consultant({"to": session["id"], "turn_only": turn_only})
+        self.assertEqual(running["status"], "inProgress")
+        self.assertFalse({"turn/interrupt", "thread/archive"} & set(daemon.calls))
 
     def test_an_interrupt_that_doesnt_take(self):
         c = self.consultant("st0002")
@@ -1702,6 +1776,9 @@ class HandlerTest(unittest.TestCase):
         daemon = self.use(FakeDaemon([mine]))
         out = server.start_consultant({"cwd": ROOT})
         self.assertIn("thread/start", daemon.calls)
+        # 0.26.1: the literal values, so a change to the constants can't pass unseen.
+        self.assertEqual((daemon.thread_started["sandbox"], daemon.thread_started["approvalPolicy"]),
+                         ("read-only", "never"))
         self.assertTrue(out.startswith("Started "))
         self.assertIn("were not used", out)
         self.assertIn(server.short_name(mine), out)
@@ -1820,6 +1897,19 @@ class HandlerTest(unittest.TestCase):
             out = server.send_consultant_message({"kind": "review", "to": thread["id"], "message": "more", "wait": 0})
         self.assertIn("steered", out)
         self.assertIn("turn/steer", daemon.calls)
+
+    def test_a_send_with_no_pick_keeps_the_consultants_settings(self):
+        """0.26.1: when the usage can't be read, or no subscription has room, a send of any kind goes
+        ahead on the consultant's current model and effort, and says nothing of a pick."""
+        with mock.patch.object(server, "claude_budget", side_effect=RuntimeError("unreadable")):
+            self.assertIsNone(server.send_route("review", "codex"))
+        thread = self.consultant("tune07")
+        daemon = self.use(FakeDaemon([thread]))
+        with mock.patch.object(server, "send_route", return_value=None):
+            out = server.send_consultant_message({"kind": "review", "to": thread["id"], "message": "hi", "wait": 0})
+        self.assertNotIn("model", daemon.started)
+        self.assertNotIn("effort", daemon.started)
+        self.assertNotIn("nouez's pick", out)
 
     def test_bad_model_or_effort_is_refused_before_sending(self):
         thread = self.consultant("tune03")
@@ -2119,6 +2209,35 @@ class HandlerTest(unittest.TestCase):
         self.assertIn("still working", out)
         self.assertIn(f"run the same command again in the background:\n", out)
         self.assertIn(f"wait {thread['id']} turn-1", out)
+
+    def test_reply_and_waiter_on_a_running_turn_say_it_runs_on(self):
+        """0.26.1: through the entry points themselves, GetConsultantReply on a running turn (with
+        and without a background waiter) and the waiter out of time say the turn still runs and
+        what they show isn't a reply."""
+        thread = self.consultant("wait09")
+        running = {"id": "turn-1", "status": "inProgress", "items": [user("q"), agent("half", "commentary")]}
+        self.use(FakeDaemon([thread], {thread["id"]: [running]}))
+        for waiter in (True, False):
+            with self.subTest(waiter=waiter), mock.patch.object(server, "background_waiter", lambda: waiter):
+                out = server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-1"})
+                self.assertIn("still working on turn turn-1; this is not a reply", out)
+        with mock.patch.object(server, "WAITER_SECONDS", 0.05), mock.patch.object(server, "STALL_SECONDS", 3600):
+            code, out = self.run_waiter(thread["id"], "turn-1")
+        self.assertEqual(code, 0)
+        self.assertIn("still working on turn turn-1; this is not a reply", out)
+        self.assertIn(f"wait {thread['id']} turn-1", out)
+
+    def test_a_reply_is_looked_up_among_the_100_most_recent_turns(self):
+        """0.26.1: GetConsultantReply finds a turn among the 100 most recent and says when it isn't
+        there, rather than reading the whole conversation."""
+        self.assertEqual(server.REPLY_LOOKBACK, 100)
+        thread = self.consultant("look01")
+        turns = [{"id": f"turn-{n}", "status": "completed", "items": [user("q"), agent(f"answer {n}", "final_answer")]}
+                 for n in range(101, 0, -1)]  # newest first, as the daemon lists them
+        self.use(FakeDaemon([thread], {thread["id"]: turns}))
+        self.assertIn("answer 2", server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-2"}))
+        out = server.get_consultant_reply({"to": thread["id"], "turn_id": "turn-1"})
+        self.assertIn("has no turn turn-1 among its 100 most recent turns", out)
 
     def test_waiter_says_when_a_turn_shows_nothing_new(self):
         """0.20.0: a turn that shows nothing new for STALL_SECONDS wakes Claude, rather than the
@@ -3456,6 +3575,26 @@ class RevisionTest(unittest.TestCase):
         self.put("app.py", "changed\n")
         self.assertIn(b"+changed\n", server.revision(self.repo, base="HEAD")[1])
 
+    def test_large_and_extra_untracked_files_are_named_not_sent(self):
+        """0.26.1: an untracked file over 256 KB, and those past the 200th, are named in the revision
+        line and left out of the diff."""
+        self.assertEqual((server.PATCH_FILE_BYTES, server.PATCH_UNTRACKED_FILES), (256 * 1024, 200))
+        self.put("at-limit.txt", "x" * (256 * 1024))
+        self.put("big.txt", "y" * (256 * 1024 + 1))
+        line, patch, _ = server.revision(self.repo)
+        self.assertIn("big.txt (too large)", line)
+        self.assertIn(b"at-limit.txt", patch)
+        self.assertNotIn(b"big.txt", patch)
+        os.remove(os.path.join(self.repo, "at-limit.txt"))
+        os.remove(os.path.join(self.repo, "big.txt"))
+        for n in range(3):
+            self.put(f"f{n}.txt", f"{n}\n")
+        with mock.patch.object(server, "PATCH_UNTRACKED_FILES", 2):  # the 200th, made small
+            line, patch, _ = server.revision(self.repo)
+        self.assertIn("f2.txt (over 2 untracked files)", line)
+        self.assertIn(b"f1.txt", patch)
+        self.assertNotIn(b"f2.txt", patch)
+
     def test_the_diff_is_taken_once_and_applies(self):
         self.put("app.py", "a = 1\nb = 3\n")
         self.put("new/notes.txt", "café\nlast line without a newline")
@@ -3625,6 +3764,23 @@ class HardeningTest(unittest.TestCase):
         self.assertFalse(server.write_json_atomic(os.path.join(self.dir, "agy", "abc", "consultant.json"), {}))
         self.assertTrue(server.write_json_atomic(os.path.join(self.dir, "fine", "x.json"), {"a": 1}))
         self.assertEqual(os.listdir(self.outside), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows only: a file open for reading can't be replaced there")
+    def test_saved_json_waits_for_a_reader_to_let_go(self):
+        """0.26.1: a file another process has open can't be replaced on Windows, and the dispatcher's
+        last state was lost when its status was read just then; the replace is tried again."""
+        path = os.path.join(self.dir, "fine", "state.json")
+        self.assertTrue(server.write_json_atomic(path, {"phase": "connected"}))
+        reader = open(path, encoding="utf-8")  # as another process reading it holds it
+        threading.Timer(0.2, reader.close).start()
+        self.assertTrue(server.write_json_atomic(path, {"phase": "stopped"}))
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"phase": "stopped"})
+        held = open(path, encoding="utf-8")
+        self.addCleanup(held.close)
+        with mock.patch.object(server.time, "sleep"):  # a reader that never lets go: given up, nothing left behind
+            self.assertFalse(server.write_json_atomic(path, {"phase": "later"}))
+        self.assertEqual(sorted(os.listdir(os.path.dirname(path))), ["state.json"])
 
     def test_a_linked_pane_key_is_replaced_not_read(self):
         """0.22.0: a pane key that is a link is neither read nor written through."""
@@ -4894,6 +5050,12 @@ class SuggestTest(unittest.TestCase):
         got = server.suggest_consultant("review", {"codex": tight}, self.NOW)
         self.assertEqual((got["model"], got["effort"]), ("gpt-6.2-astra", "medium"))
         self.assertIn("one level down while its week is tight", got["why"])
+        # 0.26.1: a model that doesn't list the level below keeps its effort
+        tight["models"] = {m: (("low", "high", "xhigh"), "low", i == 0)
+                           for i, m in enumerate(["gpt-6.2-sol", "gpt-6.2-astra"])}
+        got = server.suggest_consultant("review", {"codex": tight}, self.NOW)
+        self.assertEqual((got["model"], got["effort"]), ("gpt-6.2-astra", "high"))
+        self.assertNotIn("one level down while its week is tight", got["why"])
         # Gemini past 70%, Codex's week ending within two days half unused: the critique goes to Codex
         busy = self.agy(gemini=60, days_left=2)  # 5 of 7 days gone: about 84%
         spare = self.codex(used=30, days_left=1)  # about 35% at a reset a day away
@@ -5055,6 +5217,19 @@ class SuggestTest(unittest.TestCase):
         self.assertIn('The other provider now: provider "antigravity", model "gemini-4-neon", effort "high".', text)
         self.assertIn('Gemini 4 Neon scores best (Artificial Analysis by subject): provider "antigravity", '
                       'model "gemini-4-neon", effort "xhigh".', text)
+        # 0.26.1: each kind's own note reaches Claude with its suggestion, in its own words.
+        self.assertIn("Ask for every finding in the first round", text)
+        # The advice itself, written here and not read from CONSULT_NOTES, so a note emptied or
+        # dropped there fails.
+        for kind, said in (("review", "Ask for every finding in the first round"),
+                           ("re-check", "send the review's model and effort again"),
+                           ("bug-hunt", "draft the fix as a unified diff"),
+                           ("bug-hunt", "git apply"),
+                           ("plan-critique", "whether any premise, assumption or framing is wrong"),
+                           ("research", "Ask for a short answer with its sources"),
+                           ("fact-check", "Ask for its sources, and check the ones you will rely on")):
+            with self.subTest(kind=kind, said=said):
+                self.assertIn(said, "\n".join(server.suggestion_lines(kind, state, self.NOW)))
         # an Antigravity suggestion names the model and level for StartConsultant too
         agy = server.suggestion_lines("plan-critique", state, self.NOW)
         self.assertIn('StartConsultant provider "antigravity", model "gemini-4-neon", effort "xhigh"; ', "\n".join(agy))
@@ -5270,13 +5445,20 @@ class AgyTest(unittest.TestCase):
         self.assertEqual(cwd, self.work)
         self.assertEqual(argv[-2:], ["-p", ""])
         self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), server.AGY_READ_ONLY)
+        # 0.26.1: the entries themselves, so dropping one from the constant can't pass unseen.
+        self.assertLessEqual({"write_file(*)", "command(*)", "mcp(*)", "execute_url(*)"},
+                             set(json.loads(argv[argv.index("--settings") + 1])["permissions"]["deny"]))
         self.assertIn("--disable-slash-commands", argv)
         self.assertEqual(argv[argv.index("--model") + 1], "gemini-4-neon-high")
-        self.assertEqual(argv[argv.index("--print-timeout") + 1], server.AGY_TURN_LIMIT)
+        self.assertEqual(argv[argv.index("--print-timeout") + 1], "30m")
         self.assertNotIn("--conversation", argv)
         content = json.loads(sent)["message"]["content"]
         self.assertEqual(json.loads(sent)["event"], "user")
         self.assertTrue(content.startswith(server.AGY_PREAMBLE))
+        # 0.26.1: the first brief's own words, so a rule dropped from the constant can't pass unseen
+        for said in ("You are a read-only consultant", "writing or editing files, running commands and MCP "
+                     "tools are denied", "Don't schedule tasks or start background work"):
+            self.assertIn(said, content)
         self.assertIn("<<<\nAnswer in French.\n>>>", content)
         self.assertIn("The diff named in the revision line below (sha256 d1g3st), as nouez took it:\n<<<\n--- a/x\n"
                       "+++ b/x\n>>>\n\n[Message from Claude Code via the consultants bridge]\n[Revision: commit abc. Name", content)
@@ -5295,6 +5477,9 @@ class AgyTest(unittest.TestCase):
             self.assertFalse(json.loads(sent)["message"]["content"].startswith(server.AGY_PREAMBLE))
             # 0.26.0: the read-only rules again on every later turn
             self.assertTrue(json.loads(sent)["message"]["content"].startswith(server.AGY_REMINDER))
+            for said in ("still a read-only consultant", "Don't write files, run commands, schedule tasks",
+                         "start background work"):  # the reminder's words, not only the constant
+                self.assertIn(said, json.loads(sent)["message"]["content"])
             with self.assertRaisesRegex(server.BridgeError, "still working on turn .* nothing was sent"):
                 server.send_consultant_message({"kind": "other", "to": name, "message": "Third", "wait": 0})
             self.assertEqual(len(self.runs), 2)
@@ -6883,6 +7068,29 @@ class ApprovalRetryTest(unittest.TestCase):
             trust.assert_called_once()  # asked once: the made folder isn't asked about again
             window.assert_not_called()  # folder_trusted still says no in this test
 
+    def test_an_answer_after_the_prompt_expired_approves_nothing(self):
+        """0.26.1: a prompt's id is good for ASK_SECONDS (10 minutes); an answer that comes later is
+        asked again, with a new id, and nothing is done."""
+        self.assertEqual(server.ASK_SECONDS, 600)
+        plain = tempfile.mkdtemp(prefix="nouez-test-plain-")
+        self.addCleanup(shutil.rmtree, plain, True)
+        new = os.path.join(plain, "late")
+        args = {"cwd": new, "create": True, "trust": True}
+        now = time.monotonic()
+        with mock.patch.dict(os.environ, {"NOUEZ_ASK_TRUST": "1"}), \
+                mock.patch.object(server, "trust_folder", return_value=(new, None)) as trust, \
+                mock.patch.object(server, "open_window"), \
+                mock.patch.object(server, "folder_trusted", return_value=False), \
+                mock.patch.object(server, "exactly_trusted", return_value=False):
+            with mock.patch.object(server.time, "monotonic", return_value=now):
+                first = self.call("OpenClaudeSession", args)
+            with mock.patch.object(server.time, "monotonic", return_value=now + server.ASK_SECONDS + 1):
+                late = self.answer(first, "accept", "OpenClaudeSession", args)
+            self.assertEqual(late["resultType"], "input_required")
+            self.assertNotEqual(late["requestState"], first["requestState"])
+            self.assertFalse(os.path.exists(new))
+            trust.assert_not_called()
+
     def test_a_user_session_message_is_approved_for_that_call_only(self):
         # Codex finding 1, Neon N2: changing the message past what the prompt shows, or any other
         # argument, makes it another call, asked about again.
@@ -7034,6 +7242,83 @@ class TrustReportFirstTest(unittest.TestCase):
         self.assertIn("apiKeyHelper runs: key.sh", first)
         trust.assert_called_once()
         window.assert_not_called()  # folder_trusted still says no in this test
+
+    def test_the_dispatcher_records_trust_only_inside_its_projects_folder(self):
+        """0.26.1: in the phone dispatcher, code (not only its instructions) keeps trust inside its
+        projects folder: a folder outside it, the folder itself, or an unknown one is refused with
+        nothing changed or made; outside the dispatcher the projects folder plays no part."""
+        parent = os.path.dirname(self.dir)
+        other = tempfile.mkdtemp(prefix="nouez-test-elsewhere-")
+        self.addCleanup(shutil.rmtree, other, True)
+        mark = {"NOUEZ_DISPATCHER": "1"}
+        self.assertIsNone(server.dispatcher_trust_problem(self.dir, {"NOUEZ_DISPATCHER_PROJECTS": other}))
+        self.assertIsNone(server.dispatcher_trust_problem(self.dir, {**mark, "NOUEZ_DISPATCHER_PROJECTS": parent}))
+        for env, says in (({**mark, "NOUEZ_DISPATCHER_PROJECTS": other}, "isn't one"),
+                          ({**mark, "NOUEZ_DISPATCHER_PROJECTS": self.dir}, "isn't one"),
+                          ({**mark, "NOUEZ_DISPATCHER_PROJECTS": os.path.join(self.dir, "..", "..")}, None),
+                          (mark, "can't tell which folder"),
+                          ({**mark, "NOUEZ_DISPATCHER_PROJECTS": "relative"}, "can't tell which folder")):
+            with self.subTest(env=env):
+                problem = server.dispatcher_trust_problem(self.dir, env)
+                if says is None:  # a folder further up still holds it
+                    self.assertIsNone(problem)
+                    continue
+                self.assertIn(says, problem)
+        # Inside means both as written and with links resolved: a link from outside into the
+        # projects folder isn't inside (trust would be kept for the link's path), nor one leading out.
+        inner = os.path.join(other, "inner")
+        os.mkdir(inner)
+        into, out_of = os.path.join(self.dir, "into"), os.path.join(other, "out-of")
+        dir_link(inner, into)
+        dir_link(self.dir, out_of)
+        boxed = {**mark, "NOUEZ_DISPATCHER_PROJECTS": other}
+        self.assertIsNone(server.dispatcher_trust_problem(inner, boxed))
+        self.assertIn("isn't one", server.dispatcher_trust_problem(into, boxed))
+        self.assertIn("isn't one", server.dispatcher_trust_problem(out_of, boxed))
+        # 0.26.1: spelled exactly as the projects folder is, with no link below it, even one that
+        # leads inside, since it could be pointed elsewhere once the trust is kept for its path.
+        within = os.path.join(other, "within")
+        dir_link(inner, within)
+        self.assertIn("no link below it", server.dispatcher_trust_problem(within, boxed))
+        self.assertIn("isn't one", server.dispatcher_trust_problem(os.path.join(within, "sub"), boxed))
+        respelled = other.replace("nouez-test-elsewhere", "NOUEZ-test-elsewhere")  # the same folder where case doesn't count
+        self.assertIn("isn't one", server.dispatcher_trust_problem(os.path.join(respelled, "inner"), boxed))
+        lower = {**mark, "NOUEZ_DISPATCHER_PROJECTS": other[0].lower() + other[1:]}  # a drive letter's case is no spelling
+        self.assertIsNone(server.dispatcher_trust_problem(inner, lower))
+        for link in (into, out_of, within):  # the links only, not what they lead to
+            os.rmdir(link) if os.name == "nt" else os.unlink(link)
+        self.assertTrue(os.path.isdir(inner))
+        with mock.patch.object(server, "trust_folder", return_value=(self.dir, None)) as trust, \
+                mock.patch.object(server, "open_window"):
+            with mock.patch.dict(os.environ, {**mark, "NOUEZ_DISPATCHER_PROJECTS": other}):
+                report = server.open_claude_session({"cwd": self.dir})  # the report alone is still given
+                self.assertIn("phone dispatcher", report)
+                self.assertIn("open_untrusted=true", report)
+                self.assertNotIn("call OpenClaudeSession again with trust=true", report)
+                with self.assertRaisesRegex(server.BridgeError, "phone dispatcher.*Nothing was changed"):
+                    server.open_claude_session({"cwd": self.dir, "trust": True})
+                new = os.path.join(parent, "nouez-test-not-made")
+                with self.assertRaisesRegex(server.BridgeError, "phone dispatcher"):
+                    server.open_claude_session({"cwd": new, "create": True, "trust": True})
+                self.assertFalse(os.path.exists(new))  # refused before the folder was made
+                trust.assert_not_called()
+            with mock.patch.dict(os.environ, {**mark, "NOUEZ_DISPATCHER_PROJECTS": parent}):
+                server.open_claude_session({"cwd": self.dir, "trust": True})
+            trust.assert_called_once()
+        # A worktree's trust is kept for its main checkout, which is checked too: here the worktree
+        # is inside the projects folder (`other`) and its main checkout (self.dir) isn't.
+        worktree = os.path.join(other, "wt")
+        os.mkdir(worktree)
+        with mock.patch.object(server, "trust_key", return_value=(self.dir, True)), \
+                mock.patch.object(server, "trust_folder") as trust, \
+                mock.patch.dict(os.environ, {**mark, "NOUEZ_DISPATCHER_PROJECTS": other}):
+            with self.assertRaisesRegex(server.BridgeError, "isn't one"):
+                server.open_claude_session({"cwd": worktree, "trust": True})
+            new = os.path.join(worktree, "new")  # a new folder in it is trusted with that checkout too
+            with self.assertRaisesRegex(server.BridgeError, "isn't one"):
+                server.open_claude_session({"cwd": new, "create": True, "trust": True})
+            self.assertFalse(os.path.exists(new))  # refused before the folder was made
+            trust.assert_not_called()
 
     def test_with_ask_trust_the_user_approves_each_recording(self):
         """0.26.0: NOUEZ_ASK_TRUST=1 asks in the client's own prompt, naming the report shown, before
@@ -8566,6 +8851,11 @@ class DispatcherTest(unittest.TestCase):
         env = server.dispatcher_env(exe, None, {"PATH": os.path.dirname(exe)})
         self.assertEqual(env["PATH"], os.path.dirname(exe))
         self.assertNotIn("CLAUDE_CONFIG_DIR", env)
+        self.assertNotIn("NOUEZ_DISPATCHER_PROJECTS", env)
+        env = server.dispatcher_env(exe, None, {"PATH": ""}, projects=self.home)
+        self.assertEqual((env["NOUEZ_DISPATCHER"], env["NOUEZ_DISPATCHER_PROJECTS"]), ("1", self.home))
+        # Neither reaches a session the dispatcher opens.
+        self.assertFalse({"NOUEZ_DISPATCHER", "NOUEZ_DISPATCHER_PROJECTS"} & set(server.fresh_claude_env(env)))
 
     def test_a_log_that_cant_move_aside_stops_growing(self):
         path = os.path.join(self.cache, "dispatcher.log")
@@ -8654,14 +8944,16 @@ class DispatcherTest(unittest.TestCase):
         os.makedirs(self.folder)
         claude = FakeClaude(code=None)
         state = server.DispatcherState(self.folder)
-        jobs = []
+        jobs, envs = [], []
         with mock.patch.object(server, "dispatcher_claude", lambda env=None: "/bin/claude"), \
                 mock.patch.object(server, "end_dispatcher_claude", lambda proc, job=None: setattr(proc, "ended", True)):
             self.assertIsNone(server.run_dispatcher_once(self.folder, threading.Event(), state,
-                                                         popen=lambda argv, **kw: claude,
+                                                         popen=lambda argv, **kw: envs.append(kw["env"]) or claude,
                                                          new_job=lambda: jobs.append(NoJob()) or jobs[-1]))
         self.assertTrue(claude.ended)
         self.assertTrue(jobs[0].closed)
+        # 0.26.1: its nouez learns the projects folder, the only place it records trust.
+        self.assertEqual(envs[0]["NOUEZ_DISPATCHER_PROJECTS"], os.path.dirname(self.folder))
 
     def test_each_run_has_its_own_job(self):
         jobs = []
@@ -9026,12 +9318,17 @@ class DispatcherTest(unittest.TestCase):
         with open(os.path.join(self.folder, "CLAUDE.md"), encoding="utf-8") as f:
             md = f.read()
         self.assertIn(f"directly inside `{self.projects}`", md)
+        # 0.26.1: the rules the code doesn't hold, in the words the dispatcher gets.
+        self.assertIn(f"If it isn't\ninside `{self.projects}`, or nouez can't tell, decline.", md)
+        self.assertIn("Don't start consultants or consult from this session.", md)
+        self.assertIn("Close one with `CloseClaudeSession` only when the user\n  names it.", md)
         self.assertNotIn("{projects}", md)
         self.assertNotIn("dangerously", md.lower())
         with open(os.path.join(self.folder, ".claude", "settings.json"), encoding="utf-8") as f:
             allow = json.load(f)["permissions"]["allow"]
         self.assertEqual(allow, [f"mcp__consultants__{t}" for t in server.DISPATCHER_TOOLS])
         self.assertIn("claude remote-control --name dispatcher --spawn same-dir", out)
+        self.assertIn("Don't use this run from the phone: it is plain Claude Code", out)  # 0.26.1
         code, out = self.setup()
         self.assertIn("already allows", out)
         self.assertIn("kept as it is", out)

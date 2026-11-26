@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.26.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.26.1\\[0.3em]\large Architecture and message reference}
 \date{November 25, 2026}
 \author{}
 
@@ -290,7 +290,7 @@ the folder the call names, never in a workspace above it.
   "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
   "ttlMs": 0, "cacheScope": "private",
-  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.26.0"}}}}
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.26.1"}}}}
 \end{wire}
 
 Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
@@ -2315,7 +2315,14 @@ connects out to Anthropic and nothing on it listens, but a \code{claude remote-c
 starts every session in its own folder. \code{server.py dispatcher} keeps one such server, named
 \code{dispatcher}, running in a folder of its own (\code{\textasciitilde/Projects/dispatcher} unless
 \code{-{}-folder}), and that folder's sessions have nouez's session tools, so one server reaches
-every project (Figure~\ref{fig:dispatcher}).
+every project (Figure~\ref{fig:dispatcher}). The supervisor gives \code{claude} the projects folder
+(the one that holds the dispatcher's) in \code{NOUEZ\_DISPATCHER\_PROJECTS}, and the dispatcher's
+nouez records trust only for a folder inside it, checked for the folder and for the one trust is
+kept for (a worktree's main checkout): spelled under it exactly as it is set, case included, with no
+link below it, and inside it with links resolved, before a folder is made, before the write and after
+it, when a failed check sets the trust back to false; without it, none. Sessions it opens get neither that variable nor
+\code{NOUEZ\_DISPATCHER}. The one-time \code{claude remote-control} run that setup asks for, to
+answer the trust question, is plain Claude Code and isn't covered.
 
 \begin{figure}[H]
 \centering
