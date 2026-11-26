@@ -69,7 +69,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.26.3"
+SERVER_VERSION = "0.26.4"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -6102,33 +6102,127 @@ def window_text(label, used, resets_at, length, now, sampled=None):
     return text
 
 
+# The usage readers. Each reads one subscription's windows the one way that routing, ConsultantBudget,
+# the status screen, the usage log and doctor all use: a window is a dict {"key": its name in the
+# source, "label": "weekly" and the like, "group": Antigravity's quota group or "", "length": seconds
+# or None, "used": percent, "resets_at", "sampled": when it was read, never None}. A window with no
+# usable percentage or reset time, or one that has already reset, is left out here, once.
+
+def quota_window(key, label, length, used, resets_at, sampled, now, group=""):
+    used, resets_at, length = number(used), number(resets_at), number(length)
+    if used is None or resets_at is None or resets_at <= now:
+        return None
+    return {"key": key, "label": label, "group": group, "length": length or None, "used": used,
+            "resets_at": resets_at, "sampled": min(number(sampled) or now, now)}
+
+
+def codex_windows(limits, now):
+    """Codex's usage from the `rateLimits` of account/rateLimits/read: {"plan", "windows",
+    "limit_reached": the kind of limit Codex says is reached, or None}. None when `limits` isn't a
+    dict (no answer)."""
+    if not isinstance(limits, dict):
+        return None
+    windows = []
+    for key in ("primary", "secondary"):
+        w = limits.get(key)
+        if isinstance(w, dict):
+            mins = number(w.get("windowDurationMins"))
+            length = mins * 60 if mins else None
+            q = quota_window(key, window_label(length) if length else "usage", length, w.get("usedPercent"),
+                             w.get("resetsAt"), now, now)
+            if q:
+                windows.append(q)
+    plan, reached = limits.get("planType"), limits.get("rateLimitReachedType")
+    return {"plan": plan if isinstance(plan, str) else None, "windows": windows,
+            "limit_reached": reached if isinstance(reached, str) else None}
+
+
+def codex_saved_windows(saved, now):
+    """Codex's usage as its newest session file recorded it (scan_usage's "codex_limits"), in
+    codex_windows' shape with "saved": when it was recorded. None without a usable record."""
+    ts = number(saved.get("ts")) if isinstance(saved, dict) else None
+    if ts is None:
+        return None
+    windows = []
+    for key in ("primary", "secondary"):
+        w = saved.get(key)
+        if isinstance(w, dict):
+            mins = number(w.get("window_minutes"))
+            length = mins * 60 if mins else None
+            q = quota_window(key, window_label(length) if length else "usage", length, w.get("used_percent"),
+                             w.get("resets_at"), ts, now)
+            if q:
+                windows.append(q)
+    plan = saved.get("plan")
+    return {"plan": plan if isinstance(plan, str) else None, "windows": windows, "limit_reached": None, "saved": ts}
+
+
+def claude_quota(now, path=None):
+    """Claude Code's usage from the file its status line saves: {"status": "missing", "unreadable"
+    or "ok", "saved": when the file says it was saved, or None, "windows"}. A window's "sampled" is
+    when it was observed, else when the file was saved."""
+    path = path or os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE)
+    if not os.path.lexists(path):
+        return {"status": "missing", "saved": None, "windows": []}
+    saved = cache_json(path, CLAUDE_USAGE_BYTES, "utf-8-sig")
+    if saved is None:
+        return {"status": "unreadable", "saved": None, "windows": []}
+    limits = saved.get("rate_limits") if isinstance(saved, dict) else None
+    at = number(saved.get("saved")) if isinstance(saved, dict) else None
+    windows = []
+    for key, length in CLAUDE_WINDOWS:
+        w = limits.get(key) if isinstance(limits, dict) else None
+        if isinstance(w, dict):
+            q = quota_window(key, window_label(length), length, w.get("used_percentage"), w.get("resets_at"),
+                             number(w.get("observed")) or at, now)
+            if q:
+                windows.append(q)
+    return {"status": "ok", "saved": at, "windows": windows}
+
+
+def agy_windows(live, now):
+    """Antigravity's quota windows from read_agy_usage's {"groups": [...]}, each with its quota
+    group's name ("group": None when agy gave none). The percent used is rounded once, here, so
+    99.96 is used up for routing and the screen alike. Never changes `live`: it is agy's cache."""
+    windows = []
+    groups = live.get("groups") if isinstance(live, dict) else None
+    for g in groups if isinstance(groups, list) else []:
+        if not isinstance(g, dict) or not isinstance(g.get("buckets"), list):
+            continue
+        name = g.get("name") if isinstance(g.get("name"), str) else None
+        for b in g["buckets"]:
+            left = number(b.get("remaining_fraction")) if isinstance(b, dict) else None
+            if left is None:
+                continue
+            window = b.get("window")
+            length = AGY_WINDOWS.get(window) if isinstance(window, str) else None
+            q = quota_window(str(window) if window else "usage",
+                             window_label(length) if length else (str(window) if window else "usage"), length,
+                             round(100 * (1 - left), 1), iso_seconds(b.get("reset_time")), now, now, group=name)
+            if q:
+                windows.append(q)
+    return windows
+
+
 def codex_budget(client, now, state=None):
     """Lines on the Codex account's usage windows and the models it offers. A `state` dict gets
     the same as data, for suggest_consultant: {"windows": [(length, used, resets_at)], "models":
     {id: (efforts, default effort, is the default model)} or None when they couldn't be read}."""
     state = {} if state is None else state
     state.update(windows=[], models=None)
-    lines = []
     limits = client.request("account/rateLimits/read", None)
     limits = limits if isinstance(limits, dict) else {}
-    snap = limits.get("rateLimits")
-    plan = snap.get("planType") if isinstance(snap, dict) else None
-    lines.append(f"Codex{f' ({plan} plan)' if isinstance(plan, str) else ''}:")
-    if isinstance(snap, dict):
-        for key in ("primary", "secondary"):
-            w = snap.get(key)
-            if isinstance(w, dict):
-                mins = number(w.get("windowDurationMins"))
-                length = mins * 60 if mins else None
-                text = window_text(window_label(length) if length else "usage", w.get("usedPercent"),
-                                   w.get("resetsAt"), length, now)
-                if text:
-                    lines.append(f"  - {text}")
-                    state["windows"].append((length, number(w["usedPercent"]), number(w["resetsAt"])))
-        if isinstance(snap.get("rateLimitReachedType"), str):
-            lines.append(f"  - limit reached: {snap['rateLimitReachedType']}")
-            state["windows"].append((None, 100, now + 1))
-        credits = snap.get("credits")
+    snap = codex_windows(limits.get("rateLimits"), now)
+    plan = snap["plan"] if snap else None
+    lines = [f"Codex{f' ({plan} plan)' if plan else ''}:"]
+    if snap:
+        for q in snap["windows"]:
+            lines.append(f"  - {window_text(q['label'], q['used'], q['resets_at'], q['length'], now)}")
+            state["windows"].append((q["length"], q["used"], q["resets_at"]))
+        if snap["limit_reached"]:
+            lines.append(f"  - limit reached: {snap['limit_reached']}")
+            state["windows"].append((None, 100, now + 1))  # for routing only: blocked, whatever the windows say
+        credits = limits["rateLimits"].get("credits")
         if isinstance(credits, dict) and (credits.get("unlimited") is True or credits.get("hasCredits") is True):
             balance = "unlimited" if credits.get("unlimited") is True else credits.get("balance")
             lines.append(f"  - credits: {balance}")
@@ -6263,26 +6357,16 @@ def claude_budget(now, path=None, state=None):
     `state` dict gets {"windows": [(length, used, resets_at, when it was read)]}."""
     state = {} if state is None else state
     state["windows"] = []
-    path = path or os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE)
-    if not os.path.lexists(path):
+    quota = claude_quota(now, path)
+    if quota["status"] == "missing":
         return ["Claude Code: not known. Its usage reaches nouez only through the status line; "
                 "see Choosing a consultant in nouez's docs/consultants.md."]
-    saved = cache_json(path, CLAUDE_USAGE_BYTES, "utf-8-sig")
-    if saved is None:
+    if quota["status"] == "unreadable":
         return ["Claude Code: the saved usage file can't be read."]
-    limits = saved.get("rate_limits") if isinstance(saved, dict) else None
-    at = number(saved.get("saved")) if isinstance(saved, dict) else None
-    lines = []
-    if isinstance(limits, dict):
-        for key, length in CLAUDE_WINDOWS:
-            w = limits.get(key)
-            if isinstance(w, dict):
-                text = window_text(window_label(length), w.get("used_percentage"), w.get("resets_at"), length,
-                                   now, number(w.get("observed")) or at)
-                if text:
-                    lines.append(f"  - {text}")
-                    state["windows"].append((length, number(w["used_percentage"]), number(w["resets_at"]),
-                                             min(number(w.get("observed")) or at or now, now)))
+    at, lines = quota["saved"], []
+    for q in quota["windows"]:
+        lines.append(f"  - {window_text(q['label'], q['used'], q['resets_at'], q['length'], now, q['sampled'])}")
+        state["windows"].append((q["length"], q["used"], q["resets_at"], q["sampled"]))
     if not lines:
         return ["Claude Code: no current usage window saved (a window is dropped once it resets, and "
                 "none is reported before a session's first reply)."]
@@ -6489,12 +6573,28 @@ PROVIDER_TITLES = {"codex": "Codex", "antigravity": "Antigravity"}
 
 
 def usage_outlook(windows, now):
+    """(state, percent or why) from usage_outlook_detail."""
+    return usage_outlook_detail(windows, now)[:2]
+
+
+def pace_words(pct, basis):
+    """A weekly percentage as words that follow "Codex is" or "Claude Code:"."""
+    if basis == "pace":
+        return f"on pace for about {pct:.0f}% of its week"
+    why = "an old reading" if basis == "old" else "too early in the week for a pace"
+    return f"at {pct:.0f}% of its week or more ({why})"
+
+
+def usage_outlook_detail(windows, now):
     """Where a subscription stands for one more consultation, from its (length, used, resets_at
-    [, read at]) windows: ("blocked", why) when one is used up or runs out before its reset at
-    this rate; otherwise by where the weekly window's pace lands at its reset: ("tight", %) past
-    90, ("busy", %) past 70, ("spare", %) under 60 with the reset within SPARE_DAYS (usage that
-    would go unused), ("ok", % or None); ("unknown", None) with no reading. A reading too old to
-    project from counts only as the least the week will reach: never "spare", and "ok" with None."""
+    [, read at]) windows, as (state, percent or why, basis): ("blocked", why, None) when one is
+    used up or runs out before its reset at this rate; otherwise by where the weekly window's pace
+    lands at its reset: "tight" past 90, "busy" past 70, "spare" under 60 with the reset within
+    SPARE_DAYS (usage that would go unused), "ok" (percent or None); ("unknown", None, None) with
+    no reading. basis says how the weekly percent was found: "pace", where the current rate lands
+    at the reset; "old", a reading too old to project from, or "early", too little of the week
+    gone to tell, where it is the share used so far, the least the week will reach (never
+    "spare", and "ok" with None); None without a weekly percent."""
     week, seen = None, False
     for w in windows or ():
         length, used, resets = w[0], number(w[1]), number(w[2])
@@ -6504,26 +6604,27 @@ def usage_outlook(windows, now):
         seen = True
         label = window_label(length) if length else "usage"
         if used >= 100:
-            return ("blocked", f"its {label} window is used up")
+            return ("blocked", f"its {label} window is used up", None)
         pace = window_pace(used, resets, length, at) if length and now - at <= CLAUDE_USAGE_STALE else None
         if pace and pace[0] == "runs out":
-            return ("blocked", f"its {label} window runs out before its reset at this rate")
+            return ("blocked", f"its {label} window runs out before its reset at this rate", None)
         if length and length >= 7 * 86400:
-            week = (pace[1] if pace else used, resets, bool(pace))
+            week = (pace[1] if pace else used, resets,
+                    "pace" if pace else "old" if now - at > CLAUDE_USAGE_STALE else "early")
     if not seen:
-        return ("unknown", None)
+        return ("unknown", None, None)
     if week is None:
-        return ("ok", None)
-    pct, resets, projected = week
+        return ("ok", None, None)
+    pct, resets, basis = week
     if pct > 90:
-        return ("tight", pct)
+        return ("tight", pct, basis)
     if pct > 70:
-        return ("busy", pct)
-    if not projected:
-        return ("ok", None)
+        return ("busy", pct, basis)
+    if basis != "pace":
+        return ("ok", None, None)
     if pct < 60 and resets - now < SPARE_DAYS * 86400:
-        return ("spare", pct)
-    return ("ok", pct)
+        return ("spare", pct, basis)
+    return ("ok", pct, basis)
 
 
 def newest_of_family(model, ids):
@@ -6682,7 +6783,8 @@ def suggest_consultant(kind, state, now, only=None):
             blocked.append(f"{PROVIDER_TITLES[provider]} {got[0]}: a Claude model shares the author's blind spots")
             continue
         windows = provider_windows(provider, got[0], st)
-        outlook = usage_outlook(windows, now)
+        *outlook, basis = usage_outlook_detail(windows, now)
+        outlook = tuple(outlook)
         if outlook[0] == "blocked":
             blocked.append(f"{PROVIDER_TITLES[provider]} {got[0] or 'default model'}: {outlook[1]}")
             continue
@@ -6691,7 +6793,8 @@ def suggest_consultant(kind, state, now, only=None):
             notes.append("A reused Antigravity consultant switches to this model for the message and keeps "
                          "its conversation.")
         options.append({"provider": provider, "model": got[0], "effort": got[1], "why": [why], "notes": notes,
-                        "outlook": outlook, "title": quota_title(provider, got[0]), "resets": week_resets(windows),
+                        "outlook": outlook, "basis": basis, "title": quota_title(provider, got[0]),
+                        "resets": week_resets(windows),
                         "behind": behind_schedule(windows, now), "unstarted": week_unstarted(windows, now)})
     if not options:
         return {"none": "; ".join(blocked) if blocked else "no consultant CLI is installed"}
@@ -6701,7 +6804,7 @@ def suggest_consultant(kind, state, now, only=None):
     calm = [o for o in others if o["outlook"][0] in ("ok", "spare")]
     spare = [o for o in others if o["outlook"][0] == "spare"]
     pct = best["outlook"][1]
-    first = (f"{best['title']} is on pace for about {pct:.0f}% of its week" if isinstance(pct, (int, float))
+    first = (f"{best['title']} is {pace_words(pct, best['basis'])}" if isinstance(pct, (int, float))
              else f"{best['title']}: usage not known" if best["outlook"][0] == "unknown"
              else f"{best['title']} has room")
     # The first choice first, so another week takes its place only by resetting sooner.
@@ -6735,7 +6838,7 @@ def suggest_consultant(kind, state, now, only=None):
         best["why"].append(f"{title} resets within {SPARE_DAYS} days at about {outlook[1]:.0f}% of its week, "
                            "so the rest would go unused")
     elif outlook[1] is not None:
-        best["why"].append(f"{title} on pace for about {outlook[1]:.0f}% of its week")
+        best["why"].append(f"{title} {pace_words(outlook[1], best['basis'])}")
     if outlook[0] == "tight" and best["effort"] in EFFORT_ORDER[2:]:
         lower = EFFORT_ORDER[EFFORT_ORDER.index(best["effort"]) - 1]
         models = provider_models(best["provider"], state[best["provider"]])
@@ -6763,12 +6866,12 @@ HAND_OUT_LOCAL = "Do it yourself when that takes seconds."
 def claude_pace(claude_state, now):
     """(where Claude Code's usage stands for handing work out: "ok", "busy", "tight" or "unknown",
     the text on it: "on pace for about 84% of its week", a window used up...)."""
-    state, pct = usage_outlook((claude_state or {}).get("windows"), now)
+    state, pct, basis = usage_outlook_detail((claude_state or {}).get("windows"), now)
     if state == "unknown":
         return ("unknown", "its usage isn't known")
     if state == "blocked":
         return ("tight", pct)  # why: a window used up, or running out before its reset
-    at = f"on pace for about {pct:.0f}% of its week" if pct is not None else "has room"
+    at = pace_words(pct, basis) if pct is not None else "has room"
     return ("ok" if state == "spare" else state, at)
 
 
@@ -7076,23 +7179,16 @@ def usage_snapshot(client):
     snap = {}
     try:
         limits = client.request("account/rateLimits/read", None)
-        rl = limits.get("rateLimits") if isinstance(limits, dict) else None
-        codex = {}
-        for key in ("primary", "secondary"):
-            w = rl.get(key) if isinstance(rl, dict) else None
-            if isinstance(w, dict) and number(w.get("usedPercent")) is not None:
-                mins = number(w.get("windowDurationMins"))
-                codex[window_label(mins * 60) if mins else key] = w["usedPercent"]
+        # The time after the answer, so a window that resets while the daemon answers is left out.
+        codex = codex_windows(limits.get("rateLimits") if isinstance(limits, dict) else None, time.time())
+        # A window of no known length is logged by its name, so the two can't share a key.
+        codex = {q["label"] if q["length"] else q["key"]: q["used"] for q in (codex or {}).get("windows", ())}
         if codex:
             snap["codex"] = codex
     except Exception:
         pass
     try:
-        limits = (cache_json(os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE), CLAUDE_USAGE_BYTES, "utf-8-sig")
-                  or {}).get("rate_limits")
-        claude = {window_label(length): limits[key]["used_percentage"] for key, length in CLAUDE_WINDOWS
-                  if isinstance(limits.get(key), dict) and number(limits[key].get("used_percentage")) is not None
-                  and (number(limits[key].get("resets_at")) or 0) > time.time()}  # not one that has reset
+        claude = {q["label"]: q["used"] for q in claude_quota(time.time())["windows"]}
         if claude:
             snap["claude"] = claude
     except Exception:
@@ -7823,6 +7919,13 @@ def window_state(used, resets_at, length, now, sampled=None):
             "colour": outlook[2], "rank": outlook[3], "gone": gone}
 
 
+def limit_state(kind):
+    """A row for a limit Codex says is reached, which blocks routing whatever its windows show. It
+    has no reset time of its own."""
+    return {"used": 100, "resets_at": None, "long": f"limit reached: {kind}", "short": "reached",
+            "colour": "31", "rank": 3, "gone": None}
+
+
 def window_gauge(scr, state, width=TOP_BAR):
     """The window's bar, with the marker where the time gone in the window has got to: a bar past
     it uses the window faster than evenly."""
@@ -7832,14 +7935,15 @@ def window_gauge(scr, state, width=TOP_BAR):
 
 
 def full_row(scr, owner, label, state, now):
-    reset = time.strftime("%a %H:%M", time.localtime(state["resets_at"]))
-    return (f"  {owner[:15]:<16}{label:<8}{window_gauge(scr, state)}  resets {reset} "
-            f"(in {span_text(state['resets_at'] - now)})  {scr.dim(state['long'])}")
+    reset = ("" if state["resets_at"] is None else
+             f"resets {time.strftime('%a %H:%M', time.localtime(state['resets_at']))} "
+             f"(in {span_text(state['resets_at'] - now)})  ")
+    return f"  {owner[:15]:<16}{label:<8}{window_gauge(scr, state)}  {reset}{scr.dim(state['long'])}"
 
 
 def compact_row(scr, label, state):
     """A window in a narrow card: 46 cells."""
-    reset = time.strftime("%a %H:%M", time.localtime(state["resets_at"]))
+    reset = "" if state["resets_at"] is None else time.strftime("%a %H:%M", time.localtime(state["resets_at"]))
     return f"{label[:7]:<8}{window_gauge(scr, state, 10)}  " + scr.dim(f"{state['short'][:11]:<11}") + " " + reset
 
 
@@ -7850,56 +7954,38 @@ def subscription_groups(now, codex_live, codex_saved, claude_path=None, agy_live
     status line file, Antigravity from `agy` (left out when it isn't installed)."""
     groups = []
     entries, note, short = [], None, None
-    limits = codex_live.get("rateLimits") if isinstance(codex_live, dict) else None
-    title = "Codex"
-    if isinstance(limits, dict):
-        plan = limits.get("planType")
-        title = f"Codex {plan}" if isinstance(plan, str) else "Codex"
-        for key in ("primary", "secondary"):
-            w = limits.get(key)
-            if isinstance(w, dict):
-                mins = number(w.get("windowDurationMins"))
-                state = window_state(w.get("usedPercent"), w.get("resetsAt"), mins * 60 if mins else None, now)
-                if state:
-                    entries.append(("", window_label(mins * 60) if mins else "usage", state))
-    elif isinstance(codex_saved, dict):
-        title = f"Codex {codex_saved.get('plan') or ''}".strip()
-        for key in ("primary", "secondary"):
-            w = codex_saved.get(key)
-            if isinstance(w, dict):
-                mins = number(w.get("window_minutes"))
-                state = window_state(w.get("used_percent"), w.get("resets_at"), mins * 60 if mins else None, now,
-                                     codex_saved.get("ts"))
-                if state:
-                    entries.append(("", window_label(mins * 60) if mins else "usage", state))
+    # The daemon's answer when it gave one (even with no windows), else the last session file's.
+    codex = codex_windows(codex_live.get("rateLimits") if isinstance(codex_live, dict) else None, now)
+    live = codex is not None
+    codex = codex if live else codex_saved_windows(codex_saved, now)
+    title = f"Codex {codex['plan']}" if codex and codex["plan"] else "Codex"
+    for q in codex["windows"] if codex else ():
+        entries.append(("", q["label"], window_state(q["used"], q["resets_at"], q["length"], now, q["sampled"])))
+    if codex and codex["limit_reached"]:
+        entries.append(("", "limit", limit_state(codex["limit_reached"])))
+    if codex and not live:
         installed = codex_installed()
         if entries:
-            ago = span_text(now - codex_saved["ts"])
+            ago = span_text(now - codex["saved"])
             why = "the daemon didn't answer" if installed else "Codex isn't on PATH"
             note = f"(from Codex's last session file, {ago} ago; {why})"
             short = f"from the last session file, {ago} ago"
     if entries or codex_installed():  # left out when Codex isn't installed and never reported usage
+        empty = ("no current usage windows: the daemon reports none" if live else
+                 "usage not known: the daemon didn't answer and no recent session reports it")
         groups.append({"title": title if entries else "Codex", "entries": entries, "note": note, "short": short,
-                       "empty": "usage not known: the daemon didn't answer and no recent session reports it"})
-    path = claude_path or os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE)
-    saved = cache_json(path, CLAUDE_USAGE_BYTES, "utf-8-sig")
-    limits = saved.get("rate_limits") if isinstance(saved, dict) else None
-    at = number(saved.get("saved")) if isinstance(saved, dict) else None
-    entries, note, short = [], None, None
-    for key, length in CLAUDE_WINDOWS:
-        w = limits.get(key) if isinstance(limits, dict) else None
-        if isinstance(w, dict):
-            state = window_state(w.get("used_percentage"), w.get("resets_at"), length, now,
-                                 number(w.get("observed")) or at)
-            if state:
-                entries.append(("", window_label(length), state))
+                       "empty": empty})
+    quota = claude_quota(now, claude_path)
+    at, note, short = quota["saved"], None, None
+    entries = [("", q["label"], window_state(q["used"], q["resets_at"], q["length"], now, q["sampled"]))
+               for q in quota["windows"]]
     if entries and at:
         old = now - at > CLAUDE_USAGE_STALE
         note = f"(from the status line, saved {span_text(now - at)} ago{' - old, may be out of date' if old else ''})"
         short = f"status line, {span_text(now - at)} ago" + (" - old" if old else "")
     groups.append({"title": "Claude Code", "entries": entries, "note": note, "short": short,
                    "empty": "usage not known: it reaches nouez through the status line (docs/consultants.md, Choosing a consultant)"
-                   if saved is None else "no current window saved yet"})
+                   if quota["status"] != "ok" else "no current window saved yet"})
     if agy_live is not None:
         groups.append(agy_group(now, agy_live))
     return groups
@@ -7967,19 +8053,10 @@ def agy_group(now, agy_live):
         return {**group, "checking": True, "empty": "checking (agy -p /usage takes a while)…"}
     if not isinstance(agy_live.get("groups"), list):
         return {**group, "empty": f"usage not known: {agy_live.get('error') or 'agy gave no quota'}"}
-    for quota in agy_live["groups"]:
-        if not isinstance(quota, dict) or not isinstance(quota.get("buckets"), list):
-            continue
-        name = quota.get("name") if isinstance(quota.get("name"), str) else "?"
-        sub = AGY_GROUPS.get(name, f"AG {name}")[3:][:13]
-        for b in quota["buckets"]:
-            left = number(b.get("remaining_fraction")) if isinstance(b, dict) else None
-            if left is None:
-                continue
-            length = AGY_WINDOWS.get(b.get("window"))
-            state = window_state((1 - left) * 100, iso_seconds(b.get("reset_time")), length, now)
-            if state:
-                group["entries"].append((sub, window_label(length) if length else "usage", state))
+    for q in agy_windows(agy_live, now):
+        name = q["group"] if q["group"] is not None else "?"
+        group["entries"].append((AGY_GROUPS.get(name, f"AG {name}")[3:][:13], q["label"],
+                                 window_state(q["used"], q["resets_at"], q["length"], now)))
     return {**group, "empty": "no current quota window reported"}
 
 
@@ -8809,14 +8886,9 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
 def agy_snapshot(groups):
     """Percent used per Antigravity quota group and window, for the usage log."""
     snap = {}
-    for g in groups if isinstance(groups, list) else []:
-        if not isinstance(g, dict) or not isinstance(g.get("name"), str):
-            continue
-        for b in g.get("buckets") or []:
-            frac = number(b.get("remaining_fraction")) if isinstance(b, dict) else None
-            if frac is not None:
-                window = window_label(AGY_WINDOWS.get(b.get("window"), 0)) if b.get("window") in AGY_WINDOWS else b.get("window")
-                snap.setdefault(AGY_GROUPS.get(g["name"], g["name"]), {})[str(window)] = round(100 * (1 - frac), 1)
+    for q in agy_windows({"groups": groups}, time.time()):
+        if q["group"] is not None:
+            snap.setdefault(AGY_GROUPS.get(q["group"], q["group"]), {})[q["label"]] = q["used"]
     return snap
 
 
@@ -9020,20 +9092,10 @@ def agy_budget(now, agy_live=None, state=None):
     if live.get("error"):
         return [f"Antigravity: usage not known ({live['error']})."] + tail
     lines = []
-    for g in live.get("groups") or []:
-        if not isinstance(g, dict) or not isinstance(g.get("name"), str):
-            continue
-        for b in g.get("buckets") or []:
-            if not isinstance(b, dict) or number(b.get("remaining_fraction")) is None:
-                continue
-            length = AGY_WINDOWS.get(b.get("window"))
-            text = window_text(window_label(length) if length else str(b.get("window") or "usage"),
-                               round(100 * (1 - b["remaining_fraction"]), 1), iso_seconds(b.get("reset_time")),
-                               length, now)
-            if text:
-                lines.append(f"  - {g['name']}: {text}")
-                state["groups"].setdefault(g["name"], []).append(
-                    (length, round(100 * (1 - b["remaining_fraction"]), 1), iso_seconds(b.get("reset_time"))))
+    for q in agy_windows(live, now):
+        if q["group"] is not None:
+            lines.append(f"  - {q['group']}: {window_text(q['label'], q['used'], q['resets_at'], q['length'], now)}")
+            state["groups"].setdefault(q["group"], []).append((q["length"], q["used"], q["resets_at"]))
     head = ("Antigravity (Google; the Claude and GPT models group runs those models on Google's quota, "
             "not Claude Code's):")
     return [head] + (lines or ["  - no current quota window reported"]) + tail
@@ -13763,8 +13825,7 @@ def usage_command(sub):
 def usage_setup_report(settings):
     """doctor's lines on what passes Claude Code's usage to nouez (the status line) and what acts on
     it before Claude starts work (the UserPromptSubmit hook), with the settings to add for each."""
-    saved = cache_json(os.path.join(nouez_cache_dir(), CLAUDE_USAGE_FILE), CLAUDE_USAGE_BYTES, "utf-8-sig")
-    saved = number(saved.get("saved")) if isinstance(saved, dict) else None
+    saved = claude_quota(time.time())["saved"]
     fresh = saved is not None and time.time() - saved < USAGE_SETUP_DAYS * 86400
     lines = [(True, f"a status line passes Claude Code's usage to nouez (saved {span_text(time.time() - saved)} "
                     "ago)") if fresh else

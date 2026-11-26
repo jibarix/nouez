@@ -6,6 +6,19 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.26.4] - 2026-11-26
+
+One reader for each subscription's usage, shared by the consultant suggestion, `ConsultantBudget`, the status screen, the usage log and `doctor`, so they no longer disagree. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version; an open status screen restarts on it by itself.
+
+### Fixed
+
+- When Codex says a limit is reached, the status screen shows a used-up `limit` row. The suggestion already treated Codex as blocked then, while the screen showed only its windows.
+- Antigravity's use is rounded once, to a tenth of a percent, before it is judged, so a group at 99.96% is used up on the screen as it is for the suggestion.
+- A weekly percent that isn't a pace is no longer called one. When the reading is old, or too early in the week to project from, the suggestion and `ConsultantBudget` say "at 95% of its week or more" with the reason, instead of "on pace for about 95%".
+- The usage log leaves out Codex and Antigravity windows that have reset, as it already did for Claude Code's and as the screen and `ConsultantBudget` do, and judges each reset at the time the reading arrives, so a window that resets while Codex answers isn't logged.
+- When Codex answers with no usage windows, the status screen says so, instead of saying the daemon didn't answer.
+- An Antigravity window of a kind nouez doesn't know is named on the screen as in `ConsultantBudget`, by the name agy gives it, rather than "usage".
+
 ## [0.26.3] - 2026-11-26
 
 Recording trust made exact about which entry it writes and takes back, and the phone dispatcher's projects folder checked. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
@@ -721,7 +734,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.26.3...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.26.4...HEAD
+[0.26.4]: https://github.com/jibarix/nouez/compare/v0.26.3...v0.26.4
 [0.26.3]: https://github.com/jibarix/nouez/compare/v0.26.2...v0.26.3
 [0.26.2]: https://github.com/jibarix/nouez/compare/v0.26.1...v0.26.2
 [0.26.1]: https://github.com/jibarix/nouez/compare/v0.26.0...v0.26.1
