@@ -69,7 +69,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.28.0"
+SERVER_VERSION = "0.28.1"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -4149,9 +4149,11 @@ def same_folder(a, b):
         return False
 
 
-def connection_note(before, cwd, cancel=None):
+def connection_note(before, cwd, cancel=None, resumed=False):
     """Whether a session new since `before` (pids) appeared in cwd with Remote Control, checked for
-    up to CONNECT_SECONDS. Only a report: the window is open either way."""
+    up to CONNECT_SECONDS. Only a report: the window is open either way. A resumed conversation can be
+    refused its old Remote Control session once the account requires trusted devices (Claude Code
+    2.1.332 says "Trusted devices now required"); `/remote-control` typed in it starts a new one."""
     deadline, seen = time.monotonic() + CONNECT_SECONDS, None
     while True:
         try:
@@ -4170,7 +4172,10 @@ def connection_note(before, cwd, cancel=None):
         time.sleep(1)
     if seen:
         return (f"Checked: it is running, but hadn't connected to Remote Control after {CONNECT_SECONDS}s. "
-                "It may still be connecting, or waiting for an answer on the computer.")
+                "It may still be connecting, or waiting for an answer on the computer."
+                + (" A resumed conversation can also be refused its old Remote Control session when the "
+                   "account now requires trusted devices (its window says \"Trusted devices now required\"): "
+                   "typing /remote-control in that window on the computer starts a new one." if resumed else ""))
     return (f"Checked: it hadn't shown up as a running session after {CONNECT_SECONDS}s. It may still be "
             "starting (resuming a long conversation takes longer), or waiting for an answer on the computer. "
             "Call ListClaudeSessions in a moment to see it, before telling the user it failed or opening "
@@ -4561,7 +4566,7 @@ def open_claude_session(args, cancel=None, progress=None):
                 + ", ".join(f"{s['name']} (pid {s['pid']})" for s in already)
                 + ". Both can work there; they don't see each other's conversation.")
     if trusted is not False:
-        out += " " + connection_note({s["pid"] for s in before}, cwd, cancel)
+        out += " " + connection_note({s["pid"] for s in before}, cwd, cancel, bool(resume))
     if trusted is False:
         out += (" Warning: Claude Code hasn't been trusted in this folder yet, so the new session is "
                 "waiting at the trust question on the computer and won't connect until someone answers it there.")
@@ -5742,12 +5747,13 @@ def use_named(kind, provider):
             del _named[kind]
 
 
-def send_route(kind, provider, client=None, now=None):
+def send_route(kind, provider, client=None, now=None, revision=False, usage=None):
     """The model and effort nouez picks for a send that names neither: ConsultantBudget's suggestion
-    for `kind` within the addressed consultant's provider, as {"provider", "model", "effort", "why",
-    "notes"}; None for kind other, when none has room, or when the usage can't be read. When the
-    latest ConsultantBudget for this kind had the user name this provider ("ask Gemini"), the pick
-    keeps to what that named, as the suggestion did."""
+    for `kind` (with revision=true, as ConsultantBudget's revision gives it) within the addressed
+    consultant's provider, as {"provider", "model", "effort", "why", "notes"}; None for kind other,
+    when none has room, or when the usage can't be read. When the latest ConsultantBudget for this
+    kind had the user name this provider ("ask Gemini"), the pick keeps to what that named, as the
+    suggestion did. A `usage` dict gets the usage read, for send_check."""
     if kind in (None, "other"):
         return None
     only = provider if named_provider(kind, provider) else None
@@ -5762,8 +5768,129 @@ def send_route(kind, provider, client=None, now=None):
     except Exception as e:  # the route is a convenience: the send goes ahead without it
         log("route at send:", repr(e))
         return None
-    pick = suggest_consultant(kind, state, now, only)
+    if usage is not None:
+        usage.update(state)
+    pick = suggest_consultant(kind, state, now, only, revision)
     return pick if "none" not in pick and pick["provider"] == provider else None
+
+
+def peek_agy_usage():
+    """Antigravity's quota reading when a fresh one is cached, else None, starting one in the
+    background for later sends: a send never waits for it."""
+    agy = agy_command()
+    if not agy:
+        return None
+    with _agy_guard:
+        if _agy_usage["agy"] == agy and 0 <= time.time() - _agy_usage["at"] < AGY_USAGE_CACHE:
+            return _agy_usage["value"]
+        if _agy_usage.get("reading"):
+            return None
+        _agy_usage["reading"] = True
+
+    def read():
+        try:
+            read_agy_usage()
+        finally:
+            with _agy_guard:
+                _agy_usage["reading"] = False
+    threading.Thread(target=read, daemon=True).start()
+    return None
+
+
+def send_usage(provider, client=None, now=None):
+    """The addressed provider's usage for a send that named its model or effort (send_route reads it
+    for the others), without making the send wait: Codex's from the client already open,
+    Antigravity's only when a reading is cached. {} when it can't be had."""
+    now = now or time.time()
+    state = {provider: {}}
+    try:
+        if provider == "codex":
+            if client is None:
+                return {}
+            codex_budget(client, now, state["codex"])
+        else:
+            live = peek_agy_usage()
+            if not live or not agy_budget(now, live, state["antigravity"]):
+                return {}
+    except Exception as e:  # the checks are a convenience: the send goes ahead without them
+        log("usage at send:", repr(e))
+        return {}
+    return state
+
+
+def send_elsewhere(kind, provider, model, usage, now, revision=False, blind=False, only=None, refused=False):
+    """Where the work could go, as a sentence, keeping to a blind second opinion's provider and to
+    one the user named. For a refusal: another quota group of the same provider with room, then the
+    other provider, from its usage reading kept from the last AGY_USAGE_CACHE seconds only (a send
+    never waits for a reading), saying when it isn't set up or its usage isn't known. For a note on
+    a turn that went ahead: only where later turns can go, never to send this one again."""
+    st, k = usage.get(provider), kind if kind in CONSULT_PICKS else "other"
+    same = suggest_consultant(k, {provider: st}, now, only, revision)
+    room = "none" not in same and same["title"] != quota_title(provider, model, st) and same["outlook"][0] != "unknown"
+    settings = ", ".join(f'{f} "{same[f]}"' for f in ("model", "effort") if room and same[f])
+    other = "antigravity" if provider == "codex" else "codex"
+    installed = agy_command() if other == "antigravity" else codex_installed()
+    if not refused:
+        if room:
+            return f"For later turns, {same['title']} has room: {settings}."
+        return ("ConsultantBudget names where later turns can go." if installed and not blind and only != provider
+                else "")
+    if room:
+        return f"{same['title']} has room: send again with {settings}."
+    title = PROVIDER_TITLES[provider]
+    if blind:
+        return f"A blind second opinion here has to come from {title}, so none can take it now: tell the user."
+    if only == provider:
+        return f"The user named {title}: tell them, and ask whether to use the other one."
+    if not installed:
+        return f"No consultant other than {title} is set up, so none has room: tell the user."
+    if other == "codex":
+        return "ConsultantBudget names one with room."
+    state, pick = {}, None
+    try:
+        live = peek_agy_usage()
+        if live and agy_budget(now, live, state):
+            pick = suggest_consultant(k, {"antigravity": state}, now, None, revision)
+    except Exception as e:
+        log("elsewhere at send:", repr(e))
+    if pick is None:
+        return "Antigravity's usage isn't read yet: call ConsultantBudget, which reads it, before sending there."
+    if "none" in pick:
+        return "None has room: tell the user."
+    if pick["outlook"][0] == "unknown":
+        return (f"Antigravity's usage for its pick isn't known: StartConsultant {call_text(pick)} and send "
+                "there, or tell the user.")
+    return f"Antigravity has room: StartConsultant {call_text(pick)}, then send there."
+
+
+def send_check(kind, provider, model, usage, now, revision=False, blind=False, only=None):
+    """What the addressed quota says about a new turn on `model`, from the usage read for the send
+    (send_route's or send_usage's): (a refusal, or None; a note, or ""). Only a limit the provider
+    reported reached refuses (a share at 100% alone is a note), and only when it reported no credits
+    to go past it, as Codex does: Antigravity never says whether credits can be spent, so a turn
+    there is never refused. A forecast that a window runs out before its reset only adds a note.
+    A refusal names where the work can go; a note, where later turns can."""
+    st = (usage or {}).get(provider)
+    if not st:
+        return None, ""
+    windows = provider_windows(provider, model, st) or []
+    state, why, _ = usage_outlook_detail(windows, now)
+    limit = st.get("limit") if provider == "codex" else None
+    reported = limit or any(number(w[1]) is not None and number(w[1]) >= 100 and (number(w[2]) or 0) > now
+                            for w in windows)
+    if not reported and state != "blocked":
+        return None, ""
+    title = quota_title(provider, model, st)
+    what = f"its limit reached ({limit})" if limit else why
+    if limit and st.get("credits") is False:
+        return (f"{title} reports {what}, and no credits to go past it, so a new turn would fail. Nothing was "
+                f"sent. {send_elsewhere(kind, provider, model, usage, now, revision, blind, only, True)}"), ""
+    where = send_elsewhere(kind, provider, model, usage, now, revision, blind, only)
+    where = f" {where}" if where else ""
+    if reported:
+        unless = " unless your plan has AI credits" if provider == "antigravity" else " unless its credits cover it"
+        return None, f"{title} reports {what}: this turn may fail{unless}.{where}"
+    return None, f"{title}: {what}.{where}"
 
 
 def send_consultant_message(args, cancel=None, progress=None):
@@ -5846,13 +5973,18 @@ def send_consultant_message(args, cancel=None, progress=None):
                               "message" + (f", sent with {' and '.join(extra)}" if extra else "") + ".\n\n"
                               + (f"{stamp.strip()}\n\n" if stamp else "")
                               + preview[:500] + more, "NOUEZ_ASK_USER_SESSION", cancel)
-        routed = None
-        if not overrides and is_bridge(thread):
+        routed, usage = None, {}
+        try:  # a message for a running turn keeps that turn's settings: no pick, so no usage read before it
+            ahead = latest_turn(client, tid)
+        except Exception:
+            ahead = None
+        if not overrides and is_bridge(thread) and not (ahead and ahead.get("status") == "inProgress"):
             # Neither named: the kind's suggestion, as ConsultantBudget gives it, within Codex.
-            routed = send_route(kind, "codex", client)
+            routed = send_route(kind, "codex", client, revision=want_revision, usage=usage)
             if routed:
                 overrides = {k: routed[k] for k in ("model", "effort") if routed[k]}
                 settings = ", ".join(f"{k} {v}" for k, v in overrides.items())
+        model_for, only_codex = overrides.get("model") or thread.get("model"), named_provider(kind, "codex")
         text =f"[Message from {sender} via the consultants bridge]\n{stamp}\n{message}"
         with send_lock(tid), codex_lock(tid):
             # Last point a cancellation can still stop the message from being delivered.
@@ -5863,6 +5995,15 @@ def send_consultant_message(args, cancel=None, progress=None):
             if blind and current:
                 raise BridgeError(NOT_BLIND.format(name=name))
             busy = bool(current) and current.get("status") == "inProgress"
+            # What Codex's own usage says about a new turn: a refusal only on a limit it reported with
+            # no credits; a note on a forecast. A message added to a running turn has its quota already:
+            # no usage is read before it goes, so a steer never waits for one.
+            refusal, quota = (None, "") if busy else send_check(
+                kind, "codex", model_for, usage or send_usage("codex", client), time.time(), want_revision,
+                blind, "codex" if only_codex else None)
+            if refusal:
+                raise BridgeError(refusal)
+            quota = f"\n\n(Usage: {quota})" if quota else ""
             if busy and routed:
                 overrides = {}  # nouez's own pick never stops a steer: the running turn keeps its own
             if busy:
@@ -5964,7 +6105,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                 "routed": bool(routed and overrides) or None,
                 "base": args.get("base"), "patch": patch_digest(digest), "user_session": not is_bridge(thread) or None, "usage": usage_snapshot(client)})
         if not timeout:
-            return f"Delivered to {name} ({mode}, turn {turn_id}). {read_later(tid, turn_id)}"
+            return f"Delivered to {name} ({mode}, turn {turn_id}). {read_later(tid, turn_id)}{quota}"
         try:
             done, turn_id, turn = wait_for_turn(client, tid, turn_id, timeout, cancel, text,
                                                 progress_reporter(progress, name))
@@ -5981,11 +6122,11 @@ def send_consultant_message(args, cancel=None, progress=None):
                        + (f", and the turn kept its {' and '.join(overrides)}" if overrides else "") + ".)"
                        if repeat else f"\n\n({name} now runs on {settings} until changed{picked}.)" if overrides
                        else f"\n\n({name} runs on {now_on}.)" if now_on else "")
-            return format_turn(name, turn) + changed + note
+            return format_turn(name, turn) + changed + note + quota
         return still_working(
             name, turn_id, turn,
             f"Delivered ({mode}), but no reply within {timeout:.0f}s. Don't send the message again. "
-            f"{read_later(tid, turn_id)}")
+            f"{read_later(tid, turn_id)}{quota}")
 
 
 def carried_note(asked, turn):
@@ -6233,8 +6374,9 @@ def window_text(label, used, resets_at, length, now, sampled=None):
     text = (f"{label} window: {used:g}% used, resets "
             f"{time.strftime('%a %b %d %H:%M', time.localtime(resets_at))} (in {span_text(left)})")
     at = min(number(sampled) or now, now)
-    if now - at > CLAUDE_USAGE_STALE:
-        return text + ("; used up at the last reading" if used >= 100 else "; pace not known: an old reading")
+    if now - at > CLAUDE_USAGE_STALE:  # judged as everywhere else: the share used is the least it reaches
+        return text + ("; used up at the last reading" if used >= 100 else
+                       f"; an old reading ({span_text(now - at)} old): at least {used:g}% by the reset")
     pace = window_pace(used, resets_at, length, at)
     if pace and pace[0] == "used up":
         text += "; used up"
@@ -6366,6 +6508,10 @@ def codex_budget(client, now, state=None):
             lines.append(f"  - limit reached: {snap['limit_reached']}")
             state["windows"].append((None, 100, now + 1))  # for routing only: blocked, whatever the windows say
         credits = limits["rateLimits"].get("credits")
+        state["limit"] = snap["limit_reached"] or None
+        # True or False only when Codex says: whether credits can take a turn past a limit.
+        state["credits"] = (None if not isinstance(credits, dict) or not isinstance(credits.get("hasCredits"), bool)
+                            else credits.get("unlimited") is True or credits.get("hasCredits") is True)
         if isinstance(credits, dict) and (credits.get("unlimited") is True or credits.get("hasCredits") is True):
             balance = "unlimited" if credits.get("unlimited") is True else credits.get("balance")
             lines.append(f"  - credits: {balance}")
@@ -6743,6 +6889,29 @@ def pace_words(pct, basis):
     return f"at {pct:.0f}% of its week or more ({why})"
 
 
+def window_level(used, resets_at, length, now, sampled=None):
+    """The one judgment of a usage window as read at `sampled` (default now), which routing,
+    ConsultantBudget, the hook and the status screen all take; None when it can't be used (no
+    numbers, or it has reset). {"level": "used up", "runs out" (before its reset, at this rate),
+    "tight" (past 90%), "busy" (past 70%) or "fine"; "pct": what it is judged by: where the current
+    rate lands at the reset, or, for a reading too old to project from or too early in the window,
+    the share used, the least it will reach; "basis": "pace", "old" or "early"; "out": seconds until
+    it runs out; "age": seconds since the reading}. A used-up reading counts however old it is."""
+    used, resets_at, length = number(used), number(resets_at), number(length)
+    if used is None or resets_at is None or resets_at <= now:
+        return None
+    at = min(number(sampled) or now, now)
+    old = now - at > CLAUDE_USAGE_STALE
+    judged = {"pct": None, "basis": "old" if old else "pace", "out": None, "age": now - at}
+    if used >= 100:
+        return {**judged, "level": "used up", "pct": 100.0}
+    pace = None if old or not length else window_pace(used, resets_at, length, at)
+    if pace and pace[0] == "runs out":
+        return {**judged, "level": "runs out", "out": at + pace[1] - now}
+    pct, basis = (pace[1], "pace") if pace else (used, "old" if old else "early")
+    return {**judged, "level": "tight" if pct > 90 else "busy" if pct > 70 else "fine", "pct": pct, "basis": basis}
+
+
 def usage_outlook_detail(windows, now):
     """Where a subscription stands for one more consultation, from its (length, used, resets_at
     [, read at]) windows, as (state, percent or why, basis): ("blocked", why, None) when one is
@@ -6755,29 +6924,26 @@ def usage_outlook_detail(windows, now):
     "spare", and "ok" with None); None without a weekly percent."""
     week, seen = None, False
     for w in windows or ():
-        length, used, resets = w[0], number(w[1]), number(w[2])
-        at = min(number(w[3]) or now, now) if len(w) > 3 else now
-        if used is None or resets is None or resets <= now:
+        length = w[0]
+        judged = window_level(w[1], w[2], length, now, w[3] if len(w) > 3 else None)
+        if judged is None:
             continue
         seen = True
         label = window_label(length) if length else "usage"
-        if used >= 100:
-            return ("blocked", f"its {label} window is used up", None)
-        pace = window_pace(used, resets, length, at) if length and now - at <= CLAUDE_USAGE_STALE else None
-        if pace and pace[0] == "runs out":
+        if judged["level"] == "used up":
+            return ("blocked", f"its {label} window is used up"
+                    + (" (an old reading)" if judged["basis"] == "old" else ""), None)
+        if judged["level"] == "runs out":
             return ("blocked", f"its {label} window runs out before its reset at this rate", None)
         if length and length >= 7 * 86400:
-            week = (pace[1] if pace else used, resets,
-                    "pace" if pace else "old" if now - at > CLAUDE_USAGE_STALE else "early")
+            week = (judged["pct"], number(w[2]), judged["basis"], judged["level"])
     if not seen:
         return ("unknown", None, None)
     if week is None:
         return ("ok", None, None)
-    pct, resets, basis = week
-    if pct > 90:
-        return ("tight", pct, basis)
-    if pct > 70:
-        return ("busy", pct, basis)
+    pct, resets, basis, level = week
+    if level in ("tight", "busy"):
+        return (level, pct, basis)
     if basis != "pace":
         return ("ok", None, None)
     if pct < 60 and resets - now < SPARE_DAYS * 86400:
@@ -6870,16 +7036,55 @@ def resolve_pick(provider, model, effort, st):
     return (model, effort, note)
 
 
-def agy_group_of(model):
-    """The Antigravity quota group a model runs on."""
+AGY_MEMBERS = "Models within this group:"  # how agy's /usage lists a quota group's models in its description
+
+
+def agy_members(live):
+    """{quota group name: the display names of its models} from agy's /usage, for the groups that list
+    them ("Models within this group: Gemini 4 Neon, Gemini 4 Argon, ..."); {} when none does."""
+    members = {}
+    groups = live.get("groups") if isinstance(live, dict) else None
+    for g in groups if isinstance(groups, list) else []:
+        if not isinstance(g, dict) or not isinstance(g.get("name"), str):
+            continue
+        text = g.get("description")
+        if isinstance(text, str) and AGY_MEMBERS in text:
+            listed = text.split(AGY_MEMBERS, 1)[1].strip().rstrip(".")
+            members[g["name"]] = {n.strip() for n in listed.split(",") if n.strip()}
+    return members
+
+
+def agy_display(model, names):
+    """The name agy's /usage lists `model` by: its `agy models` display name with only a level
+    suffix such as " (High)" taken off ("Orchestrator (Neon)" keeps its own); None unless every
+    listed id of the model gives the same one."""
+    level = re.compile(r" \((?:" + "|".join(AGY_LEVELS) + r")\)$", re.I)
+    found = {level.sub("", d) for i, d in (names or {}).items() if model in (i, agy_base(i))}
+    return found.pop() if len(found) == 1 else None
+
+
+def agy_group_of(model, members=None, names=None):
+    """The Antigravity quota group a model runs on: when agy's /usage lists its groups' models
+    (agy_members), the one group listing the model's display name from `agy models`, or None when
+    none or several do; only when no group lists its models, nouez's own guess."""
+    if members:
+        display = agy_display(model, names) if model else None
+        found = [g for g, m in members.items() if display in m] if display else []
+        return found[0] if len(found) == 1 else None
     if model and model.startswith(("claude-", "gpt-")):
         return "Claude and GPT models"
     return "Gemini 4 Argon" if model and "argon" in model else "Gemini Models"
 
 
-def quota_title(provider, model):
+AGY_GROUP_UNKNOWN = "Antigravity (its quota group not known)"
+
+
+def quota_title(provider, model, st=None):
     """The usage a pick spends, by name: Codex, or the Antigravity quota group of its model."""
-    return "Codex" if provider == "codex" else f"Antigravity's {agy_group_of(model)}"
+    if provider == "codex":
+        return "Codex"
+    group = agy_group_of(model, (st or {}).get("members"), (st or {}).get("names"))
+    return f"Antigravity's {group}" if group else AGY_GROUP_UNKNOWN
 
 
 def week_resets(windows):
@@ -6903,14 +7108,25 @@ def behind_schedule(windows, now):
 def provider_windows(provider, model, st):
     if provider == "codex":
         return st.get("windows")
-    return (st.get("groups") or {}).get(agy_group_of(model))
+    return (st.get("groups") or {}).get(agy_group_of(model, st.get("members"), st.get("names")))
 
 
-def suggest_consultant(kind, state, now, only=None):
+def eased_effort(provider, model, effort, level, st):
+    """`effort`, one level down while the quota's week is tight (`level`), when the model lists it."""
+    if level != "tight" or effort not in EFFORT_ORDER[2:]:
+        return effort
+    lower = EFFORT_ORDER[EFFORT_ORDER.index(effort) - 1]
+    models = provider_models(provider, st)
+    return lower if models is None or lower in models.get(model, ()) else effort
+
+
+def suggest_consultant(kind, state, now, only=None, revision=False):
     """The consultant to use for one kind of consultation: {"provider", "model", "effort", "why":
     [...], "notes": [...]}, or {"none": why} when no installed one has room. `state` maps "codex"
     and "antigravity" to what codex_budget and agy_budget gathered (missing or None: not installed).
-    `only`: the provider the user named; for Antigravity ("ask Gemini") only its Gemini models."""
+    `only`: the provider the user named; for Antigravity ("ask Gemini") only its Gemini models.
+    `revision`: the message carries the work's diff, so, as for a review, never a Claude model."""
+    independent = kind in INDEPENDENT_KINDS or revision
     picks = CONSULT_PICKS.get(kind) or CONSULT_PICKS["other"]
     if only == "antigravity":
         picks = tuple(p for p in picks if p[0] != "antigravity" or not p[1] or p[1].startswith("gemini-"))
@@ -6930,7 +7146,7 @@ def suggest_consultant(kind, state, now, only=None):
         if only == "antigravity" == provider and not (got[0] or "").startswith("gemini-"):
             blocked.append("Antigravity lists no Gemini model")  # "ask Gemini": never a Claude or GPT one
             continue
-        if kind in INDEPENDENT_KINDS and (got[0] or "").startswith("claude-"):
+        if independent and (got[0] or "").startswith("claude-"):
             blocked.append(f"{PROVIDER_TITLES[provider]} {got[0]}: a Claude model shares the author's blind spots")
             continue
         windows = provider_windows(provider, got[0], st)
@@ -6944,7 +7160,7 @@ def suggest_consultant(kind, state, now, only=None):
             notes.append("A reused Antigravity consultant switches to this model for the message and keeps "
                          "its conversation.")
         options.append({"provider": provider, "model": got[0], "effort": got[1], "why": [why], "notes": notes,
-                        "outlook": outlook, "basis": basis, "title": quota_title(provider, got[0]),
+                        "outlook": outlook, "basis": basis, "title": quota_title(provider, got[0], st),
                         "resets": week_resets(windows),
                         "behind": behind_schedule(windows, now)})
     if not options:
@@ -6961,7 +7177,9 @@ def suggest_consultant(kind, state, now, only=None):
     # The first choice first, so another week takes its place only by resetting sooner.
     soonest = min(([best] if best["outlook"][0] == "spare" else []) + spare,
                   key=lambda o: o["resets"] or float("inf"), default=None)
-    if best["outlook"][0] == "tight" and calm:
+    if best["title"] == AGY_GROUP_UNKNOWN and calm:  # usage known to have room comes first
+        best = {**calm[0], "why": calm[0]["why"] + [first]}
+    elif best["outlook"][0] == "tight" and calm:
         best = {**calm[0], "why": calm[0]["why"] + [first]}
     elif best["outlook"][0] == "busy" and spare and kind != "fact-check":
         best = {**spare[0], "why": spare[0]["why"] + [first]}
@@ -6985,12 +7203,10 @@ def suggest_consultant(kind, state, now, only=None):
                            "so the rest would go unused")
     elif outlook[1] is not None:
         best["why"].append(f"{title} {pace_words(outlook[1], best['basis'])}")
-    if outlook[0] == "tight" and best["effort"] in EFFORT_ORDER[2:]:
-        lower = EFFORT_ORDER[EFFORT_ORDER.index(best["effort"]) - 1]
-        models = provider_models(best["provider"], state[best["provider"]])
-        if models is None or lower in models.get(best["model"], ()):
-            best["effort"] = lower
-            best["why"].append("one level down while its week is tight")
+    eased = eased_effort(best["provider"], best["model"], best["effort"], outlook[0], state[best["provider"]])
+    if eased != best["effort"]:
+        best["effort"] = eased
+        best["why"].append("one level down while its week is tight")
     best["notes"] = best["notes"] + ([CONSULT_NOTES[kind]] if kind in CONSULT_NOTES else [])
     return best
 
@@ -7014,12 +7230,17 @@ HAND_OUT_LOCAL = "Do it yourself when that takes seconds."
 def claude_pace(claude_state, now):
     """(where Claude Code's usage stands for handing work out: "ok", "busy", "tight" or "unknown",
     the text on it: "on pace for about 84% of its week", a window used up...)."""
-    state, pct, basis = usage_outlook_detail((claude_state or {}).get("windows"), now)
+    windows = (claude_state or {}).get("windows")
+    state, pct, basis = usage_outlook_detail(windows, now)
     if state == "unknown":
         return ("unknown", "its usage isn't known")
     if state == "blocked":
         return ("tight", pct)  # why: a window used up, or running out before its reset
     at = pace_words(pct, basis) if pct is not None else "has room"
+    for w in windows or ():  # a shorter window past 90% shows amber on the screen: say so, though
+        judged = window_level(w[1], w[2], w[0], now, w[3] if len(w) > 3 else None)  # handing out follows the week
+        if w[0] and w[0] < 7 * 86400 and judged and judged["level"] == "tight" and judged["basis"] == "pace":
+            at += f"; its {window_label(w[0])} window on pace for about {judged['pct']:.0f}%"
     return ("ok" if state == "spare" else state, at)
 
 
@@ -7032,15 +7253,16 @@ def claude_outlook(claude_state, now):
 
 
 def hook_text(now, path=None):
-    """What `server.py hook` adds to each prompt: the hand-out line when Claude Code's saved usage,
-    read within CLAUDE_USAGE_STALE, is on pace past 70% of its week or a window runs out; "" otherwise."""
+    """What `server.py hook` adds to each prompt: the hand-out line when Claude Code's saved usage is
+    on pace past 70% of its week, or a window is used up or runs out; from a reading older than
+    CLAUDE_USAGE_STALE, only when the share already used is past 90%, the least the week will reach,
+    saying it is an old reading; "" otherwise."""
     if auto_consult_off():
         return ""
     state = {}
     claude_budget(now, path, state)
-    fresh = [w for w in state["windows"] if now - w[3] <= CLAUDE_USAGE_STALE]
-    pace, at = claude_pace({"windows": fresh}, now)
-    if pace not in ("busy", "tight"):
+    pace, at = claude_pace(state, now)
+    if pace not in ("busy", "tight") or (pace == "busy" and usage_outlook_detail(state["windows"], now)[2] == "old"):
         return ""
     return (f"nouez: Claude Code is {at}. Before doing this prompt's work yourself: {HAND_OUT[pace]} "
             f"{HAND_OUT_LOCAL} Call ConsultantBudget with the kind first.")
@@ -7084,9 +7306,10 @@ def suggestion_text(kind, best):
             + ", ".join(send + [f'kind "{kind}"']) + ". Why: " + "; ".join(best["why"]) + ".")
 
 
-def suggestion_lines(kind, state, now, only=None):
+def suggestion_lines(kind, state, now, only=None, revision=False):
     """ConsultantBudget's closing part: what to use for `kind`, or for every kind when it's None;
-    `only` is the provider the user named, the only one left in `state`."""
+    `only` is the provider the user named, the only one left in `state`; `revision`: the message
+    will carry the work's diff, so every pick here, as the send's, keeps off Claude models."""
     if state.get("codex") is None and state.get("antigravity") is None:
         if only:
             return [f"Nothing to suggest: {PROVIDER_TITLES[only]} isn't installed. Tell the user, and ask "
@@ -7095,31 +7318,36 @@ def suggestion_lines(kind, state, now, only=None):
     lines = ["Suggested consultant (use it unless the user named a provider or model, or the user's own "
              "instructions route otherwise):", "  " + claude_outlook(state.get("claude"), now)]
     for k in [kind] if kind else [k for k in CONSULT_KINDS if k != "other"]:
-        best = suggest_consultant(k, state, now, only)
+        best = suggest_consultant(k, state, now, only, revision)
         lines.append("  " + suggestion_text(k, best))
         if "none" in best and only:
             lines.append("  The user named it: tell them, and ask whether to use the other one.")
         if not kind or "none" in best:
             continue
         lines += [f"  {n}" for n in best["notes"]]
+        if not revision and k not in INDEPENDENT_KINDS and (best["model"] or "").startswith("claude-"):
+            lines.append("  With the work's diff (revision=true) it goes to a model of another family: call "
+                         "ConsultantBudget with revision=true for that pick.")
         if k in ("review", "bug-hunt", "plan-critique"):
             # The other provider, chosen the same way: from its models, levels and usage.
-            other = suggest_consultant(k, {**state, best["provider"]: None}, now)
+            other = suggest_consultant(k, {**state, best["provider"]: None}, now, None, revision)
             if "none" not in other:
                 lines.append(f"  {SECOND_OPINION} The other provider now: {call_text(other)}.")
         if k == "research" and best["provider"] == "antigravity" and state.get("codex") is not None:
-            page = suggest_consultant(k, {**state, "antigravity": None}, now)
+            page = suggest_consultant(k, {**state, "antigravity": None}, now, None, revision)
             if "none" not in page:
                 lines.append("  Antigravity can search the web but can't open a page: research that needs a "
                              f"page's text (docs, a changelog, an issue) goes to Codex: {call_text(page)}.")
         neon = state.get("antigravity") is not None and resolve_pick("antigravity", "gemini-4-neon", "xhigh",
                                                                        state["antigravity"])
+        level = neon and usage_outlook(provider_windows("antigravity", neon[0], state["antigravity"]), now)[0]
         if k in ("review", "research", "plan-critique") and neon and not (best["provider"] == "antigravity" and
                                                                           (best["model"] or "").startswith("gemini-")) \
-                and neon[0].startswith("gemini-4-neon") and usage_outlook(provider_windows(
-                    "antigravity", neon[0], state["antigravity"]), now)[0] != "blocked":
+                and neon[0].startswith("gemini-4-neon") and level != "blocked":
+            effort = eased_effort("antigravity", neon[0], neon[1], level, state["antigravity"])  # as a pick's
             lines.append(f"  For {NEON_SUBJECTS}, Gemini 4 Neon scores best (Artificial Analysis by subject): "
-                         + call_text({"provider": "antigravity", "model": neon[0], "effort": neon[1]}) + ".")
+                         + call_text({"provider": "antigravity", "model": neon[0], "effort": effort})
+                         + (", one level down while its week is tight" if effort != neon[1] else "") + ".")
     lines.append("  SendConsultantMessage with the kind and no model or effort applies this pick itself, within the "
                  "consultant's provider; a model or effort you pass wins and stays for later messages."
                  + ("" if kind else " Pass kind for one kind, with its notes."))
@@ -7171,7 +7399,7 @@ def consultant_budget(args, cancel=None, progress=None):
         out += aa_lines(cache, note, now)
     if only:
         state = {p: v for p, v in state.items() if p in (only, "claude")}
-    out += ([""] if out[-1] else []) + suggestion_lines(kind, state, now, only)
+    out += ([""] if out[-1] else []) + suggestion_lines(kind, state, now, only, flag(args, "revision"))
     if brief:
         out.append("  details=true shows each subscription's windows, the models and the benchmark scores.")
     return "\n".join(out)
@@ -8049,35 +8277,36 @@ def window_state(used, resets_at, length, now, sampled=None):
     """A usage window's numbers and outlook, or None if they can't be used. A reading saved at
     `sampled` gives its pace as of then; an old one gives none. `rank` orders how pressing it is:
     0 fine, 1 on pace past 90%, 2 runs out before the reset, 3 used up."""
-    used, resets_at, length = number(used), number(resets_at), number(length)
-    if used is None or resets_at is None or resets_at <= now:
+    judged = window_level(used, resets_at, length, now, sampled)
+    if judged is None:
         return None
-    at = min(number(sampled) or now, now)
-    pace = window_pace(used, resets_at, length, at)
-    if now - at > CLAUDE_USAGE_STALE:
-        outlook = (("used up at the last reading", "used up", "31", 3) if used >= 100
-                   else ("pace not known: an old reading", "old reading", "32", 0))
-    elif pace and pace[0] == "used up":
-        outlook = ("used up", "used up", "31", 3)
-    elif pace and pace[0] == "runs out":
-        left = span_text(at + pace[1] - now)
+    used, resets_at, length = number(used), number(resets_at), number(length)
+    level, pct, tight = judged["level"], judged["pct"], judged["level"] == "tight"
+    if level == "used up":
+        outlook = ("used up at the last reading" if judged["basis"] == "old" else "used up", "used up", "31", 3)
+    elif level == "runs out":
+        left = span_text(judged["out"])
         outlook = (f"runs out in ~{left}", f"out ~{left}", "31", 2)
-    elif pace:
-        busy = pace[1] > 90
-        outlook = (f"pace: ~{pace[1]:.0f}% by the reset", f"~{pace[1]:.0f}% pace", "33" if busy else "32", int(busy))
+    elif judged["basis"] == "pace":
+        outlook = (f"pace: ~{pct:.0f}% by the reset", f"~{pct:.0f}% pace", "33" if tight else "32", int(tight))
+    elif judged["basis"] == "old":  # the share used is the least the window reaches: judged by that
+        outlook = (f"an old reading ({span_text(judged['age'])} old): at least {pct:.0f}% by the reset",
+                   "old reading", "33" if tight else "32", int(tight))
+    elif tight:
+        outlook = (f"too early for a pace: at least {pct:.0f}% by the reset", f"early, ≥{pct:.0f}%", "33", 1)
     else:
         outlook = ("too early for a pace", "early", "32", 0)
     left = resets_at - now
     gone = (length - left) / length if length and 0 < left <= length else None
     return {"used": used, "resets_at": resets_at, "long": outlook[0], "short": outlook[1],
-            "colour": outlook[2], "rank": outlook[3], "gone": gone}
+            "colour": outlook[2], "rank": outlook[3], "gone": gone, "level": level}
 
 
 def limit_state(kind):
     """A row for a limit Codex says is reached, which blocks routing whatever its windows show. It
     has no reset time of its own."""
     return {"used": 100, "resets_at": None, "long": f"limit reached: {kind}", "short": "reached",
-            "colour": "31", "rank": 3, "gone": None}
+            "colour": "31", "rank": 3, "gone": None, "level": "used up"}
 
 
 def window_gauge(scr, state, width=TOP_BAR):
@@ -8137,6 +8366,12 @@ def subscription_groups(now, codex_live, codex_saved, claude_path=None, agy_live
         old = now - at > CLAUDE_USAGE_STALE
         note = f"(from the status line, saved {span_text(now - at)} ago{' - old, may be out of date' if old else ''})"
         short = f"status line, {span_text(now - at)} ago" + (" - old" if old else "")
+    # The hand-out advice at the week's level, as ConsultantBudget and the hook give it, on the note line.
+    advice = next((TOP_HAND_OUT[s["level"]] for _, label, s in entries
+                   if s and label == "weekly" and s["level"] in TOP_HAND_OUT), "")
+    if advice:
+        note = f"{note} · {advice}" if note else advice
+        short = f"{short} · {advice.split(':')[0]}" if short else advice.split(":")[0]
     groups.append({"title": "Claude Code", "entries": entries, "note": note, "short": short,
                    "empty": "usage not known: it reaches nouez through the status line (docs/consultants.md, Choosing a consultant)"
                    if quota["status"] != "ok" else "no current window saved yet"})
@@ -8182,9 +8417,9 @@ def card_rows(scr, group, width=TOP_CARD - 4):
     return rows
 
 
-def badge(scr, group):
+def badge(scr, group, word=True):
     """A subscription in the top bar: a dot in its most pressing window's colour, and that window's
-    use, with its name when it isn't the weekly one."""
+    use, with its name when it isn't the weekly one, and (with `word`) "busy" when its week is."""
     name = {"Claude Code": "Claude", "Antigravity": "Gemini"}.get(group["title"], "Codex")
     if not group["entries"]:
         return scr.dim(f"○ {name}" + (" …" if group.get("checking") else " ?"))
@@ -8192,9 +8427,16 @@ def badge(scr, group):
     if sub and sub != "Gemini":
         name = f"AG {sub}"
     shown = "<1%" if 0 < state["used"] < 0.5 else f"{state['used']:.0f}%"
-    return scr.paint("●", state["colour"]) + f" {name} {shown}" + (scr.dim(f" {label}") if label != "weekly" else "")
+    # Busy (past 70% of the week) is a word, not a colour: amber stays for past 90%.
+    busy = state["rank"] == 0 and any(s_ == sub and lab == "weekly" and s["level"] == "busy"
+                                      for s_, lab, s in group["entries"])  # its own quota group's week
+    return (scr.paint("●", state["colour"]) + f" {name} {shown}" + (scr.dim(f" {label}") if label != "weekly" else "")
+            + (scr.dim(" busy") if busy and word else ""))
 
 
+# What Claude Code's weekly row adds at each level, the hand-out advice of HAND_OUT in brief.
+TOP_HAND_OUT = {"busy": "busy: hand read-only work to consultants",
+                "tight": "tight: hand out all but what only Claude can do"}
 AGY_GROUPS = {"Gemini Models": "AG Gemini", "Claude and GPT models": "AG Claude+GPT", "Gemini 4 Argon": "AG Argon"}
 AGY_WINDOWS = {"weekly": 7 * 86400, "5h": 5 * 3600}
 
@@ -8234,7 +8476,7 @@ def agy_command(env=None):
 
 
 AGY_USAGE_CACHE = 90  # seconds a quota reading is reused: agy takes seconds to answer, and each send reads it
-_agy_usage = {"at": 0.0, "agy": None, "value": None}
+_agy_usage = {"at": 0.0, "agy": None, "value": None, "reading": False}
 
 
 def read_agy_usage():
@@ -8302,7 +8544,7 @@ AGY_PREAMBLE = ("You are a read-only consultant, asked by another AI agent throu
                 "schedule tasks or start background work: the turn ends when you reply. Answer in your reply.")
 AGY_REMINDER = ("[nouez: you are still a read-only consultant. Don't write files, run commands, schedule tasks "
                 "or start background work; answer in your reply.]")
-_agy_models = {"at": 0, "ids": None}
+_agy_models = {"at": 0, "ids": None, "names": {}}
 _agy_guard = threading.Lock()
 
 
@@ -8490,13 +8732,24 @@ def agy_models(env=None, now=None):
                            cwd=tempfile.gettempdir(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.SubprocessError):
         return None
-    ids = [line.split("\t", 1)[0].strip() for line in p.stdout.splitlines() if "\t" in line]
-    ids = [i for i in ids if AGY_MODEL_NAME.fullmatch(i)]
+    names = {}
+    for line in p.stdout.splitlines():
+        if "\t" in line:
+            model, shown = (part.strip() for part in line.split("\t", 1))
+            if AGY_MODEL_NAME.fullmatch(model):
+                names[model] = shown
+    ids = list(names)
     if not ids:
         return None
     with _agy_guard:
-        _agy_models.update(at=now, ids=ids)
+        _agy_models.update(at=now, ids=ids, names=names)
     return ids
+
+
+def agy_model_names():
+    """{model id: display name} from the latest `agy models` list (agy_models), {} without one."""
+    with _agy_guard:
+        return dict(_agy_models["names"] or {})
 
 
 def agy_level(model):
@@ -8928,12 +9181,14 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
     cid, name = rec["id"], rec["name"]
     given, given_effort = args.get("model"), args.get("effort")  # the caller's, not nouez's own pick below
     override = given or given_effort
-    routed = None if override else send_route(kind, "antigravity")
+    revision, usage = flag(args, "revision"), {}
+    routed = None if override else send_route(kind, "antigravity", revision=revision, usage=usage)
     if routed:  # neither named: the kind's suggestion, as ConsultantBudget gives it, within Antigravity
         args = {**args, "model": routed["model"], "effort": routed["effort"]}
         override = True
+    usage = usage or send_usage("antigravity")
     # Work that checks Claude's own (an independent kind, or a diff) never runs on a Claude model.
-    independent = kind in INDEPENDENT_KINDS or flag(args, "revision")
+    independent = kind in INDEPENDENT_KINDS or revision
     known = (agy_models() if override or (independent and (rec.get("model") or "").startswith("claude-"))
              else None)  # can take seconds, so read before taking the lock
     # 0.28: an Antigravity consultant runs no git, so it gets the diff text unless attach_diff=false.
@@ -8962,17 +9217,31 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
         switched = ""
         if independent and model.startswith("claude-"):
             what = f"a {kind}" if kind in INDEPENDENT_KINDS else "a message with revision=true"
-            pick = next((p for p in CONSULT_PICKS.get(kind, ()) if p[0] == "antigravity" and p[1]
-                         and not p[1].startswith("claude-")), None)
+            # ConsultantBudget's own pick for it (revision=true), from the models alone when the usage
+            # can't be read: never a Claude model.
+            # Kind other has no pick, here as in ConsultantBudget: refused, naming the model to pass.
+            pickable = kind in CONSULT_PICKS and kind != "other"
+            pick = suggest_consultant(kind, {"antigravity": usage.get("antigravity") or {"models": known, "groups": {}}},
+                                      time.time(), None, True) if pickable else {"none": ""}
+            if pickable and "none" in pick:  # none with room: the best of another family all the same, as
+                # the same send naming it would run; the usage note below says it may fail
+                pick = suggest_consultant(kind, {"antigravity": {"models": known, "groups": {}}}, time.time(), None, True)
+            pick = None if "none" in pick else (pick["model"] or AGY_MODEL, pick["effort"])
             if given or not pick:
                 raise BridgeError(
                     f"{model} is a Claude model, and {what} goes to a model of another family: a Claude "
                     f"model shares the blind spots of the Claude that wrote the work. Nothing was sent. "
-                    f"Pass model={pick[1] if pick else AGY_MODEL}, or the model ConsultantBudget suggests.")
+                    f"Pass model={pick[0] if pick else AGY_MODEL}, or the model ConsultantBudget suggests "
+                    "with revision=true.")
             was = model
-            model = agy_model_id(model, pick[1], given_effort or pick[2], known)
+            model = agy_model_id(model, pick[0], given_effort or pick[1], known)
             switched = (f" ({name} was on {was}, a Claude model, which shares the blind spots of the Claude "
                         f"that wrote the work, so this {kind} runs on {model} instead.)")
+        # Antigravity never says whether credits can take a turn past a used-up group: a note, never a refusal.
+        _, quota = send_check(kind, "antigravity", model, usage, time.time(), revision,
+                              args.get("second_opinion_of") not in (None, ""),
+                              "antigravity" if named_provider(kind, "antigravity") else None)
+        switched += f" (Usage: {quota})" if quota else ""
         current = agy_turns(cid, 1)
         if current and current[0]["status"] == "inProgress":
             raise BridgeError(
@@ -9243,7 +9512,7 @@ def agy_budget(now, agy_live=None, state=None):
         return []
     models = agy_models()
     state = {} if state is None else state
-    state.update(groups={}, models=models)
+    state.update(groups={}, models=models, members=agy_members(live), names=agy_model_names() if models else {})
     tail = ([f"  Models (model for StartConsultant with provider antigravity, effort the level): "
              f"{agy_model_families(models)}"] if models else [])
     if live.get("error"):
@@ -9280,17 +9549,31 @@ def agy_model_families(ids):
                      for base, levels in families.items())
 
 
+def share(n, total):
+    """n as a whole percentage of total: "<1%" for a share that rounds to nothing, "" without a total."""
+    if not total:
+        return ""
+    pct = round(100 * n / total)
+    return f"{pct}%" if pct or not n else "<1%"
+
+
 def columns(blocks, widths):
-    """Side-by-side lists: each block is (title, [(label, count)...]), with one width per block."""
-    height = max((len(items) for _, items in blocks), default=0)
-    lines = ["  " + "".join(f"{title:<{w}}" for (title, _), w in zip(blocks, widths))]
+    """Side-by-side lists: each block is (title, counter), its most common entries shown with their
+    count and their share of the counter's total (not only of the entries shown); one width per block."""
+    top = 6
+    shown = [(title, counter.most_common(top), sum(counter.values())) for title, counter in blocks]
+    height = max((len(items) for _, items, _ in shown), default=0)
+    lines = ["  " + "".join(f"{title:<{w}}" for (title, _, _), w in zip(shown, widths))]
     for i in range(height):
         cells = []
-        for (_, items), width in zip(blocks, widths):
+        for (_, items, total), width in zip(shown, widths):
             if i < len(items):
                 label, n = items[i]
-                label = label if len(label) <= width - 7 else label[:width - 8] + "…"
-                cells.append(f"{label:<{width - 6}}{n:>4}  ")
+                room = width - 11  # count (4), a space, share (4) and a gap of 2
+                head, _, tail = label.rpartition(" ")
+                label = (label if len(label) <= room else
+                         head[:room - len(tail) - 2] + "… " + tail if head and len(tail) <= 7 else label[:room - 1] + "…")
+                cells.append(f"{label:<{room}}{n:>4} {share(n, total):>4}  ")
             else:
                 cells.append(" " * width)
         lines.append("  " + "".join(cells).rstrip())
@@ -9311,11 +9594,10 @@ def consultation_rows(scr, summary, days, compact=False, table=True):
         return rows
     rows += [f"  {s['steered']} steered into a running turn · {s['changed']} changed model/effort"
              + (f" ({changed})" if changed else "") + f" · {s['new_consultants']} new consultants"] + ([""] if table else [])
-    top = 6
-    rows += [] if not table else columns([("by model and effort", s["models"].most_common(top)),
-                     ("by kind", s["kinds"].most_common(top)),
-                     ("verdicts", s["verdicts"].most_common(top)),
-                     ("by project", s["projects"].most_common(top))], (30, 18, 18, 24))
+    # Shares of all messages sent (verdicts: of the replies read), each with its count.
+    rows += [] if not table else columns([("by model and effort", s["models"]), ("by kind", s["kinds"]),
+                                          ("verdicts", s["verdicts"]), ("by project", s["projects"])],
+                                         (30, 22, 21, 23))  # 94 cells, as wide as the panel beside the cards
     if not compact:
         rows += ["", "  which kind went where"]
         rows += [f"  {n:>4}  {kind} → {model}" for (kind, model), n in s["routes"].most_common(4)]
@@ -9460,12 +9742,18 @@ def login_badge(scr, now):
 
 def top_bar(scr, groups, days, now, width):
     """The version, the phone dispatcher's badge, each subscription's badge and the sign-in badge,
-    then the period and clock on the right. When it doesn't fit, the clock goes first, then the subscription badges are cut: the
-    sign-in badge stays whole, since its date and days are the point of it."""
+    then the period and clock on the right. When it doesn't fit, the clock goes first, then the
+    badges' "busy" words (Claude Code's note line still says it), then the subscription badges are
+    cut: the sign-in badge stays whole, since its date and days are the point of it."""
     login, phone = login_badge(scr, now), dispatcher_badge(scr)
-    left = scr.bold(f"nouez {SERVER_VERSION}") + "   " + "   ".join(
-        ([phone] if phone else []) + [badge(scr, g) for g in groups])
     tail = f"   {login}" if login else ""
+
+    def badges(word):
+        return scr.bold(f"nouez {SERVER_VERSION}") + "   " + "   ".join(
+            ([phone] if phone else []) + [badge(scr, g, word) for g in groups])
+    left = badges(True)
+    if visible(left) + visible(tail) > width:
+        left = badges(False)
     right = scr.dim(f"{period_text(days)} · {time.strftime('%a %b %d %H:%M:%S', time.localtime(now))}")
     gap = width - visible(left) - visible(tail) - visible(right)
     if gap >= 2:
@@ -11082,6 +11370,7 @@ TOOLS = [
             "properties": {
                 "kind": {"type": "string", "enum": list(CONSULT_KINDS), "description": "The kind of consultation, for one suggestion with its notes. Default: one line for each kind."},
                 "provider": {"type": "string", "enum": list(PROVIDERS), "description": "Only when the user named a provider (\"ask Codex\", \"ask Gemini\"): suggest a model and effort on that one."},
+                "revision": {"type": "boolean", "description": "The message will carry the work's diff (SendConsultantMessage with revision=true): suggest as for that send, never a Claude model, as for a review. Default false."},
                 "details": {"type": "boolean", "description": "With a kind, also show each subscription's usage windows, the models and the benchmark scores. Default false: with a kind, only the suggestion and its notes."},
                 "refresh": {"type": "boolean", "description": "Fetch the model scores again now if the saved ones are over an hour old, and show them. Default false; pass true only when the user asks for fresh scores."},
             },

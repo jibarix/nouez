@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.28.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.28.1\\[0.3em]\large Architecture and message reference}
 \date{November 26, 2026}
 \author{}
 
@@ -290,7 +290,7 @@ the folder the call names, never in a workspace above it.
   "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
   "ttlMs": 0, "cacheScope": "private",
-  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.28.0"}}}}
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.28.1"}}}}
 \end{wire}
 
 Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
@@ -1448,8 +1448,9 @@ but not open a page. Each option is checked against what is installed and listed
   only its Gemini models are options. A \code{kind} with a \code{provider} also holds the
   send's own pick to that provider, for the next message of that kind that reaches it (unused, it
   lapses after half an hour); the message after it gets the usual pick again.
-\item Each option's usage outlook comes from its windows (for Antigravity, the quota group of its
-  model): \emph{blocked} when a window is used up or runs out before its reset at the current pace,
+\item Each option's usage outlook comes from its windows (for Antigravity, the quota group whose
+  \code{/usage} list names its model; a model no group lists has its usage not known, and an option
+  with known room comes before it): \emph{blocked} when a window is used up or runs out before its reset at the current pace,
   \emph{tight} over 90\% on pace at the weekly reset, \emph{busy} over 70\%, \emph{spare} under 60\%
   with the reset within three days, otherwise ok, or unknown with no windows. A reading older than 30
   minutes gives no pace: its percentage counts only as the least the week will reach, so it can
@@ -1460,9 +1461,17 @@ but not open a page. Each option is checked against what is installed and listed
   fact checks), and a tight one that stays drops one effort level. For research and quick checks,
   a spare option on another quota also takes the place of an ok, spare or unknown first choice,
   the one whose week resets first, the first choice winning a tie. Reviews, re-checks, bug hunts and
-  plan critiques never move this way, and a Claude model is never an option for them, not even as
-  Antigravity's default model: it shares the blind spots of the Claude that wrote the work.
+  plan critiques never move this way, and a Claude model is never an option for them, nor for any
+  kind sent with the work's diff (\code{revision: true}), not even as Antigravity's default model: it
+  shares the blind spots of the Claude that wrote the work.
 \end{itemize}
+
+The same judgment of each window serves the send, the prompt hook and the status screen. At send, a
+new Codex turn is refused, with nothing sent, only when Codex reports its limit reached and no
+credits; the refusal names another quota with room, from readings already kept, or says why none
+can be named. Antigravity never says whether AI credits can be spent, so a used-up group there, and
+a forecast that a window runs out, only add a \code{(Usage: ...)} note naming where later turns can
+go. A message added to a running turn is never refused and reads no usage before it goes.
 
 With no option left, the text says to skip the consultation and tell the user why. For an
 Antigravity choice, \code{StartConsultant}'s part names the model and level as well, since a new
@@ -1529,7 +1538,8 @@ Anything else has no verdict.
 \code{server.py top} draws a status screen from that log and from files already on the computer,
 with ANSI colours and the terminal's alternate screen: a top bar with each subscription's most
 pressing window (the highest of used up, running out first, on pace past 90\%, then the most
-used), boxed panels, and a bar of keys on the bottom line, which is written without a newline so
+used), with the word \code{busy} when that quota's week is on pace past 70\% (dropped first when the
+bar is too narrow), boxed panels, and a bar of keys on the bottom line, which is written without a newline so
 the screen never scrolls; lines stop one column short of the edge, for consoles that wrap at the
 last one. Widths are counted in terminal cells (\code{unicodedata}: wide characters take two,
 combining marks none). Below 149 columns the panels stack, at most 104 wide; from 149, the

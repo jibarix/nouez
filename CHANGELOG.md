@@ -6,6 +6,21 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-11-26
+
+One judgment of each usage window everywhere nouez shows or uses one, and a send that is refused only when its quota said no turn can run. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
+
+### Changed
+
+- One judgment of each usage window, which routing, `ConsultantBudget`, the prompt hook and the status screen all take. A reading too old to project from counts as the share already used, the least the window will reach: the screen shows it as `an old reading (45 min old): at least 93% by the reset`, amber past 90% as a fresh one is, and the prompt hook now speaks on such a reading past 90%, saying it is old. `ConsultantBudget`'s Claude Code line names a 5-hour window on pace past 90%, as the screen's amber does.
+- The status screen's badge says `busy` when the week of the quota it shows is on pace past 70% (the colour stays green until 90%), and Claude Code's note line says what to hand out when its week is busy or tight. A used-up window from an old reading says it is an old reading, in the prompt hook too.
+- A Codex send that would start a new turn is refused, with nothing sent, when Codex reports its limit reached and no credits to go past it; the refusal names another quota with room, or says to tell you. A used-up Antigravity group (agy never says whether AI credits can be spent) and a forecast that a window runs out before its reset only add a `(Usage: ...)` note to the send's result. A window at 100% that Codex hasn't reported as a reached limit only gets a note. When the refusal can't name room elsewhere it says why: no other consultant is set up, or Antigravity's usage isn't read yet. A note on a turn that went ahead names where later turns can go, never to send it again. A message added to a running turn is never refused and reads no usage before it goes, so a correction sent while a review runs can't miss it while nouez reads Codex's usage; a refusal never waits for a usage reading.
+- `ConsultantBudget` takes `revision: true` and then gives the pick a message with the work's diff gets at send, never a Claude model; without it, a draft or research whose pick is a Claude model says so. An Antigravity consultant left on a Claude model moves to that same pick, or, when no model of another family has room, to the best one all the same, with the usage note, as the same send naming it would go.
+- Antigravity's quota groups come from agy's own lists: a model counts against the group whose `/usage` list names it, so a model Antigravity adds to a group, such as Gemini 4 Argon, shows its usage there. A model no group lists has its usage not known, and a pick with known room comes before it. The subject note (Gemini 4 Neon for finance, legal and the rest) drops a level while Gemini's week is tight, as a pick does.
+
+- The status screen's consultation tables (by model and effort, by kind, verdicts, by project) show each entry's share beside its count: of the period's messages, and for verdicts, of their replies read. A name cut to fit keeps its last word, so `claude-opus-5… high` and `claude-opus… medium` stay apart.
+- When a conversation `OpenClaudeSession` resumed hasn't connected to Remote Control, its report adds the likely cause when your account requires trusted devices (the conversation's old Remote Control session is refused) and the fix: `/remote-control` typed in that window.
+
 ## [0.28.0] - 2026-11-26
 
 Easier first steps and lighter use of Claude Code's week: a new dispatcher needs no `~/Projects`, setup offers the status line, research and drafts of code go to Antigravity's Claude models, and every rule in docs/rules.md has an example. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
@@ -774,7 +789,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.1...HEAD
+[0.28.1]: https://github.com/jibarix/nouez/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/jibarix/nouez/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/jibarix/nouez/compare/v0.26.4...v0.27.0
 [0.26.4]: https://github.com/jibarix/nouez/compare/v0.26.3...v0.26.4

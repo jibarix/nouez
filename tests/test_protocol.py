@@ -2096,6 +2096,56 @@ class HandlerTest(unittest.TestCase):
         self.assertIn("steered", out)
         self.assertIn("turn/steer", daemon.calls)
 
+    def test_a_reported_limit_with_no_credits_refuses_a_new_turn(self):
+        """0.28.1: a Codex quota that reports its limit reached and no credits refuses a new turn with
+        nothing sent, saying where to go; credits not reported, or a message added to a running turn,
+        goes ahead; a forecast only adds a note."""
+        now = time.time()
+
+        def limits(reached, credits, used=100):
+            return {"rateLimits": {"primary": {"usedPercent": used, "windowDurationMins": 10080,
+                                               "resetsAt": int(now + 2 * 86400)},
+                                   "rateLimitReachedType": reached, "credits": credits}}
+
+        class Limited(FakeDaemon):
+            def __init__(self, *a, rl=None, **k):
+                super().__init__(*a, **k)
+                self.rl = rl
+
+            def request(self, method, params):
+                if method == "account/rateLimits/read":
+                    self.calls.append(method)
+                    return self.rl
+                if method == "model/list":
+                    return {"data": []}
+                return super().request(method, params)
+        thread = self.consultant("lim001")
+        none_left = limits("weekly", {"hasCredits": False, "unlimited": False})
+        daemon = self.use(Limited([thread], rl=none_left))
+        with mock.patch.object(server, "agy_command", lambda env=None: None), \
+                self.assertRaisesRegex(server.BridgeError, "no credits to go past it.*Nothing was sent"):
+            server.send_consultant_message({"kind": "review", "to": thread["id"], "message": "hi", "wait": 0,
+                                            "effort": "high"})
+        self.assertNotIn("turn/start", daemon.calls)
+        daemon = self.use(Limited([thread], rl=limits("weekly", None)))  # credits not reported: Codex decides
+        out = server.send_consultant_message({"kind": "review", "to": thread["id"], "message": "hi", "wait": 0,
+                                              "effort": "high"})
+        self.assertIn("turn/start", daemon.calls)
+        self.assertIn("(Usage: Codex reports its limit reached (weekly): this turn may fail", out)
+        running = {"id": "turn-1", "status": "inProgress", "items": [user("q")]}
+        daemon = self.use(Limited([thread], {thread["id"]: [running]}, rl=none_left))
+        with mock.patch.object(server, "_bridge_turns", {"turn-1"}):
+            out = server.send_consultant_message({"kind": "review", "to": thread["id"], "message": "more", "wait": 0})
+        self.assertIn("turn/steer", daemon.calls)
+        self.assertNotIn("Usage:", out)
+        # a steer reads no usage before it goes, so never waits for it (the log's snapshot comes after)
+        self.assertNotIn("account/rateLimits/read", daemon.calls[:daemon.calls.index("turn/steer")])
+        daemon = self.use(Limited([thread], rl=limits(None, None, used=80)))  # 80% five days in: runs out first
+        out = server.send_consultant_message({"kind": "review", "to": thread["id"], "message": "hi", "wait": 0,
+                                              "effort": "high"})
+        self.assertIn("turn/start", daemon.calls)
+        self.assertIn("(Usage: Codex: its weekly window runs out before its reset at this rate.", out)
+
     def test_a_send_with_no_pick_keeps_the_consultants_settings(self):
         """0.26.1: when the usage can't be read, or no subscription has room, a send of any kind goes
         ahead on the consultant's current model and effort, and says nothing of a pick."""
@@ -4157,6 +4207,9 @@ class OpenedSessionCheckTest(unittest.TestCase):
             out = self.open([[], [self.session(2, tmp, False)]], tmp)
             self.assertIn("hadn't connected to Remote Control", out)
             self.assertNotIn("already running", out)
+            self.assertNotIn("trusted devices", out)  # only said of a resumed conversation
+            with mock.patch.object(server, "claude_sessions", return_value=[self.session(2, tmp, False)]),                     mock.patch.object(server, "CONNECT_SECONDS", 0):
+                self.assertIn("typing /remote-control in that window", server.connection_note(set(), tmp, resumed=True))
             out = self.open([[], []], tmp)
             self.assertIn("hadn't shown up as a running session", out)
 
@@ -4307,8 +4360,14 @@ class BudgetTest(unittest.TestCase):
         self.assertIn(server.HAND_OUT["busy"], text)
         save(80, 1)  # past 90%
         self.assertIn(server.HAND_OUT["tight"], server.hook_text(self.NOW, path))
-        save(80, 1, age=server.CLAUDE_USAGE_STALE + 60)  # an old reading says nothing
+        save(80, 1, age=server.CLAUDE_USAGE_STALE + 60)  # an old reading at 80% says nothing
         self.assertEqual(server.hook_text(self.NOW, path), "")
+        save(93, 1, age=server.CLAUDE_USAGE_STALE + 60)  # 0.28.1: at 93% it is tight however old, as the screen says
+        text = server.hook_text(self.NOW, path)
+        self.assertIn("at 93% of its week or more (an old reading)", text)
+        save(100, 1, age=server.CLAUDE_USAGE_STALE + 60)  # used up however old, and still said to be old
+        self.assertIn("used up (an old reading)", server.hook_text(self.NOW, path))
+        self.assertIn(server.HAND_OUT["tight"], text)
         save(60, 2)
         with mock.patch.dict(os.environ, {"NOUEZ_NO_AUTO_CONSULT": "1"}):
             self.assertEqual(server.hook_text(self.NOW, path), "")
@@ -4528,8 +4587,8 @@ class BudgetTest(unittest.TestCase):
         lines = server.claude_budget(now, path)
         five = next(l for l in lines if "5-hour" in l or "5h" in l)
         week = next(l for l in lines if "week" in l.lower() and l is not five)
-        self.assertNotIn("pace not known", five)
-        self.assertIn("pace not known: an old reading", week)
+        self.assertNotIn("an old reading", five)
+        self.assertIn("old): at least", week)
         with open(path, "w", encoding="utf-8") as f:
             f.write("[" * 100000)  # nested past Python's recursion limit
         self.assertEqual(server.claude_budget(now, path), ["Claude Code: the saved usage file can't be read."])
@@ -4831,6 +4890,9 @@ class UsageLogTest(HandlerTest):
         text = "\n".join(server.consultation_rows(scr, s, 7))
         self.assertIn("4 messages (last 7 days)", text)
         self.assertIn("1 consultant(s) had 3+ CHANGES rounds in a row", text)
+        # Each count with its share, of the messages (verdicts: of the replies read).
+        self.assertRegex(text, r"m high +3  75%.*not given +2  50%.*changes +3 100%.*p +3  75%")
+        self.assertEqual([server.share(n, t) for n, t in ((0, 4), (1, 400), (1, 3), (2, 0))], ["0%", "<1%", "33%", ""])
         self.assertIn("No consultations logged", "\n".join(server.consultation_rows(scr, server.log_summary([]), None)))
 
     def test_summary_counts_replies_to_the_periods_messages(self):
@@ -4891,7 +4953,7 @@ class UsageLogTest(HandlerTest):
         fresh = window_row("Claude Code", "weekly", 40, now + 3 * 86400, 7 * 86400, now, now - 60)
         self.assertIn("pace: ~", fresh)
         old = window_row("Claude Code", "weekly", 40, now + 3 * 86400, 7 * 86400, now, now - 7200)
-        self.assertIn("pace not known: an old reading", old)
+        self.assertIn("an old reading (2h 0m old): at least 40% by the reset", old)
         old = window_row("Claude Code", "weekly", 100, now + 3 * 86400, 7 * 86400, now, now - 7200)
         self.assertIn("used up at the last reading", old)
         fast = window_row("Codex", "weekly", 90, now + 3 * 86400, 7 * 86400, now)
@@ -5133,8 +5195,25 @@ class UsageLogTest(HandlerTest):
         group = {"title": "Antigravity", "entries": [("Gemini", "weekly", busy), ("Claude+GPT", "5-hour", late)]}
         self.assertEqual(server.badge(plain, group), "● AG Claude+GPT 80% 5-hour")
         self.assertEqual(server.badge(plain, {"title": "Claude Code", "entries": [("", "weekly", busy)]}),
-                         "● Claude 50%")
+                         "● Claude 50% busy")  # 0.28.1: past 70% of the week is a word; the colour stays green
         self.assertEqual(server.badge(plain, {"title": "Antigravity", "entries": [], "checking": True}), "○ Gemini …")
+        fine = server.window_state(40, now + 0.38 * 7 * 86400, 7 * 86400, now)  # ~65%
+        other = server.window_state(30, now + 0.6 * 7 * 86400, 7 * 86400, now)  # ~75%: busy
+        self.assertEqual(server.badge(plain, {"title": "Antigravity", "entries": [("Gemini", "weekly", fine),
+                                                                                  ("Claude+GPT", "weekly", other)]}),
+                         "● Gemini 40%")  # Codex 0.28.1 review: the busy group isn't the one shown
+        claude = {"title": "Claude Code", "entries": [("", "weekly", busy)]}
+        groups = [claude, {"title": "Antigravity", "entries": [("Claude+GPT", "weekly", fine)]}]
+        with mock.patch.object(server, "login_badge", return_value=""), \
+                mock.patch.object(server, "dispatcher_badge", return_value=""):
+            wide = server.ANSI.sub("", server.top_bar(plain, groups, 7, now, 200))
+            narrow = server.ANSI.sub("", server.top_bar(plain, groups, 7, now, len(wide.split("   ●")[0]) + 38))
+        self.assertIn("● Claude 50% busy", wide)
+        self.assertIn("● Claude 50%   ● AG Claude+GPT 40%", narrow)  # the word goes before a badge is cut
+        rows = server.columns([("by model and effort", server.collections.Counter(
+            {"claude-opus-5-5 (AG) high": 2, "claude-opus-5-5 (AG) medium": 1}))], (30,))
+        self.assertIn("claude-opus-5… high", rows[1])  # cut to fit, the effort kept
+        self.assertIn("claude-opus… medium", rows[2])
         self.assertTrue(server.badge(scr, group).startswith("\x1b[31m●"))
         self.assertLessEqual(server.visible(server.compact_row(scr, "weekly", late)), server.TOP_CARD - 4)
         box = server.panel(plain, "T", ["  ab", "日本"], 10)
@@ -5253,6 +5332,109 @@ class SuggestTest(unittest.TestCase):
         got = server.suggest_consultant("review", {"codex": self.codex(used=75, days_left=6.9)}, self.NOW)
         self.assertIn("Codex at 75% of its week or more (too early in the week for a pace)", got["why"])
         self.assertFalse(any("on pace" in w for w in got["why"]), got["why"])
+
+    def test_one_judgment_per_window(self):
+        """0.28.1: routing, ConsultantBudget, the hook and the status screen take one judgment of each
+        window: an old reading's share used is the least the window reaches, coloured and routed by it."""
+        week, reset = 7 * self.DAY, self.NOW + 3 * self.DAY
+        old = self.NOW - 2 * server.CLAUDE_USAGE_STALE
+        for used, level, colour in ((95, "tight", "33"), (80, "busy", "32"), (40, "fine", "32"), (100, "used up", "31")):
+            judged = server.window_level(used, reset, week, self.NOW, old)
+            screen = server.window_state(used, reset, week, self.NOW, old)
+            self.assertEqual((judged["level"], judged["basis"]), (level, "old"))
+            self.assertEqual((screen["level"], screen["colour"]), (level, colour))
+            routed = server.usage_outlook_detail([(week, used, reset, old)], self.NOW)[0]
+            self.assertEqual(routed, {"used up": "blocked", "fine": "ok"}.get(level, level))
+        self.assertIn("at least 95% by the reset", server.window_state(95, reset, week, self.NOW, old)["long"])
+        self.assertIsNone(server.window_level(50, self.NOW - 1, week, self.NOW))  # reset: counts nowhere
+        five = 5 * 3600  # a 5-hour window on pace past 90% is named on Claude Code's line, as the screen's amber
+        hot = [(week, 20, self.NOW + 4 * self.DAY, self.NOW), (five, 76, self.NOW + 3600, self.NOW)]
+        self.assertIn("its 5-hour window on pace for about 95%", server.claude_pace({"windows": hot}, self.NOW)[1])
+        self.assertEqual(server.window_state(76, self.NOW + 3600, five, self.NOW)["colour"], "33")
+
+    def test_revision_picks_keep_off_claude_models(self):
+        """0.28.1: with revision=true any kind keeps off Claude models, in ConsultantBudget as at the
+        send; without it, a draft whose pick is Claude says how to get the other."""
+        agy = {"antigravity": self.agy()}
+        self.assertEqual(self.pick("draft", **agy)[1], "claude-opus-5-5")
+        got = server.suggest_consultant("draft", agy, self.NOW, None, True)
+        self.assertTrue(got["model"].startswith("gemini-"), got)
+        lines = "\n".join(server.suggestion_lines("draft", agy, self.NOW))
+        self.assertIn("ConsultantBudget with revision=true", lines)
+        self.assertNotIn("ConsultantBudget with revision=true", "\n".join(server.suggestion_lines("draft", agy, self.NOW, None, True)))
+
+    def test_quota_groups_come_from_agys_own_lists(self):
+        """0.28.1: a model's Antigravity quota group is the one whose /usage list names its `agy models`
+        display name, a level suffix taken off; a model no group (or two) lists has its usage not known;
+        only when no group lists models, nouez's own guess."""
+        live = {"groups": [
+            {"name": "Gemini Models", "description": "Models within this group: Gemini 4 Neon, Gemini 4 Argon, Orchestrator (Neon)."},
+            {"name": "Claude and GPT models", "description": "Models within this group: Claude Opus 5.5, GPT-OSS 120B"}]}
+        names = {"gemini-4-neon-high": "Gemini 4 Neon (High)", "gemini-4-argon-low": "Gemini 4 Argon (Low)",
+                 "gemini-pro-orchestrator-neon": "Orchestrator (Neon)", "claude-opus-5-5-high": "Claude Opus 5.5 (High)",
+                 "gpt-oss-120b": "GPT-OSS 120B", "gemini-9-new": "Gemini 9 New"}
+        members = server.agy_members(live)
+        group = {m: server.agy_group_of(m, members, names) for m in
+                 ("gemini-4-neon", "gemini-4-argon", "gemini-pro-orchestrator-neon", "claude-opus-5-5", "gpt-oss-120b", "gemini-9-new")}
+        self.assertEqual(group, {"gemini-4-neon": "Gemini Models", "gemini-4-argon": "Gemini Models",
+                                 "gemini-pro-orchestrator-neon": "Gemini Models", "claude-opus-5-5": "Claude and GPT models",
+                                 "gpt-oss-120b": "Claude and GPT models", "gemini-9-new": None})
+        self.assertEqual(server.quota_title("antigravity", "gemini-9-new", {"members": members, "names": names}),
+                         "Antigravity (its quota group not known)")
+        self.assertIsNone(server.provider_windows("antigravity", "gemini-9-new",
+                                                  {"groups": {"Gemini Models": []}, "members": members, "names": names}))
+        twice = {**members, "Other": {"Gemini 4 Neon"}}
+        self.assertIsNone(server.agy_group_of("gemini-4-neon", twice, names))
+        self.assertEqual(server.agy_group_of("claude-opus-5-5"), "Claude and GPT models")  # no lists: the guess
+
+    def test_a_refusal_names_only_room_it_knows(self):
+        """Codex 0.28.1 review: only a limit Codex reported refuses (a share at 100% alone is a note); a
+        refusal says when no other consultant is set up, or Antigravity's usage isn't read yet, and never
+        waits for a reading."""
+        week = self.codex(used=100, days_left=2)
+        refusal, note = server.send_check("review", "codex", "gpt-6.2-astra", {"codex": {**week, "credits": False}},
+                                          self.NOW)
+        self.assertIsNone(refusal)
+        self.assertIn("this turn may fail unless its credits cover it", note)
+        limited = {"codex": {**week, "limit": "weekly", "credits": False}}
+        with mock.patch.object(server, "agy_command", lambda env=None: None):
+            refusal, _ = server.send_check("review", "codex", "gpt-6.2-astra", limited, self.NOW)
+        self.assertIn("No consultant other than Codex is set up, so none has room", refusal)
+        with mock.patch.object(server, "agy_command", lambda env=None: "agy"), \
+                mock.patch.object(server, "peek_agy_usage", return_value=None), \
+                mock.patch.object(server, "read_agy_usage", side_effect=AssertionError("the send waited")):
+            refusal, _ = server.send_check("review", "codex", "gpt-6.2-astra", limited, self.NOW)
+        self.assertIn("Antigravity's usage isn't read yet: call ConsultantBudget", refusal)
+
+    def test_known_room_comes_before_a_group_not_known(self):
+        """Codex 0.28.1 review: a pick whose Antigravity quota group agy's lists don't name gives way to
+        one with known room; the subject note's level drops while Gemini's week is tight, as a pick's."""
+        st = self.agy()
+        st = {**st, "members": {"Gemini Models": {"Gemini 4 Neon"}, "Claude and GPT models": {"GPT-OSS 120B"}},
+              "names": {i: ("Gemini 4 Neon" if i.startswith("gemini") else "Claude Opus 5.5")
+                        + f" ({i.rsplit('-', 1)[1].title()})" for i in st["models"]}}
+        got = server.suggest_consultant("draft", {"antigravity": st}, self.NOW)
+        self.assertTrue(got["model"].startswith("gemini-4-neon"), got)
+        self.assertIn("Antigravity (its quota group not known): usage not known", got["why"])
+        lines = "\n".join(server.suggestion_lines("review", {"codex": self.codex(),
+                                                              "antigravity": self.agy(gemini=55, days_left=3)}, self.NOW))
+        self.assertIn('effort "high", one level down while its week is tight.', lines)
+
+    def test_antigravity_is_never_refused_for_its_quota(self):
+        """0.28.1: agy never says whether AI credits can take a turn past a used-up group, so a send
+        there only gets a note, with a group of room named; a forecast is a note too."""
+        st = self.agy(claude=100)
+        refusal, note = server.send_check("research", "antigravity", "claude-opus-5-5", {"antigravity": st}, self.NOW)
+        self.assertIsNone(refusal)
+        self.assertIn("this turn may fail unless your plan has AI credits", note)
+        self.assertIn("For later turns, Antigravity's Gemini Models has room", note)
+        self.assertNotIn("send again", note)
+        _, note = server.send_check("research", "antigravity", "claude-opus-5-5", {"antigravity": st}, self.NOW,
+                                    blind=True)
+        self.assertNotIn("blind second opinion", note)  # it went ahead: nothing to tell the user
+        cx = {"codex": {**self.codex(used=100, days_left=2), "limit": "weekly", "credits": False}}
+        refusal, _ = server.send_check("review", "codex", "gpt-6.2-astra", cx, self.NOW, blind=True)
+        self.assertIn("A blind second opinion here has to come from Codex", refusal)
 
     def test_the_route_at_send_stays_with_the_consultants_provider(self):
         """0.26.0: a send naming no model or effort takes the kind's suggestion, from that provider's
@@ -5738,6 +5920,23 @@ class AgyTest(unittest.TestCase):
         self.assertIn(f"{name} was on claude-opus-5-5, a Claude model", out)
         self.assertEqual(server.agy_resolve(name)["model"], "gemini-4-neon-xhigh")
 
+    def test_a_forecast_never_stops_the_move_off_a_claude_model(self):
+        """Codex 0.28.1 review: a review on a consultant left on Opus moves to Gemini even when Gemini's
+        week runs out at this rate, as the same send naming Gemini would go, with the usage note."""
+        self.MODELS = self.MODELS + ["claude-opus-5-5"]
+        _, name = self.start(model="claude-opus-5-5")
+        now = time.time()
+        hot = {"antigravity": {"groups": {"Gemini Models": [(7 * 86400, 95, now + 3 * 86400)],
+                                          "Claude and GPT models": [(7 * 86400, 10, now + 3 * 86400)]},
+                               "models": self.MODELS}}
+        self.replies = [[agy_result("ok\n")]]
+        with mock.patch.object(server, "send_route", return_value=None), \
+                mock.patch.object(server, "send_usage", return_value=hot):
+            out = server.send_consultant_message({"to": name, "message": "x", "wait": 5, "kind": "review"})
+        argv = self.runs[0][0]
+        self.assertTrue(argv[argv.index("--model") + 1].startswith("gemini-"), argv)
+        self.assertIn("runs out before its reset at this rate", out)
+
     def test_a_send_without_model_or_effort_takes_nouezs_pick(self):
         """0.26.0: on Antigravity too, a send naming neither runs on the kind's suggestion."""
         self.MODELS = self.MODELS + ["claude-opus-5-5-high"]
@@ -5747,7 +5946,7 @@ class AgyTest(unittest.TestCase):
         self.replies = [[agy_result("ok\n")]]
         with mock.patch.object(server, "send_route", return_value=pick) as route:
             out = server.send_consultant_message({"to": name, "message": "x", "wait": 5, "kind": "research"})
-        route.assert_called_once_with("research", "antigravity")
+        route.assert_called_once_with("research", "antigravity", revision=False, usage={})
         argv = self.runs[0][0]
         self.assertEqual(argv[argv.index("--model") + 1], "claude-opus-5-5-high")
         self.assertIn("runs on claude-opus-5-5-high, nouez's pick for a research.", out)
