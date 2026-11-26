@@ -69,7 +69,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.26.2"
+SERVER_VERSION = "0.26.3"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -1250,18 +1250,23 @@ def update_check_off(env=None):
 _private_roots = {}  # nouez folder -> the folder used for it in this process, once checked private
 
 
-def nouez_cache_dir():
-    """nouez's folder in the user's own cache folder: %LOCALAPPDATA%\\nouez on Windows, else
-    $XDG_CACHE_HOME/nouez or ~/.cache/nouez. A relative variable is ignored, since it would put
-    nouez's files in whatever folder the server was started from. On macOS and Linux the folder is
-    made 0700 (once per process), so other users can't read anything in it."""
+def nouez_cache_path():
+    """Where nouez_cache_dir is, without making or checking it."""
     if os.name == "nt":
         base, fallback = os.environ.get("LOCALAPPDATA"), os.path.join("~", "AppData", "Local")
     else:
         base, fallback = os.environ.get("XDG_CACHE_HOME"), os.path.join("~", ".cache")
     if not base or not rooted(base):
         base = os.path.expanduser(fallback)
-    root = os.path.join(base, "nouez")
+    return os.path.join(base, "nouez")
+
+
+def nouez_cache_dir():
+    """nouez's folder in the user's own cache folder: %LOCALAPPDATA%\\nouez on Windows, else
+    $XDG_CACHE_HOME/nouez or ~/.cache/nouez. A relative variable is ignored, since it would put
+    nouez's files in whatever folder the server was started from. On macOS and Linux the folder is
+    made 0700 (once per process), so other users can't read anything in it."""
+    root = nouez_cache_path()
     if os.name == "nt" or root in _private_roots:
         return _private_roots.get(root, root) if os.name != "nt" else root
     problem = private_folder_problem(root)
@@ -3076,12 +3081,16 @@ def _trust_norm(p):
 
 
 def trusted_folders(state_file=None):
-    """The folders the user has trusted Claude Code in (_trust_norm), or None if they can't be read.
-    `state_file`: another profile's (claude_state_file) instead of this environment's."""
+    """The folders the user has trusted Claude Code in, as {_trust_norm: [entry names]}, or None if
+    they can't be read. `state_file`: another profile's (claude_state_file) instead of this environment's."""
     try:
         with open(state_file or claude_state_file(), encoding="utf-8") as f:
             projects = json.load(f).get("projects") or {}
-        return {_trust_norm(p) for p, v in projects.items() if isinstance(v, dict) and v.get("hasTrustDialogAccepted")}
+        found = {}
+        for p, v in projects.items():
+            if isinstance(v, dict) and v.get("hasTrustDialogAccepted"):
+                found.setdefault(_trust_norm(p), []).append(p)
+        return found
     except (OSError, ValueError, AttributeError, TypeError):
         return None
 
@@ -3096,10 +3105,15 @@ def folder_trusted(path, trusted=None):
     key, in_git = trust_key(path)
     if key is None:
         return None
-    key = _trust_norm(key)
-    if in_git:
-        return key in trusted  # a folder above a repository doesn't cover it
-    return any(key == p or key.startswith(p + os.sep) for p in trusted)
+    full, key = os.path.abspath(key).rstrip("\\/"), _trust_norm(key)
+
+    def covers(p, folder):  # an entry that reads the same counts only if it is that folder on disk
+        names = trusted[p] if isinstance(trusted, dict) else [p]
+        return any(_same_entry(n, folder) for n in names)
+    if in_git:  # a folder above a repository doesn't cover it
+        return key in trusted and covers(key, full)
+    return any((key == p and covers(p, full)) or (key.startswith(p + os.sep) and covers(p, full[:len(p)]))
+               for p in trusted)
 
 
 CLAUDE_MODEL = "opus"     # the model sessions OpenClaudeSession opens start with: the latest Opus
@@ -3396,14 +3410,34 @@ def backup_claude_state(text):
 
 def exactly_trusted(key, state_file=None):
     """Whether Claude Code's state file (`state_file`, else this environment's) records trust for
-    `key` itself (not just a folder above it)."""
+    `key` itself (not just a folder above it); None if the file can't be read."""
     exact = _trust_norm(key)
     try:
         with open(state_file or claude_state_file(), encoding="utf-8") as f:
             projects = json.load(f).get("projects") or {}
         return any(_trust_norm(p) == exact and isinstance(v, dict) and v.get("hasTrustDialogAccepted") is True
-                   for p, v in projects.items())
+                   and _same_entry(p, key) for p, v in projects.items())
     except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def recorded_trust(name, state_file=None):
+    """The trust the entry spelled exactly `name` records (False if there is none), or None if the
+    state file can't be read: for checking the one entry nouez wrote, not any other spelling."""
+    try:
+        with open(state_file or claude_state_file(), encoding="utf-8") as f:
+            entry = (json.load(f).get("projects") or {}).get(name)
+        return isinstance(entry, dict) and entry.get("hasTrustDialogAccepted") is True
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def _same_entry(name, key):
+    """Whether the state file's entry `name` is the folder `key` on disk: on Windows a case-sensitive
+    folder's `projects` beside its `Projects` reads the same to _trust_norm but isn't."""
+    try:
+        return os.path.samefile(name, key)
+    except (OSError, ValueError):
         return False
 
 
@@ -3434,7 +3468,9 @@ def trust_folder(path, expect=None):
 
 def _record_trust(key, value):
     """Set hasTrustDialogAccepted for `key` to `value` in Claude Code's state file, as trust_folder
-    describes; False takes back a record nouez has just made. Returns (name, backup or None)."""
+    describes; False takes back a record nouez has just made, `key` then being the entry's name as
+    trust_folder returned it. Returns (name, backup): backup is None unless this call's write is the
+    one in effect, so a record another session made meanwhile is never taken for nouez's."""
     norm_key = _trust_norm(key)
     state = claude_state_file()
     backup = None
@@ -3450,13 +3486,23 @@ def _record_trust(key, value):
             projects = data["projects"] = {}
         if not isinstance(projects, dict):
             raise BridgeError(f"{state} isn't laid out as expected (no projects table). Nothing was changed.")
-        name = next((p for p in projects if _trust_norm(p) == norm_key), None)
-        on = name is not None and isinstance(projects[name], dict) and projects[name].get("hasTrustDialogAccepted") is True
-        if on == value:
-            return name, backup
-        if name is not None and not isinstance(projects[name], dict):
+        def on(p):
+            return isinstance(projects.get(p), dict) and projects[p].get("hasTrustDialogAccepted") is True
+        if value:
+            spellings = [p for p in projects if _trust_norm(p) == norm_key and _same_entry(p, key)]
+            if any(on(p) for p in spellings):
+                return next(p for p in spellings if on(p)), None
+            if len(spellings) > 1:
+                raise BridgeError(f"{state} has {len(spellings)} entries for {key}, spelled differently, and nouez can't "
+                                  "tell which one Claude Code reads. Nothing was changed; the user can answer Claude "
+                                  "Code's trust question on the computer.")
+            name = spellings[0] if spellings else (key.replace("\\", "/") if os.name == "nt" else key)
+        else:
+            name = key  # only the entry nouez wrote
+            if not on(name):
+                return name, None
+        if name in projects and not isinstance(projects[name], dict):
             raise BridgeError(f"{state} has an unexpected entry for {name}. Nothing was changed.")
-        name = name or (key.replace("\\", "/") if os.name == "nt" else key)
         projects.setdefault(name, {})["hasTrustDialogAccepted"] = value
         try:
             # allow_nan=False: a number too big for a float (1e400) must not come back as Infinity,
@@ -3489,7 +3535,12 @@ def _record_trust(key, value):
             time.sleep(0.2)
             continue
         time.sleep(0.5)  # then make sure no session wrote over it
-        if exactly_trusted(key) == value:
+        now = recorded_trust(name)
+        if now is None:
+            raise BridgeError(f"nouez wrote {state} but couldn't read it back to check that the trust for {key} "
+                              f"is {'recorded' if value else 'taken back'}. Its version before the change is "
+                              f"backed up in {backup}.")
+        if now == value:
             return name, backup
     raise BridgeError(f"Couldn't {'record' if value else 'take back'} the trust for {key}: {state} kept changing (other Claude Code "
                       f"sessions write it). Its last version before nouez's change is backed up in "
@@ -4095,13 +4146,25 @@ def dispatcher_trust_problem(folder, env=None):
     if not rooted(projects):
         return ("This is the phone dispatcher, which records trust only inside its projects folder, and nouez "
                 "can't tell which folder that is (`server.py dispatcher install` restarts the dispatcher with it).")
+    unfit = projects_folder_problem(projects)
+    if unfit:
+        return (f"This is the phone dispatcher, whose projects folder {unfit}, so it records no trust at all: "
+                "`server.py dispatcher setup` and `install` with --folder set it up in a folder of projects.")
 
     outside = (f"This is the phone dispatcher, which records trust only for a folder inside {projects}, spelled "
                f"as it is there with no link below it, and {folder} isn't one.")
+    boxes = {_exact_spelling(projects), _exact_spelling(os.path.realpath(projects))}
+
+    def parts_below(written):
+        return next((written[len(box):].lstrip(os.sep).split(os.sep)
+                     for box in boxes if written.startswith(box.rstrip(os.sep) + os.sep)), None)
     written = _exact_spelling(folder)
-    below = next((written[len(box):].lstrip(os.sep).split(os.sep)
-                  for box in {_exact_spelling(projects), _exact_spelling(os.path.realpath(projects))}
-                  if written.startswith(box.rstrip(os.sep) + os.sep)), None)
+    below = parts_below(written)
+    if not below and not any(is_link(p) for p in ancestors(written)):
+        # Spelled in another case (git keeps a worktree's main checkout as it was typed): with no
+        # link anywhere in the path, the file system's own spelling names the same folder.
+        written = _exact_spelling(os.path.realpath(written))
+        below = parts_below(written)
     if not below or not inside_folder(os.path.realpath(folder), projects):
         return outside
     path = written[:len(written) - len(os.sep.join(below))]
@@ -4109,6 +4172,37 @@ def dispatcher_trust_problem(folder, env=None):
         path = os.path.join(path, part)
         if is_link(path):
             return outside
+    return None
+
+
+def ancestors(path):
+    """`path` (absolute) and each folder above it, up to the root."""
+    path = os.path.abspath(path)
+    while True:
+        yield path
+        parent = os.path.dirname(path)
+        if parent == path:
+            return
+        path = parent
+
+
+def projects_folder_problem(projects):
+    """Why `projects` can't be the folder the phone dispatcher records trust in, or None: it is a
+    drive's root, or is or holds the home folder, Claude Code's settings folder or nouez's cache,
+    where trusting a folder inside could reach far more than a project."""
+    if any(os.path.dirname(p) == p for p in {os.path.abspath(projects), os.path.realpath(projects)}):
+        return f"{projects} is a drive's root"
+    for what, folder in (("your home folder", os.path.expanduser("~")),
+                         ("Claude Code's settings folder", claude_config_dir()),
+                         ("nouez's cache folder", nouez_cache_path()),
+                         # where nouez_cache_dir falls back to, by path only, so a dry run makes nothing
+                         ("the temporary folder nouez's cache can fall back to", tempfile.gettempdir())):
+        try:  # told apart as the file system tells them, once the folder exists
+            same = os.path.samefile(folder, projects) if os.path.exists(folder) else same_folder(folder, projects)
+        except (OSError, ValueError):
+            same = False
+        if same or any(inside_folder(f, projects) for f in {folder, os.path.realpath(folder)}):
+            return f"{projects} is or holds {what}, {folder}"
     return None
 
 
@@ -4164,7 +4258,16 @@ def open_claude_session(args, cancel=None, progress=None):
     created = approved = False
     if flag(args, "trust") and trust_write_off() and not os.path.isdir(cwd):
         raise BridgeError(TRUST_WRITE_OFF)  # before a folder is made for nothing
-    if flag(args, "trust") and flag(args, "create") and not os.path.exists(cwd):  # before a folder is made
+
+    def unreadable_state():
+        return BridgeError(f"nouez couldn't read Claude Code's state file ({claude_state_file()}), so it can't tell "
+                           f"whether {cwd} is trusted and records nothing. Nothing was changed; the user can answer "
+                           "Claude Code's trust question on the computer (open_untrusted=true opens the session for that).")
+
+    def refuse_new_folder():
+        # Where a folder made here would be trusted, checked before anything is made or asked.
+        if trusted_folders() is None:
+            raise unreadable_state()
         refuse_dispatcher_trust(cwd)
         if os.path.isdir(os.path.dirname(cwd)):
             parent_key, parent_in_git = trust_key(os.path.dirname(cwd))
@@ -4172,6 +4275,8 @@ def open_claude_session(args, cancel=None, progress=None):
                 raise BridgeError(UNKNOWN_TRUST_KEY)
             if parent_in_git:  # a new folder in git is trusted with its repository
                 refuse_dispatcher_trust(parent_key)
+    if flag(args, "trust") and flag(args, "create") and not os.path.exists(cwd):
+        refuse_new_folder()
     if flag(args, "create") and flag(args, "trust") and ask_trust() and not os.path.exists(cwd) \
             and os.path.isdir(os.path.dirname(cwd)) and not git_root(os.path.dirname(cwd)):
         # A new folder outside git, trusted on its own: asked before it is made, so a decline (or a
@@ -4184,6 +4289,8 @@ def open_claude_session(args, cancel=None, progress=None):
         parent = os.path.dirname(cwd)
         if not os.path.isdir(parent):
             raise BridgeError(f"Can't create {cwd}: its parent folder {parent} doesn't exist.")
+        if flag(args, "trust"):  # again, as the folders stand after any prompt: a link may have been put in
+            refuse_new_folder()
         os.mkdir(cwd)
         created = True
     if not os.path.isdir(cwd):
@@ -4230,6 +4337,8 @@ def open_claude_session(args, cancel=None, progress=None):
     if flag(args, "trust") and not exact:
         if trust_write_off():
             raise BridgeError(TRUST_WRITE_OFF)
+        if exact is None:  # before a report that asks for a yes nouez couldn't act on
+            raise unreadable_state()
         if key is None:  # raised here, not by trust_folder, which would look the folder up again
             raise BridgeError(UNKNOWN_TRUST_KEY)
         refuse_dispatcher_trust(cwd)
@@ -12510,6 +12619,11 @@ def dispatcher_setup(folder, dry_run=False, out=print):
     if not os.path.isdir(projects):
         out(f"{projects} doesn't exist. Make it (it holds your projects), or pass --folder.")
         return 1
+    unfit = projects_folder_problem(projects)
+    if unfit:
+        out(f"{unfit}. The folder that holds the dispatcher's is where the phone can record trust, so it must be a "
+            "folder of projects: pass --folder with a folder inside one, such as ~/Projects/dispatcher.")
+        return 1
     rel = os.path.join(".claude", "settings.json")
     linked = linked_part(folder, rel) or (linked_part(folder, "CLAUDE.md") if os.path.lexists(folder) else None)
     if linked:
@@ -13266,6 +13380,10 @@ def dispatcher_install(folder, dry_run=False, force=False, out=print):
                         + ("" if folder == dispatcher_default_folder() else f" --folder {folder}") + " first.")
     if not claude:
         problems.append("claude isn't on PATH or in ~/.local/bin: install Claude Code first.")
+    unfit = projects_folder_problem(os.path.dirname(folder))
+    if unfit:
+        problems.append(f"{unfit}, so the dispatcher would record trust nowhere: set it up with --folder inside a "
+                        "folder of projects.")
     if os.path.isdir(folder) and dispatcher_trusted(folder) is not True:
         problems.append(f"Claude Code isn't trusted in {folder} itself yet ({DISPATCHER_TRUST_NOTE}), so a server "
                         f"started at sign-in would wait at that question. Run "
