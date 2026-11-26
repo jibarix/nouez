@@ -1393,6 +1393,174 @@ class TrustTest(unittest.TestCase):
                 server.trust_folder(self.repo)
         self.assertEqual(os.listdir(self.config), [".claude.json"])
 
+    def unchanged(self):
+        with open(self.state, encoding="utf-8") as f:
+            return f.read()
+
+    def test_several_spellings_of_one_folder_are_refused(self):
+        """0.26.3: two entries for one folder (here with and without a trailing slash): nouez can't
+        tell which one Claude Code reads, so it records neither and changes nothing."""
+        data = self.read()
+        data["projects"][self.slash(self.repo)] = {"allowedTools": []}
+        data["projects"][self.slash(self.repo) + "/"] = {}
+        self.write(data)
+        before = self.unchanged()
+        with self.assertRaisesRegex(server.BridgeError, "2 entries.*Nothing was changed"):
+            server.trust_folder(self.repo)
+        self.assertEqual(self.unchanged(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_an_entry_for_another_folder_on_disk_is_neither_reused_nor_trust(self):
+        """0.26.3: an entry that reads the same but is another folder on disk (on Windows, a
+        case-sensitive folder's `repo` beside its `REPO`) doesn't count as trust and isn't the one written."""
+        lookalike = self.slash(self.repo) + "/"
+        data = self.read()
+        data["projects"][lookalike] = {"hasTrustDialogAccepted": True}
+        self.write(data)
+        real = server._same_entry
+        with mock.patch.object(server, "_same_entry", lambda name, key: name != lookalike and real(name, key)), \
+                mock.patch.object(server.time, "sleep"):
+            name, backup = server.trust_folder(self.repo)
+        self.assertEqual(name, self.slash(self.repo))
+        self.assertIsNotNone(backup)
+        with mock.patch.object(server, "_same_entry", lambda name, key: name != lookalike and real(name, key)):
+            data = self.read()
+            del data["projects"][name]
+            self.write(data)
+            self.assertFalse(server.exactly_trusted(self.repo))  # nor does the reading side take it for trust
+            self.assertFalse(server.folder_trusted(self.repo))
+            data["projects"][lookalike.rstrip("/") + "/plain/"] = {"hasTrustDialogAccepted": True}
+            self.write(data)
+            self.assertTrue(server.folder_trusted(self.plain))  # through the trusted Projects above
+            data["projects"] = {lookalike: {"hasTrustDialogAccepted": True}}
+            self.write(data)
+            self.assertFalse(server.folder_trusted(os.path.join(self.repo, "src")))
+        data["projects"][name] = {"hasTrustDialogAccepted": True}
+        self.write(data)
+        projects = self.read()["projects"]
+        self.assertEqual((projects[name], projects[lookalike]),
+                         ({"hasTrustDialogAccepted": True}, {"hasTrustDialogAccepted": True}))
+
+    def test_trust_another_session_records_meanwhile_isnt_taken_for_nouezs(self):
+        """0.26.3: if a Claude Code session records the same trust while nouez writes, nouez returns
+        no backup (its own write isn't the one in effect), so nothing it does next takes that trust back."""
+        real = server.backup_claude_state
+
+        def and_a_session_writes(text):
+            done = real(text)
+            data = self.read()
+            data["projects"][self.slash(self.repo)] = {"hasTrustDialogAccepted": True}
+            self.write(data)
+            return done
+        with mock.patch.object(server, "backup_claude_state", and_a_session_writes):
+            self.assertEqual(server.trust_folder(self.repo), (self.slash(self.repo), None))
+        self.assertTrue(server.exactly_trusted(self.repo))
+
+    def test_taking_trust_back_touches_only_the_entry_nouez_wrote(self):
+        """0.26.3: the take-back sets false only on the entry named exactly as nouez wrote it; trust
+        recorded under another spelling stays."""
+        data = self.read()
+        data["projects"][self.slash(self.repo) + "/"] = {"hasTrustDialogAccepted": True}
+        self.write(data)
+        before = self.unchanged()
+        self.assertEqual(server._record_trust(self.slash(self.repo), False), (self.slash(self.repo), None))
+        self.assertEqual(self.unchanged(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_a_write_that_cant_be_read_back_says_so(self):
+        """0.26.3: once written, the entry itself is read back; if it can't be, nouez says so and names
+        the backup, rather than taking the trust as recorded or retrying over it."""
+        with mock.patch.object(server, "recorded_trust", return_value=None), mock.patch.object(server.time, "sleep"):
+            with self.assertRaisesRegex(server.BridgeError, "couldn't read it back.*backed up in"):
+                server.trust_folder(self.repo)
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_trust_that_cant_be_read_is_unknown(self):
+        """0.26.3: an unreadable state file is neither trust nor its absence: trust=true is refused at
+        once, with no report asking the user for a yes nouez couldn't act on, and nothing changed."""
+        with open(self.state, "a", encoding="utf-8") as f:
+            f.write("garbage")
+        before = self.unchanged()
+        with mock.patch.dict(server.os.environ, {"NOUEZ_ASK_TRUST": "1"}), \
+                mock.patch.object(server, "user_approves") as approves:
+            for _ in range(2):
+                with self.assertRaisesRegex(server.BridgeError, "couldn't read Claude Code's state file"):
+                    self.open({"cwd": self.repo, "trust": True})
+            new = os.path.join(self.projects, "brand-new")
+            with self.assertRaisesRegex(server.BridgeError, "couldn't read Claude Code's state file"):
+                self.open({"cwd": new, "create": True, "trust": True})
+        approves.assert_not_called()
+        self.assertFalse(os.path.exists(new))  # nothing made, nothing asked
+        os.remove(self.state)  # a missing file records no trust: the report comes, as before
+        out, opened = self.open({"cwd": self.repo, "trust": True})
+        self.assertIn("Not trusted yet", out)
+        self.assertFalse(opened)
+        with open(self.state, "w", encoding="utf-8") as f:
+            f.write(before)
+        self.assertEqual(self.unchanged(), before)
+        self.assertEqual(self.backups(), [])
+        self.assertIsNone(server.exactly_trusted(self.projects))
+        self.assertIsNone(server.recorded_trust(self.slash(self.projects)))
+        self.write({"projects": {self.slash(self.repo) + "/": {"hasTrustDialogAccepted": True}}})
+        self.assertTrue(server.exactly_trusted(self.repo))
+        self.assertFalse(server.recorded_trust(self.slash(self.repo)))  # that one entry only
+
+    def test_a_projects_folder_holding_what_nouez_protects_is_refused(self):
+        """0.26.3: the dispatcher's projects folder can't be a drive's root, or be or hold the home
+        folder, Claude Code's settings folder or nouez's cache, also through a link."""
+        home = os.path.join(self.tmp, "home")
+        os.mkdir(home)
+        os.makedirs(self.data_home, exist_ok=True)
+        env = {"HOME": home, "USERPROFILE": home, "XDG_CACHE_HOME": self.data_home}
+        with mock.patch.dict(server.os.environ, env):
+            problem = server.projects_folder_problem
+            self.assertIn("drive's root", problem(os.path.abspath(os.sep)))
+            for folder, says in ((self.tmp, "your home folder"), (home, "your home folder"),
+                                 (self.config, "Claude Code's settings folder"),
+                                 (self.data_home, "nouez's cache folder")):
+                with self.subTest(folder=folder):
+                    self.assertIn(says, problem(folder))
+            for folder in (self.projects, os.path.join(home, "Projects"), os.path.join(self.data_home, "other")):
+                self.assertIsNone(problem(folder))
+            link = os.path.join(self.projects, "to-home")
+            dir_link(home, link)
+            self.assertIn("your home folder", problem(link))
+            real_config = os.path.join(self.projects, "private", "config")
+            os.makedirs(real_config)
+            linked_config = os.path.join(self.tmp, "linked-config")
+            dir_link(real_config, linked_config)
+            with mock.patch.object(server, "claude_config_dir", lambda: linked_config):
+                self.assertIn("Claude Code's settings folder", problem(self.projects))  # where it really is
+            fallback = os.path.join(self.projects, "nouez-fallback")
+            os.makedirs(fallback)
+            with mock.patch.object(server.tempfile, "gettempdir", lambda: fallback),                     mock.patch.object(server, "nouez_cache_dir", side_effect=AssertionError("makes the folder")):
+                self.assertIn("the temporary folder nouez's cache can fall back to", problem(self.projects))
+            os.rmdir(linked_config) if os.name == "nt" else os.unlink(linked_config)
+            self.assertIn("records no trust at all", server.dispatcher_trust_problem(
+                self.repo, {"NOUEZ_DISPATCHER": "1", "NOUEZ_DISPATCHER_PROJECTS": self.tmp}))
+            os.rmdir(link) if os.name == "nt" else os.unlink(link)
+
+    def test_a_new_folder_is_checked_again_just_before_it_is_made(self):
+        """0.26.3: in the dispatcher, create=true with trust checks where the folder would go again
+        right before making it, as the folders stand after the user's prompt: a link put in meanwhile
+        is refused and nothing is made through it."""
+        outside = os.path.join(self.tmp, "outside")
+        os.mkdir(outside)
+        parent = os.path.join(self.projects, "swap")
+        os.mkdir(parent)
+        new = os.path.join(parent, "new")
+
+        def approve_and_swap(*args, **kwargs):
+            os.rename(parent, os.path.join(self.projects, "moved"))
+            dir_link(outside, parent)
+        with mock.patch.dict(server.os.environ, {"NOUEZ_DISPATCHER": "1", "NOUEZ_DISPATCHER_PROJECTS": self.projects,
+                                                 "NOUEZ_ASK_TRUST": "1"}), \
+                mock.patch.object(server, "user_approves", approve_and_swap):
+            with self.assertRaisesRegex(server.BridgeError, "phone dispatcher"):
+                self.open({"cwd": new, "create": True, "trust": True})
+        self.assertEqual(os.listdir(outside), [])
+        os.rmdir(parent) if os.name == "nt" else os.unlink(parent)
+
     def test_relative_backup_folders_are_ignored(self):
         with mock.patch.dict(server.os.environ, {"LOCALAPPDATA": "rel", "XDG_STATE_HOME": "rel"}):
             folder = server.trust_backup_dir()
@@ -7247,15 +7415,19 @@ class TrustReportFirstTest(unittest.TestCase):
         """0.26.1: in the phone dispatcher, code (not only its instructions) keeps trust inside its
         projects folder: a folder outside it, the folder itself, or an unknown one is refused with
         nothing changed or made; outside the dispatcher the projects folder plays no part."""
-        parent = os.path.dirname(self.dir)
+        parent = tempfile.mkdtemp(prefix="nouez-test-projects-")  # not the temporary folder itself, refused
+        self.addCleanup(shutil.rmtree, parent, True)
+        shutil.move(self.dir, os.path.join(parent, "repo"))
+        self.dir = os.path.join(parent, "repo")
         other = tempfile.mkdtemp(prefix="nouez-test-elsewhere-")
         self.addCleanup(shutil.rmtree, other, True)
         mark = {"NOUEZ_DISPATCHER": "1"}
+        os.mkdir(os.path.join(self.dir, "x"))  # macOS and Linux go through it for `x/..`
         self.assertIsNone(server.dispatcher_trust_problem(self.dir, {"NOUEZ_DISPATCHER_PROJECTS": other}))
         self.assertIsNone(server.dispatcher_trust_problem(self.dir, {**mark, "NOUEZ_DISPATCHER_PROJECTS": parent}))
         for env, says in (({**mark, "NOUEZ_DISPATCHER_PROJECTS": other}, "isn't one"),
                           ({**mark, "NOUEZ_DISPATCHER_PROJECTS": self.dir}, "isn't one"),
-                          ({**mark, "NOUEZ_DISPATCHER_PROJECTS": os.path.join(self.dir, "..", "..")}, None),
+                          ({**mark, "NOUEZ_DISPATCHER_PROJECTS": os.path.join(self.dir, "x", "..", "..")}, None),
                           (mark, "can't tell which folder"),
                           ({**mark, "NOUEZ_DISPATCHER_PROJECTS": "relative"}, "can't tell which folder")):
             with self.subTest(env=env):
@@ -7281,8 +7453,14 @@ class TrustReportFirstTest(unittest.TestCase):
         dir_link(inner, within)
         self.assertIn("no link below it", server.dispatcher_trust_problem(within, boxed))
         self.assertIn("isn't one", server.dispatcher_trust_problem(os.path.join(within, "sub"), boxed))
-        respelled = other.replace("nouez-test-elsewhere", "NOUEZ-test-elsewhere")  # the same folder where case doesn't count
-        self.assertIn("isn't one", server.dispatcher_trust_problem(os.path.join(respelled, "inner"), boxed))
+        # 0.26.3: spelled in another case with no link above it (git keeps a worktree's main checkout
+        # as it was typed), the folder on disk counts: on Windows, where case doesn't count, inside.
+        respelled = other.replace("nouez-test-elsewhere", "NOUEZ-test-elsewhere")
+        problem = server.dispatcher_trust_problem(os.path.join(respelled, "inner"), boxed)
+        if os.name == "nt":
+            self.assertIsNone(problem)
+        else:  # realpath keeps the case as written there, and Linux tells the two apart
+            self.assertIn("isn't one", problem)
         lower = {**mark, "NOUEZ_DISPATCHER_PROJECTS": other[0].lower() + other[1:]}  # a drive letter's case is no spelling
         self.assertIsNone(server.dispatcher_trust_problem(inner, lower))
         for link in (into, out_of, within):  # the links only, not what they lead to
@@ -9322,6 +9500,23 @@ class DispatcherTest(unittest.TestCase):
         out = []
         code = server.dispatcher_setup(self.folder, *args, out=out.append, **kwargs)
         return code, "\n".join(out)
+
+    def test_setup_and_install_refuse_a_projects_folder_holding_claude_codes_settings(self):
+        """0.26.3: the folder that holds the dispatcher's is where the phone can record trust, so
+        setup refuses one that holds Claude Code's settings folder, and install lists it as a problem."""
+        settings = os.path.join(self.projects, ".claude")
+        with mock.patch.object(server, "claude_config_dir", lambda: settings):
+            code, out = self.setup()
+        self.assertEqual(code, 1, out)
+        self.assertIn("Claude Code's settings folder", out)
+        self.assertIn("--folder", out)
+        self.assertFalse(os.path.exists(self.folder))
+        self.assertEqual(self.setup()[0], 0)
+        with mock.patch.object(server, "claude_config_dir", lambda: settings):
+            code, out, ran, popen = self.install("linux")
+        self.assertEqual(code, 1, out)
+        self.assertIn("would record trust nowhere", out)
+        popen.assert_not_called()
 
     def test_setup_makes_the_folder_its_instructions_and_rules(self):
         code, out = self.setup()

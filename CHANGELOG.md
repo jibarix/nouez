@@ -6,6 +6,20 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.26.3] - 2026-11-26
+
+Recording trust made exact about which entry it writes and takes back, and the phone dispatcher's projects folder checked. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
+
+### Fixed
+
+- nouez writes trust to the one entry Claude Code's state file has for the folder, told by the folder on disk, and reads that entry back after writing. Until now any entry that read the same counted, so on Windows a case-sensitive folder's `projects` could be taken for its `Projects`, both when writing and when telling whether a folder is already trusted.
+  - When the file spells the folder more than one way and none of them is trusted, nouez can't tell which one Claude Code reads, so it records none and says so; answer Claude Code's question on the computer.
+  - Taking trust back changes only the entry nouez wrote. Trust already in the file nouez compares just before writing is left alone, and nouez no longer reports it as its own; a Claude Code session that saves the file in the moment between that comparison and the read-back can't be told apart.
+  - If the file can't be read back after the write, nouez says so and names the backup, rather than retrying over it. A state file that can't be read no longer counts as an answer that the folder isn't trusted: `trust: true` is refused at once, before any report, prompt or new folder.
+- The phone dispatcher records no trust when its projects folder is a drive's root or is or holds your home folder, Claude Code's settings folder or nouez's cache, also where a link takes them, or the temporary folder nouez's cache can fall back to: trust recorded there would reach far more than projects. `dispatcher setup` refuses such a folder and `dispatcher install` lists it as a problem; pass `--folder` with a folder inside a folder of projects. A projects folder that holds the nouez clone, such as `~/Projects`, is fine.
+- In the dispatcher, a folder that `create: true` makes with `trust: true` is checked again right before it is made, after any prompt, so a link put in meanwhile is refused with nothing made through it.
+- On Windows, the dispatcher accepts a folder spelled in another case than it is on disk when no link is on its path. Git keeps a worktree's main checkout as it was typed, so a worktree of a project inside the projects folder was refused.
+
 ## [0.26.2] - 2026-11-25
 
 The status screen is no longer arranged. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version. If you turned automatic arranging on, the arranger already running keeps the old behavior until it ends: turn it off and on again (`ArrangeWindows` with `auto: false`, then `auto: true`).
@@ -707,7 +721,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.26.2...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.26.3...HEAD
+[0.26.3]: https://github.com/jibarix/nouez/compare/v0.26.2...v0.26.3
 [0.26.2]: https://github.com/jibarix/nouez/compare/v0.26.1...v0.26.2
 [0.26.1]: https://github.com/jibarix/nouez/compare/v0.26.0...v0.26.1
 [0.26.0]: https://github.com/jibarix/nouez/compare/v0.25.0...v0.26.0
