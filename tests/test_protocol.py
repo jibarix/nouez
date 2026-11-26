@@ -4133,6 +4133,66 @@ class BudgetTest(unittest.TestCase):
         for used, resets in ((None, self.NOW + 60), (True, self.NOW + 60), (5, self.NOW - 1), (5, float("nan"))):
             self.assertIsNone(server.window_text("weekly", used, resets, week, self.NOW))
 
+    def test_one_reader_per_subscription(self):
+        """0.26.4: routing, ConsultantBudget, the status screen and the usage log read each
+        subscription's windows the one way, so they agree."""
+        now, week, scr = self.NOW, 7 * 86400, server.Screen(False)
+        # Codex says a limit is reached: routing is blocked, and the screen shows it, with no reset time
+        rl = {"planType": "pro", "rateLimitReachedType": "workspace_credits_depleted",
+              "primary": {"usedPercent": 20, "windowDurationMins": 10080, "resetsAt": now + 86400},
+              "secondary": {"usedPercent": 99, "windowDurationMins": 300, "resetsAt": now - 1}}  # has reset
+        got = server.codex_windows(rl, now)
+        self.assertEqual([(q["label"], q["used"]) for q in got["windows"]], [("weekly", 20)])
+        self.assertEqual(got["limit_reached"], "workspace_credits_depleted")
+        state = {}
+        server.codex_budget(mock.Mock(request=lambda m, p: {"rateLimits": rl} if m.startswith("account") else {}),
+                            now, state)
+        self.assertEqual(server.usage_outlook(state["windows"], now)[0], "blocked")
+        (codex,) = [g for g in server.subscription_groups(now, {"rateLimits": rl}, None, os.path.join(self.dir, "x"))
+                    if g["title"].startswith("Codex")]
+        self.assertEqual(codex["title"], "Codex pro")
+        self.assertEqual([label for _, label, _ in codex["entries"]], ["weekly", "limit"])
+        rows = "\n".join(server.group_rows(scr, now, codex) + server.card_rows(scr, codex))
+        self.assertIn("limit reached: workspace_credits_depleted", rows)
+        self.assertEqual(rows.count("resets "), 1)  # the weekly window's only
+        self.assertIn("100%", server.badge(scr, codex))
+        # the daemon answered with no windows: no falling back to the session file
+        saved = {"ts": now - 60, "primary": {"used_percent": 50, "window_minutes": 10080, "resets_at": now + 86400}}
+        (codex,) = [g for g in server.subscription_groups(now, {"rateLimits": {}}, saved, os.path.join(self.dir, "x"))
+                    if g["title"].startswith("Codex")]
+        self.assertEqual(codex["entries"], [])
+        self.assertEqual(codex["empty"], "no current usage windows: the daemon reports none")
+        (codex,) = [g for g in server.subscription_groups(now, None, saved, os.path.join(self.dir, "x"))
+                    if g["title"].startswith("Codex")]
+        self.assertEqual(codex["entries"][0][2]["used"], 50)
+        self.assertIsNone(server.codex_saved_windows({k: v for k, v in saved.items() if k != "ts"}, now))
+        # Antigravity: rounded once, so 99.96% used is used up on the screen as for routing
+        live = {"groups": [{"name": "Gemini Models", "buckets": [
+            {"window": "weekly", "remaining_fraction": 0.0004, "reset_time": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 86400))},
+            {"window": "5h", "remaining_fraction": 0.5, "reset_time": "2000-01-01T00:00:00Z"}]}]}  # has reset
+        before = json.dumps(live)
+        state = {}
+        server.agy_budget(now, live, state)
+        self.assertEqual(state["groups"]["Gemini Models"], [(week, 100.0, now + 86400)])
+        (entry,) = server.agy_group(now, live)["entries"]
+        self.assertEqual((entry[2]["used"], entry[2]["rank"]), (100.0, 3))
+        self.assertEqual(json.dumps(live), before)  # agy's cached answer is never changed
+        # the usage log leaves out a window that has reset, for Antigravity as for the others
+        with mock.patch.object(server.time, "time", lambda: now):
+            self.assertEqual(server.agy_snapshot(live["groups"]), {"AG Gemini": {"weekly": 100.0}})
+        # Claude Code: each window keeps when it was observed; the file's own time is for doctor
+        path = os.path.join(self.dir, "claude.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"saved": now - 600, "rate_limits": {
+                "five_hour": {"used_percentage": 10, "resets_at": now + 3600, "observed": now - 60},
+                "seven_day": {"used_percentage": 40, "resets_at": now + 86400}}}, f)
+        quota = server.claude_quota(now, path)
+        self.assertEqual((quota["status"], quota["saved"]), ("ok", now - 600))
+        self.assertEqual([(q["label"], q["sampled"]) for q in quota["windows"]],
+                         [("5-hour", now - 60), ("weekly", now - 600)])
+        self.assertEqual(server.claude_quota(now, os.path.join(self.dir, "none"))["status"], "missing")
+
     def test_span_and_label(self):
         self.assertEqual(server.span_text(3 * 86400 + 5 * 3600 + 59), "3d 5h")
         self.assertEqual(server.span_text(4 * 3600 + 600), "4h 10m")
@@ -4560,15 +4620,18 @@ class UsageLogTest(HandlerTest):
         self.assertEqual(self.events(), [])
 
     def test_send_and_reply_are_logged(self):
+        later = time.time() + 7 * 86400  # the send reads the real clock: windows that haven't reset
         with open(os.path.join(self.dir, server.CLAUDE_USAGE_FILE), "w", encoding="utf-8") as f:
-            json.dump({"rate_limits": {"seven_day": {"used_percentage": 41, "resets_at": self.NOW}}}, f)
+            json.dump({"rate_limits": {"seven_day": {"used_percentage": 41, "resets_at": later}}}, f)
         thread = self.consultant("log001", model="gpt-a", reasoningEffort="high")
         daemon = self.use(FakeDaemon([thread], answer="Verdict: CHANGES\n1. fix x"))
         plain = daemon.request
 
         def request(method, params):
             if method == "account/rateLimits/read":
-                return {"rateLimits": {"primary": {"usedPercent": 12, "windowDurationMins": 10080}}}
+                # 0.26.4: a window past its reset is left out, as ConsultantBudget and top do
+                return {"rateLimits": {"primary": {"usedPercent": 12, "windowDurationMins": 10080, "resetsAt": later},
+                                       "secondary": {"usedPercent": 99, "windowDurationMins": 300, "resetsAt": 1}}}
             return plain(method, params)
         daemon.request = request
         out = server.send_consultant_message({"to": thread["id"], "message": "review this", "model": "gpt-b",
@@ -4981,7 +5044,7 @@ class UsageLogTest(HandlerTest):
         self.assertRegex(text, r"pace: ~8[78]% by the reset")  # 75% used in 6 of 7 days
         self.assertRegex(text, r"\n +5-hour .*  0%")
         self.assertNotRegex(text, r"Claude\+GPT +weekly")
-        self.assertRegex(text, r"\n    New group +usage .* 50%")
+        self.assertRegex(text, r"\n    New group +daily .* 50%")  # 0.26.4: its own name, as ConsultantBudget has it
         frame = "\n".join(server.top_frame(scr, now, 7, None, {}, [], False, 120, live))
         self.assertIn("│   Gemini ", frame)
         frame = server.top_frame(scr, now, 7, None, {}, [], False, 200, live)
@@ -5113,6 +5176,25 @@ class SuggestTest(unittest.TestCase):
     def pick(self, kind, **state):
         got = server.suggest_consultant(kind, state, self.NOW)
         return got.get("none") or (got["provider"], got["model"], got["effort"])
+
+    def test_a_week_percent_that_isnt_a_pace_isnt_called_one(self):
+        """0.26.4: an old reading, or one too early in the week to project from, is the least the
+        week reaches, and the words say so; a projection is a pace."""
+        week = 7 * self.DAY
+        old = [(week, 95, self.NOW + 3 * self.DAY, self.NOW - 7200)]
+        self.assertEqual(server.usage_outlook_detail(old, self.NOW), ("tight", 95, "old"))
+        self.assertEqual(server.usage_outlook(old, self.NOW), ("tight", 95))  # its callers' two, unchanged
+        self.assertEqual(server.claude_pace({"windows": old}, self.NOW),
+                         ("tight", "at 95% of its week or more (an old reading)"))
+        early = [(week, 75, self.NOW + week - 3600, self.NOW)]
+        self.assertEqual(server.claude_pace({"windows": early}, self.NOW),
+                         ("busy", "at 75% of its week or more (too early in the week for a pace)"))
+        paced = [(week, 30, self.NOW + week / 2, self.NOW)]
+        self.assertEqual(server.claude_pace({"windows": paced}, self.NOW), ("ok", "on pace for about 60% of its week"))
+        self.assertEqual(server.usage_outlook_detail([], self.NOW), ("unknown", None, None))
+        got = server.suggest_consultant("review", {"codex": self.codex(used=75, days_left=6.9)}, self.NOW)
+        self.assertIn("Codex at 75% of its week or more (too early in the week for a pace)", got["why"])
+        self.assertFalse(any("on pace" in w for w in got["why"]), got["why"])
 
     def test_the_route_at_send_stays_with_the_consultants_provider(self):
         """0.26.0: a send naming no model or effort takes the kind's suggestion, from that provider's
@@ -6827,6 +6909,22 @@ class RoundTwoFixesTest(unittest.TestCase):
         with mock.patch.object(server, "nouez_cache_dir", lambda: root):
             snap = server.usage_snapshot(client)
         self.assertEqual(snap.get("claude"), {server.window_label(7 * 86400): 40})
+
+    def test_usage_log_judges_resets_after_the_daemon_answers(self):
+        """0.26.4: a Claude window that resets while the daemon answers is left out."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with open(os.path.join(root, server.CLAUDE_USAGE_FILE), "w", encoding="utf-8") as f:
+            json.dump({"rate_limits": {"seven_day": {"used_percentage": 98, "resets_at": 101}}}, f)
+        clock = [100.0]
+
+        def request(method, params):
+            clock[0] = 102.0  # the answer comes after the reset
+            return {"rateLimits": {"primary": {"usedPercent": 12, "windowDurationMins": 10080, "resetsAt": 101.5},
+                                   "secondary": {"usedPercent": 30, "windowDurationMins": 300, "resetsAt": 500}}}
+        with mock.patch.object(server, "nouez_cache_dir", lambda: root),                 mock.patch.object(server.time, "time", lambda: clock[0]):
+            snap = server.usage_snapshot(mock.Mock(request=request))
+        self.assertEqual(snap, {"codex": {server.window_label(300 * 60): 30}})
 
 
 class SignInTest(unittest.TestCase):
