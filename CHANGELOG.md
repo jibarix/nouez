@@ -6,6 +6,29 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-11-26
+
+Easier first steps and lighter use of Claude Code's week: a new dispatcher needs no `~/Projects`, setup offers the status line, research and drafts of code go to Antigravity's Claude models, and every rule in docs/rules.md has an example. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
+
+### Added
+
+- docs/rules.md has a "For example" column: a short scenario for every rule. Fifteen rules are also stated more exactly (the order of the routing rules, a named provider, the usage reminder, long replies, review rounds outside git, second opinions, files left out of a diff, additions to a running turn, the trust report, doctor's checks, the supervisor's allow rules, the Windows cache folder).
+- doctor lists nouez's copies of `~/.claude.json` (how many, the newest, where) and how to put one back by hand. Each copy's name now carries a tag of the profile it came from, so with more than one Claude Code profile (`CLAUDE_CONFIG_DIR`), doctor offers only that profile's copies; others, and copies from before 0.28.0, are only counted.
+- The README says what nouez changes in your Claude Code setup, and nothing else.
+
+### Changed
+
+- Research goes first to Antigravity's Claude models whenever that quota has room, sparing Claude Code's and Codex's usage; for research that needs a page's text the suggestion also names Codex, since Antigravity can search but can't open a page. A new kind, `draft`, sends code to write to the same models as text that Claude checks and applies, so Claude stays the only one editing your files; past 70% of Claude Code's week it is told to use it. The rule that research starts an Antigravity week not yet begun is gone: research goes there first anyway.
+- `dispatcher setup` offers nouez's status line when Claude Code has none, and adds it only on a yes at the terminal or with `--statusline`, after a copy of the settings. A status line of your own is kept.
+- A new install puts the phone dispatcher in `~/.nouez/dispatcher`; one set up in `~/Projects/dispatcher` stays there. `dispatcher setup` or `install` without `--projects` or `--no-projects` then lists the folders that look like they hold your projects, with how many trusted projects each holds, and changes nothing until you pick.
+- `OpenClaudeSession` `create: true` makes the new folder a project: `git init` there (unless it is inside a git repository already, and without git's sample hooks) and a starter `CLAUDE.md`. Without git it says so and opens anyway.
+- Resuming goes through the list: Claude is told to show it, and `OpenClaudeSession` `resume` takes only the id of a conversation from `ListClaudeSessions` with `cwd` (newest first, each marked open or not). `resume: "latest"` is refused with that pointer. The id's transcript must also have run in the same folder on disk, so a case-sensitive folder's `Repo` and `repo` are told apart.
+- `ListProjects` has no `recent` list any more: recency matters only for resuming, and `ListClaudeSessions` with `cwd` lists a folder's conversations.
+- **An Antigravity review now gets the diff's text, which goes to Google.** `revision: true` puts the diff in the message by default, since an Antigravity consultant runs no git; `attach_diff: false` sends only the revision line, as before (the consultant can still read the project's files).
+- A provider you name ("ask Gemini") holds for the next message of that kind only, not for half an hour; the message after it gets nouez's usual pick again.
+- For a review, the suggestion now says to have the reviewer weigh each finding itself before giving it: the user's setup and what they do, what goes wrong, where they would notice it, and whether a user in a normal setup would meet it. Only those count as findings and make the verdict CHANGES; the rest are left out or listed as not blocking. Re-checks, bug hunts and plan critiques weigh theirs the same way.
+- An Antigravity consultant's standing instructions no longer say it can read web pages: it searches the web but opens no page.
+
 ## [0.27.0] - 2026-11-26
 
 Projects in any folder: the phone dispatcher can have several projects folders, or none, and its folder no longer needs a `~/Projects`. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
@@ -751,7 +774,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/jibarix/nouez/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/jibarix/nouez/compare/v0.26.4...v0.27.0
 [0.26.4]: https://github.com/jibarix/nouez/compare/v0.26.3...v0.26.4
 [0.26.3]: https://github.com/jibarix/nouez/compare/v0.26.2...v0.26.3

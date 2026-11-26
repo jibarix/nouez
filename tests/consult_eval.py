@@ -45,7 +45,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_SERVER = os.path.join(os.path.dirname(HERE), "server.py")
 DAY = 86400
 SETUPS = ("both", "codex", "antigravity", "neither")
-CONSULT_KINDS = ("quick-check", "re-check", "review", "bug-hunt", "plan-critique", "research", "fact-check", "other")
+CONSULT_KINDS = ("quick-check", "re-check", "review", "bug-hunt", "plan-critique", "research", "draft", "fact-check",
+                 "other")
 CALLS = "eval-calls.jsonl"  # the calls the stub accepted, in its cache folder
 
 # --- Canned usage -------------------------------------------------------------------------------
@@ -512,7 +513,8 @@ EXPECTED = {
             'review': ('codex', 'gpt-6.2-astra', 'high'),
             'bug-hunt': ('codex', 'gpt-6.2-astra', 'high'),
             'plan-critique': ('antigravity', 'gemini-4-neon', 'xhigh'),
-            'research': ('codex', 'gpt-6.2-astra', 'xhigh'),
+            'research': ('antigravity', 'claude-opus-5-5', 'high'),
+            'draft': ('antigravity', 'claude-opus-5-5', 'high'),
             'fact-check': ('codex', 'gpt-6.2-astra', 'high'),
             'other': ('codex', 'gpt-6.2-sol', 'medium'),
         },
@@ -522,7 +524,8 @@ EXPECTED = {
             'review': ('antigravity', 'gemini-4-neon', 'high'),
             'bug-hunt': ('antigravity', 'gemini-4-neon', 'high'),
             'plan-critique': ('antigravity', 'gemini-4-neon', 'xhigh'),
-            'research': ('antigravity', 'gemini-4-neon', 'xhigh'),
+            'research': ('antigravity', 'claude-opus-5-5', 'high'),
+            'draft': ('antigravity', 'claude-opus-5-5', 'high'),
             'fact-check': ('antigravity', 'claude-opus-5-5', 'high'),
             'other': ('antigravity', 'gemini-4-neon', 'high'),
         },
@@ -532,7 +535,8 @@ EXPECTED = {
             'review': ('antigravity', 'gemini-4-neon', 'high'),
             'bug-hunt': ('antigravity', 'gemini-4-neon', 'high'),
             'plan-critique': ('antigravity', 'gemini-4-neon', 'xhigh'),
-            'research': ('antigravity', 'gemini-4-neon', 'xhigh'),
+            'research': ('antigravity', 'claude-opus-5-5', 'high'),
+            'draft': ('antigravity', 'claude-opus-5-5', 'high'),
             'fact-check': ('antigravity', 'claude-opus-5-5', 'high'),
             'other': ('antigravity', 'gemini-4-neon', 'high'),
         },
@@ -542,7 +546,8 @@ EXPECTED = {
             'review': ('codex', 'gpt-6.2-astra', 'high'),
             'bug-hunt': ('codex', 'gpt-6.2-astra', 'high'),
             'plan-critique': ('antigravity', 'gemini-4-neon', 'xhigh'),
-            'research': ('codex', 'gpt-6.2-astra', 'xhigh'),
+            'research': ('antigravity', 'claude-opus-5-5', 'high'),
+            'draft': ('antigravity', 'claude-opus-5-5', 'high'),
             'fact-check': ('codex', 'gpt-6.2-astra', 'high'),
             'other': ('codex', 'gpt-6.2-sol', 'medium'),
         },
@@ -553,6 +558,7 @@ EXPECTED = {
             'bug-hunt': ('codex', 'gpt-6.2-astra', 'high'),
             'plan-critique': ('antigravity', 'gemini-4-neon', 'xhigh'),
             'research': ('antigravity', 'claude-opus-5-5', 'high'),
+            'draft': ('antigravity', 'claude-opus-5-5', 'high'),
             'fact-check': ('codex', 'gpt-6.2-astra', 'high'),
             'other': ('codex', 'gpt-6.2-sol', 'medium'),
         },
@@ -565,6 +571,7 @@ EXPECTED = {
             'bug-hunt': ('codex', 'gpt-6.2-astra', 'high'),
             'plan-critique': ('codex', 'gpt-6.2-astra', 'high'),
             'research': ('codex', 'gpt-6.2-astra', 'xhigh'),
+            'draft': ('codex', 'gpt-6.2-astra', 'high'),
             'fact-check': ('codex', 'gpt-6.2-astra', 'high'),
             'other': ('codex', 'gpt-6.2-sol', 'medium'),
         },
@@ -575,6 +582,7 @@ EXPECTED = {
             'bug-hunt': ('codex', 'gpt-6.2-astra', 'medium'),
             'plan-critique': ('codex', 'gpt-6.2-astra', 'medium'),
             'research': ('codex', 'gpt-6.2-astra', 'high'),
+            'draft': ('codex', 'gpt-6.2-astra', 'medium'),
             'fact-check': ('codex', 'gpt-6.2-astra', 'medium'),
             'other': ('codex', 'gpt-6.2-sol', 'low'),
         },
@@ -586,6 +594,7 @@ EXPECTED = {
             'bug-hunt': ('codex', 'gpt-6.2-astra', 'high'),
             'plan-critique': ('codex', 'gpt-6.2-astra', 'high'),
             'research': ('codex', 'gpt-6.2-astra', 'xhigh'),
+            'draft': ('codex', 'gpt-6.2-astra', 'high'),
             'fact-check': ('codex', 'gpt-6.2-astra', 'high'),
             'other': ('codex', 'gpt-6.2-sol', 'medium'),
         },
@@ -596,6 +605,7 @@ EXPECTED = {
             'bug-hunt': ('codex', 'gpt-6.2-astra', 'high'),
             'plan-critique': ('codex', 'gpt-6.2-astra', 'high'),
             'research': ('codex', 'gpt-6.2-astra', 'xhigh'),
+            'draft': ('codex', 'gpt-6.2-astra', 'high'),
             'fact-check': ('codex', 'gpt-6.2-astra', 'high'),
             'other': ('codex', 'gpt-6.2-sol', 'medium'),
         },
@@ -607,7 +617,8 @@ EXPECTED = {
             'review': ('antigravity', 'gemini-4-neon', 'high'),
             'bug-hunt': ('antigravity', 'gemini-4-neon', 'high'),
             'plan-critique': ('antigravity', 'gemini-4-neon', 'xhigh'),
-            'research': ('antigravity', 'gemini-4-neon', 'xhigh'),
+            'research': ('antigravity', 'claude-opus-5-5', 'high'),
+            'draft': ('antigravity', 'claude-opus-5-5', 'high'),
             'fact-check': ('antigravity', 'claude-opus-5-5', 'high'),
             'other': ('antigravity', 'gemini-4-neon', 'high'),
         },
@@ -617,7 +628,8 @@ EXPECTED = {
             'review': ('antigravity', 'gemini-4-neon', 'high'),
             'bug-hunt': ('antigravity', 'gemini-4-neon', 'high'),
             'plan-critique': ('antigravity', 'gemini-4-neon', 'xhigh'),
-            'research': ('antigravity', 'gemini-4-neon', 'xhigh'),
+            'research': ('antigravity', 'claude-opus-5-5', 'high'),
+            'draft': ('antigravity', 'claude-opus-5-5', 'high'),
             'fact-check': ('antigravity', 'claude-opus-5-5', 'high'),
             'other': ('antigravity', 'gemini-4-neon', 'high'),
         },
@@ -627,7 +639,8 @@ EXPECTED = {
             'review': ('antigravity', 'gemini-4-neon', 'high'),
             'bug-hunt': ('antigravity', 'gemini-4-neon', 'high'),
             'plan-critique': ('antigravity', 'gemini-4-neon', 'xhigh'),
-            'research': ('antigravity', 'gemini-4-neon', 'xhigh'),
+            'research': ('antigravity', 'claude-opus-5-5', 'high'),
+            'draft': ('antigravity', 'claude-opus-5-5', 'high'),
             'fact-check': ('antigravity', 'claude-opus-5-5', 'high'),
             'other': ('antigravity', 'gemini-4-neon', 'high'),
         },
@@ -637,7 +650,8 @@ EXPECTED = {
             'review': ('antigravity', 'gemini-4-neon', 'high'),
             'bug-hunt': ('antigravity', 'gemini-4-neon', 'high'),
             'plan-critique': ('antigravity', 'gemini-4-neon', 'xhigh'),
-            'research': ('antigravity', 'gemini-4-neon', 'xhigh'),
+            'research': ('antigravity', 'claude-opus-5-5', 'high'),
+            'draft': ('antigravity', 'claude-opus-5-5', 'high'),
             'fact-check': ('antigravity', 'claude-opus-5-5', 'high'),
             'other': ('antigravity', 'gemini-4-neon', 'high'),
         },
@@ -648,6 +662,7 @@ EXPECTED = {
             'bug-hunt': ('antigravity', 'gemini-4-neon', 'high'),
             'plan-critique': ('antigravity', 'gemini-4-neon', 'xhigh'),
             'research': ('antigravity', 'claude-opus-5-5', 'high'),
+            'draft': ('antigravity', 'claude-opus-5-5', 'high'),
             'fact-check': ('antigravity', 'claude-opus-5-5', 'high'),
             'other': ('antigravity', 'gemini-4-neon', 'high'),
         },
@@ -669,6 +684,13 @@ def choice_of(r):
     return provider, send.get("model") or default, send.get("effort"), r["send"].get("kind")
 
 
+# Research that reads current web pages: the suggestion names Codex for page reading (an Antigravity
+# consultant searches the web but opens no page), so with both installed and Codex not used up, its
+# Codex route counts too, at the level the suggestion gives for it (lower when Codex is tight).
+PAGE_CASES = {"research-config", "research-sqlite"}
+PAGE_ROUTES = {("codex", "gpt-6.2-astra", "xhigh"), ("codex", "gpt-6.2-astra", "high")}
+
+
 def score(results, opts, expected):
     lines = []
     room = bool(expected)  # with no provider installed or with room, nothing should consult
@@ -680,7 +702,9 @@ def score(results, opts, expected):
             want = expected.get(kind if kind in CONSULT_KINDS else (r["fits"] or ["other"])[0])
             fits = kind in r["fits"]  # a case that expects no consultation has no kind that fits
             r["choice"] = {"provider": provider, "model": model, "effort": effort, "kind": kind,
-                           "expected": want, "right": fits and want == (provider, model, effort),
+                           "expected": want, "right": fits and (want == (provider, model, effort) or (
+                               r["case"] in PAGE_CASES and (provider, model, effort) in PAGE_ROUTES
+                               and opts.setup == "both" and opts.scenario != "codex-out")),
                            "kind_fits": fits, "budget_first": bool(r["budget"])}
     by = {}
     for r in results:

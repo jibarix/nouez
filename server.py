@@ -69,7 +69,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.27.0"
+SERVER_VERSION = "0.28.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -3231,29 +3231,16 @@ def saved_conversations(cwd, cancel=None):
 
 def resume_target(value, cwd, running):
     """The conversation OpenClaudeSession's `resume` names: (session id, note). `value` is a session id
-    or "latest", the newest conversation held in cwd that no running session has open."""
+    the user picked from ListClaudeSessions' list of the folder's conversations; there is no "latest",
+    so the user always sees the list, each marked open or not, before one is resumed."""
     if not isinstance(value, str):
-        raise BridgeError("resume must be a session id or \"latest\".")
+        raise BridgeError("resume must be a session id.")
     in_use = {str(s.get("session_id") or "").lower(): s for s in running}
-    if value.strip().lower() == "latest":
-        skipped = []
-        for mtime, sid, _ in saved_conversations(cwd):
-            if sid.lower() not in in_use:
-                break
-            skipped.append(sid)
-        else:
-            raise BridgeError(f"No earlier conversation in {cwd} to resume"
-                              + (" that isn't open in a running session" if skipped else "")
-                              + ". Nothing was opened.")
-        note = f"It resumes the latest conversation in this folder, {sid}, last active {mtime_text(mtime)}."
-        if skipped:
-            note += (f" Skipped {len(skipped)} newer one(s) already open in a running session: "
-                     + ", ".join(f"{in_use[i.lower()]['name']} (pid {in_use[i.lower()]['pid']})" for i in skipped) + ".")
-        return sid, note
     sid = value.strip().lower()
     if not CLAUDE_SESSION_ID.fullmatch(sid):
-        raise BridgeError("resume must be a session id (such as 4b4f3c8c-0010-4e93-a427-9db7032f2be3) or "
-                          "\"latest\". Nothing was opened.")
+        raise BridgeError("resume must be a session id (such as 4b4f3c8c-0010-4e93-a427-9db7032f2be3) that the "
+                          "user picked: ListClaudeSessions with cwd lists the folder's conversations, newest first, "
+                          "each marked open or not; show the user the list. Nothing was opened.")
     if sid.lower() in in_use:
         s = in_use[sid.lower()]
         raise BridgeError(f"Conversation {sid} is already open in a running session, {s['name']} (pid {s['pid']}), "
@@ -3271,7 +3258,7 @@ def resume_target(value, cwd, running):
         raise BridgeError(f"Conversation {sid}'s transcript doesn't say which folder it ran in, so it can't be "
                           f"checked that it ran in {cwd}, the only folder Claude Code resumes it in. "
                           "Nothing was opened.")
-    if not same_folder(ran_in, cwd):
+    if not ran_here(path, cwd):  # by its spelling and, when both exist, the folder on disk
         raise BridgeError(f"Conversation {sid} ran in {ran_in}, not {cwd}; Claude Code resumes it only "
                           f"there. Open the session with cwd {ran_in}. Nothing was opened.")
     return sid, f"It resumes conversation {sid}, last active {mtime_text(os.path.getmtime(path))}."
@@ -3382,7 +3369,46 @@ def trust_backup_dir():
     return os.path.join(base, "nouez", TRUST_BACKUP_FOLDER)
 
 
-def backup_claude_state(text):
+def state_file_tag(state):
+    """A short tag for the state file a backup copies, so a copy names its Claude Code profile."""
+    return hashlib.sha256(os.path.normcase(os.path.abspath(state)).encode("utf-8", "surrogatepass")).hexdigest()[:8]
+
+
+def trust_backups_report():
+    """doctor's note on nouez's copies of Claude Code's state file: how many are of this profile's, the
+    newest, and how to put one back by hand; the others (another profile's, or from before 0.28.0, when
+    copies named none) are only counted. Only regular files count, as in backup_claude_state. None when
+    there are none."""
+    folder = trust_backup_dir()
+    state = claude_state_file()
+    tag = state_file_tag(state)
+    mine, others = [], 0
+    for path in glob.glob(os.path.join(glob.escape(folder), ".claude.json.*.bak")):
+        try:
+            if not regular_file(path):
+                continue
+            if os.path.basename(path).split(".")[4:5] == [tag]:  # .claude.json.<stamp>.<tag>.<random>.bak
+                mine.append((os.lstat(path).st_mtime, path))
+            else:
+                others += 1
+        except OSError:
+            pass
+    if not mine and not others:
+        return None
+    rest = (f" {others} other cop{'ies are' if others != 1 else 'y is'} of another Claude Code profile's state "
+            "file, or from before 0.28.0, which didn't record whose: leave those unless you know where they came "
+            "from." if others else "")
+    if not mine:
+        return f"nouez has no copy of this profile's state file ({state}) in {folder}." + rest
+    when, newest = max(mine)
+    return (f"{len(mine)} cop{'ies' if len(mine) != 1 else 'y'} of this profile's state file, made before nouez "
+            f"recorded trust, {'are' if len(mine) != 1 else 'is'} in {folder} (the newest, "
+            f"{os.path.basename(newest)}, from {time.strftime('%Y-%m-%d %H:%M', time.localtime(when))}). To put "
+            f"one back: close every Claude Code window, then copy it over {state}. That undoes everything "
+            "Claude Code saved there since the copy was made." + rest)
+
+
+def backup_claude_state(text, state):
     """Save `text` (the state file as read) to a new dated backup, check it, and keep only the newest
     TRUST_BACKUPS_KEPT. Returns the backup's path. The copies hold all of Claude Code's state file,
     so their folder must be private (on macOS and Linux) and not a link, or nothing is changed."""
@@ -3396,7 +3422,8 @@ def backup_claude_state(text):
     except OSError as e:
         raise BridgeError(f"Couldn't back up Claude Code's settings to {folder}: {e}. Nothing was changed.")
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    fd, path = tempfile.mkstemp(prefix=f".claude.json.{stamp}.", suffix=".bak", dir=folder)  # private (0600)
+    fd, path = tempfile.mkstemp(prefix=f".claude.json.{stamp}.{state_file_tag(state)}.", suffix=".bak",
+                                dir=folder)  # private (0600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
@@ -3532,7 +3559,7 @@ def _record_trust(key, value):
             same = False
         if not same:
             raise BridgeError(f"{state} has values nouez can't write back unchanged. Nothing was changed.")
-        backup = backup_claude_state(text)
+        backup = backup_claude_state(text, state)
         with open(state, encoding="utf-8", newline="") as f:
             if f.read() != text:
                 continue  # a Claude Code session wrote it meanwhile: start over from its version
@@ -4296,6 +4323,35 @@ def refuse_dispatcher_trust(folder):
                           "Code's trust question on the computer.")
 
 
+STARTER_CLAUDE_MD = ("# {name}\n\nWhat this project is, how to build and test it, and the rules to follow "
+                     "here. Claude Code reads this file at the start of every session.\n")
+
+
+def start_project(folder):
+    """create: a folder OpenClaudeSession just made becomes a project: `git init` there, unless it is
+    inside a git work tree already, and a starter CLAUDE.md. Neither adds project settings, so the
+    new folder's trust report is still empty. Returns the notes for the result; a step that can't be
+    done is said, and the session opens anyway."""
+    notes = []
+    if not git_root(os.path.dirname(folder)):
+        git = which("git")  # never the project's own git.exe
+        # No template: git's sample hooks and the user's own template stay out of a new repository.
+        # An empty --template outranks GIT_TEMPLATE_DIR and init.templateDir; with no GIT_* variable,
+        # nouez's own environment can't point git at another repository (GIT_DIR) instead.
+        env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+        done = git and run_bytes([git, "init", "-q", "--template=", folder], 30, env=env)[0] is not None
+        notes.append("Made it a git repository (git init)." if done else
+                     "git isn't installed, so it isn't a git repository yet." if not git else
+                     "git init failed there, so it isn't a git repository yet.")
+    try:
+        with open(os.path.join(folder, "CLAUDE.md"), "x", encoding="utf-8", newline="\n") as f:
+            f.write(STARTER_CLAUDE_MD.format(name=os.path.basename(folder.rstrip("\\/"))))
+        notes.append("Wrote a starter CLAUDE.md for the project's instructions.")
+    except OSError as e:
+        notes.append(f"Couldn't write a starter CLAUDE.md ({e.strerror or e}).")
+    return notes
+
+
 def open_claude_session(args, cancel=None, progress=None):
     cwd = args.get("cwd")
     if not isinstance(cwd, str) or not rooted(cwd):
@@ -4346,6 +4402,7 @@ def open_claude_session(args, cancel=None, progress=None):
             refuse_new_folder()
         os.mkdir(cwd)
         created = True
+    starts = start_project(cwd) if created else []  # before the trust check: .git makes it a repo's top
     if not os.path.isdir(cwd):
         raise BridgeError("cwd must be the absolute path of an existing folder "
                           "(or pass create=true to make a new one).")
@@ -4354,15 +4411,15 @@ def open_claude_session(args, cancel=None, progress=None):
     if not isinstance(prompt, str):
         raise BridgeError("name and prompt must be strings.")
     if re.match(r"\s*/(resume|continue)\b", prompt):
-        raise BridgeError("To pick up an earlier conversation, pass resume (its session id, or \"latest\") "
-                          "instead of a /resume prompt. Nothing was opened.")
+        raise BridgeError("To pick up an earlier conversation, list them with ListClaudeSessions (cwd set), let the "
+                          "user pick one and pass its id as resume, instead of a /resume prompt. Nothing was opened.")
     model = args.get("model") or CLAUDE_MODEL
     effort = args.get("effort") or CLAUDE_EFFORT
     if not isinstance(model, str) or not CLAUDE_MODEL_NAME.fullmatch(model):
         raise BridgeError("model must be a Claude Code model alias (such as opus or sonnet) or a model's full name.")
     if effort not in CLAUDE_EFFORTS:
         raise BridgeError("effort must be one of " + ", ".join(CLAUDE_EFFORTS) + ".")
-    notes = [f"Created the folder {cwd}."] if created else []
+    notes = [" ".join([f"Created the folder {cwd}."] + starts)] if created else []
     trusted = folder_trusted(cwd)
     key, in_git = trust_key(cwd)
     launched = git_root(cwd) or cwd  # the checkout the session opens in: a worktree has its own files
@@ -4804,9 +4861,6 @@ def hidden_on_windows(path):
         return False
 
 
-RECENT_SHOWN = 20  # ListProjects with recent: the folders listed at most
-
-
 def project_marks(path, here, sessions, trusted):
     """ListProjects' marks for the folder `path`: git, trust, project settings, running sessions."""
     marks = []
@@ -4866,108 +4920,29 @@ def folder_rows(folder, here, sessions, trusted, shown, cancel=None):
     return [head, *rows] + (["- … and more, not listed"] if more else [])
 
 
-def recent_projects(here, cancel=None):
-    """The folders Claude Code was used in lately, newest first, at most RECENT_SHOWN: those its
-    state file has trusted (each entry on its own, not through a folder above it), that exist,
-    each counted once (a folder inside a git work tree counts as that tree, listed with that tree's
-    own trust mark, and two spellings of one folder as one), by when a conversation there last
-    changed (transcript_time). Left out: this session's folder, hidden folders, and folders that are
-    or hold the home folder, a drive's root or Claude Code's or nouez's own folders, or are inside
-    those or the temporary folder. None if the state file can't be read."""
-    try:
-        with open(claude_state_file(), encoding="utf-8") as f:
-            entries = json.load(f).get("projects") or {}
-        entries = [(p, v) for p, v in entries.items() if isinstance(v, dict) and v.get("hasTrustDialogAccepted") is True]
-    except (OSError, ValueError, AttributeError, TypeError):
-        return None
-    own = [tempfile.gettempdir(), claude_config_dir(), nouez_cache_path(),
-           os.path.join(os.path.expanduser("~"), ".nouez")]
-    found = {}  # file identity -> [folder, newest transcript time]
-    try:
-        at = os.stat(here)
-    except OSError:
-        at = None
-    for entry, value in entries:
-        check_cancel(cancel)
-        if not isinstance(entry, str) or not rooted(entry):
-            continue
-        path = os.path.normpath(entry)
-        if not os.path.isdir(path):
-            continue
-        folder = git_root(path) or path  # checked once collapsed: a repository at home is home
-        if projects_folder_problem(folder) or any(inside_folder(p, f) for f in own
-                                                  for p in (folder, os.path.realpath(folder))):
-            continue
-        if os.path.basename(folder).startswith(".") or hidden_on_windows(folder):
-            continue
-        try:
-            st = os.stat(folder)
-        except OSError:
-            continue
-        if at is not None and os.path.samestat(st, at):
-            continue
-        seen = transcript_time(entry, cancel)
-        key = (st.st_dev, st.st_ino) if st.st_ino else os.path.normcase(os.path.realpath(folder))
-        if key in found:
-            found[key][1] = max(found[key][1], seen)
-        else:
-            found[key] = [folder, seen]
-    rows = sorted(found.values(), key=lambda r: -r[1])
-    return [folder for folder, seen in rows if seen > 0][:RECENT_SHOWN]
-
-
-def transcript_time(cwd, cancel=None):
-    """When a conversation held in `cwd` last changed: the newest transcript in its transcript
-    folder that records `cwd` as where it ran (another folder's can share that transcript folder).
-    0 when there is none."""
-    found = []
-    try:
-        with os.scandir(transcript_folder(cwd)) as it:
-            for e in it:
-                with contextlib.suppress(OSError):
-                    if e.name.endswith(".jsonl") and e.is_file():
-                        found.append((e.stat().st_mtime, e.path))
-    except OSError:
-        return 0
-    for mtime, path in sorted(found, reverse=True):
-        if ran_here(path, cwd, cancel):
-            return mtime
-    return 0
-
-
 def list_projects(args, cancel=None, progress=None):
     """The folders in one folder (by default the one holding this session's folder; in the phone
-    dispatcher, each of its projects folders), or with `recent` the folders Claude Code was used in
-    lately, each with whether it is a git repository, whether Claude Code is trusted there, the
-    sessions running in it and which project settings it has. Read from disk each time; it
+    dispatcher, each of its projects folders), each with whether it is a git repository, whether
+    Claude Code is trusted there, the sessions running in it and which project settings it has. Read from disk each time; it
     changes nothing."""
     here = os.path.abspath(default_cwd())
-    folder, recent = args.get("folder"), args.get("recent", False)
+    folder = args.get("folder")
     if folder is not None and (not isinstance(folder, str) or not rooted(folder)):
         raise BridgeError("folder must be an absolute path.")
-    if not isinstance(recent, bool):
-        raise BridgeError("recent must be true or false.")
-    if recent and folder is not None:
-        raise BridgeError("recent lists folders from anywhere, so it isn't given with folder.")
+    if "recent" in args:  # removed in 0.28; a dispatcher's CLAUDE.md from before may still name it
+        raise BridgeError("ListProjects has no recent list any more. To pick up an earlier conversation, "
+                          "ListClaudeSessions with cwd lists that folder's conversations, newest first.")
     try:
         sessions = claude_sessions()
     except Exception as e:  # only a detail of the list
         log("claude_sessions:", repr(e))
         sessions = None
     trusted = trusted_folders()
-    roots = dispatcher_projects() if folder is None and not recent else None
-    if recent:
-        found = recent_projects(here, cancel)
-        if found is None:
-            raise BridgeError(f"Claude Code's settings ({claude_state_file()}) couldn't be read, so nouez can't tell "
-                              "which folders it was used in.")
-        lines = ([f"Folders Claude Code was used in lately, newest first ({len(found)}):"] if found else
-                 ["No trusted folder has a conversation yet, other than this one."])
-        lines += [f"- {p} [{'; '.join(project_marks(p, here, sessions, trusted))}]" for p in found]
-    elif roots == []:
+    roots = dispatcher_projects() if folder is None else None
+    if roots == []:
         return with_login_warning(
             "This dispatcher was set up with no projects folders (--no-projects), so there is none to list. "
-            "`recent: true` lists the folders Claude Code was used in lately; `folder` lists the folders in one.")
+            "`folder` lists the folders in one.")
     elif roots:
         lines, left = [], PROJECTS_SHOWN
         for root in roots:
@@ -5678,10 +5653,10 @@ def second_opinion(args, to):
         raise BridgeError(f"{fname}'s latest consultation isn't the one whose first brief nouez kept: it has "
                           f"had another message since, or nouez can't find that one. {yourself}")
     if chain.get("revision"):
-        if provider == "antigravity" and not flag(args, "attach_diff"):
-            raise BridgeError("That review named a revision, and an Antigravity consultant runs no git: send "
-                              "again with attach_diff=true to put the diff in the message (its text goes to "
-                              "Google). Nothing was sent.")
+        if provider == "antigravity" and not flag(args, "attach_diff", True):
+            raise BridgeError("That review named a revision, and an Antigravity consultant runs no git, so it "
+                              "needs the diff in the message: send again without attach_diff=false (its text "
+                              "goes to Google). Nothing was sent.")
         args = {**args, "revision": True, **({"base": chain["base"]} if chain.get("base") else {}),
                 "_work": {k: chain.get(k) for k in ("repo", "patch", "head", "clean")}}
     return chain["brief"], args
@@ -5746,16 +5721,25 @@ def revision_for(args, cwd, take=True, inline_limit=None):
             "changed since, and name that sha256 in your answer.]\n"), (patch if take else b""), digest
 
 
-NAMED_SECONDS = 1800  # how long a provider the user named in ConsultantBudget holds for the send's pick
+NAMED_SECONDS = 1800  # how long a provider the user named in ConsultantBudget waits for its one send
 _named = {}  # kind -> (provider the user named, monotonic deadline), from the latest ConsultantBudget
 _named_guard = threading.Lock()
 
 
 def named_provider(kind, provider):
-    """Whether the user named `provider` for this kind of consultation in a recent ConsultantBudget."""
+    """Whether the user named `provider` for this kind of consultation in a recent ConsultantBudget
+    and no message of that kind has gone to it since. Only reads: use_named spends it."""
     with _named_guard:
         named = _named.get(kind)
     return bool(named) and named[0] == provider and named[1] > time.monotonic()
+
+
+def use_named(kind, provider):
+    """A message of this kind reached `provider`: a provider the user named for it ("ask Gemini")
+    holds for that one message, so the next one gets ConsultantBudget's own pick again."""
+    with _named_guard:
+        if kind in _named and _named[kind][0] == provider:
+            del _named[kind]
 
 
 def send_route(kind, provider, client=None, now=None):
@@ -5937,6 +5921,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                     raise
                 turn_id, mode = current["id"], "steered into the running turn"
                 _delivered.setdefault(turn_id, set()).add(text)
+                use_named(kind, "codex")
             else:
                 recent = list_turns(client, tid, 20) if kind in REVIEW_ROUND_KINDS else []
                 chain = next_review_round(tid, name, thread.get("cwd"), kind, recent)
@@ -5950,6 +5935,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                 _bridge_turns.add(turn_id)
                 _delivered.setdefault(turn_id, set()).add(text)
                 save_review_round(tid, chain, turn_id, message, args, cwd=thread.get("cwd"), digest=digest)
+                use_named(kind, "codex")
                 if overrides:
                     mode += f" on {settings}, which the consultant keeps for later messages until changed"
                     if routed:
@@ -6674,16 +6660,25 @@ CONSULT_PICKS = {
     "re-check": (("codex", "gpt-6.2-sol", "medium", "checking named fixes needs less than a first review"),
                  ("antigravity", "gemini-4-neon", "medium", "checking named fixes needs less than a first review")),
     "review": (("codex", "gpt-6.2-astra", "high", "the strongest Codex model; it runs git and the tests itself"),
-               ("antigravity", "gemini-4-neon", "high", "put the diff in the message (revision and attach_diff)")),
+               ("antigravity", "gemini-4-neon", "high", "revision=true puts the diff in the message")),
     "bug-hunt": (("codex", "gpt-6.2-astra", "high", "the strongest Codex model; it can run the failing test"),
                  ("antigravity", "gemini-4-neon", "high", "put the failing command's output in the message")),
     "plan-critique": (("antigravity", "gemini-4-neon", "xhigh",
                        "at xhigh it says a premise is wrong most often (BullshitBench)"),
                       ("codex", "gpt-6.2-astra", "high", "ask it about premises outright: it pushes back less often")),
-    "research": (("codex", "gpt-6.2-astra", "xhigh", "the strongest Codex model, with web search"),
-                 ("antigravity", "gemini-4-neon", "xhigh", "Gemini 4 Neon at its top level"),
-                 ("antigravity", "claude-opus-5-5", "high",
-                  "on Google's quota, not Claude Code's, but Claude's own family: for heavy reading")),
+    # 0.28 (#26): research runs on Antigravity's Claude and GPT quota whenever it has room, which
+    # spares both Claude Code's and Codex's; it searches the web but can't open a page (agy has no
+    # page tool headless), so research that needs a page's text goes to Codex (suggestion_lines).
+    "research": (("antigravity", "claude-opus-5-5", "high",
+                  "heavy reading on Google's quota, not Claude Code's or Codex's; it searches the web but "
+                  "can't open a page"),
+                 ("codex", "gpt-6.2-astra", "xhigh", "the strongest Codex model, with web search and page reading"),
+                 ("antigravity", "gemini-4-neon", "xhigh", "Gemini 4 Neon at its top level")),
+    # Code as text that Claude Code checks and applies, so it stays the only writer (#26).
+    "draft": (("antigravity", "claude-opus-5-5", "high",
+               "Claude's own family writes code best (FrontierCode), on Google's quota, not Claude Code's"),
+              ("antigravity", "gemini-4-neon", "high", "Gemini 4 Neon, on Google's Gemini quota"),
+              ("codex", "gpt-6.2-astra", "high", "the strongest Codex model; it can read the code and run the tests")),
     "fact-check": (("codex", "gpt-6.2-astra", "high", "the model least likely to make up an answer"),
                    ("antigravity", "claude-opus-5-5", "high",
                     "Gemini models seldom say they don't know; this one runs on Google's quota, not Claude Code's"),
@@ -6692,14 +6687,24 @@ CONSULT_PICKS = {
               ("antigravity", None, None, "the provider's default model")),
 }
 CONSULT_NOTES = {
-    "review": "Ask for every finding in the first round; later rounds that only check named fixes are re-checks. "
+    "review": "Ask for every finding in the first round. Ask it to weigh each finding itself before giving it: work out the scenario (the user's setup and what "
+              "they do, what goes wrong, and where they would notice it: a command, a tool result, a screen, a file) "
+              "and whether a user in a normal setup would meet it. It gives as findings only those, each with its "
+              "scenario, and its verdict is CHANGES only for them; the rest it leaves out or lists as not blocking. Later rounds that only check named fixes are re-checks. "
               "nouez counts the rounds and says when to show the user the open points.",
-    "re-check": "When new work comes up for review, send the review's model and effort again.",
-    "bug-hunt": "Give it the failing command, its output and what you have ruled out. For a hard problem whose fix "
+    "re-check": "Ask it to weigh any new finding as in a review: only one a user in a normal setup would meet, "
+                "with its scenario, makes the verdict CHANGES. When new work comes up for review, send the "
+                "review's model and effort again.",
+    "bug-hunt": "Give it the failing command, its output and what you have ruled out, and ask for the cause with the "
+                "scenario where a user meets it, and whether one in a normal setup would. For a hard problem whose fix "
                 "is small, ask it to draft the fix as a unified diff in its reply; check it, then apply it with "
                 "git apply.",
-    "plan-critique": "In the brief, ask it first to say whether any premise, assumption or framing is wrong.",
+    "plan-critique": "In the brief, ask it first to say whether any premise, assumption or framing is wrong, and "
+                     "to weigh each objection by the scenario where a user would be affected, giving only those a "
+                     "user in a normal setup would meet.",
     "research": "Also for reading many files or long logs, and audits. Ask for a short answer with its sources.",
+    "draft": "Consultants can't write files: ask for the change as a unified diff in its reply, naming the files. "
+             "Check it, apply it with git apply, run the tests, and have the change reviewed as usual.",
     "fact-check": "Ask for its sources, and check the ones you will rely on.",
 }
 # The subjects where Artificial Analysis's scores put Gemini 4 Neon ahead of every Codex model.
@@ -6719,10 +6724,6 @@ SPEND_FIRST_KINDS = ("research", "quick-check")
 # Among those, a subscription at least this many points further behind an even pace through its week
 # than the first choice takes the work.
 BEHIND_MARGIN = 15
-# The kinds that start a week that begins on first use while Claude Code is busy: research, which
-# Antigravity's Claude and GPT group does well (heavy reading).
-SEED_KINDS = ("research",)
-UNSTARTED_SLACK = 600  # a reset this close to a full week away counts as a week not yet started
 # The kinds that check Claude's own work: never a Claude model, which shares the author's blind spots,
 # even through the default model or a quota that is tight.
 INDEPENDENT_KINDS = ("review", "re-check", "bug-hunt", "plan-critique")
@@ -6899,13 +6900,6 @@ def behind_schedule(windows, now):
     return None
 
 
-def week_unstarted(windows, now):
-    """True when a weekly window is unused and its reset is a full week away: a week that starts on
-    first use (Antigravity's) and hasn't."""
-    return any(w[0] and w[0] >= 7 * 86400 and number(w[1]) == 0 and number(w[2])
-               and number(w[2]) - now >= w[0] - UNSTARTED_SLACK for w in windows or ())
-
-
 def provider_windows(provider, model, st):
     if provider == "codex":
         return st.get("windows")
@@ -6952,7 +6946,7 @@ def suggest_consultant(kind, state, now, only=None):
         options.append({"provider": provider, "model": got[0], "effort": got[1], "why": [why], "notes": notes,
                         "outlook": outlook, "basis": basis, "title": quota_title(provider, got[0]),
                         "resets": week_resets(windows),
-                        "behind": behind_schedule(windows, now), "unstarted": week_unstarted(windows, now)})
+                        "behind": behind_schedule(windows, now)})
     if not options:
         return {"none": "; ".join(blocked) if blocked else "no consultant CLI is installed"}
     best = options[0]
@@ -6975,11 +6969,6 @@ def suggest_consultant(kind, state, now, only=None):
             and soonest is not best:
         # Usage that would go unused goes first, the week that resets soonest first.
         best = {**soonest, "why": soonest["why"] + [first]}
-    elif kind in SEED_KINDS and best["outlook"][0] != "tight" and claude_pace(state.get("claude"), now)[0] \
-            in ("busy", "tight") and (seed := next((o for o in others if o["unstarted"]), None)):
-        # A week that starts on first use slips with each idle day: start it while Claude Code is busy.
-        best = {**seed, "why": seed["why"] + [first, f"{seed['title']} hasn't started its week, and starting it "
-                                              "now keeps its weeks from slipping while Claude Code is busy"]}
     elif kind in SPEND_FIRST_KINDS and best["outlook"][0] in ("ok", "spare", "unknown") and (ahead := max(
             (o for o in calm if o["behind"] is not None), key=lambda o: o["behind"], default=None)) \
             and ahead["behind"] - (best["behind"] or 0) >= BEHIND_MARGIN:
@@ -7013,9 +7002,11 @@ HAND_OUT = {
     "ok": "Hand bulky read-only work (reading many files or long logs, audits, research across sources) to a "
           "consultant, for a short reply.",
     "busy": "Hand everything read-only that can go out (reviews, bug hunts, research, reading many files, audits, "
-            "checks) to a consultant, for short replies; keep writing code and edits here.",
-    "tight": "Hand out everything except what only Claude can do here (writing code, edits, the browser, the "
-             "user's sign-ins), put off optional work, and tell the user.",
+            "checks) to a consultant, for short replies. Code to write can go out as a draft (kind draft): code "
+            "as text you check and apply here, as the only one editing files.",
+    "tight": "Hand out everything except what only Claude can do here (edits, the browser, the user's "
+             "sign-ins), code to write going out as a draft (kind draft) that you check and apply; put off "
+             "optional work, and tell the user.",
 }
 HAND_OUT_LOCAL = "Do it yourself when that takes seconds."
 
@@ -7116,9 +7107,15 @@ def suggestion_lines(kind, state, now, only=None):
             other = suggest_consultant(k, {**state, best["provider"]: None}, now)
             if "none" not in other:
                 lines.append(f"  {SECOND_OPINION} The other provider now: {call_text(other)}.")
+        if k == "research" and best["provider"] == "antigravity" and state.get("codex") is not None:
+            page = suggest_consultant(k, {**state, "antigravity": None}, now)
+            if "none" not in page:
+                lines.append("  Antigravity can search the web but can't open a page: research that needs a "
+                             f"page's text (docs, a changelog, an issue) goes to Codex: {call_text(page)}.")
         neon = state.get("antigravity") is not None and resolve_pick("antigravity", "gemini-4-neon", "xhigh",
                                                                        state["antigravity"])
-        if k in ("review", "research", "plan-critique") and best["provider"] == "codex" and neon \
+        if k in ("review", "research", "plan-critique") and neon and not (best["provider"] == "antigravity" and
+                                                                          (best["model"] or "").startswith("gemini-")) \
                 and neon[0].startswith("gemini-4-neon") and usage_outlook(provider_windows(
                     "antigravity", neon[0], state["antigravity"]), now)[0] != "blocked":
             lines.append(f"  For {NEON_SUBJECTS}, Gemini 4 Neon scores best (Artificial Analysis by subject): "
@@ -7136,8 +7133,8 @@ def consultant_budget(args, cancel=None, progress=None):
         raise BridgeError(f"`kind` must be one of {', '.join(CONSULT_KINDS)}.")
     if only is not None and only not in PROVIDERS:
         raise BridgeError(f"`provider` must be one of {', '.join(PROVIDERS)}.")
-    if kind and only:  # the send's own pick for this kind keeps to what the user named ("ask Gemini")
-        with _named_guard:  # until it runs out or the user names another; a lookup without one keeps it
+    if kind and only:  # the next send of this kind keeps to what the user named ("ask Gemini"), for that
+        with _named_guard:  # one message (use_named), or until it runs out unused; a lookup without one keeps it
             _named[kind] = (only, time.monotonic() + NAMED_SECONDS)
     head = [f"Consultation budget, {time.strftime('%a %b %d %H:%M', time.localtime(now))}:", ""]
     out = list(head)
@@ -7192,7 +7189,7 @@ USAGE_LOG_KEEP_DAYS = 365           # a renamed log not changed for this long is
 USAGE_LOG_KEEP_BYTES = 100 * 1024 * 1024  # and the oldest go while the renamed ones add up to more
 USAGE_LOG_WAIT = 2                  # seconds a write waits for another server's; then the event is skipped
 CONSULT_KINDS = ("quick-check", "re-check", "review", "bug-hunt", "plan-critique", "research",
-                 "fact-check", "other")
+                 "draft", "fact-check", "other")
 REASON_CHARS = 300
 _usage_log_lock = threading.Lock()
 
@@ -8300,7 +8297,7 @@ AGY_START_GRACE = 30          # a turn whose process can't be seen yet counts as
 AGY_TURN_LIMIT = "30m"        # agy's --print-timeout: a turn still running then ends with what it has
 AGY_TURN_SECONDS = 30 * 60    # the same, in seconds: a process nouez can't check counts as running this long
 AGY_PREAMBLE = ("You are a read-only consultant, asked by another AI agent through the nouez bridge. "
-                "You can read files, search and read web pages; writing or editing files, running "
+                "You can read files and search the web, but not open web pages; writing or editing files, running "
                 "commands and MCP tools are denied by the user's settings, so don't try them. Don't "
                 "schedule tasks or start background work: the turn ends when you reply. Answer in your reply.")
 AGY_REMINDER = ("[nouez: you are still a read-only consultant. Don't write files, run commands, schedule tasks "
@@ -8929,7 +8926,8 @@ def start_agy_consultant(args, cwd):
 def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, reason, cancel, progress):
     """SendConsultantMessage for an Antigravity consultant."""
     cid, name = rec["id"], rec["name"]
-    override = args.get("model") or args.get("effort")
+    given, given_effort = args.get("model"), args.get("effort")  # the caller's, not nouez's own pick below
+    override = given or given_effort
     routed = None if override else send_route(kind, "antigravity")
     if routed:  # neither named: the kind's suggestion, as ConsultantBudget gives it, within Antigravity
         args = {**args, "model": routed["model"], "effort": routed["effort"]}
@@ -8938,7 +8936,8 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
     independent = kind in INDEPENDENT_KINDS or flag(args, "revision")
     known = (agy_models() if override or (independent and (rec.get("model") or "").startswith("claude-"))
              else None)  # can take seconds, so read before taking the lock
-    stamp, patch, digest = (revision_for(args, rec.get("cwd"), take=flag(args, "attach_diff"),
+    # 0.28: an Antigravity consultant runs no git, so it gets the diff text unless attach_diff=false.
+    stamp, patch, digest = (revision_for(args, rec.get("cwd"), take=flag(args, "attach_diff", True),
                                          inline_limit=AGY_PATCH_BYTES)
                             if flag(args, "revision") else ("", b"", ""))
     shown = f"[Message from {sender} via the consultants bridge]\n{stamp}\n{message}"
@@ -8956,7 +8955,7 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
         model = rec.get("model") or f"{AGY_MODEL}-{AGY_EFFORT}"
         if override:
             model = agy_model_id(model, args.get("model"), args.get("effort"), known)
-        if not args.get("model") and named_provider(kind, "antigravity") and not model.startswith("gemini-"):
+        if not given and named_provider(kind, "antigravity") and not model.startswith("gemini-"):
             raise BridgeError(
                 f"The user named Gemini for this {kind}, and {name} is on {model}, with no Gemini model that "
                 "has room to move it to. Nothing was sent. Tell the user, or pass a Gemini model they accept.")
@@ -8965,13 +8964,13 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
             what = f"a {kind}" if kind in INDEPENDENT_KINDS else "a message with revision=true"
             pick = next((p for p in CONSULT_PICKS.get(kind, ()) if p[0] == "antigravity" and p[1]
                          and not p[1].startswith("claude-")), None)
-            if args.get("model") or not pick:
+            if given or not pick:
                 raise BridgeError(
                     f"{model} is a Claude model, and {what} goes to a model of another family: a Claude "
                     f"model shares the blind spots of the Claude that wrote the work. Nothing was sent. "
                     f"Pass model={pick[1] if pick else AGY_MODEL}, or the model ConsultantBudget suggests.")
             was = model
-            model = agy_model_id(model, pick[1], args.get("effort") or pick[2], known)
+            model = agy_model_id(model, pick[1], given_effort or pick[2], known)
             switched = (f" ({name} was on {was}, a Claude model, which shares the blind spots of the Claude "
                         f"that wrote the work, so this {kind} runs on {model} instead.)")
         current = agy_turns(cid, 1)
@@ -8992,6 +8991,7 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
                                   agy_turns(cid, 20) if kind in REVIEW_ROUND_KINDS else [])
         turn_id = agy_start_turn(rec, text, model, conversation, shown)
         save_review_round(cid, chain, turn_id, message, args, cwd=rec.get("cwd"), digest=digest)
+        use_named(kind, "antigravity")
         rec_before = rec
         changed, kept = model != rec.get("model"), True
         if changed:
@@ -10864,9 +10864,9 @@ TOOLS = [
                 "second_opinion_of": {"type": "string", "description": "Instead of a message: the name of a consultant of the other provider whose review this is a blind second opinion on. nouez sends the first brief of that review as it was (and the same revision), so neither your findings nor the first consultant's reach this one; it must have had no messages yet (StartConsultant with new=true)."},
                 "from": {"type": "string", "description": "Sender label shown to the consultant, e.g. your session name. Default 'Claude Code'."},
                 "owner_words": {"type": "string", "description": "Optional: text the user typed, quoted exactly as they wrote it (never a summary). The consultant sees it in its own block, marked as the user's words, apart from your message."},
-                "revision": {"type": "boolean", "description": "Optional: add a line with the consultant's repository commit, branch and number of uncommitted paths, and ask it to name that revision in its answer. With uncommitted changes, nouez also takes their diff (tracked changes and untracked files, leaving out binary files, untracked files over 256 KB and untracked files whose path looks like a secret), saves it in its cache folder under its SHA-256 and asks the consultant to review that diff. An Antigravity consultant gets only the line, unless attach_diff is true. Use it for a review when the uncommitted work is all you will commit; otherwise put the staged diff in the message. Default false."},
+                "revision": {"type": "boolean", "description": "Optional: add a line with the consultant's repository commit, branch and number of uncommitted paths, and ask it to name that revision in its answer. With uncommitted changes, nouez also takes their diff (tracked changes and untracked files, leaving out binary files, untracked files over 256 KB and untracked files whose path looks like a secret), saves it in its cache folder under its SHA-256 and asks the consultant to review that diff. An Antigravity consultant also gets that diff's text in the message (it goes to Google), unless attach_diff is false. Use it for a review when the uncommitted work is all you will commit; otherwise put the staged diff in the message. Default false."},
                 "base": {"type": "string", "description": "With revision=true, review the working tree against the merge base of HEAD and this local branch, tag or commit id. Includes committed and uncommitted changes."},
-                "attach_diff": {"type": "boolean", "description": "Optional, Antigravity consultants only, and refused without revision=true: put the revision diff nouez takes in the message, so the consultant reviews exactly that. Its text goes to Google, deleted lines and untracked files included. Default false."},
+                "attach_diff": {"type": "boolean", "description": "Optional, Antigravity consultants only, and refused as true without revision=true: whether the revision diff nouez takes goes in the message, so the consultant reviews exactly that. Its text goes to Google, deleted lines and untracked files included. false sends only the revision line, and is refused for a blind second opinion on a review that named a revision. Default true."},
                 "model": {"type": "string", "maxLength": 200, "description": "Model id for this message and later ones: Codex, e.g. gpt-6-astra; Antigravity, e.g. gemini-4-neon. Default: with neither model nor effort, nouez's pick for the kind (ConsultantBudget's suggestion, within this consultant's provider; for kind other, unchanged). Pass one only when the user asked for it or ConsultantBudget suggests another provider's."},
                 "effort": {"type": "string", "maxLength": 200, "description": "Reasoning effort (Codex) or model level (Antigravity) for this message and later ones, such as low, medium, high or xhigh; which levels exist depends on the model. Default: as for model. Pass one only when the user asked for it."},
                 "kind": {"type": "string", "enum": list(CONSULT_KINDS), "description": "What kind of consultation this is (other when none fits), also recorded in the user's usage log (nouez/usage-log.jsonl on this computer). Reviews, re-checks, bug hunts, plan critiques and any message with revision=true never run on a Claude model: an Antigravity consultant on one is moved to the suggested Gemini model, or refused when a Claude model is passed."},
@@ -10945,8 +10945,9 @@ TOOLS = [
             "their phone or the web. Use when the user asks for a new Claude Code session, for "
             "example for another project. The session starts as if the user had typed `claude` in a "
             "fresh terminal: its transcript is saved, unlike a `claude` started from your own shell, "
-            "which inherits this session's environment. To pick up an earlier conversation, pass "
-            "resume (a session id, or \"latest\"). If Claude Code hasn't been trusted in the "
+            "which inherits this session's environment. To pick up an earlier conversation, list them "
+            "with ListClaudeSessions (cwd set), show the user the list and pass the id they pick as "
+            "resume. If Claude Code hasn't been trusted in the "
             "folder (or only through a folder above it, while the folder has its own "
             ".claude/settings.json), nothing is opened and the result gives a report of what the "
             "folder's project settings would run, to show the user with the question. Only when the "
@@ -10959,14 +10960,14 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "cwd": {"type": "string", "description": "Absolute path of the project folder the session works in."},
-                "create": {"type": "boolean", "description": "Create the folder if it doesn't exist (its parent must exist). Use when the user asks for a session in a new folder."},
+                "create": {"type": "boolean", "description": "Create the folder if it doesn't exist (its parent must exist), with git init (unless inside a git repository) and a starter CLAUDE.md. Use when the user asks for a session in a new folder."},
                 "trust": {"type": "boolean", "description": "true: the user has seen this folder's report and said, in this conversation, that they trust it; record that in Claude Code's settings before opening, as its trust dialog would. Never set it on your own judgment or on the first call. Refused for a folder not already trusted on its own when the user set NOUEZ_NO_TRUST_WRITE=1. Default false."},
                 "open_untrusted": {"type": "boolean", "description": "Open the window even though Claude Code hasn't been trusted in the folder, so the user can answer the trust question on the computer. Default false. Set it only when the user asks for that."},
                 "model": {"type": "string", "description": "Claude Code model alias or full name. Default: opus (the latest Opus). Set it only when the user asks for another model."},
                 "effort": {"type": "string", "enum": list(CLAUDE_EFFORTS), "description": "Effort level. Default: medium. Set it only when the user asks for another."},
                 "name": {"type": "string", "description": "Session name, shown in the Claude app's session list: letters, digits, spaces, '.', '_' and '-', starting with a letter or digit, up to 64 characters. Default: the folder's name."},
                 "prompt": {"type": "string", "description": "Optional first message for the new session. Leave it out unless the user gave one."},
-                "resume": {"type": "string", "description": "Pick up an earlier conversation held in cwd instead of starting a new one: its session id (the transcript's file name without .jsonl), or \"latest\" for the newest one no running session has open. Use it when the user asks to resume or continue a session. A prompt, if given, is sent to it as the next message."},
+                "resume": {"type": "string", "description": "Pick up an earlier conversation held in cwd instead of starting a new one: the session id the user picked from ListClaudeSessions' list for cwd (the transcript's file name without .jsonl). Use it when the user asks to resume or continue a session. A prompt, if given, is sent to it as the next message."},
             },
             "required": ["cwd"],
         },
@@ -10992,8 +10993,7 @@ TOOLS = [
         "description": (
             "List the folders in a folder on the user's computer, by default the one that holds your "
             "own working folder (for a session started in a projects folder's subfolder, the user's "
-            "projects; in the phone dispatcher, each projects folder it was set up with), or with "
-            "recent the folders Claude Code was used in lately, wherever they are: for each, whether it "
+            "projects; in the phone dispatcher, each projects folder it was set up with): for each, whether it "
             "is a git repository, whether Claude Code is trusted there, the Claude Code sessions running "
             "in it and which project settings files it has. Use it when the user asks which projects "
             "there are, or to find a folder's full path for OpenClaudeSession. Hidden folders are left "
@@ -11003,7 +11003,6 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "folder": {"type": "string", "description": "Absolute path of the folder to list. Default: the folder holding your working folder (in the dispatcher, its projects folders)."},
-                "recent": {"type": "boolean", "description": "true: instead, up to 20 trusted folders Claude Code was used in lately, newest first, from anywhere on the computer. Not with folder."},
             },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
@@ -11479,7 +11478,8 @@ TERMINAL_CODES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|
 STATUS_LINE = re.compile(r"^[^\w]{0,12}(Connected|Reconnected|Reconnecting|Connecting|Disconnected|[Nn]ot [Cc]onnected)"
                          r"\s+·\s+\S")
 PYTHON_NAME = re.compile(r"pythonw?(?:\d+(?:\.\d+)*)?(?:\.exe)?", re.I)  # the program a sign-in start runs
-DISPATCHER_USAGE = ("usage: server.py dispatcher setup [--folder DIR] [--projects DIR]... [--no-projects] [--dry-run]\n"
+DISPATCHER_USAGE = ("usage: server.py dispatcher setup [--folder DIR] [--projects DIR]... [--no-projects] [--dry-run] "
+                    "[--statusline]\n"
                     "       server.py dispatcher install [--folder DIR] [--projects DIR]... [--no-projects] [--dry-run] "
                     "[--force]\n"
                     "       server.py dispatcher uninstall [--dry-run]\n"
@@ -11624,17 +11624,63 @@ def dispatcher_where(name):
 
 def dispatcher_default_folder():
     """The one of ~/Projects/dispatcher and ~/.nouez/dispatcher that is set up (has its CLAUDE.md),
-    ~/Projects/dispatcher when both are (as before 0.27). When neither is, ~/Projects/dispatcher if
-    ~/Projects exists, beside the projects, which are then its projects folder; else
-    ~/.nouez/dispatcher, whose parent can't be one (dispatcher_roots_problem asks for --projects or
-    --no-projects). So a dispatcher set up in either stays the default, whatever appears later."""
+    ~/Projects/dispatcher when both are (as before 0.27). When neither is (a new install, 0.28),
+    ~/.nouez/dispatcher, whose parent can't be a projects folder: dispatcher_roots_problem asks for
+    --projects or --no-projects and lists the folders that look like they hold projects. So a
+    dispatcher set up in either stays the default, whatever appears later."""
     home = os.path.expanduser("~")
     beside, own = os.path.join(home, "Projects", DISPATCHER_NAME), os.path.join(home, ".nouez", DISPATCHER_NAME)
-    if os.path.isfile(os.path.join(own, "CLAUDE.md")) and not os.path.isfile(os.path.join(beside, "CLAUDE.md")):
-        return own
-    if os.path.isfile(os.path.join(beside, "CLAUDE.md")) or os.path.isdir(os.path.dirname(beside)):
+    if os.path.isfile(os.path.join(beside, "CLAUDE.md")):
         return beside
     return own
+
+
+def projects_folder_candidates(state_file=None):
+    """[(folder, how many trusted projects it holds)] that look like they hold the user's projects,
+    for the user to pick with --projects: ~/Projects when it exists, and each folder holding two or
+    more of the folders Claude Code is trusted in (a folder inside a git repository counts as the
+    repository). Only folders that could be projects folders (projects_folder_problem), each once,
+    most projects first. Never chosen for the user."""
+    trusted = trusted_folders(state_file) or {}
+    held = {}  # identity -> [spelling, set of trusted projects]
+    def add(folder, project=None):
+        if not os.path.isdir(folder) or projects_folder_problem(folder):
+            return
+        try:
+            st = os.stat(folder)
+            ident = (st.st_dev, st.st_ino) if st.st_ino else _trust_norm(os.path.realpath(folder))
+        except OSError:
+            return
+        entry = held.setdefault(ident, [folder, set()])
+        if project:
+            entry[1].add(_trust_norm(project))
+    for names in trusted.values():
+        project = names[0]
+        if not os.path.isdir(project):
+            continue
+        project = git_root(project) or project
+        add(os.path.dirname(os.path.abspath(project)), project)
+    found = [(f, len(p)) for f, p in held.values() if len(p) >= 2]
+    mine = os.path.join(os.path.expanduser("~"), "Projects")
+    if os.path.isdir(mine) and not any(same_folder(f, mine) for f, _ in found):
+        add(mine)
+        found += [(f, len(p)) for f, p in held.values() if same_folder(f, mine)]
+    return sorted(found, key=lambda c: (-c[1], c[0].lower()))[:10]
+
+
+def pick_projects_text(folder, state_file=None):
+    """What a bare setup or install says when the folder above the dispatcher's can't be its
+    projects folder: the candidates it found, and the command to run again."""
+    candidates = projects_folder_candidates(state_file)
+    lines = [f"The dispatcher's folder is {folder}, and the folder that holds it isn't a folder of projects, "
+             "so say which folders hold your projects: the phone can record trust only for projects inside "
+             "them. Run this again with --projects DIR (once for each), or --no-projects to trust folders "
+             "only at the computer."]
+    if candidates:
+        lines.append("Folders that look like they hold your projects (nothing is chosen for you):")
+        lines += [f"  {f} ({n} trusted project{'s' if n != 1 else ''})" for f, n in candidates]
+        lines.append("For example: " + shlex.join(["--projects", candidates[0][0]]))
+    return "\n".join(lines)
 
 
 DISPATCHER_ROOTS_MAX = 20  # projects folders the dispatcher takes at most
@@ -11642,12 +11688,12 @@ DISPATCHER_COMMAND_MAX = 8000  # characters in the sign-in start's command, with
 
 
 def dispatcher_options(argv, allowed):
-    """{"folder", "config-dir", "projects", "dry-run", "force", "sign-in"} from the command line;
+    """{"folder", "config-dir", "projects", "dry-run", "force", "sign-in", "statusline"} from the command line;
     ValueError naming what is wrong. "projects": None when neither --projects nor --no-projects
     is given (the folder above the dispatcher's is then its projects folder: dispatcher_roots),
     else the list of folders, [] for --no-projects."""
     opts = {"folder": None, "config-dir": None, "projects": None, "dry-run": False, "force": False,
-            "sign-in": False}
+            "sign-in": False, "statusline": False}
     none = False
     i = 0
     while i < len(argv):
@@ -11664,7 +11710,7 @@ def dispatcher_options(argv, allowed):
         elif arg == "--no-projects" and "projects" in allowed:
             none = True
             i += 1
-        elif arg in ("--dry-run", "--force", "--sign-in") and arg[2:] in allowed:
+        elif arg in ("--dry-run", "--force", "--sign-in", "--statusline") and arg[2:] in allowed:
             opts[arg[2:]] = True
             i += 1
         else:
@@ -11690,12 +11736,14 @@ def dispatcher_roots(folder, projects):
     return [os.path.dirname(folder)] if projects is None else list(projects)
 
 
-def dispatcher_roots_problem(folder, projects):
+def dispatcher_roots_problem(folder, projects, state_file=None):
     """Why setup or install can't use these projects folders, or None: one doesn't exist, can't hold
     trust (projects_folder_problem), or is, or is inside, another. When none were given and the
     folder above the dispatcher's can't be one, the user names them, or none."""
     if projects is None:
         above = os.path.dirname(folder)
+        if same_folder(above, os.path.join(os.path.expanduser("~"), ".nouez")):  # the default for a new install
+            return pick_projects_text(folder, state_file)
         if not os.path.isdir(above):
             return (f"{above} doesn't exist. Make it (it holds your projects), or pass --folder, or name the "
                     "folders that hold your projects with --projects (--no-projects for none).")
@@ -12622,10 +12670,11 @@ class SettingsFolder:
     and Linux everything goes through a descriptor of .claude, opened without following a link at
     the folder or at .claude, so a folder swapped for a link after that changes nothing; Windows
     has no such descriptors, so there the folder and .claude are checked by their paths before
-    each step. `exists`: whether there is a .claude (made, with create). OSError for a link."""
+    each step. `exists`: whether there is a .claude (made, with create). OSError for a link.
+    `name`: another folder in `folder` than .claude (Claude Code's own settings folder, by its name)."""
 
-    def __init__(self, folder, create=False):
-        self.folder, self.path, self.fd = folder, os.path.join(folder, ".claude"), None
+    def __init__(self, folder, create=False, name=".claude"):
+        self.folder, self.path, self.fd = folder, os.path.join(folder, name), None
         if os.name == "nt":
             self.check()
             if create and os.path.isdir(folder) and not os.path.lexists(self.path):
@@ -12646,9 +12695,9 @@ class SettingsFolder:
         try:
             if create:
                 with contextlib.suppress(FileExistsError):
-                    os.mkdir(".claude", dir_fd=top)
+                    os.mkdir(name, dir_fd=top)
             try:
-                self.fd = os.open(".claude", flags, dir_fd=top)
+                self.fd = os.open(name, flags, dir_fd=top)
             except FileNotFoundError:
                 if create:
                     raise
@@ -12938,11 +12987,75 @@ def dispatcher_flags(folder, projects):
     return flags + [a for r in projects or () for a in ("--projects", r)]
 
 
-def dispatcher_setup(folder, dry_run=False, out=print, projects=None):
+def ours_statusline(entry):
+    """Whether a statusLine setting runs nouez's `statusline`, by itself or passed on."""
+    command = entry.get("command") if isinstance(entry, dict) else None
+    return isinstance(command, str) and "server.py" in command and re.search(r"\bstatusline\b", command) is not None
+
+
+def statusline_offer(dry_run, add, out=print, ask=None):
+    """The end of a setup that went well (#52): when Claude Code's user settings have no status
+    line, offer nouez's, which passes Claude Code's usage to nouez, and add it only on a yes: `add`
+    (--statusline), or `ask`, a question on a terminal (asked only when stdin and stdout are one).
+    Without either it says how to add it. A status line of the user's own is kept, with how to pass
+    its input on. The settings are copied first (write_settings). Never fails the setup."""
+    config = os.path.abspath(claude_config_dir())
+    path = os.path.join(config, "settings.json")
+    command = usage_command("statusline")
+    if not os.path.isdir(config):
+        out(f"\nClaude Code's settings folder {config} isn't there yet, so nouez's status line isn't offered; "
+            "run setup again after Claude Code's first start.")
+        return
+    try:
+        settings = SettingsFolder(os.path.dirname(config), name=os.path.basename(config))
+    except OSError as e:
+        out(f"\nCouldn't read {path} to offer nouez's status line: {e}")
+        return
+    try:
+        try:
+            data, raw = read_settings_for_edit(settings)
+        except (OSError, ValueError) as e:
+            out(f"\nCouldn't read {path} to offer nouez's status line: {e}")
+            return
+        entry = data.get("statusLine")
+        if ours_statusline(entry):
+            out(f"\n{path} already has nouez's status line, which passes Claude Code's usage to nouez.")
+            return
+        if entry is not None:
+            out(f"\n{path} has a status line of your own; it is kept. To let nouez see Claude Code's usage, "
+                f"have it pass its input on to `{usage_command('statusline --quiet')}` (docs/consultants.md).")
+            return
+        offer = ("nouez's status line passes Claude Code's usage to nouez, so it can hand work to consultants "
+                 "before Claude Code runs short, and shows the model and both usage windows")
+        if dry_run:
+            out(f"\nWould offer to add nouez's status line to {path} ({offer}).")
+            return
+        if not add and ask is not None and sys.stdin and sys.stdout and sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                add = ask(f"\nAdd nouez's status line to {path}? ({offer}) [y/N] ").strip().lower() in ("y", "yes")
+            except (EOFError, OSError):
+                add = False
+        if not add:
+            out(f"\nOptional: {offer}. Run setup again with --statusline to add it to {path}, or add it "
+                "yourself:\n    " + json.dumps({"statusLine": {"type": "command", "command": command}}))
+            return
+        data["statusLine"] = {"type": "command", "command": command}
+        try:
+            write_settings(settings, data, raw, out)
+        except OSError as e:
+            out(f"Couldn't change {path}: {e}")
+            return
+        out(f"Added nouez's status line to {path}; a new Claude Code session shows it.")
+    finally:
+        settings.close()
+
+
+def dispatcher_setup(folder, dry_run=False, out=print, projects=None, statusline=False, ask=None):
     """`server.py dispatcher setup`: make the dispatcher folder, its CLAUDE.md (only if it has none)
     and the allow rules for nouez's session tools in its .claude/settings.json (only those, the
     file backed up first). `projects` as dispatcher_options gives it, checked here
-    (dispatcher_roots_problem). With dry_run, say what would change and change nothing. Exit code."""
+    (dispatcher_roots_problem). With dry_run, say what would change and change nothing. Then, when
+    it went well, nouez's status line (statusline_offer; `statusline`: --statusline). Exit code."""
     act = "Would" if dry_run else "Will"
     if os.path.lexists(folder) and not plain_folder(folder):
         out(f"{folder} is a link or isn't a folder; nouez doesn't set up a dispatcher there.")
@@ -13045,6 +13158,7 @@ def dispatcher_setup(folder, dry_run=False, out=print, projects=None):
             "Code, without the trust limit nouez gives the dispatcher it starts.")
     install = shlex.join(["server.py", "dispatcher", "install", *dispatcher_flags(folder, projects)])
     out(f"\n{'Then' if not trusted else 'Next'}: `{install}` starts it at sign-in.")
+    statusline_offer(dry_run, statusline, out, ask)
     return 0
 
 
@@ -13769,7 +13883,8 @@ def dispatcher_install(folder, dry_run=False, force=False, out=print, projects=N
                         + "` first.")
     if not claude:
         problems.append("claude isn't on PATH or in ~/.local/bin: install Claude Code first.")
-    unfit = dispatcher_roots_problem(folder, projects)
+    unfit = dispatcher_roots_problem(folder, projects,
+                                     claude_state_file({"CLAUDE_CONFIG_DIR": config_dir}) if config_dir else None)
     if unfit:
         blocking.append(unfit)
     if os.path.isdir(folder) and dispatcher_trusted(folder) is not True:
@@ -14200,7 +14315,7 @@ def script_paths_report(settings):
 
 def run_dispatcher(argv):
     """`server.py dispatcher setup|install|uninstall|status|run`."""
-    allowed = {"setup": {"folder", "projects", "dry-run"}, "install": {"folder", "projects", "dry-run", "force"},
+    allowed = {"setup": {"folder", "projects", "dry-run", "statusline"}, "install": {"folder", "projects", "dry-run", "force"},
                "uninstall": {"dry-run"}, "status": set(), "run": {"folder", "projects", "config-dir", "sign-in"}}
     sub = argv[0] if argv else ""
     if sub not in allowed:
@@ -14214,7 +14329,8 @@ def run_dispatcher(argv):
     if sub == "run":
         return run_dispatcher_supervisor(opts["folder"], opts["config-dir"], opts["sign-in"], opts["projects"])
     if sub == "setup":
-        return dispatcher_setup(opts["folder"], opts["dry-run"], projects=opts["projects"])
+        return dispatcher_setup(opts["folder"], opts["dry-run"], projects=opts["projects"],
+                                statusline=opts["statusline"], ask=input)
     if sub == "install":
         return dispatcher_install(opts["folder"], opts["dry-run"], opts["force"], projects=opts["projects"])
     if sub == "uninstall":
@@ -14251,8 +14367,9 @@ def usage_setup_report(settings):
     lines = [(True, f"a status line passes Claude Code's usage to nouez (saved {span_text(time.time() - saved)} "
                     "ago)") if fresh else
              (None, f"no status line has passed Claude Code's usage to nouez in {USAGE_SETUP_DAYS} days, so its "
-                    "pace isn't known. Add to the "
-                    "settings (or pass the input on from your own script, docs/consultants.md):\n    "
+                    "pace isn't known. Add to the settings (or pass the input on from your own script, "
+                    "docs/consultants.md), or, with the phone dispatcher, run `server.py dispatcher setup` again "
+                    "with the options you set it up with and --statusline:\n    "
                     + json.dumps({"statusLine": {"type": "command", "command": usage_command("statusline")}}))]
     hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
     groups = hooks.get("UserPromptSubmit") if isinstance(hooks.get("UserPromptSubmit"), list) else []
@@ -14323,6 +14440,9 @@ def run_doctor():
             say(*paths)
     if clone_place_note():
         say(None, clone_place_note())
+    backups = trust_backups_report()
+    if backups:
+        say(None, backups)
     if os.name == "nt":
         wt = which("wt")
         say(True if wt else None, "Windows Terminal is installed: Claude Code sessions and the status screen "

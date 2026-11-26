@@ -67,6 +67,9 @@ os.makedirs(server._dispatcher_root[0], exist_ok=True)
 server.dispatcher_default_folder = lambda: os.path.join(_DISPATCHER_EMPTY, "Projects", "dispatcher")
 server.dispatcher_installed = lambda check_off=True, want=None: "no"
 server.other_remote_controls = lambda own=None: []
+# Nor this computer's own Claude Code settings: a setup's status line offer reads them (#52).
+_REAL_STATUSLINE_OFFER = server.statusline_offer
+server.statusline_offer = lambda dry_run, add, out=print, ask=None: None
 
 # Tests never open a real terminal window: one that reaches a launcher without mocking Popen fails.
 _REAL_POPEN = subprocess.Popen
@@ -1292,6 +1295,33 @@ class TrustTest(unittest.TestCase):
         with open(self.state, encoding="utf-8") as f:
             self.assertEqual(f.read(), before)
 
+    def test_doctor_says_where_the_copies_are_and_how_to_put_one_back(self):
+        """0.28.0: doctor lists nouez's copies of Claude Code's state file; links aren't counted."""
+        self.assertIsNone(server.trust_backups_report())
+        server.trust_folder(self.plain)
+        server.trust_folder(self.repo)
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        dir_link(outside, os.path.join(server.trust_backup_dir(), ".claude.json.19990101-000000.x.bak"))
+        text = server.trust_backups_report()
+        self.assertTrue(text.startswith("2 copies of this profile's state file"), text)
+        self.assertIn(server.trust_backup_dir(), text)
+        self.assertIn("close every Claude Code window, then copy it over " + server.claude_state_file() + ".", text)
+        self.assertIn("undoes everything Claude Code saved there since", text)
+        self.assertNotIn("other cop", text)
+        # Codex 0.28 review, round 2: a copy of another profile's file, or one from before 0.28.0 (no
+        # tag), is only counted, never offered for putting back over this profile's.
+        with open(os.path.join(server.trust_backup_dir(), ".claude.json.20200101-000000.abc.bak"), "w") as f:
+            f.write("{}")
+        self.assertIn("2 copies of this profile's state file", server.trust_backups_report())
+        self.assertIn(" 1 other copy is of another Claude Code profile's state file, or from before 0.28.0",
+                      server.trust_backups_report())
+        with mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": os.path.join(outside, "work")}):
+            text = server.trust_backups_report()
+        self.assertTrue(text.startswith("nouez has no copy of this profile's state file"), text)
+        self.assertIn("3 other copies are of another", text)
+        self.assertNotIn("To put one back", text)
+
     def test_a_linked_backup_is_neither_counted_nor_removed(self):
         """0.22.0: only nouez's own backup files are trimmed."""
         server.trust_folder(self.plain)
@@ -1446,8 +1476,8 @@ class TrustTest(unittest.TestCase):
         no backup (its own write isn't the one in effect), so nothing it does next takes that trust back."""
         real = server.backup_claude_state
 
-        def and_a_session_writes(text):
-            done = real(text)
+        def and_a_session_writes(text, state):
+            done = real(text, state)
             data = self.read()
             data["projects"][self.slash(self.repo)] = {"hasTrustDialogAccepted": True}
             self.write(data)
@@ -2338,6 +2368,7 @@ class HandlerTest(unittest.TestCase):
                  mock.patch.object(server, "run_status", lambda argv, timeout=20: login), \
                  mock.patch.object(server, "run_text", lambda argv, timeout=20: "1.5.14"), \
                  mock.patch.object(server, "read_agy_usage", lambda: usage), \
+                 mock.patch.object(server, "trust_backups_report", lambda: None), \
                  mock.patch.object(server, "CodexClient", FakeDaemon([])), \
                  mock.patch.object(server, "claude_config_dir", lambda: tempfile.gettempdir() + "/no-such-dir"),                  contextlib.redirect_stdout(io.StringIO()) as out:
                 return server.run_doctor(), out.getvalue()
@@ -3319,15 +3350,16 @@ class OpenClaudeSessionTests(unittest.TestCase):
                 with open(path, "w") as f:
                     f.write(json.dumps({"cwd": ROOT}) + "\n")
                 os.utime(path, (1000 + i, 1000 + i))
-            spec, out = self.open_resumed(config, "latest")
-            self.assertEqual(spec["resume"], new)
-            self.assertIn(f"resumes the latest conversation in this folder, {new}", out)
+            # 0.28: no "latest": the user always picks from ListClaudeSessions' list.
+            with self.assertRaisesRegex(server.BridgeError, "ListClaudeSessions with cwd"):
+                self.open_resumed(config, "latest")
             busy = dict(self.session("busy", 41), session_id=new)
-            spec, out = self.open_resumed(config, "latest", [busy])
-            self.assertEqual(spec["resume"], old)
-            self.assertIn("busy (pid 41)", out)
             spec, out = self.open_resumed(config, old.upper())
             self.assertEqual(spec["resume"], old)
+            self.assertIn(f"resumes conversation {old}", out)
+            with mock.patch.object(server.os.path, "samefile", lambda a, b: False):  # a case-sensitive Repo and repo
+                with self.assertRaisesRegex(server.BridgeError, "ran in"):
+                    self.open_resumed(config, old)
             for bad, running in (("--fork-session", ()), (new, [busy]),
                                  ("33333333-3333-3333-3333-333333333333", ()), (5, ())):
                 with self.assertRaises(server.BridgeError):
@@ -3339,7 +3371,7 @@ class OpenClaudeSessionTests(unittest.TestCase):
                 f.write(json.dumps({"type": "summary"}) + "\n" + json.dumps({"cwd": "C:/elsewhere"}) + "\n")
             with self.assertRaisesRegex(server.BridgeError, "ran in C:/elsewhere"):
                 self.open_resumed(config, third)
-            with self.assertRaisesRegex(server.BridgeError, "pass resume"):
+            with self.assertRaisesRegex(server.BridgeError, "pass its id as resume"):
                 self.open_resumed(config, None, prompt="/resume " + old)
 
     def test_resume_checks_the_folder_each_transcript_recorded(self):
@@ -3354,34 +3386,16 @@ class OpenClaudeSessionTests(unittest.TestCase):
                 with open(path, "w") as f:
                     f.write(json.dumps({"cwd": ran_in}) + "\n")
                 os.utime(path, (1000 + i, 1000 + i))
-            spec, out = self.open_resumed(config, "latest")
-            self.assertEqual(spec["resume"], mine)
             spec, out = self.open_resumed(config, mine.upper())
             self.assertEqual(spec["resume"], mine)
             with self.assertRaisesRegex(server.BridgeError, "ran in .*_twin"):
                 self.open_resumed(config, theirs)
-            # With this folder's only conversation busy, the other folder's isn't picked instead.
-            busy = dict(self.session("busy", 42), session_id=mine)
-            with self.assertRaisesRegex(server.BridgeError, "isn't open in a running session"):
-                self.open_resumed(config, "latest", [busy])
-            # A busy conversation older than the one picked wasn't skipped, so it isn't reported.
-            newest = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
-            path = os.path.join(folder, newest + ".jsonl")
-            with open(path, "w") as f:
-                f.write(json.dumps({"cwd": ROOT}) + "\n")
-            os.utime(path, (2000, 2000))
-            spec, out = self.open_resumed(config, "latest", [busy])
-            self.assertEqual(spec["resume"], newest)
-            self.assertNotIn("Skipped", out)
-            # A transcript that doesn't say where it ran isn't taken for latest.
+            # A transcript that doesn't say where it ran isn't taken by its id: in this shared folder
+            # it may be the twin's.
             unknown = "cccccccc-dddd-eeee-ffff-000000000000"
             path = os.path.join(folder, unknown + ".jsonl")
             with open(path, "w") as f:
                 f.write(json.dumps({"type": "summary"}) + "\n")
-            os.utime(path, (3000, 3000))
-            spec, out = self.open_resumed(config, "latest", [busy])
-            self.assertEqual(spec["resume"], newest)
-            # Nor by its id: in this shared folder it may be the twin's.
             with self.assertRaisesRegex(server.BridgeError, "doesn't say which folder it ran in"):
                 self.open_resumed(config, unknown)
 
@@ -3448,6 +3462,7 @@ class OpenClaudeSessionTests(unittest.TestCase):
             with mock.patch.object(server, "open_window") as open_window, \
                     mock.patch.object(server, "folder_trusted", return_value=False):
                 out = server.open_claude_session({"cwd": cwd, "create": True})
+            self.made = out
             self.assertTrue(os.path.isdir(cwd))
             open_window.assert_not_called()
             self.assertIn("Created the folder", out)
@@ -3460,6 +3475,49 @@ class OpenClaudeSessionTests(unittest.TestCase):
             self.assertNotIn("Note", out)
             with self.assertRaises(server.BridgeError):  # parent must exist
                 server.open_claude_session({"cwd": os.path.join(parent, "a", "b"), "create": True})
+            # 0.28 (#15): a made folder is a project: git (no sample hooks) and a starter CLAUDE.md,
+            # with its trust report still empty.
+            with open(os.path.join(cwd, "CLAUDE.md"), encoding="utf-8") as f:
+                self.assertTrue(f.read().startswith("# economic recession\n\nWhat this project is"))
+            if server.which("git"):
+                self.assertIn("Made it a git repository", self.made)
+                self.assertTrue(os.path.isdir(os.path.join(cwd, ".git")))
+                self.assertFalse(os.path.exists(os.path.join(cwd, ".git", "hooks", "pre-commit.sample")))
+            self.assertTrue(server.config_review([cwd])[0].startswith("No project"))
+            # Inside a git work tree: no repository of its own. Without git: said, and it opens anyway.
+            inner = os.path.join(cwd, "sub")
+            with mock.patch.object(server, "open_window", return_value=None), \
+                    mock.patch.object(server, "folder_trusted", return_value=False):
+                out = server.open_claude_session({"cwd": inner, "create": True})
+            self.assertFalse(os.path.exists(os.path.join(inner, ".git")))
+            self.assertNotIn("git", out.split("Not opened")[0])
+            alone = os.path.join(parent, "no-git")
+            with mock.patch.object(server, "which", lambda name, env=None: None), \
+                    mock.patch.object(server, "open_window", return_value=None), \
+                    mock.patch.object(server, "folder_trusted", return_value=False):
+                out = server.open_claude_session({"cwd": alone, "create": True})
+            self.assertIn("git isn't installed, so it isn't a git repository yet.", out)
+            # A CLAUDE.md already there is kept as it is.
+            with open(os.path.join(alone, "CLAUDE.md"), "w", encoding="utf-8") as f:
+                f.write("mine")
+            self.assertTrue(server.start_project(alone)[-1].startswith("Couldn't write a starter CLAUDE.md"))
+            with open(os.path.join(alone, "CLAUDE.md"), encoding="utf-8") as f:
+                self.assertEqual(f.read(), "mine")
+            if server.which("git"):
+                # The user's GIT_TEMPLATE_DIR (which outranks init.templateDir) puts no hook in, and a
+                # GIT_DIR in nouez's environment doesn't send git init to another repository.
+                template = os.path.join(parent, "template")
+                os.makedirs(os.path.join(template, "hooks"))
+                with open(os.path.join(template, "hooks", "pre-commit"), "w") as f:
+                    f.write("#!/bin/sh\n")
+                elsewhere = os.path.join(parent, "elsewhere.git")
+                fresh = os.path.join(parent, "fresh")
+                os.mkdir(fresh)
+                with mock.patch.dict(server.os.environ, {"GIT_TEMPLATE_DIR": template, "GIT_DIR": elsewhere}):
+                    self.assertIn("Made it a git repository (git init).", server.start_project(fresh))
+                self.assertTrue(os.path.isdir(os.path.join(fresh, ".git")))
+                self.assertFalse(os.path.exists(os.path.join(fresh, ".git", "hooks", "pre-commit")))
+                self.assertFalse(os.path.exists(elsewhere))
 
     @unittest.skipUnless(os.name == "nt", "Windows checks the process creation time")
     def test_registry_entries_need_a_matching_start_time(self):
@@ -5210,8 +5268,9 @@ class SuggestTest(unittest.TestCase):
             self.assertEqual((got["provider"], got["model"], got["effort"]), ("antigravity", "gemini-4-neon", "xhigh"))
             self.assertIsNone(server.send_route("other", "codex", object(), self.NOW))
             # Codex finding 6: after "ask Gemini" (ConsultantBudget with provider antigravity), the
-            # send's own pick keeps to Gemini, as the suggestion did, until the half hour is up or
-            # the user names another provider; a lookup that names none (round 2) keeps it.
+            # send's own pick keeps to Gemini, as the suggestion did, until a message of that kind
+            # reaches it (0.28), the half hour is up unused, or the user names another provider; a
+            # lookup that names none (round 2) keeps it.
             self.addCleanup(server._named.clear)
             got = server.send_route("fact-check", "antigravity", None, self.NOW)
             self.assertEqual(got["model"], "claude-opus-5-5")
@@ -5232,6 +5291,15 @@ class SuggestTest(unittest.TestCase):
                 self.assertFalse(server.named_provider("fact-check", "antigravity"))
                 self.assertEqual(server.send_route("fact-check", "antigravity", None, self.NOW)["model"],
                                  "claude-opus-5-5")
+                # 0.28: one message. Reading it doesn't spend it; a delivery of that kind to that
+                # provider does, and a delivery elsewhere or of another kind doesn't.
+                server.consultant_budget({"kind": "fact-check", "provider": "antigravity"})
+                server.send_route("fact-check", "antigravity", None, self.NOW)
+                server.use_named("fact-check", "codex")
+                server.use_named("research", "antigravity")
+                self.assertTrue(server.named_provider("fact-check", "antigravity"))
+                server.use_named("fact-check", "antigravity")
+                self.assertFalse(server.named_provider("fact-check", "antigravity"))
         with mock.patch.object(server, "claude_budget", lambda now, path=None, state=None: []), \
                 mock.patch.object(server, "codex_budget", side_effect=server.BridgeError("daemon down")):
             self.assertIsNone(server.send_route("review", "codex", object(), self.NOW))
@@ -5245,7 +5313,7 @@ class SuggestTest(unittest.TestCase):
         self.assertEqual(self.pick("review", **both), ("codex", "gpt-6.2-astra", "high"))
         self.assertEqual(self.pick("quick-check", **both), ("codex", "gpt-6.2-sol", "low"))
         self.assertEqual(self.pick("re-check", **both), ("codex", "gpt-6.2-sol", "medium"))
-        self.assertEqual(self.pick("research", **both), ("codex", "gpt-6.2-astra", "xhigh"))
+        self.assertEqual(self.pick("research", **both), ("antigravity", "claude-opus-5-5", "high"))  # 0.28
         self.assertEqual(self.pick("plan-critique", **both), ("antigravity", "gemini-4-neon", "xhigh"))
         self.assertEqual(self.pick("fact-check", **both), ("codex", "gpt-6.2-astra", "high"))
         self.assertEqual(self.pick("other", **both), ("codex", "gpt-6.2-sol", "low"))
@@ -5318,23 +5386,33 @@ class SuggestTest(unittest.TestCase):
                                         self.NOW)
         self.assertEqual(got["provider"], "codex")
 
-    def test_a_busy_claude_code_starts_a_week_not_yet_begun(self):
-        """0.26.0: while Claude Code is past 70%, research starts Antigravity's Claude and GPT week
-        when it hasn't begun (unused, its reset a full week away), so its weeks don't slip."""
-        codex = self.codex()
-        idle = self.agy(gemini=10, claude=0, days_left=7)
-        busy = {"windows": [(7 * self.DAY, 60, self.NOW + 2 * self.DAY, self.NOW)]}  # about 84%
-        calm = {"windows": [(7 * self.DAY, 10, self.NOW + 2 * self.DAY, self.NOW)]}
-        got = server.suggest_consultant("research", {"codex": codex, "antigravity": idle, "claude": busy}, self.NOW)
-        self.assertEqual((got["provider"], got["model"]), ("antigravity", "claude-opus-5-5"))
-        self.assertTrue(any("hasn't started its week" in w for w in got["why"]), got["why"])
-        self.assertEqual(self.pick("research", codex=codex, antigravity=idle, claude=calm),
-                         ("codex", "gpt-6.2-astra", "xhigh"))
-        started = self.agy(gemini=10, claude=0, days_left=5)  # unused, but its week began two days ago
-        self.assertTrue(server.week_unstarted(idle["groups"]["Claude and GPT models"], self.NOW))
-        self.assertFalse(server.week_unstarted(started["groups"]["Claude and GPT models"], self.NOW))
-        for kind in ("review", "quick-check", "fact-check"):  # only research starts it
-            self.assertNotEqual(self.pick(kind, codex=codex, antigravity=idle, claude=busy)[1], "claude-opus-5-5")
+    def test_research_and_drafts_go_to_antigravitys_claude_models(self):
+        """0.28 (#26): research and drafts run on Antigravity's Claude and GPT quota whenever it has
+        room, sparing Claude Code's and Codex's; research names Codex for a page's text, since
+        Antigravity can't open a page. A tight Claude and GPT week hands them on. Reviews never go there."""
+        codex, agy = self.codex(), self.agy()
+        both = {"codex": codex, "antigravity": agy, "claude": {}}
+        self.assertEqual(self.pick("research", **both), ("antigravity", "claude-opus-5-5", "high"))
+        self.assertEqual(self.pick("draft", **both), ("antigravity", "claude-opus-5-5", "high"))
+        self.assertEqual(self.pick("research", codex=codex), ("codex", "gpt-6.2-astra", "xhigh"))
+        self.assertEqual(self.pick("draft", codex=codex), ("codex", "gpt-6.2-astra", "high"))
+        tight = self.agy(claude=100)  # the Claude and GPT week used up
+        self.assertEqual(self.pick("draft", codex=codex, antigravity=tight), ("antigravity", "gemini-4-neon", "high"))
+        self.assertEqual(self.pick("research", codex=codex, antigravity=tight), ("codex", "gpt-6.2-astra", "xhigh"))
+        got = server.suggest_consultant("draft", {"antigravity": agy}, self.NOW, only="antigravity")
+        self.assertEqual(got["model"], "gemini-4-neon")  # "ask Gemini": never a Claude model
+        lines = "\n".join(server.suggestion_lines("research", both, self.NOW))
+        self.assertIn("can't open a page", lines)
+        self.assertIn('goes to Codex: provider "codex", model "gpt-6.2-astra", effort "xhigh"', lines)
+        self.assertIn("Gemini 4 Neon scores best", lines)
+        self.assertNotIn("goes to Codex", "\n".join(server.suggestion_lines("research", {"antigravity": agy,
+                                                                                            "claude": {}}, self.NOW)))
+        draft = "\n".join(server.suggestion_lines("draft", both, self.NOW))
+        self.assertIn("unified diff", draft)
+        self.assertIn("draft", server.CONSULT_KINDS)
+        for kind in ("review", "re-check", "bug-hunt", "plan-critique"):
+            self.assertNotEqual(self.pick(kind, **both)[1], "claude-opus-5-5")
+        self.assertIn("kind draft", server.HAND_OUT["busy"])
         self.assertEqual(server.behind_schedule([(7 * self.DAY, 10, self.NOW + 2 * self.DAY)], self.NOW),
                          100 * 5 / 7 - 10)
         self.assertIsNone(server.behind_schedule([(5 * 3600, 10, self.NOW + 3600)], self.NOW))
@@ -5349,7 +5427,6 @@ class SuggestTest(unittest.TestCase):
         agy = self.agy(gemini=50, claude=0, days_left=2, models=sonnet)
         got = server.suggest_consultant("research", {"codex": codex, "antigravity": agy}, self.NOW)
         self.assertEqual((got["provider"], got["model"], got["effort"]), ("antigravity", "claude-opus-5-5", "high"))
-        self.assertIn("Codex is on pace for about 35% of its week", got["why"])
         self.assertIn("Antigravity's Claude and GPT models resets within 3 days at about 0% of its week, "
                       "so the rest would go unused", got["why"])
         self.assertTrue(any("switches to this model" in n for n in got["notes"]), got["notes"])
@@ -5364,33 +5441,33 @@ class SuggestTest(unittest.TestCase):
         # four days to the reset: not unused yet, but 0.26.0 sends interchangeable work to the
         # subscription furthest behind an even pace: the idle group 43 points behind, Codex 19
         later = self.agy(gemini=50, claude=0, days_left=4, models=sonnet)
-        got = server.suggest_consultant("research", {"codex": codex, "antigravity": later}, self.NOW)
-        self.assertEqual((got["provider"], got["model"]), ("antigravity", "claude-opus-5-5"))
+        got = server.suggest_consultant("quick-check", {"codex": codex, "antigravity": later}, self.NOW)
+        self.assertEqual((got["provider"], got["model"]), ("antigravity", "claude-sonnet-5-5"))
         self.assertIn("Antigravity's Claude and GPT models is 43 points behind an even pace through its week",
                       got["why"])
         # less than 15 points further behind than the first choice: it stays
         near = self.agy(gemini=50, claude=25, days_left=4, models=sonnet)  # 18 behind, Codex 19
-        self.assertEqual(self.pick("research", codex=codex, antigravity=near), ("codex", "gpt-6.2-astra", "xhigh"))
+        self.assertEqual(self.pick("quick-check", codex=codex, antigravity=near), ("codex", "gpt-6.2-sol", "low"))
         for kind in ("review", "bug-hunt", "plan-critique", "fact-check"):  # quality first: never moved
             self.assertNotEqual(self.pick(kind, codex=codex, antigravity=later)[1], "claude-opus-5-5", kind)
         # both would go unused: the one that resets first
         soon = self.codex(used=10, days_left=1)
         self.assertEqual(self.pick("research", codex=soon, antigravity=agy), ("codex", "gpt-6.2-astra", "xhigh"))
-        # Gemini tight, the other group calm: Antigravity's research moves to it, not one level down
-        tight = self.agy(gemini=80, claude=0, days_left=1)
-        got = server.suggest_consultant("research", {"antigravity": tight}, self.NOW)
-        self.assertEqual((got["model"], got["effort"]), ("claude-opus-5-5", "high"))
+        # Gemini tight, the other group calm: Antigravity's quick check moves to it, not one level down
+        tight = self.agy(gemini=80, claude=0, days_left=1, models=sonnet)
+        got = server.suggest_consultant("quick-check", {"antigravity": tight}, self.NOW)
+        self.assertEqual((got["model"], got["effort"]), ("claude-sonnet-5-5", "low"))
         self.assertIn("Antigravity's Gemini Models is on pace for about 93% of its week", got["why"])
         # "ask Gemini" never moves to the Claude group
         got = server.suggest_consultant("research", {"antigravity": agy}, self.NOW, only="antigravity")
         self.assertEqual(got["model"], "gemini-4-neon")
         # a tie in reset time keeps the first choice
         both_spare = {"codex": self.codex(used=10, days_left=2), "antigravity": self.agy(gemini=10, days_left=2)}
-        self.assertEqual(self.pick("research", **both_spare), ("codex", "gpt-6.2-astra", "xhigh"))
+        self.assertEqual(self.pick("quick-check", **both_spare), ("codex", "gpt-6.2-sol", "low"))
         # unknown usage is said as such, not as room
         unknown = {"codex": {"windows": [], "models": None}, "antigravity": agy}
-        got = server.suggest_consultant("research", unknown, self.NOW)
-        self.assertEqual(got["model"], "claude-opus-5-5")
+        got = server.suggest_consultant("quick-check", unknown, self.NOW)
+        self.assertEqual(got["model"], "claude-sonnet-5-5")
         self.assertIn("Codex: usage not known", got["why"])
         # work that checks Claude's own never goes to a Claude model, not even through the default
         # model of an Antigravity that lists only Opus, with Codex tight or absent
@@ -5474,6 +5551,12 @@ class SuggestTest(unittest.TestCase):
         for kind, said in (("review", "Ask for every finding in the first round"),
                            ("re-check", "send the review's model and effort again"),
                            ("bug-hunt", "draft the fix as a unified diff"),
+                           ("review", "Ask it to weigh each finding itself before giving it"),
+                           ("review", "whether a user in a normal setup would meet it"),
+                           ("review", "its verdict is CHANGES only for them"),
+                           ("re-check", "only one a user in a normal setup would meet"),
+                           ("bug-hunt", "the scenario where a user meets it, and whether one in a normal setup"),
+                           ("plan-critique", "giving only those a user in a normal setup would meet"),
                            ("bug-hunt", "git apply"),
                            ("plan-critique", "whether any premise, assumption or framing is wrong"),
                            ("research", "Ask for a short answer with its sources"),
@@ -5669,6 +5752,26 @@ class AgyTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--model") + 1], "claude-opus-5-5-high")
         self.assertIn("runs on claude-opus-5-5-high, nouez's pick for a research.", out)
 
+    def test_nouezs_own_claude_pick_for_a_diff_moves_to_gemini(self):
+        """Codex 0.28 review, finding 3: a draft of branch changes (revision=true) whose pick at send is
+        Opus runs on Gemini, at Gemini's own level (round 2), not Opus's; only a Claude model the caller
+        passed is refused."""
+        self.MODELS = self.MODELS + ["claude-opus-5-5-low"]
+        _, name = self.start()
+        pick = {"provider": "antigravity", "model": "claude-opus-5-5", "effort": "low",
+                "why": ["Claude's own family writes code best"], "notes": []}
+        self.replies = [[agy_result("ok\n")]]
+        with mock.patch.object(server, "send_route", return_value=pick):
+            out = server.send_consultant_message({"to": name, "message": "x", "wait": 5, "kind": "draft",
+                                                  "revision": True})
+        argv = self.runs[0][0]
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-4-neon-high")
+        self.assertIn("runs on gemini-4-neon-high instead", out)
+        with self.assertRaisesRegex(server.BridgeError, "goes to a model of another family"):
+            server.send_consultant_message({"to": name, "message": "x", "wait": 0, "kind": "draft",
+                                            "revision": True, "model": "claude-opus-5-5-low"})
+        self.assertEqual(len(self.runs), 1)
+
     def test_a_named_gemini_never_runs_on_another_model(self):
         """Codex round 2, finding 5: after "ask Gemini", a send nouez can't move to a Gemini model
         (none has room) is refused rather than left on the consultant's Claude model."""
@@ -5680,10 +5783,28 @@ class AgyTest(unittest.TestCase):
                 self.assertRaisesRegex(server.BridgeError, "The user named Gemini for this research"):
             server.send_consultant_message({"to": name, "message": "x", "wait": 0, "kind": "research"})
         self.assertEqual(self.runs, [])
+        self.assertTrue(server.named_provider("research", "antigravity"))  # refused: still waiting for its one send
         self.replies = [[agy_result("ok\n")]]  # a model the user accepted, passed outright, goes ahead
         server.send_consultant_message({"to": name, "message": "x", "wait": 5, "kind": "research",
                                         "model": "claude-opus-5-5"})
         self.assertEqual(len(self.runs), 1)
+        self.assertFalse(server.named_provider("research", "antigravity"))  # 0.28: that was its one message
+
+    def test_the_diff_goes_in_by_default(self):
+        """0.28 (#47): an Antigravity consultant runs no git, so revision=true puts the diff in the
+        message unless attach_diff is false; true without revision, or a non-boolean, is refused."""
+        _, name = self.start()
+        self.replies = [[agy_result("ok\n")], [agy_result("ok\n")]]
+        server.send_consultant_message({"to": name, "message": "x", "wait": 5, "kind": "review", "revision": True})
+        self.assertIn("(sha256 d1g3st), as nouez took it:", json.loads(self.runs[0][2])["message"]["content"])
+        server.send_consultant_message({"to": name, "message": "x", "wait": 5, "kind": "review", "revision": True,
+                                        "attach_diff": False})
+        self.assertNotIn("as nouez took it", json.loads(self.runs[1][2])["message"]["content"])
+        for bad, why in ((True, "attach_diff requires revision=true"), ("yes", "must be true or false")):
+            with self.assertRaisesRegex(server.BridgeError, why):
+                server.send_consultant_message({"to": name, "message": "x", "wait": 0, "kind": "review",
+                                                "attach_diff": bad})
+        self.assertEqual(len(self.runs), 2)
 
     def test_send_reply_history_stop(self):
         _, name = self.start(instructions="Answer in French.")
@@ -9773,7 +9894,7 @@ class DispatcherTest(unittest.TestCase):
     def test_options(self):
         opts = server.dispatcher_options(["--folder", self.folder, "--dry-run"], {"folder", "dry-run"})
         self.assertEqual(opts, {"folder": self.folder, "config-dir": None, "dry-run": True, "force": False,
-                                "sign-in": False, "projects": None})
+                                "sign-in": False, "projects": None, "statusline": False})
         opts = server.dispatcher_options(["--config-dir", self.home], {"folder", "config-dir"})
         self.assertEqual(opts["config-dir"], self.home)
         for argv in (["--config-dir", "relative"], ["--config-dir", self.home]):
@@ -10524,8 +10645,8 @@ class ProjectsFoldersTest(unittest.TestCase):
             server.run_dispatcher(["run", "--folder", self.folder, "--projects", a, "--sign-in"])
         run.assert_called_once_with(self.folder, None, True, [a])
         with mock.patch.object(server, "dispatcher_setup", return_value=0) as setup:
-            server.run_dispatcher(["setup", "--no-projects"])
-        setup.assert_called_once_with(self.folder, False, projects=[])
+            server.run_dispatcher(["setup", "--no-projects", "--statusline"])
+        setup.assert_called_once_with(self.folder, False, projects=[], statusline=True, ask=input)
         with mock.patch.object(server, "dispatcher_install", return_value=0) as install:
             server.run_dispatcher(["install", "--projects", a, "--projects", b])
         install.assert_called_once_with(self.folder, False, False, projects=[a, b])
@@ -10596,18 +10717,102 @@ class ProjectsFoldersTest(unittest.TestCase):
             os.mkdir(os.path.join(home, "Projects"))
             self.assertEqual(self.real_default_folder(), folder, "a dispatcher set up there stays the default")
             shutil.rmtree(os.path.join(home, ".nouez"))
-            self.assertEqual(self.real_default_folder(), os.path.join(home, "Projects", "dispatcher"))
+            # 0.28 (#2): a new install goes in ~/.nouez/dispatcher even with a ~/Projects, and a bare
+            # setup lists the folders that look like they hold projects, choosing none.
+            self.assertEqual(self.real_default_folder(), folder)
+            out = []
+            self.assertEqual(server.dispatcher_setup(folder, out=out.append), 1)
+            said = "\n".join(out)
+            self.assertNotIn("doesn't exist. Make it", said)  # Neon: ~/.nouez is made by setup, not the user
+            self.assertIn(f"  {os.path.join(home, 'Projects')} (0 trusted projects)", said)
+            self.assertFalse(os.path.exists(os.path.join(home, ".nouez")))
             os.mkdir(os.path.join(home, ".nouez"))
             os.mkdir(os.path.join(home, ".nouez", "dispatcher"))
             os.mkdir(os.path.join(home, "Projects", "dispatcher"))
-            self.assertEqual(self.real_default_folder(), os.path.join(home, "Projects", "dispatcher"))
+            self.assertEqual(self.real_default_folder(), folder, "a folder that merely appears doesn't take its place")
             with open(os.path.join(folder, "CLAUDE.md"), "w"):
                 pass
-            self.assertEqual(self.real_default_folder(), folder, "a folder that merely appears doesn't take its place")
+            self.assertEqual(self.real_default_folder(), folder)
             with open(os.path.join(home, "Projects", "dispatcher", "CLAUDE.md"), "w"):
                 pass
             self.assertEqual(self.real_default_folder(), os.path.join(home, "Projects", "dispatcher"),
                              "both set up: the one from before 0.27")
+
+    def test_the_projects_folders_a_bare_setup_suggests(self):
+        """0.28 (#2): folders holding two or more trusted projects (a folder inside a git
+        repository counting as the repository), each once, most projects first; none that
+        couldn't be a projects folder."""
+        top = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, top, True)
+        work, other, repo = (os.path.join(top, n) for n in ("work", "other", os.path.join("code", "repo")))
+        for p in (os.path.join(work, "a"), os.path.join(work, "b"), os.path.join(work, "c"),
+                  os.path.join(other, "d"), os.path.join(top, "code", "e"), os.path.join(repo, ".git"),
+                  os.path.join(repo, "sub")):
+            os.makedirs(p)
+        trusted = [os.path.join(work, "a"), os.path.join(work, "b"), os.path.join(work, "b") + os.sep,
+                   os.path.join(work, "c"), os.path.join(other, "d"), os.path.join(top, "code", "e"),
+                   os.path.join(repo, "sub"), os.path.join(top, "gone", "f"), os.path.join(top, "gone", "g")]
+        state = os.path.join(top, ".claude.json")
+        with open(state, "w", encoding="utf-8") as f:
+            json.dump({"projects": {p: {"hasTrustDialogAccepted": True} for p in trusted}}, f)
+        with mock.patch.object(server.os.path, "expanduser", side_effect=lambda p: p.replace("~", top)):
+            got = server.projects_folder_candidates(state)
+        self.assertEqual(got, [(work, 3), (os.path.join(top, "code"), 2)])
+        text = server.pick_projects_text(os.path.join(top, ".nouez", "dispatcher"), state)
+        self.assertIn("nothing is chosen for you", text)
+
+    def test_setup_offers_the_status_line_and_adds_it_only_on_a_yes(self):
+        """0.28 (#52): with no status line in Claude Code's settings, setup offers nouez's: on a
+        terminal it asks, elsewhere it says how; it is added only with --statusline or a yes, after
+        a copy, keeping the other settings. One of the user's own is kept."""
+        top = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, top, True)
+        config = os.path.join(top, "claude-profile")
+        path = os.path.join(config, "settings.json")
+        offer = _REAL_STATUSLINE_OFFER
+        tty = mock.Mock(isatty=lambda: True)
+        with mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": config}):
+            out = []
+            offer(False, True, out.append)
+            self.assertIn("isn't there yet", out[-1])
+            os.mkdir(config)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"model": "opus"}, f)
+            out, asked = [], []
+            offer(True, True, out.append, asked.append)
+            self.assertIn("Would offer", out[-1])
+            pipe = mock.Mock(isatty=lambda: False)
+            with mock.patch.object(server.sys, "stdin", pipe), mock.patch.object(server.sys, "stdout", pipe):
+                offer(False, False, out.append, lambda q: asked.append(q) or "y")  # not a terminal: no question
+            self.assertEqual(asked, [])
+            self.assertIn("--statusline", out[-1])
+            with mock.patch.object(server.sys, "stdin", tty), mock.patch.object(server.sys, "stdout", tty):
+                offer(False, False, out.append, lambda q: asked.append(q) or "n")
+                self.assertIn("Optional:", out[-1])
+                with open(path, encoding="utf-8") as f:
+                    self.assertNotIn("statusLine", json.load(f))
+                offer(False, False, out.append, lambda q: asked.append(q) or " Yes ")
+            self.assertEqual(len(asked), 2)
+            self.assertIn("[y/N]", asked[0])
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data["model"], "opus")
+            self.assertTrue(server.ours_statusline(data["statusLine"]))
+            self.assertEqual(data["statusLine"]["command"], server.usage_command("statusline"))
+            self.assertEqual(len(glob.glob(os.path.join(config, "settings.json.nouez-*.bak"))), 1)
+            offer(False, True, out.append)
+            self.assertIn("already has nouez's status line", out[-1])
+            own = {"statusLine": {"type": "command", "command": "~/bin/my-line.sh"}}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(own, f)
+            offer(False, True, out.append)
+            self.assertIn("of your own; it is kept", out[-1])
+            self.assertIn("statusline --quiet", out[-1])
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), own)
+        self.assertEqual(server.dispatcher_options(["--statusline"], {"statusline"})["statusline"], True)
+        with self.assertRaises(ValueError):
+            server.dispatcher_options(["--statusline"], {"folder"})  # install has no --statusline
 
     def test_setup_and_install_with_several_projects_folders(self):
         a, b = self.roots("work", "Mes projets \u00e9")
@@ -10818,8 +11023,8 @@ class ProjectsFoldersTest(unittest.TestCase):
 
 
 class ListProjectsFoldersTest(unittest.TestCase):
-    """0.27.0: in the dispatcher, ListProjects lists each projects folder; `recent` lists the
-    folders Claude Code was used in lately, from anywhere."""
+    """0.27.0: in the dispatcher, ListProjects lists each projects folder. 0.28: its `recent` list is
+    gone (resume lists a folder's conversations instead)."""
 
     def setUp(self):
         self.base = tempfile.mkdtemp(prefix="nouez-test-roots-")
@@ -10874,53 +11079,18 @@ class ListProjectsFoldersTest(unittest.TestCase):
         self.assertTrue(server.ran_here(transcript, cwd))
         with mock.patch.object(server.os.path, "samefile", lambda a, b: False):  # a case-sensitive Repo and repo
             self.assertFalse(server.ran_here(transcript, cwd))
-            self.assertEqual(server.transcript_time(cwd), 0)
         with mock.patch.object(server.os.path, "samefile", side_effect=FileNotFoundError("gone")):
             self.assertTrue(server.ran_here(transcript, cwd))
         with mock.patch.object(server.os.path, "samefile", side_effect=PermissionError("denied")):
             self.assertFalse(server.ran_here(transcript, cwd))
         self.assertFalse(server.ran_here(transcript, os.path.join(self.b, "delta")))
 
-    def test_the_recently_used_folders(self):
-        trusted = {"hasTrustDialogAccepted": True}
-        entries = {os.path.join(self.a, "alpha", "src"): trusted, os.path.join(self.a, "alpha"): trusted,
-                   os.path.join(self.b, "gamma"): dict(trusted, lastSessionId="g1"),
-                   os.path.join(self.b, "delta"): {"hasTrustDialogAccepted": False},
-                   os.path.join(self.b, "quiet"): trusted, self.here: trusted,
-                   os.path.join(self.b, ".hidden"): trusted,
-                   os.path.join(self.base, "gone"): trusted, "relative": trusted,
-                   os.path.join(self.base, "claude"): trusted}
-        with open(self.state, "w", encoding="utf-8") as f:
-            json.dump({"projects": entries}, f)
-        os.mkdir(os.path.join(self.b, ".hidden"))
-        self.chat(os.path.join(self.b, ".hidden"), 7000)
-        self.chat(os.path.join(self.a, "alpha", "src"), 3000)
-        self.chat(os.path.join(self.a, "alpha"), 1000)
-        self.chat(os.path.join(self.a, "alpha"), 9000, "stray", ran_in=os.path.join(self.base, "a_alpha"))
-        self.chat(os.path.join(self.b, "gamma"), 2000, "g1")
-        self.chat(os.path.join(self.b, "gamma"), 4500, "newer")  # newer than its last session
-        self.chat(os.path.join(self.b, "delta"), 4000)
-        self.chat(self.here, 6000)
-        self.chat(os.path.join(self.base, "claude"), 6000)
-        with mock.patch.object(server.tempfile, "gettempdir", lambda: os.path.join(self.base, "elsewhere")):
-            out = server.list_projects({"recent": True})
-            self.assertIn("Folders Claude Code was used in lately, newest first (2):", out)
-            alpha, gamma = os.path.join(self.a, "alpha"), os.path.join(self.b, "gamma")
-            self.assertLess(out.index(f"- {gamma} ["), out.index(f"- {alpha} ["),
-                            "by the newest transcript that ran there: not another folder's, not the last session's")
-            self.assertEqual(out.count(f"- {alpha} ["), 1, "a folder inside a repository counts as it")
-            for left_out in ("delta", "quiet", "dispatcher", "gone", "relative", ".hidden",
-                             os.path.join(self.base, "claude")):
-                self.assertNotIn(left_out + " [", out)
-        out = server.list_projects({"recent": True})  # here everything is in the temporary folder
-        self.assertIn("No trusted folder has a conversation yet", out)
-        os.remove(self.state)
-        with self.assertRaises(server.BridgeError):
+    def test_the_recent_list_is_gone_and_says_where_to_look(self):
+        with self.assertRaises(server.BridgeError) as e:
             server.list_projects({"recent": True})
-        with self.assertRaises(server.BridgeError):
-            server.list_projects({"recent": True, "folder": self.a})
-        with self.assertRaises(server.BridgeError):
-            server.list_projects({"recent": "yes"})
+        self.assertIn("ListClaudeSessions with cwd", str(e.exception))
+        tool = next(x for x in server.TOOLS if x["name"] == "ListProjects")
+        self.assertNotIn("recent", tool["inputSchema"]["properties"])
 
 
 class ClonePlaceTest(unittest.TestCase):

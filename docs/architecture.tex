@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.27.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.28.0\\[0.3em]\large Architecture and message reference}
 \date{November 26, 2026}
 \author{}
 
@@ -290,7 +290,7 @@ the folder the call names, never in a workspace above it.
   "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
   "ttlMs": 0, "cacheScope": "private",
-  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.27.0"}}}}
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.28.0"}}}}
 \end{wire}
 
 Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
@@ -1018,11 +1018,12 @@ set, or whose settings \code{git config -{}-list} can't read: the line asks the 
 the working tree. Clean filters the repository configures still run. The
 usage log records only the digest (\code{patch}). A Codex consultant reads the file itself, and
 nouez takes the diff only after checking that the session is one it may message. An Antigravity
-consultant runs no commands and may not be allowed to read nouez's folder, so with
-\code{attach\_diff} its message carries the diff, before the bridge header, where
-\code{GetConsultantHistory} doesn't show it; the message stays in the consultant's records like any
-other, and goes to Google. Without \code{attach\_diff} nouez takes no diff for it, and the line
-gives only the commit, branch and count. A diff over 200{,}000 bytes, or with bytes that aren't
+consultant runs no commands and may not be allowed to read nouez's folder, so its message carries
+the diff, before the bridge header, where \code{GetConsultantHistory} doesn't show it; the message
+stays in the consultant's records like any other, and goes to Google. With
+\code{attach\_diff} false nouez takes no diff for it, and the line gives only the commit, branch and
+count; that is refused for a blind second opinion on a review that named a revision, which must see
+the same diff. A diff over 200{,}000 bytes, or with bytes that aren't
 UTF-8 (which the message couldn't carry unchanged), isn't attached: the line gives its size and asks
 for a review of the working tree.
 
@@ -1394,6 +1395,11 @@ was seen. Under a lock on \code{claude-usage.json.lock} it merges them with the 
 window replaces an earlier one, the same window keeps the higher percentage, and a window that has
 reset is dropped. It writes atomically, prints a short status line (nothing with \code{-{}-quiet}),
 and exits 0 whatever happens, so it can't break the status line. The server only reads the file.
+When Claude Code's own \code{settings.json} has no \code{statusLine}, a \code{dispatcher setup} that
+went well, and isn't a dry run, offers nouez's (\code{statusline\_offer}): it asks when stdin and
+stdout are a terminal and adds it only on a yes, or with \code{-{}-statusline}, after a checked copy
+of the file, the other settings kept; elsewhere it says how. One of the user's own is kept, with the
+\code{-{}-quiet} command to pass its input on.
 
 Model scores come from \code{https://artificialanalysis.ai/api/v2/language/models/free}, with the key
 from \code{ARTIFICIAL\_ANALYSIS\_API\_KEY} in an \code{x-api-key} header, page by page while
@@ -1426,7 +1432,11 @@ The suggestion comes from \code{suggest\_consultant}. \code{ConsultantBudget} ta
 \code{kind} (one of the usage log's kinds) and \code{provider}; without a kind it gives one line per
 kind, and with a provider it considers only that one. \code{CONSULT\_PICKS} lists, for each kind,
 the (provider, model, effort) options in order of preference, from the public benchmarks dated in
-\code{docs/consultants.md}. Each option is checked against what is installed and listed:
+\code{docs/consultants.md}. Since 0.28, research and drafts (code as text, which Claude checks and
+applies itself, so it stays the only writer) go first to Antigravity's \code{claude-opus-5-5}, on
+Google's quota rather than Claude Code's or Codex's; for research the lines after the choice also
+name Codex's own pick for research that needs a page's text, since \code{agy} headless can search
+but not open a page. Each option is checked against what is installed and listed:
 
 \begin{itemize}
 \item A provider that isn't installed is left out. A model that isn't listed becomes the newest
@@ -1435,7 +1445,9 @@ the (provider, model, effort) options in order of preference, from the public be
   Gemini~4 Neon when listed, else a listed Gemini model). An effort the model doesn't list becomes
   the closest listed level below it, and a level is always named, since a reused consultant keeps
   its last one; each fallback adds a note. With \code{provider} antigravity (``ask Gemini'')
-  only its Gemini models are options.
+  only its Gemini models are options. A \code{kind} with a \code{provider} also holds the
+  send's own pick to that provider, for the next message of that kind that reaches it (unused, it
+  lapses after half an hour); the message after it gets the usual pick again.
 \item Each option's usage outlook comes from its windows (for Antigravity, the quota group of its
   model): \emph{blocked} when a window is used up or runs out before its reset at the current pace,
   \emph{tight} over 90\% on pace at the weekly reset, \emph{busy} over 70\%, \emph{spare} under 60\%
@@ -1457,7 +1469,11 @@ Antigravity choice, \code{StartConsultant}'s part names the model and level as w
 Antigravity consultant checks its starting model before the first message can change it. The lines after
 the choice carry the kind's notes (rounds of a review, the premise question of a critique, sources
 for a fact check), the blind second opinion with the other provider's own suggestion when it has room, the subjects
-Gemini~4 Neon scores best on when Neon is listed and its group has room, and that a reused consultant keeps its last model and effort.
+Gemini~4 Neon scores best on when Neon is listed, its group has room and the choice isn't already
+a Gemini model, and that a reused consultant keeps its last model and effort. Past 70\% of Claude
+Code's week the hand-out line adds that code to write can go out as a draft (kind \code{draft}).
+The rule that research starts an Antigravity week not yet begun is gone in 0.28: research goes to
+that group first anyway.
 \code{tests/consult\_eval.py} checks in fresh \code{claude -p} sessions that Claude calls it and
 follows it.
 
@@ -1795,7 +1811,15 @@ Opus), \code{effort} (default \code{medium}), \code{create}, \code{trust} and
 the user's own Claude Code defaults, and with \code{CLAUDE\_CODE\_EFFORT\_LEVEL} set to the same
 effort, since that variable outranks the flag; a model must be an alias or a full model name, so it can't read
 as another option. With
-\code{create: true} a missing folder is made (its parent must exist). It writes \code{cwd}, name, prompt,
+\code{create: true} a missing folder is made (its parent must exist) and becomes a project, before
+the trust check: unless it is inside a git work tree already, \code{git init -{}-template=}
+makes it a repository (\code{git} found on \code{PATH}, never in the project's folder, with no
+\code{GIT\_} variable from nouez's environment and an empty template, which outranks
+\code{GIT\_TEMPLATE\_DIR} and \code{init.templateDir}, so neither git's sample hooks nor the user's
+own template go in), and a starter
+\code{CLAUDE.md} is written, never over one there. Neither is a project setting, so the new
+folder's trust report stays empty. Without git, or when a step fails, the result says so and the
+session opens anyway. It writes \code{cwd}, name, prompt,
 model, effort and the conversation to resume to a temporary file and opens a new terminal window running \code{server.py claude <file>}
 (Section~\ref{sec:claude-os}); the window reads the file, deletes it, and starts Claude Code.
 
@@ -1826,19 +1850,23 @@ can't read only leaves the note out. A session already running in the folder is 
 ... Checked: it is running, but hadn't connected to Remote Control after 30s. It may still be connecting, or waiting for an answer on the computer.
 ... Checked: it hadn't shown up as a running session after 30s. It may still be starting (resuming a long conversation takes longer), or waiting for an answer on the computer. Call ListClaudeSessions in a moment to see it, before telling the user it failed or opening another session.
 \end{plain}
-\code{resume} picks up an earlier conversation instead of starting one: a session id, or
-\code{latest}, the newest transcript in Claude Code's folder for \code{cwd}
-(\code{\textasciitilde/.claude/projects/<cwd, other characters as ->/}) whose id no running
-session has open and whose transcript recorded this folder: the folder name is lossy, so
+\code{resume} picks up an earlier conversation instead of starting one, by the session id the
+user picked from the list \code{ListClaudeSessions} gives for \code{cwd} (newest first, each marked open
+or not).
+There is no ``latest'': Claude is told to show the user that list first, and nouez checks the id it passes. The transcript must have recorded
+this folder, by its spelling and, when both exist, as the same folder on disk (a case-sensitive
+folder's \code{Repo} and \code{repo} aren't): Claude Code's folder for \code{cwd}
+(\code{\textasciitilde/.claude/projects/<cwd, other characters as ->/}) is named lossily, so
 \code{C:\textbackslash{}a-b} and \code{C:\textbackslash{}a\_b} share one. An id must look like a session id, so it can't read as an option, and the helper
 checks it again before passing \code{-{}-resume}; it is passed in lowercase, the spelling of the
 transcript files. nouez refuses an id open in a running session, an id
 whose transcript recorded another folder (naming it), an id with no transcript, one whose transcript
 doesn't say where it ran (even in this folder's transcripts, which may be a twin folder's), and any \code{resume}
 when the running sessions can't be read, since it couldn't tell whether one has it open; a \code{prompt}
-starting with \code{/resume} or \code{/continue} is refused with a pointer to \code{resume}.
+starting with \code{/resume} or \code{/continue}, or a \code{resume} that isn't an id (such as
+\code{latest}), is refused with a pointer to \code{ListClaudeSessions}.
 \begin{plain}[Result text: resuming]
-... It resumes the latest conversation in this folder, 4b4f3c8c-0010-4e93-a427-9db7032f2be3, last active 2026-11-07 14:33. Checked: it is running and connected to Remote Control. ...
+... It resumes conversation 4b4f3c8c-0010-4e93-a427-9db7032f2be3, last active 2026-11-07 14:33. Checked: it is running and connected to Remote Control. ...
 \end{plain}
 \begin{wire}[Claude Code $\rightarrow$ nouez: a new folder]
 {"jsonrpc": "2.0", "id": 20, "method": "tools/call", "params": {"name": "OpenClaudeSession", "arguments": {"cwd": "C:\\Users\\me\\Projects\\economic-recession", "create": true}}}
@@ -1933,13 +1961,8 @@ with a dot or, on Windows, the hidden attribute (counted in the heading). Each i
 not trusted, or of unknown trust; with the project settings files it has, the sessions in the
 registry whose folder is in it, and the caller's own folder. Claude Code's state file is read once
 per call. In the dispatcher, with no \code{folder}, it lists each projects folder in turn, 300 folders in
-all, and says so when it was set up with none. With \code{recent} (not with \code{folder}) it lists
-instead, newest first, up to \code{RECENT\_SHOWN} folders the state file trusts on their own entry
-that exist, each once (a folder in a git work tree as that tree, with that tree's own trust mark), by
-when the newest transcript that records it as the folder it ran in last changed
-(\code{transcript\_time}), leaving out the caller's folder, hidden folders and any that is or holds
-the home folder or a drive's root, or is in Claude Code's, nouez's or the temporary folder
-(\code{recent\_projects}).
+all, and says so when it was set up with none. It has no list of recently used folders: to pick up
+an earlier conversation, \code{ListClaudeSessions} with \code{cwd} lists that folder's conversations.
 \begin{plain}[Result text]
 Folders in C:\Users\me\Projects (3):
 - dispatcher [trusted through a folder above it; has .claude/settings.json; this session's folder]
@@ -2324,9 +2347,13 @@ leave or overlap a few pixels.
 Remote Control lets the Claude app drive a Claude Code session on the computer. The computer
 connects out to Anthropic and nothing on it listens, but a \code{claude remote-control} server
 starts every session in its own folder. \code{server.py dispatcher} keeps one such server, named
-\code{dispatcher}, running in a folder of its own (\code{\textasciitilde/Projects/dispatcher}, or
-\code{\textasciitilde/.nouez/dispatcher} when only that one is set up, or neither is and there is no
-\code{\textasciitilde/Projects}, unless \code{-{}-folder}), and that folder's sessions have nouez's session tools, so one server reaches
+\code{dispatcher}, running in a folder of its own (\code{\textasciitilde/.nouez/dispatcher}, or
+\code{\textasciitilde/Projects/dispatcher} when that one is set up, as before 0.28, unless
+\code{-{}-folder}; without \code{-{}-projects} or \code{-{}-no-projects}, setup and install in
+\code{\textasciitilde/.nouez} are refused with the folders that look like they hold projects:
+\code{\textasciitilde/Projects}, and each folder holding two or more trusted folders, a folder in a
+git repository counting as the repository, those that could be projects folders, each once, with
+their counts; none is chosen), and that folder's sessions have nouez's session tools, so one server reaches
 every project (Figure~\ref{fig:dispatcher}). The supervisor gives \code{claude} the projects folders
 (those \code{-{}-projects} names, up to \code{DISPATCHER\_ROOTS\_MAX}, none inside another; by default
 the one that holds the dispatcher's) in \code{NOUEZ\_DISPATCHER\_PROJECTS}: one as its path, as
@@ -2578,7 +2605,6 @@ Default \code{wait} & 5 s / 0 s & SendConsultantMessage / GetConsultantReply \\
 \code{LOGIN\_EARLY\_DAYS} & 3 days & the earlier sign-in end, before the last moment \\
 \code{LOGIN\_WAIT\_SECONDS} & 25 s & ConsultantBudget's wait for a sign-in reading \\
 \code{PROJECTS\_SHOWN} & 300 & folders \code{ListProjects} lists \\
-\code{RECENT\_SHOWN} & 20 & folders \code{ListProjects} lists with \code{recent} \\
 \code{DISPATCHER\_ROOTS\_MAX} & 20 & projects folders the dispatcher takes \\
 \code{DISPATCHER\_COMMAND\_MAX} & 8000 & characters in the sign-in start's command \\
 \code{REPORT\_ITEMS} & 20 & items per list in a trust report \\

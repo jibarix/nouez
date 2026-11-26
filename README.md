@@ -65,11 +65,11 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.27.0 |
+| nouez | 0.28.0 |
 | Claude Code | 2.1.332 |
-| Codex CLI | 0.170.0 |
+| Codex CLI | 0.172.0 |
 | Codex app-server daemon | 0.172.0 |
-| Antigravity CLI (optional: Antigravity consultants, its quota) | 1.5.17 |
+| Antigravity CLI (optional: Antigravity consultants, its quota) | 1.5.18 |
 | Python | 3.11.9 |
 | OS | Windows 11 (the dispatcher's sign-in start on macOS and Linux is covered by tests, not yet run on those systems) |
 
@@ -93,13 +93,13 @@ claude mcp add --scope user consultants -- python "/absolute/path/to/nouez/serve
 
 On Windows, use a path like `"C:/Users/you/nouez/server.py"`. The setup guide shows how to add a key for [model scores](docs/consultants.md#choosing-a-consultant), and how to register it for one project only, which leaves the phone without nouez's tools elsewhere.
 
-**3. Set up the phone dispatcher,** a Remote Control server in a folder of its own, `~/Projects/dispatcher` by default, beside your projects (`~/.nouez/dispatcher` when there is no `~/Projects`). With the `python` and path you registered:
+**3. Set up the phone dispatcher,** a Remote Control server in a folder of its own, `~/.nouez/dispatcher` by default (a dispatcher already set up in `~/Projects/dispatcher` stays there). With the `python` and path you registered:
 
 ```sh
 python "/absolute/path/to/nouez/server.py" dispatcher setup
 ```
 
-It makes the folder (`--folder` picks another), writes a `CLAUDE.md` there that gives the dispatcher its job, and adds allow rules for nouez's session tools to the folder's `.claude/settings.json` (`--dry-run` shows what it would change). The phone can trust projects only inside the dispatcher's projects folders, by default the one that holds its folder (`~/Projects`): if your projects are elsewhere, or in several places, name each folder that holds them with `--projects DIR`, or pass `--no-projects` to trust folders only at the computer, and give `install` the same. Then, once, in a terminal in that folder:
+It makes the folder (`--folder` picks another), writes a `CLAUDE.md` there that gives the dispatcher its job, and adds allow rules for nouez's session tools to the folder's `.claude/settings.json` (`--dry-run` shows what it would change). The phone can trust projects only inside the dispatcher's projects folders, so name each folder that holds your projects with `--projects DIR`, or pass `--no-projects` to trust folders only at the computer, and give `install` the same. Run without either, `setup` lists the folders that look like they hold your projects (`~/Projects`, and folders holding two or more folders you trusted Claude Code in), with how many each holds, and changes nothing: pick from them and run it again. At its end, when Claude Code has no status line, `setup` offers nouez's, which lets nouez see Claude Code's usage, and adds it only on your yes (`--statusline` says yes ahead). Then, once, in a terminal in that folder:
 
 ```sh
 claude remote-control --name dispatcher --spawn same-dir
@@ -136,6 +136,16 @@ python "/absolute/path/to/nouez/server.py" doctor
 
 It checks Claude Code's side, the phone dispatcher and each consultant CLI, and says what to fix; a CLI you didn't install is a note, not a problem. Then `/mcp` inside Claude Code should show `consultants` connected. Sessions that were already open keep the old server until you reconnect `consultants` there with `/mcp`; do the same after [updating nouez](docs/setup.md#nouez-updates).
 
+### What nouez changes in your Claude Code setup
+
+- **The MCP entry** for `consultants`, made by Claude Code's own `claude mcp add` in step 2.
+- **One trust mark in `~/.claude.json`** for each folder you trust a session in, only after nouez reports what it will mark and you say yes. It copies the file first and keeps the newest 20 copies, in `%LOCALAPPDATA%\nouez\claude-json-backups` on Windows and `~/.local/state/nouez/claude-json-backups` on macOS and Linux. `doctor` lists them and says how to put one back. `NOUEZ_NO_TRUST_WRITE=1` turns this off.
+- **The dispatcher folder's own files:** its `CLAUDE.md`, and allow rules for nouez's session tools in its `.claude/settings.json`, copied first.
+- **The sign-in start** that `dispatcher install` adds, which `dispatcher uninstall` removes.
+- **nouez's status line** in Claude Code's own `settings.json`, only on your yes and only when it has none, copied first.
+
+nouez changes nothing else in your Claude Code settings. The waiter's allow rules (step 5) are yours to add.
+
 ## From your phone
 
 In the Claude app, start a new session and pick the computer, `dispatcher`. Then ask in plain language:
@@ -144,7 +154,7 @@ In the Claude app, start a new session and pick the computer, `dispatcher`. Then
 
 > Open a session in hours-tracker.
 
-> Resume the latest nouez session.
+> Show my earlier nouez conversations, then resume the one I pick.
 
 > Make a new project, economic-recession, and open a session there.
 
