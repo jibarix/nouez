@@ -3421,6 +3421,13 @@ def exactly_trusted(key, state_file=None):
         return None
 
 
+def state_unreadable():
+    """Whether Claude Code's state file is there but can't be read: trust it holds is unknown. A
+    missing one records no trust (and the writer refuses to make one)."""
+    state = claude_state_file()
+    return os.path.exists(state) and trusted_folders(state) is None
+
+
 def recorded_trust(name, state_file=None):
     """The trust the entry spelled exactly `name` records (False if there is none), or None if the
     state file can't be read: for checking the one entry nouez wrote, not any other spelling."""
@@ -4266,7 +4273,7 @@ def open_claude_session(args, cancel=None, progress=None):
 
     def refuse_new_folder():
         # Where a folder made here would be trusted, checked before anything is made or asked.
-        if trusted_folders() is None:
+        if state_unreadable():
             raise unreadable_state()
         refuse_dispatcher_trust(cwd)
         if os.path.isdir(os.path.dirname(cwd)):
@@ -4337,7 +4344,7 @@ def open_claude_session(args, cancel=None, progress=None):
     if flag(args, "trust") and not exact:
         if trust_write_off():
             raise BridgeError(TRUST_WRITE_OFF)
-        if exact is None:  # before a report that asks for a yes nouez couldn't act on
+        if exact is None and state_unreadable():  # before a report that asks for a yes nouez couldn't act on
             raise unreadable_state()
         if key is None:  # raised here, not by trust_folder, which would look the folder up again
             raise BridgeError(UNKNOWN_TRUST_KEY)

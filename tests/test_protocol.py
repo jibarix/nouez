@@ -1491,6 +1491,12 @@ class TrustTest(unittest.TestCase):
                 self.open({"cwd": new, "create": True, "trust": True})
         approves.assert_not_called()
         self.assertFalse(os.path.exists(new))  # nothing made, nothing asked
+        os.remove(self.state)  # a missing file records no trust: the report comes, as before
+        out, opened = self.open({"cwd": self.repo, "trust": True})
+        self.assertIn("Not trusted yet", out)
+        self.assertFalse(opened)
+        with open(self.state, "w", encoding="utf-8") as f:
+            f.write(before)
         self.assertEqual(self.unchanged(), before)
         self.assertEqual(self.backups(), [])
         self.assertIsNone(server.exactly_trusted(self.projects))
