@@ -69,7 +69,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.26.1"
+SERVER_VERSION = "0.26.2"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -2235,7 +2235,8 @@ def open_window(cwd, argv, title):
 
 # Arranging nouez's own windows (Windows only). The helper in each window OpenClaudeSession or
 # OpenStatusScreen opens (`server.py claude`, `server.py top --arranged`) finds its Windows
-# Terminal window and records it in nouez/windows/. With automatic arranging on, a small process,
+# Terminal window and records it in nouez/windows/. Only the sessions' windows are arranged; the
+# status screen's is recorded so OpenStatusScreen can bring it forward, and stays where it is put. With automatic arranging on, a small process,
 # `server.py arrange`, sleeps until one opens, closes, moves or changes state, or the screens
 # change, then puts them in a grid on one screen. ArrangeWindows arranges them once on request.
 
@@ -2351,9 +2352,10 @@ def whole(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def arrange_entries():
-    """The windows recorded in nouez/windows/, as (path, entry), oldest first. An entry whose
-    helper has ended is deleted."""
+def arrange_entries(status=False):
+    """The windows recorded in nouez/windows/ to arrange, as (path, entry), oldest first; with
+    `status`, the status screen's too, which is never arranged. An entry whose helper has ended is
+    deleted."""
     found = []
     try:
         folder = windows_folder()
@@ -2373,7 +2375,8 @@ def arrange_entries():
             e["slot"] = 0
         if not (isinstance(e.get("box"), list) and len(e["box"]) == 4 and all(map(whole, e["box"]))):
             e["box"] = None
-        found.append((path, e))
+        if status or e.get("kind") != "status":
+            found.append((path, e))
     return sorted(found, key=lambda pe: (pe[1]["slot"], pe[1]["start"]))
 
 
@@ -3009,8 +3012,8 @@ def arrange_windows(args, cancel=None, progress=None):
         wake_arranger()
     n = summary.get("windows", 0)
     if not n:
-        text = ("No window nouez opened is open in Windows Terminal. ArrangeWindows arranges the windows "
-                "OpenClaudeSession and OpenStatusScreen opened, not other terminals.")
+        text = ("No Claude Code session window nouez opened is open in Windows Terminal. ArrangeWindows "
+                "arranges the sessions OpenClaudeSession opened, not the status screen or other terminals.")
     else:
         text = f"Arranged {summary.get('arranged', 0)} of the {n} window(s) nouez opened in a grid on one screen."
         if summary.get("not_fitting"):
@@ -9879,7 +9882,7 @@ def show_status_window():
         return False
     try:
         pid = (cache_json(status_screen_file(), 4096) or {}).get("pid")
-        entry = next((e for _, e in arrange_entries() if e.get("pid") == pid and e.get("kind") == "status"), None)
+        entry = next((e for _, e in arrange_entries(status=True) if e.get("pid") == pid and e.get("kind") == "status"), None)
         if not entry or not whole(pid):
             return False
         screen = WindowsScreen()
@@ -10137,7 +10140,8 @@ def _supervise_top(args, flags, source, state):
 
 def run_top(argv):
     """`server.py top [--once] [--days N] [--page usage|consultations]`: the status screen.
-    --arranged (OpenStatusScreen's windows) puts its window among those nouez arranges."""
+    --arranged (OpenStatusScreen's windows) records its window, so OpenStatusScreen can bring it
+    forward; the status screen is never arranged."""
     arranged = "--arranged" in argv
     argv = [a for a in argv if a != "--arranged"]
     if "--once" not in argv and "--screen" not in argv:
@@ -10689,9 +10693,9 @@ TOOLS = [
     {
         "name": "ArrangeWindows",
         "description": (
-            "Windows only. Arrange the windows nouez opened on the user's computer (OpenClaudeSession's "
-            "Claude Code sessions and OpenStatusScreen's status screens, in Windows Terminal) in a grid "
-            "filling one screen, now. Automatic arranging is off until the user asks to turn it on. "
+            "Windows only. Arrange the Claude Code session windows OpenClaudeSession opened on the user's "
+            "computer (in Windows Terminal) in a grid filling one screen, now. The status screen is never "
+            "arranged. Automatic arranging is off until the user asks to turn it on. "
             "Each box needs about 60 by 16 characters; extra windows stay where they are. Other "
             "windows are never moved."
         ),
@@ -13710,7 +13714,7 @@ def run_doctor():
     if os.name == "nt":
         wt = which("wt")
         say(True if wt else None, "Windows Terminal is installed: Claude Code sessions and the status screen "
-            "open in it and are arranged" if wt
+            "open in it, and the sessions are arranged" if wt
             else "Windows Terminal isn't on PATH: Claude Code sessions and the status screen open in console "
                  "windows, which aren't arranged")
     elif sys.platform != "darwin":

@@ -90,4 +90,4 @@ A change to one of these rules changes this page in the same commit ([REVIEW.md]
 | Fetches model scores from Artificial Analysis about once a week, only with the user's key | Code | `ARTIFICIAL_ANALYSIS_API_KEY` | `aa_needs_a_key`, `aa_fetch_cache_and_retry` |
 | Web requests go only to those two sites; a redirect to another is refused | Code | none | `redirect_to_another_site_is_refused` |
 | Warns in results within a week of Claude Code's sign-in ending | Code | `NOUEZ_NO_LOGIN_CHECK=1` | `warned_only_within_a_week_of_the_earlier_date`, `off_with_the_switch` |
-| Arranges only its own windows, and only when asked; automatic arranging is off | Code | `ArrangeWindows` with `auto` | `arrange_windows_tool`, `only_nouezs_windows_register` |
+| Arranges only the Claude Code session windows it opened, never the status screen, and only when asked; automatic arranging is off | Code | `ArrangeWindows` with `auto` | `arrange_windows_tool`, `only_nouezs_windows_register`, `the_status_screen_is_never_arranged` |

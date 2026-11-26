@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.26.1\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.26.2\\[0.3em]\large Architecture and message reference}
 \date{November 25, 2026}
 \author{}
 
@@ -290,7 +290,7 @@ the folder the call names, never in a workspace above it.
   "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
   "ttlMs": 0, "cacheScope": "private",
-  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.26.1"}}}}
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.26.2"}}}}
 \end{wire}
 
 Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
@@ -1303,7 +1303,7 @@ nothing, and exits with code~1 when a problem blocks consultations.
 [ok] codex CLI 0.165.0 at C:\Users\you\AppData\Roaming\npm\codex.CMD
 [ok] the Codex app-server daemon answers (version 0.167.2)
 [ok] Claude Code allows the waiter command without asking
-[ok] Windows Terminal is installed: Claude Code sessions and the status screen open in it and are arranged
+[ok] Windows Terminal is installed: Claude Code sessions and the status screen open in it, and the sessions are arranged
 [ok] claude at C:\Users\you\.local\bin\claude.exe (for OpenClaudeSession)
 No problems found.
 \end{plain}
@@ -1945,7 +1945,8 @@ to the page, and to the period when \code{days} is given (Section~\ref{sec:consu
 status screen''). Otherwise it opens a new terminal window in the user's home folder (not a project
 folder, which an open window would keep from being renamed) running \code{server.py top -{}-arranged
 -{}-days <days> -{}-page <page>}, with 7 days when \code{days} isn't given (Section~\ref{sec:usage});
-\code{-{}-arranged} records the window for arranging (Section~\ref{sec:arrange}).
+\code{-{}-arranged} records the window, so a later call can bring it forward; it is never
+arranged (Section~\ref{sec:arrange}).
 \begin{plain}[Result text: opened, then switched]
 Opened a new Windows Terminal window on the computer with nouez's status screen, on its usage page (consultations counted: last 7 days). It shows only on the computer's screen: to tell a user who is away from it how their usage stands, use ConsultantBudget instead. [c] switches pages; they close it with q.
 The status screen was already open on the computer: switched it to its consultations page and asked Windows to bring its window forward. It shows only on the computer's screen: ...
@@ -2188,15 +2189,15 @@ The read-back catches the second; the backups are there for the first.
 
 On Windows, nouez puts the Windows Terminal windows it opened in a grid that fills one screen, and
 arranges them again as they open, close or are moved if automatic arranging is on. Those are the Claude Code sessions from
-\code{OpenClaudeSession} and the status screens from \code{OpenStatusScreen}. It never moves another window:
-not a terminal the user opened, nor one Claude Code runs in.
+\code{OpenClaudeSession}. It never moves another window: not the status screen, which stays where
+the user puts it, nor a terminal the user opened, nor one Claude Code runs in.
 Everything below uses \code{ctypes} and the Win32 API; on macOS and Linux nothing is recorded or
 moved.
 
 \subsubsection*{Recording a window}
 
 The helper in each window (\code{server.py claude}, \code{server.py top -{}-arranged}) finds the
-window it is shown in: its own console window, from
+window it is shown in (the status screen's is recorded only to be brought forward, never arranged): its own console window, from
 \code{GetConsoleWindow}, is a hidden pseudo-console window owned by the Windows Terminal window
 (\code{GW\_OWNER}, class \code{CASCADIA\_HOSTING\_WINDOW\_CLASS}). Windows Terminal may show the
 window a moment after the tab starts, so a background thread looks for up to 3 seconds. In a

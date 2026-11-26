@@ -41,7 +41,7 @@ With the 7- or 30-day period, a line of small bars shows the messages sent each 
 
 ## Arranging nouez's windows (Windows)
 
-On Windows, ask Claude to arrange the windows nouez opened in Windows Terminal. These are the Claude Code sessions from `OpenClaudeSession` and the status screens from `OpenStatusScreen`. Automatic arranging is off until you ask Claude to turn it on. Other windows, your own terminals included, are never moved.
+On Windows, ask Claude to arrange the windows nouez opened in Windows Terminal. These are the Claude Code sessions from `OpenClaudeSession`. The status screen isn't arranged: it stays where you put it. Automatic arranging is off until you ask Claude to turn it on. Other windows, your own terminals included, are never moved.
 
 ![Three windows nouez opened, arranged on one screen](images/arranged-windows.png)
 

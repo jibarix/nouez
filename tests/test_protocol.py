@@ -8183,13 +8183,24 @@ class ArrangeTest(unittest.TestCase):
             self.addCleanup(patch.stop)
         self.screen = FakeScreen()
 
-    def open(self, hwnd, rect=(100, 100, 900, 600)):
+    def open(self, hwnd, rect=(100, 100, 900, 600), kind="claude"):
         """A window registered as a helper would: hwnd doubles as its console, pid and slot."""
         self.screen.add(hwnd, rect)
         self.starts[hwnd] = 1000 + hwnd
         server.write_json_atomic(os.path.join(server.windows_folder(create=True), f"{hwnd}-{1000 + hwnd}.json"),
                                  {"hwnd": hwnd, "console": hwnd, "pid": hwnd, "start": 1000 + hwnd,
-                                  "kind": "status", "slot": hwnd, "box": None, "left": False})
+                                  "kind": kind, "slot": hwnd, "box": None, "left": False})
+
+    def test_the_status_screen_is_never_arranged(self):
+        """0.26.2: the status screen's window stays recorded, for OpenStatusScreen to bring it forward,
+        but isn't moved and takes no room: the one session window gets the whole screen."""
+        self.open(1, (10, 10, 500, 400), kind="status")
+        self.open(2, (600, 50, 1200, 500))
+        out = server.arrange_pass(self.screen, explicit=True)
+        self.assertEqual(out["windows"], 1)
+        self.assertEqual(self.where(), {1: (10, 10, 500, 400), 2: (0, 0, 1920, 1040)})
+        self.assertEqual([e["hwnd"] for _, e in server.arrange_entries()], [2])
+        self.assertEqual([e["hwnd"] for _, e in server.arrange_entries(status=True)], [1, 2])
 
     def close(self, hwnd):
         del self.starts[hwnd]  # the helper ended

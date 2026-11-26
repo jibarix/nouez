@@ -6,6 +6,14 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.26.2] - 2026-11-25
+
+The status screen is no longer arranged. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version. If you turned automatic arranging on, the arranger already running keeps the old behavior until it ends: turn it off and on again (`ArrangeWindows` with `auto: false`, then `auto: true`).
+
+### Changed
+
+- Arranging windows moves only the Claude Code session windows `OpenClaudeSession` opened. The status screen from `OpenStatusScreen` stays where you put it, and the sessions no longer leave room for it. Opening the status screen again while it is open still restores it if minimized and asks Windows to bring it forward (Windows may only flash it in the taskbar).
+
 ## [0.26.1] - 2026-11-25
 
 The phone dispatcher's trust boundary now held by code, and the [rules](docs/rules.md) page made complete. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
@@ -699,7 +707,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.26.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.26.2...HEAD
+[0.26.2]: https://github.com/jibarix/nouez/compare/v0.26.1...v0.26.2
 [0.26.1]: https://github.com/jibarix/nouez/compare/v0.26.0...v0.26.1
 [0.26.0]: https://github.com/jibarix/nouez/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/jibarix/nouez/compare/v0.24.0...v0.25.0
