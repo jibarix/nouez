@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.26.4\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.27.0\\[0.3em]\large Architecture and message reference}
 \date{November 26, 2026}
 \author{}
 
@@ -290,7 +290,7 @@ the folder the call names, never in a workspace above it.
   "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
   "ttlMs": 0, "cacheScope": "private",
-  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.26.4"}}}}
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.27.0"}}}}
 \end{wire}
 
 Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
@@ -1291,11 +1291,14 @@ the Claude Code session that started it; the reply stays readable with \code{Get
 
 \code{server.py doctor} is a command line too, for checking a setup. It prints one line per check,
 marked \code{[ok]}, \code{[note]} or \code{[problem]}: nouez's version and path and the Python
-running it; the \code{codex} CLI on the PATH; whether the app-server daemon answers, with its
+running it, with a note when that path is in the temporary or Downloads folder
+(\code{clone\_place\_note}), which may be emptied; the \code{codex} CLI on the PATH; whether the app-server daemon answers, with its
 version and any update notice (connecting may start it, as any consultation would); whether
-\code{settings.json} in Claude Code's config folder holds the waiter's allow rules; and, on
+\code{settings.json} in Claude Code's config folder holds the waiter's allow rules; whether the
+\code{server.py} that the \code{consultants} registration, those rules, the status line, the prompt hook
+and the running dispatcher name is this one (\code{script\_paths\_report}, by file identity); and, on
 Windows, whether Windows Terminal (where nouez's windows open and are arranged) and \code{claude} are on the PATH; then the phone dispatcher
-(Section~\ref{sec:dispatcher}): its folder, its allow rules, trust there, whether it starts at
+(Section~\ref{sec:dispatcher}): its folder, its allow rules, trust there, its projects folders, whether it starts at
 sign-in, whether it is connected, and any other \code{claude remote-control} running. It changes
 nothing, and exits with code~1 when a problem blocks consultations.
 \begin{plain}[Output]
@@ -1929,7 +1932,14 @@ with a dot or, on Windows, the hidden attribute (counted in the heading). Each i
 \code{.git} in it), trusted exactly, trusted through a folder above it (Section~\ref{sec:trust}),
 not trusted, or of unknown trust; with the project settings files it has, the sessions in the
 registry whose folder is in it, and the caller's own folder. Claude Code's state file is read once
-per call.
+per call. In the dispatcher, with no \code{folder}, it lists each projects folder in turn, 300 folders in
+all, and says so when it was set up with none. With \code{recent} (not with \code{folder}) it lists
+instead, newest first, up to \code{RECENT\_SHOWN} folders the state file trusts on their own entry
+that exist, each once (a folder in a git work tree as that tree, with that tree's own trust mark), by
+when the newest transcript that records it as the folder it ran in last changed
+(\code{transcript\_time}), leaving out the caller's folder, hidden folders and any that is or holds
+the home folder or a drive's root, or is in Claude Code's, nouez's or the temporary folder
+(\code{recent\_projects}).
 \begin{plain}[Result text]
 Folders in C:\Users\me\Projects (3):
 - dispatcher [trusted through a folder above it; has .claude/settings.json; this session's folder]
@@ -2314,17 +2324,21 @@ leave or overlap a few pixels.
 Remote Control lets the Claude app drive a Claude Code session on the computer. The computer
 connects out to Anthropic and nothing on it listens, but a \code{claude remote-control} server
 starts every session in its own folder. \code{server.py dispatcher} keeps one such server, named
-\code{dispatcher}, running in a folder of its own (\code{\textasciitilde/Projects/dispatcher} unless
-\code{-{}-folder}), and that folder's sessions have nouez's session tools, so one server reaches
-every project (Figure~\ref{fig:dispatcher}). The supervisor gives \code{claude} the projects folder
-(the one that holds the dispatcher's) in \code{NOUEZ\_DISPATCHER\_PROJECTS}, and the dispatcher's
-nouez records trust only for a folder inside it, checked for the folder and for the one trust is
+\code{dispatcher}, running in a folder of its own (\code{\textasciitilde/Projects/dispatcher}, or
+\code{\textasciitilde/.nouez/dispatcher} when only that one is set up, or neither is and there is no
+\code{\textasciitilde/Projects}, unless \code{-{}-folder}), and that folder's sessions have nouez's session tools, so one server reaches
+every project (Figure~\ref{fig:dispatcher}). The supervisor gives \code{claude} the projects folders
+(those \code{-{}-projects} names, up to \code{DISPATCHER\_ROOTS\_MAX}, none inside another; by default
+the one that holds the dispatcher's) in \code{NOUEZ\_DISPATCHER\_PROJECTS}: one as its path, as
+before 0.27, several or none (\code{-{}-no-projects}) as a JSON list, and the dispatcher's
+nouez records trust only for a folder inside one of them, checked for the folder and for the one trust is
 kept for (a worktree's main checkout): spelled under it exactly as it is set, case included, with no
 link below it (on Windows, with no link on the way, as it is on disk too), and inside it with links
 resolved, before a folder is made, again right before it is made, before the write and after it, when
-a failed check sets the trust back to false; without it, or when it is a drive's root or is or holds
-the home folder, Claude Code's settings folder or nouez's cache (where links take them too), or the
-temporary folder nouez's cache can fall back to, none. Sessions it opens get neither that variable nor
+a failed check sets the trust back to false; without them, none, and never inside one that is a
+drive's root or is or holds the home folder, Claude Code's settings folder, nouez's cache or
+\code{\textasciitilde/.nouez} (where links take them too), or the temporary folder nouez's cache can
+fall back to (\code{projects\_folder\_problem}). Sessions it opens get neither that variable nor
 \code{NOUEZ\_DISPATCHER}. The one-time \code{claude remote-control} run that setup asks for, to
 answer the trust question, is plain Claude Code and isn't covered.
 
@@ -2350,7 +2364,10 @@ computer accepts no connections.}
 \label{fig:dispatcher}
 \end{figure}
 
-\paragraph{Commands.} \code{setup} makes the folder (its parent must exist), writes
+\paragraph{Commands.} \code{setup} makes the folder (its parent must exist, except
+\code{\textasciitilde/.nouez}), checks the projects folders (\code{dispatcher\_roots\_problem}: each a
+folder, fit to hold trust, none the same as or inside another; without \code{-{}-projects}, the folder
+above the dispatcher's must be fit, or it asks for \code{-{}-projects} or \code{-{}-no-projects}), writes
 \code{CLAUDE.md} from \code{DISPATCHER\_CLAUDE\_MD} when there is none, and merges allow rules
 \code{mcp\_\_consultants\_\_}\textit{tool} for each of \code{DISPATCHER\_TOOLS} into
 \code{.claude/settings.json}. It reaches that file only through a \code{.claude} that is a
@@ -2365,8 +2382,10 @@ It warns when neither \code{\textasciitilde/.claude.json} (for every project or 
 nor the folder's \code{.mcp.json} registers nouez as \code{consultants}, the name the rules use. \code{install} checks that the folder has \code{CLAUDE.md}, that
 \code{claude} can be found, that Claude Code is trusted there (a server at sign-in would
 otherwise wait at the trust question), and on Windows that \code{pythonw.exe} is beside Python;
-\code{-{}-force} skips those, but never a missing \code{pythonw.exe} or a
-\code{CLAUDE\_CONFIG\_DIR} that isn't an absolute path. It holds
+\code{-{}-force} skips those, but never a missing \code{pythonw.exe}, a
+\code{CLAUDE\_CONFIG\_DIR} that isn't an absolute path or projects folders \code{setup} would refuse.
+Given no \code{-{}-projects}, it keeps those the running supervisor for that folder and profile
+records as given (\code{kept\_projects}), and stops if what it finds there has changed once it holds the lock. It holds
 \code{dispatcher-install.lock} while it works (\code{uninstall} too), so two don't mix, and goes
 on only when \code{dispatcher\_installed} finds no sign-in start of that name, or nouez's own:
 \code{yes}, or \code{off} when it is turned off; \code{other} and one it can't read stop it.
@@ -2374,14 +2393,15 @@ on only when \code{dispatcher\_installed} finds no sign-in start of that name, o
 \code{dispatcher\_command} makes, as \code{dispatcher\_argv\_ours} checks it: a Python by its full
 path, \code{-I}, nouez's \code{server.py} by its full path (\code{nouez\_script}: a regular file, opened
 without waiting on a pipe, that begins with \code{NOUEZ\_HEAD}), \code{dispatcher run -{}-folder}
-\textit{folder}, an optional \code{-{}-config-dir} \textit{dir}, \code{-{}-sign-in}, and nothing
-else; on Windows also a task with more than one action, or whose principal is neither this
+\textit{folder}, \code{-{}-projects} \textit{dir} pairs or one \code{-{}-no-projects}, an optional
+\code{-{}-config-dir} \textit{dir}, \code{-{}-sign-in}, and nothing else; on Windows also a task with more than one action, or whose principal is neither this
 user's SID nor name (\code{windows\_user\_ids}), and on macOS a plist with a \code{Program}
 key. It registers the sign-in start, which runs
 \code{[python, -I, server.py, dispatcher, run, -{}-folder, }\textit{folder}\code{, -{}-sign-in]}, with
-\code{-{}-config-dir} before \code{-{}-sign-in} when \code{CLAUDE\_CONFIG\_DIR} is set, asks a running
+the projects flags after the folder and \code{-{}-config-dir} before \code{-{}-sign-in} when
+\code{CLAUDE\_CONFIG\_DIR} is set (a command past \code{DISPATCHER\_COMMAND\_MAX} characters is refused), asks a running
 supervisor to stop, and starts the new one, checking within \code{DISPATCHER\_START\_WAIT} that it
-runs with that folder, profile and \code{-{}-sign-in}, all while it holds
+runs with that folder, projects folders, profile and \code{-{}-sign-in}, all while it holds
 \code{dispatcher-install.lock}:
 
 \begin{center}\small
@@ -2485,8 +2505,9 @@ Only \code{claude}'s status line counts (\code{STATUS\_LINE}: a few symbols, the
 marks the link up; \code{Connecting}, \code{Reconnecting}, \code{Disconnected} or
 \code{Not connected} marks it down; a line that only mentions the word changes nothing. Each run is numbered, and a
 reader's change counts only for its own run. Each change is saved to
-\code{dispatcher.json}: the supervisor's and \code{claude}'s process ids, the folder, the phase,
-when it connected, and the next start after an exit.
+\code{dispatcher.json}: the supervisor's and \code{claude}'s process ids, the folder, its projects
+folders and whether they were named, the \code{server.py} it runs, the phase, when it connected, and
+the next start after an exit.
 
 A \code{claude} not connected within \code{DISPATCHER\_CONNECT\_WITHIN} is ended: it is most
 likely at a question no one can answer. After an exit the supervisor waits
@@ -2557,6 +2578,9 @@ Default \code{wait} & 5 s / 0 s & SendConsultantMessage / GetConsultantReply \\
 \code{LOGIN\_EARLY\_DAYS} & 3 days & the earlier sign-in end, before the last moment \\
 \code{LOGIN\_WAIT\_SECONDS} & 25 s & ConsultantBudget's wait for a sign-in reading \\
 \code{PROJECTS\_SHOWN} & 300 & folders \code{ListProjects} lists \\
+\code{RECENT\_SHOWN} & 20 & folders \code{ListProjects} lists with \code{recent} \\
+\code{DISPATCHER\_ROOTS\_MAX} & 20 & projects folders the dispatcher takes \\
+\code{DISPATCHER\_COMMAND\_MAX} & 8000 & characters in the sign-in start's command \\
 \code{REPORT\_ITEMS} & 20 & items per list in a trust report \\
 \code{REPORT\_ITEM\_CHARS} & 160 & characters per item in a trust report \\
 \code{ARRANGE\_MIN\_BOX} & 560 $\times$ 320 & smallest box in the grid, pixels at 100\% scaling \\

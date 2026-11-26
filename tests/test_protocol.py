@@ -60,7 +60,7 @@ server.CONNECT_SECONDS = 0  # OpenClaudeSession tests look for the new session o
 _REAL_DISPATCHER = {name: getattr(server, name) for name in ("dispatcher_installed", "other_remote_controls")}
 _REAL_FILELOCK = server.FileLock
 _REAL_DISPATCHER_TRUSTED, _REAL_FOLDER_TRUSTED = server.dispatcher_trusted, server.folder_trusted
-_REAL_NOUEZ_SCRIPT = server.nouez_script
+_REAL_NOUEZ_SCRIPT, _REAL_DEFAULT_FOLDER = server.nouez_script, server.dispatcher_default_folder
 _DISPATCHER_EMPTY = tempfile.mkdtemp(prefix="nouez-test-dispatcher-")
 server._dispatcher_root[:] = [os.path.join(_DISPATCHER_EMPTY, "cache")]
 os.makedirs(server._dispatcher_root[0], exist_ok=True)
@@ -9115,11 +9115,13 @@ class DispatcherTest(unittest.TestCase):
         with mock.patch.object(server, "_dispatcher_root", []), \
                 mock.patch.dict(server.os.environ, {"LOCALAPPDATA": elsewhere, "XDG_CACHE_HOME": elsewhere}):
             if os.name == "nt":
-                with mock.patch.object(server, "known_local_appdata", lambda: self.home):
+                with mock.patch.object(server, "known_folder",
+                                       lambda known: self.home if known == server.FOLDERID_LOCAL_APPDATA else None):
                     found = server.dispatcher_dir()
                 self.assertEqual(found, os.path.join(self.home, "nouez"))
                 self.assertTrue(server.plain_folder(found))
-                self.assertTrue(server.rooted(server.known_local_appdata()))
+                self.assertTrue(server.rooted(server.known_folder(server.FOLDERID_LOCAL_APPDATA)))
+                self.assertTrue(server.rooted(server.known_folder(server.FOLDERID_DOWNLOADS)))
             else:
                 import pwd
                 with mock.patch.object(pwd, "getpwuid", lambda uid: mock.Mock(pw_dir=self.home)):
@@ -9139,8 +9141,14 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(env["PATH"], os.path.dirname(exe))
         self.assertNotIn("CLAUDE_CONFIG_DIR", env)
         self.assertNotIn("NOUEZ_DISPATCHER_PROJECTS", env)
-        env = server.dispatcher_env(exe, None, {"PATH": ""}, projects=self.home)
+        env = server.dispatcher_env(exe, None, {"PATH": ""}, projects=[self.home])
         self.assertEqual((env["NOUEZ_DISPATCHER"], env["NOUEZ_DISPATCHER_PROJECTS"]), ("1", self.home))
+        # 0.27.0: several, or none, as a JSON list; one stays its path, as a 0.26 supervisor passes it.
+        two = [self.home, self.cache]
+        self.assertEqual(server.dispatcher_env(exe, None, {"PATH": ""}, projects=two)["NOUEZ_DISPATCHER_PROJECTS"],
+                         json.dumps(two))
+        self.assertEqual(server.dispatcher_env(exe, None, {"PATH": ""}, projects=[])["NOUEZ_DISPATCHER_PROJECTS"],
+                         "[]")
         # Neither reaches a session the dispatcher opens.
         self.assertFalse({"NOUEZ_DISPATCHER", "NOUEZ_DISPATCHER_PROJECTS"} & set(server.fresh_claude_env(env)))
 
@@ -9607,13 +9615,14 @@ class DispatcherTest(unittest.TestCase):
             code, out = self.setup()
         self.assertEqual(code, 1, out)
         self.assertIn("Claude Code's settings folder", out)
-        self.assertIn("--folder", out)
+        self.assertIn("--projects DIR", out)
+        self.assertIn("--no-projects", out)
         self.assertFalse(os.path.exists(self.folder))
         self.assertEqual(self.setup()[0], 0)
         with mock.patch.object(server, "claude_config_dir", lambda: settings):
             code, out, ran, popen = self.install("linux")
         self.assertEqual(code, 1, out)
-        self.assertIn("would record trust nowhere", out)
+        self.assertIn("--projects", out)  # 0.27.0: names the folders, or --no-projects
         popen.assert_not_called()
 
     def test_setup_makes_the_folder_its_instructions_and_rules(self):
@@ -9621,9 +9630,13 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         with open(os.path.join(self.folder, "CLAUDE.md"), encoding="utf-8") as f:
             md = f.read()
-        self.assertIn(f"directly inside `{self.projects}`", md)
+        # 0.27.0: no folder in it; ListProjects names the projects folders.
+        self.assertIn("directly inside one of the projects\n  folders `ListProjects` names", md)
+        self.assertNotIn(self.projects, md)
+        self.assertIn(f"The phone can open and trust projects inside {self.projects}.", out)
         # 0.26.1: the rules the code doesn't hold, in the words the dispatcher gets.
-        self.assertIn(f"If it isn't\ninside `{self.projects}`, or nouez can't tell, decline.", md)
+        self.assertIn("If it isn't\ninside one of the projects folders `ListProjects` names, or nouez can't tell, "
+                      "decline.", md)
         self.assertIn("Don't start consultants or consult from this session.", md)
         self.assertIn("Close one with `CloseClaudeSession` only when the user\n  names it.", md)
         self.assertNotIn("{projects}", md)
@@ -9760,7 +9773,7 @@ class DispatcherTest(unittest.TestCase):
     def test_options(self):
         opts = server.dispatcher_options(["--folder", self.folder, "--dry-run"], {"folder", "dry-run"})
         self.assertEqual(opts, {"folder": self.folder, "config-dir": None, "dry-run": True, "force": False,
-                                "sign-in": False})
+                                "sign-in": False, "projects": None})
         opts = server.dispatcher_options(["--config-dir", self.home], {"folder", "config-dir"})
         self.assertEqual(opts["config-dir"], self.home)
         for argv in (["--config-dir", "relative"], ["--config-dir", self.home]):
@@ -9768,10 +9781,10 @@ class DispatcherTest(unittest.TestCase):
                 server.dispatcher_options(argv, {"folder", "config-dir"} if argv[1] == "relative" else {"folder"})
         with mock.patch.object(server, "run_dispatcher_supervisor") as run:
             server.run_dispatcher(["run", "--folder", self.folder, "--config-dir", self.home])
-        run.assert_called_once_with(self.folder, self.home, False)
+        run.assert_called_once_with(self.folder, self.home, False, None)
         with mock.patch.object(server, "run_dispatcher_supervisor") as run:
             server.run_dispatcher(["run", "--folder", self.folder, "--sign-in"])
-        run.assert_called_once_with(self.folder, None, True)
+        run.assert_called_once_with(self.folder, None, True, None)
         with self.assertRaises(ValueError):
             server.dispatcher_options(["--sign-in"], {"folder", "dry-run", "force"})
         self.assertEqual(server.dispatcher_options([], set())["folder"], self.folder)
@@ -9878,18 +9891,19 @@ class DispatcherTest(unittest.TestCase):
         for seen, stops, want, started in ((["other", True], True, True, 2), (["other"], False, None, 1),
                                            ([False, False, False], True, False, 3)):
             starts, out = [], []
-            with mock.patch.object(server, "wait_for_supervisor", lambda *a, others: seen.pop(0)), \
+            with mock.patch.object(server, "wait_for_supervisor", lambda *a, others, projects: seen.pop(0)), \
                     mock.patch.object(server, "stop_dispatcher", lambda out: stops):
                 result = server.start_new_supervisor(lambda: starts.append(7) or 7, self.folder, None, 0, False,
                                                      out.append)
             self.assertIs(result, want, out)
             self.assertEqual(len(starts), started)
-            self.assertEqual(any("another folder or profile took the lock" in line for line in out), started < 3)
+            self.assertEqual(any("set up differently (another folder, projects folders or profile) took the lock" in line for line in out), started < 3)
             self.assertEqual(any("that supervisor didn't stop" in line for line in out), not stops)
         self.assertIsNone(server.start_new_supervisor(lambda: False, self.folder, None, 0, False, print))
         # the one asked to stop leaves its record until the new one writes its own: it isn't stopped too
         other = {"pid": 5, "since": 100.0, "folder": self.home, "config_dir": None, "sign_in": True, "phase": "starting"}
-        new = dict(other, pid=7, since=101.0, folder=self.folder)
+        new = dict(other, pid=7, since=101.0, folder=self.folder, projects=[os.path.dirname(self.folder)],
+                   projects_given=False, script=os.path.abspath(server.__file__))
         records = iter([other, dict(other, phase="stopped"), other, new])
         stopped = []
         with mock.patch.object(server, "dispatcher_status", lambda: (True, next(records))), \
@@ -10075,12 +10089,12 @@ class DispatcherTest(unittest.TestCase):
 
     def install(self, platform, osname="posix", force=False, dry_run=False, trusted=True, installed="no",
                 pythonw="C:\\Python\\pythonw.exe", config_dir=None, service=(113, "Could not find service"),
-                bootstrap=(), claude="/opt/bin/claude"):
+                bootstrap=(), claude="/opt/bin/claude", projects=None):
         bootstrap = list(bootstrap)
         out, ran, real_command, is_trusted = [], [], server.dispatcher_command, trusted
 
-        def command(python, folder, config_dir=None):  # a macOS or Linux one, wherever the test runs
-            argv = real_command(python, folder, config_dir)
+        def command(python, folder, config_dir=None, projects=None):  # a macOS or Linux one, wherever the test runs
+            argv = real_command(python, folder, config_dir, projects)
             return argv if osname == "nt" else [a.replace("\\", "/") for a in argv]
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
         if config_dir:
@@ -10111,7 +10125,8 @@ class DispatcherTest(unittest.TestCase):
                 mock.patch.object(server, "autostart_path", lambda: os.path.join(self.home, "auto", "n.desktop")), \
                 mock.patch.object(server.os, "getuid", lambda: 501, create=True), \
                 mock.patch.object(server.os, "name", osname), mock.patch.object(server.sys, "platform", platform):
-            code = server.dispatcher_install(self.folder, dry_run=dry_run, force=force, out=out.append)
+            code = server.dispatcher_install(self.folder, dry_run=dry_run, force=force, out=out.append,
+                                             projects=projects)
         return code, "\n".join(out), ran, popen
 
     def test_install_checks_first(self):
@@ -10460,6 +10475,522 @@ class DispatcherTest(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, server.process_args(proc.pid))
             time.sleep(0.05)
         self.assertIn(proc.pid, server.process_ids())
+
+
+class ProjectsFoldersTest(unittest.TestCase):
+    """0.27.0: the dispatcher's projects folders: any number of them named with --projects, or none
+    with --no-projects, or the folder above the dispatcher's as before; checked by setup and
+    install, passed to the dispatcher's nouez, and kept by a later install."""
+
+    real_default_folder = staticmethod(_REAL_DEFAULT_FOLDER)
+    setUp = DispatcherTest.setUp
+    setup = DispatcherTest.setup
+    install = DispatcherTest.install
+
+    def roots(self, *names):
+        made = []
+        for name in names:
+            path = os.path.join(self.home, name)
+            os.makedirs(path, exist_ok=True)
+            made.append(path)
+        return made
+
+    def home_at(self, home):
+        return mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home})
+
+    def write_state(self, **value):
+        with open(os.path.join(self.cache, "dispatcher.json"), "w", encoding="utf-8") as f:
+            json.dump({"folder": self.folder, "phase": "running", **value}, f)
+
+    def test_the_options(self):
+        a, b = self.roots("a", "b")
+        both = {"folder", "projects"}
+        opts = server.dispatcher_options(["--projects", a, "--projects", os.path.join(b, "x", "..")], both)
+        self.assertEqual(opts["projects"], [a, b])
+        self.assertEqual(server.dispatcher_options(["--no-projects"], both)["projects"], [])
+        self.assertIsNone(server.dispatcher_options([], both)["projects"])
+        self.assertEqual(len(server.dispatcher_options(["--projects", a] * 20, both)["projects"]), 20)
+        odd = a + os.pathsep + "x"  # a folder's name may hold the path separator
+        self.assertEqual(server.dispatcher_options(["--projects", odd], both)["projects"], [odd])
+        for argv in (["--projects", a, "--no-projects"], ["--no-projects", "--projects", a],
+                     ["--projects", "relative"], ["--projects"],
+                     ["--projects", a] * 21):
+            with self.subTest(argv=argv), self.assertRaises(ValueError):
+                server.dispatcher_options(argv, both)
+        for argv in (["--projects", a], ["--no-projects"]):
+            with self.assertRaises(ValueError):  # not for uninstall or status
+                server.dispatcher_options(argv, {"dry-run"})
+        with mock.patch.object(server, "run_dispatcher_supervisor") as run:
+            server.run_dispatcher(["run", "--folder", self.folder, "--projects", a, "--sign-in"])
+        run.assert_called_once_with(self.folder, None, True, [a])
+        with mock.patch.object(server, "dispatcher_setup", return_value=0) as setup:
+            server.run_dispatcher(["setup", "--no-projects"])
+        setup.assert_called_once_with(self.folder, False, projects=[])
+        with mock.patch.object(server, "dispatcher_install", return_value=0) as install:
+            server.run_dispatcher(["install", "--projects", a, "--projects", b])
+        install.assert_called_once_with(self.folder, False, False, projects=[a, b])
+
+    def test_which_folders_can_be_projects_folders(self):
+        a, b = self.roots("a", "b")
+        sub = os.path.join(a, "sub")
+        os.mkdir(sub)
+        problem = server.dispatcher_roots_problem
+        self.assertIsNone(problem(self.folder, None))
+        self.assertIsNone(problem(self.folder, [a, b]))
+        self.assertIsNone(problem(self.folder, []))
+        self.assertIn("isn't a folder", problem(self.folder, [os.path.join(self.home, "gone")]))
+        self.assertIn("the same folder as", problem(self.folder, [a, a]))
+        self.assertIn("the same folder as", problem(self.folder, [a, os.path.join(sub, "..")]))
+        self.assertIn("inside", problem(self.folder, [a, sub]))
+        self.assertIn("inside", problem(self.folder, [sub, a]))
+        link, into = os.path.join(self.home, "link"), os.path.join(self.home, "into")
+        try:
+            dir_link(a, link)
+            dir_link(sub, into)
+        except OSError as e:
+            self.skipTest(f"can't make a link here: {e}")
+        self.assertIn("the same folder as", problem(self.folder, [a, link]))
+        self.assertIn("inside", problem(self.folder, [into, b, a]))
+        self.assertIn("a drive's root", problem(self.folder, [b, os.path.abspath(os.sep)]))
+        self.assertIn("the temporary folder", problem(self.folder, [tempfile.gettempdir()]))
+        me = os.path.join(a, "me")
+        os.mkdir(me)
+        with self.home_at(me):
+            self.assertIn("your home folder", problem(self.folder, [b, a]))
+            self.assertIsNone(problem(self.folder, [b]))
+        with self.home_at(b):
+            os.mkdir(os.path.join(b, ".nouez"))
+            self.assertIn("nouez's own folder", problem(self.folder, [os.path.join(b, ".nouez")]))
+        with mock.patch.object(server, "claude_config_dir", lambda: os.path.join(b, ".claude")):
+            self.assertIn("Claude Code's settings folder", problem(self.folder, [a, b]))
+        # without --projects, the folder above the dispatcher's, which must exist and be fit
+        missing = problem(os.path.join(self.home, "nope", "dispatcher"), None)
+        self.assertIn("doesn't exist", missing)
+        self.assertIn("--projects", missing)
+        unfit = problem(os.path.join(tempfile.gettempdir(), "dispatcher"), None)
+        self.assertIn("Without --projects", unfit)
+        self.assertIn("--no-projects", unfit)
+
+    def test_without_a_projects_folder_the_dispatcher_goes_in_nouezs_own(self):
+        """No ~/Projects: the dispatcher's folder is ~/.nouez/dispatcher, setup asks for the
+        projects folders (or none) and makes ~/.nouez; a later ~/Projects doesn't move it."""
+        home = os.path.join(self.home, "h")
+        os.mkdir(home)
+        a, = self.roots("work")
+        with self.home_at(home):
+            folder = self.real_default_folder()
+            self.assertEqual(folder, os.path.join(home, ".nouez", "dispatcher"))
+            out = []
+            self.assertEqual(server.dispatcher_setup(folder, out=out.append), 1)
+            self.assertIn("--projects", "\n".join(out))
+            self.assertFalse(os.path.exists(os.path.join(home, ".nouez")))
+            out = []
+            self.assertEqual(server.dispatcher_setup(folder, dry_run=True, out=out.append, projects=[a]), 0, out)
+            self.assertIn(f"Would make {os.path.join(home, '.nouez')}.", out)
+            self.assertFalse(os.path.exists(os.path.join(home, ".nouez")))
+            out = []
+            self.assertEqual(server.dispatcher_setup(folder, out=out.append, projects=[a]), 0, out)
+            self.assertTrue(os.path.isfile(os.path.join(folder, "CLAUDE.md")))
+            self.assertIn(f"The phone can open and trust projects inside {a}.", out)
+            self.assertTrue(any(server.shlex.join(["--projects", a]) in line for line in out), out)
+            os.mkdir(os.path.join(home, "Projects"))
+            self.assertEqual(self.real_default_folder(), folder, "a dispatcher set up there stays the default")
+            shutil.rmtree(os.path.join(home, ".nouez"))
+            self.assertEqual(self.real_default_folder(), os.path.join(home, "Projects", "dispatcher"))
+            os.mkdir(os.path.join(home, ".nouez"))
+            os.mkdir(os.path.join(home, ".nouez", "dispatcher"))
+            os.mkdir(os.path.join(home, "Projects", "dispatcher"))
+            self.assertEqual(self.real_default_folder(), os.path.join(home, "Projects", "dispatcher"))
+            with open(os.path.join(folder, "CLAUDE.md"), "w"):
+                pass
+            self.assertEqual(self.real_default_folder(), folder, "a folder that merely appears doesn't take its place")
+            with open(os.path.join(home, "Projects", "dispatcher", "CLAUDE.md"), "w"):
+                pass
+            self.assertEqual(self.real_default_folder(), os.path.join(home, "Projects", "dispatcher"),
+                             "both set up: the one from before 0.27")
+
+    def test_setup_and_install_with_several_projects_folders(self):
+        a, b = self.roots("work", "Mes projets \u00e9")
+        code, out = self.setup(projects=[a, b])
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"The phone can open and trust projects inside {a}, {b}.", out)
+        self.assertIn(server.shlex.join(["server.py", "dispatcher", "install", "--projects", a, "--projects", b]),
+                      out)
+        with open(os.path.join(self.folder, "CLAUDE.md"), encoding="utf-8") as f:
+            self.assertIsNone(server.dispatcher_md_note(self.folder), f.read())
+        code, out, ran, popen = self.install("linux", projects=[a, b])
+        self.assertEqual(code, 0, out)
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv[argv.index("--folder") + 2:],
+                         ["--projects", a.replace("\\", "/"), "--projects", b.replace("\\", "/"), "--sign-in"])
+        code, out, ran, popen = self.install("linux", projects=[a, a])
+        self.assertEqual(code, 1, out)
+        self.assertIn("the same folder as", out)
+        popen.assert_not_called()
+
+    def test_setup_and_install_with_no_projects_folders(self):
+        code, out = self.setup(projects=[])
+        self.assertEqual(code, 0, out)
+        self.assertIn("With --no-projects", out)
+        self.assertIn("server.py dispatcher install --no-projects", out)
+        code, out, ran, popen = self.install("linux", projects=[])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(popen.call_args[0][0][-2:], ["--no-projects", "--sign-in"])
+
+    def test_install_keeps_the_projects_folders_it_was_given(self):
+        a, b = self.roots("work", "more")
+        self.setup()
+        self.write_state(projects=[a], projects_given=True)
+        code, out, ran, popen = self.install_beside_running("linux")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"keeps the projects folders it was given: {a}.", out)
+        self.assertEqual(popen.call_args[0][0][-3:], ["--projects", a.replace("\\", "/"), "--sign-in"])
+        code, out, ran, popen = self.install("linux", projects=[b])  # named ones replace them
+        self.assertNotIn("keeps", out)
+        self.assertEqual(popen.call_args[0][0][-3:], ["--projects", b.replace("\\", "/"), "--sign-in"])
+        self.write_state(projects=[], projects_given=True)
+        code, out, ran, popen = self.install_beside_running("linux")
+        self.assertIn("it was given: none (--no-projects).", out)
+        self.assertEqual(popen.call_args[0][0][-2:], ["--no-projects", "--sign-in"])
+        for state in ({"projects": [self.projects], "projects_given": False},  # the folder above, as by default
+                      {"projects": [a], "projects_given": True, "folder": os.path.join(a, "dispatcher")},
+                      {"projects": ["relative"], "projects_given": True},
+                      {"projects": a, "projects_given": True},
+                      {"projects": [a], "projects_given": True, "config_dir": self.home},  # another profile's
+                      {"projects": [a], "projects_given": True, "phase": "stopped"},
+                      {"projects": [os.path.join(a, str(i)) for i in range(21)], "projects_given": True}):
+            with self.subTest(state=state):
+                self.write_state(**state)
+                code, out, ran, popen = self.install_beside_running("linux")
+                self.assertEqual(code, 0, out)
+                self.assertNotIn("keeps", out)
+                self.assertNotIn("--projects", popen.call_args[0][0])
+        self.write_state(projects=[a], projects_given=True)
+        code, out, ran, popen = self.install("linux")  # a supervisor that has stopped is no guide
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("--projects", popen.call_args[0][0])
+        code, out, ran, popen = self.install_beside_running("linux", changed={"projects": [b], "projects_given": True})
+        self.assertEqual(code, 1, out)
+        self.assertIn("the running dispatcher changed while install was checking", out)
+        popen.assert_not_called()
+        self.write_state(projects=[self.projects], projects_given=False)  # nothing to keep at first
+        code, out, ran, popen = self.install_beside_running("linux", changed={"projects": [], "projects_given": True})
+        self.assertEqual(code, 1, out)
+        self.assertIn("the running dispatcher changed while install was checking", out)
+        popen.assert_not_called()
+
+    def install_beside_running(self, platform, changed=None, **kw):
+        """install while dispatcher.json's supervisor runs; `changed`: what it records once
+        install holds the lock, as when another install replaced it meanwhile."""
+        with open(os.path.join(self.cache, "dispatcher.json"), encoding="utf-8") as f:
+            first = json.load(f)
+        calls = []
+
+        def status():
+            calls.append(1)
+            return (True, first) if len(calls) == 1 else (len(calls) == 2, dict(first, **(changed or {})))
+        with mock.patch.object(server, "dispatcher_status", status):
+            return self.install(platform, **kw)
+
+    def test_the_command_is_capped(self):
+        self.setup()
+        with mock.patch.object(server, "DISPATCHER_COMMAND_MAX", 40):
+            code, out, ran, popen = self.install("linux")
+        self.assertEqual(code, 1, out)
+        self.assertIn("longer than 40 characters", out)
+        popen.assert_not_called()
+        long = [os.path.join("C:\\" if os.name == "nt" else "/", "p" * 200, str(i)) for i in range(20)]
+        argv = server.dispatcher_command(sys.executable, self.folder, None, long)
+        self.assertLess(len(subprocess.list2cmdline(argv)), server.DISPATCHER_COMMAND_MAX)
+
+    def test_the_command_and_its_shape(self):
+        a, b = self.roots("a", "b c")
+        argv = server.dispatcher_command(sys.executable, self.folder, None, [a, b])
+        self.assertEqual(argv[6:], [self.folder, "--projects", a, "--projects", b, "--sign-in"])
+        self.assertTrue(server.dispatcher_argv_ours(argv))
+        self.assertEqual(server.command_projects(argv), [a, b])
+        none = server.dispatcher_command(sys.executable, self.folder, self.home, [])
+        self.assertEqual(none[7:], ["--no-projects", "--config-dir", self.home, "--sign-in"])
+        self.assertTrue(server.dispatcher_argv_ours(none))
+        self.assertEqual(server.command_projects(none), [])
+        self.assertIsNone(server.command_projects(server.dispatcher_command(sys.executable, self.folder)))
+        ours = server.dispatcher_argv_ours
+        base = ["/usr/bin/python3", "-I", "/opt/nouez/server.py", "dispatcher", "run", "--folder",
+                "/home/me/Projects/dispatcher"]
+        for tail, want in ((["--sign-in"], True),  # as 0.26 installed it
+                           (["--config-dir", "/home/me/.claude-work", "--sign-in"], True),
+                           (["--projects", "/home/me/work", "--sign-in"], True),
+                           (["--projects", "/home/me/work", "--projects", "/srv/Mes projets \u00e9", "--config-dir",
+                             "/c", "--sign-in"], True),
+                           (["--no-projects", "--sign-in"], True),
+                           (["--no-projects", "--config-dir", "/c", "--sign-in"], True),
+                           (["--projects", "/a"] * 20 + ["--sign-in"], True),
+                           (["--projects", "/a"] * 21 + ["--sign-in"], False),
+                           (["--projects", "work", "--sign-in"], False),
+                           (["--projects", "/a:b", "--sign-in"], True),
+                           (["--projects", "/a", "--no-projects", "--sign-in"], False),
+                           (["--no-projects", "--projects", "/a", "--sign-in"], False),
+                           (["--no-projects", "--no-projects", "--sign-in"], False),
+                           (["--projects", "--sign-in"], False),
+                           (["--config-dir", "/c", "--projects", "/a", "--sign-in"], False),
+                           (["--projects", "/a", "--sign-in", "--projects", "/b"], False)):
+            with self.subTest(tail=tail):
+                self.assertIs(ours(base + tail, windows=False), want)
+        wbase = ["C:\\Py\\pythonw.exe", "-I", "C:\\nouez\\server.py", "dispatcher", "run", "--folder",
+                 "C:\\Users\\me\\Projects\\dispatcher"]
+        self.assertTrue(ours(wbase + ["--projects", "D:\\work", "--sign-in"], windows=True))
+        self.assertTrue(ours(wbase + ["--projects", "D:\\a;b", "--sign-in"], windows=True))
+        self.assertFalse(ours(wbase + ["--projects", "\\work", "--sign-in"], windows=True))
+
+    def test_the_environment_and_trust_with_several_roots(self):
+        a, b, c = self.roots("a", "b", "c")
+        inside = []
+        for root in (a, b, c):
+            inside.append(os.path.join(root, "p"))
+            os.mkdir(inside[-1])
+        mark, var = {"NOUEZ_DISPATCHER": "1"}, "NOUEZ_DISPATCHER_PROJECTS"
+        env = {**mark, var: json.dumps([a, b])}
+        self.assertEqual(server.dispatcher_projects(env), [a, b])
+        self.assertEqual(server.dispatcher_projects({**mark, var: "[]"}), [])
+        self.assertIsNone(server.dispatcher_projects(mark))
+        self.assertIsNone(server.dispatcher_projects({**mark, var: ""}))
+        self.assertIsNone(server.dispatcher_projects({**mark, var: json.dumps([a, "relative"])}))
+        for bad in ("[", "[1]", '{"a": 1}', "relative"):
+            self.assertIsNone(server.dispatcher_projects({**mark, var: bad}), bad)
+        legacy = a + os.pathsep + b  # one folder, as a 0.26 supervisor passes it, never split
+        self.assertEqual(server.dispatcher_projects({**mark, var: legacy}), [legacy])
+        self.assertIsNone(server.dispatcher_projects({var: a}), "outside the dispatcher")
+        trust = server.dispatcher_trust_problem
+        self.assertIsNone(trust(inside[0], env))
+        self.assertIsNone(trust(inside[1], env))
+        refused = trust(inside[2], env)
+        self.assertIn(f"one of {a}, {b}", refused)
+        self.assertIn("isn't one", refused)
+        self.assertIn("--no-projects", trust(inside[0], {**mark, var: "[]"}))
+        self.assertIn("isn't one", trust(inside[0], {**mark, var: legacy}), "a 0.26 folder isn't split in two")
+        self.assertIn("can't tell which folders those are", trust(inside[0], mark))
+        temp = tempfile.gettempdir()
+        self.assertIsNone(trust(inside[0], {**mark, var: json.dumps([temp, a])}),
+                          "a projects folder that can't hold trust is passed over, not the others")
+        self.assertIn("isn't one", trust(os.path.join(self.home, "x"), {**mark, var: json.dumps([temp, a])}))
+        self.assertIn("records no trust at all", trust(inside[0], {**mark, var: temp}))
+        self.assertIn("none of whose projects folders",
+                      trust(inside[0], {**mark, var: json.dumps([temp, os.path.abspath(os.sep)])}))
+
+    def test_wait_for_supervisor_knows_it_by_its_projects_folders_too(self):
+        a, = self.roots("a")
+        state = {"pid": 7, "since": 10.0, "folder": self.folder, "config_dir": None, "sign_in": True,
+                 "phase": "running", "projects": [a], "projects_given": True,
+                 "script": os.path.abspath(server.__file__)}
+        with mock.patch.object(server, "dispatcher_status", lambda: (True, dict(state))):
+            wait = server.wait_for_supervisor
+            self.assertIs(wait(self.folder, None, 5, projects=[a], seconds=0), True)
+            self.assertEqual(wait(self.folder, None, 5, projects=[], seconds=0), "other")
+            self.assertEqual(wait(self.folder, None, 5, seconds=0), "other")
+            state["projects"] = [self.projects]  # the folder above, but named: another command
+            self.assertEqual(wait(self.folder, None, 5, seconds=0), "other")
+            self.assertIs(wait(self.folder, None, 5, projects=[self.projects], seconds=0), True)
+            state["projects_given"] = False
+            self.assertIs(wait(self.folder, None, 5, seconds=0), True)
+            state["script"] = os.path.join(self.home, "old", "server.py")  # another clone's
+            self.assertEqual(wait(self.folder, None, 5, seconds=0), "other")
+            state["script"] = os.path.abspath(server.__file__)
+            del state["projects"]  # one from before 0.27
+            self.assertEqual(wait(self.folder, None, 5, seconds=0), "other")
+
+    def test_dispatcher_status_keeps_the_spelling_of_the_projects_folders(self):
+        a, = self.roots("Mixed Case")
+        out = []
+        with mock.patch.object(server, "dispatcher_status", lambda: (True, {"folder": self.folder, "projects": [a]})), \
+                mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "yes"):
+            server.dispatcher_status_text(out=out.append)
+        self.assertIn(f"Projects folders (trust can be recorded inside): {a}", out)
+
+    def test_the_supervisor_records_its_projects_folders_and_its_server(self):
+        a, = self.roots("a")
+        value = server.DispatcherState(self.folder, projects=[a]).value
+        self.assertEqual((value["projects"], value["projects_given"]), ([a], True))
+        self.assertEqual(value["script"], os.path.abspath(server.__file__))
+        value = server.DispatcherState(self.folder).value
+        self.assertEqual((value["projects"], value["projects_given"]), ([self.projects], False))
+        self.assertIn(a, server.projects_text([a]))
+        self.assertIn("--no-projects", server.projects_text([]))
+
+
+class ListProjectsFoldersTest(unittest.TestCase):
+    """0.27.0: in the dispatcher, ListProjects lists each projects folder; `recent` lists the
+    folders Claude Code was used in lately, from anywhere."""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="nouez-test-roots-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.a, self.b = os.path.join(self.base, "a"), os.path.join(self.base, "b")
+        self.here = os.path.join(self.a, "dispatcher")
+        for path in (self.here, os.path.join(self.a, "alpha", ".git"), os.path.join(self.a, "alpha", "src"),
+                     os.path.join(self.b, "gamma"), os.path.join(self.b, "delta"), os.path.join(self.b, "quiet"),
+                     os.path.join(self.base, "claude"), os.path.join(self.base, "elsewhere")):
+            os.makedirs(path)
+        self.state = os.path.join(self.base, "claude.json")
+        for patch in (mock.patch.object(server, "default_cwd", return_value=self.here),
+                      mock.patch.object(server, "trusted_folders", return_value=set()),
+                      mock.patch.object(server, "claude_sessions", return_value=[]),
+                      mock.patch.object(server, "claude_state_file", lambda env=None: self.state),
+                      mock.patch.object(server, "claude_config_dir", lambda: os.path.join(self.base, "claude")),
+                      mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER": "1",
+                                                   "NOUEZ_DISPATCHER_PROJECTS": json.dumps([self.a, self.b])})):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def chat(self, cwd, when, session="s1", ran_in=None):
+        folder = server.transcript_folder(cwd)
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, session + ".jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"cwd": ran_in or cwd}) + "\n")
+        os.utime(path, (when, when))
+
+    def test_each_projects_folder_is_listed(self):
+        out = server.list_projects({})
+        self.assertIn(f"Folders in {self.a} (2):", out)
+        self.assertIn(f"Folders in {self.b} (3):", out)
+        self.assertIn("- gamma [", out)
+        self.assertIn("this session's folder", out)
+        with mock.patch.object(server, "PROJECTS_SHOWN", 3):
+            out = server.list_projects({})
+        self.assertIn("- … and more, not listed", out)
+        self.assertNotIn("- quiet [", out)
+        with mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER_PROJECTS": json.dumps([self.a, "/gone" if os.name != "nt" else "C:\\gone-nouez"])}):
+            out = server.list_projects({})
+        self.assertIn("- alpha [", out)
+        self.assertIn("isn't a folder", out)
+        with mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER_PROJECTS": "[]"}):
+            self.assertIn("set up with no projects folders", server.list_projects({}))
+        self.assertIn("- gamma [", server.list_projects({"folder": self.b}), "folder still lists one")
+
+    def test_a_transcript_ran_in_the_same_folder_not_one_spelled_alike(self):
+        cwd = os.path.join(self.b, "gamma")
+        self.chat(cwd, 1000)
+        transcript = os.path.join(server.transcript_folder(cwd), "s1.jsonl")
+        self.assertTrue(server.ran_here(transcript, cwd))
+        with mock.patch.object(server.os.path, "samefile", lambda a, b: False):  # a case-sensitive Repo and repo
+            self.assertFalse(server.ran_here(transcript, cwd))
+            self.assertEqual(server.transcript_time(cwd), 0)
+        with mock.patch.object(server.os.path, "samefile", side_effect=FileNotFoundError("gone")):
+            self.assertTrue(server.ran_here(transcript, cwd))
+        with mock.patch.object(server.os.path, "samefile", side_effect=PermissionError("denied")):
+            self.assertFalse(server.ran_here(transcript, cwd))
+        self.assertFalse(server.ran_here(transcript, os.path.join(self.b, "delta")))
+
+    def test_the_recently_used_folders(self):
+        trusted = {"hasTrustDialogAccepted": True}
+        entries = {os.path.join(self.a, "alpha", "src"): trusted, os.path.join(self.a, "alpha"): trusted,
+                   os.path.join(self.b, "gamma"): dict(trusted, lastSessionId="g1"),
+                   os.path.join(self.b, "delta"): {"hasTrustDialogAccepted": False},
+                   os.path.join(self.b, "quiet"): trusted, self.here: trusted,
+                   os.path.join(self.b, ".hidden"): trusted,
+                   os.path.join(self.base, "gone"): trusted, "relative": trusted,
+                   os.path.join(self.base, "claude"): trusted}
+        with open(self.state, "w", encoding="utf-8") as f:
+            json.dump({"projects": entries}, f)
+        os.mkdir(os.path.join(self.b, ".hidden"))
+        self.chat(os.path.join(self.b, ".hidden"), 7000)
+        self.chat(os.path.join(self.a, "alpha", "src"), 3000)
+        self.chat(os.path.join(self.a, "alpha"), 1000)
+        self.chat(os.path.join(self.a, "alpha"), 9000, "stray", ran_in=os.path.join(self.base, "a_alpha"))
+        self.chat(os.path.join(self.b, "gamma"), 2000, "g1")
+        self.chat(os.path.join(self.b, "gamma"), 4500, "newer")  # newer than its last session
+        self.chat(os.path.join(self.b, "delta"), 4000)
+        self.chat(self.here, 6000)
+        self.chat(os.path.join(self.base, "claude"), 6000)
+        with mock.patch.object(server.tempfile, "gettempdir", lambda: os.path.join(self.base, "elsewhere")):
+            out = server.list_projects({"recent": True})
+            self.assertIn("Folders Claude Code was used in lately, newest first (2):", out)
+            alpha, gamma = os.path.join(self.a, "alpha"), os.path.join(self.b, "gamma")
+            self.assertLess(out.index(f"- {gamma} ["), out.index(f"- {alpha} ["),
+                            "by the newest transcript that ran there: not another folder's, not the last session's")
+            self.assertEqual(out.count(f"- {alpha} ["), 1, "a folder inside a repository counts as it")
+            for left_out in ("delta", "quiet", "dispatcher", "gone", "relative", ".hidden",
+                             os.path.join(self.base, "claude")):
+                self.assertNotIn(left_out + " [", out)
+        out = server.list_projects({"recent": True})  # here everything is in the temporary folder
+        self.assertIn("No trusted folder has a conversation yet", out)
+        os.remove(self.state)
+        with self.assertRaises(server.BridgeError):
+            server.list_projects({"recent": True})
+        with self.assertRaises(server.BridgeError):
+            server.list_projects({"recent": True, "folder": self.a})
+        with self.assertRaises(server.BridgeError):
+            server.list_projects({"recent": "yes"})
+
+
+class ClonePlaceTest(unittest.TestCase):
+    """0.27.0: doctor, setup and install say when nouez runs from a folder that may be emptied, and
+    doctor whether what Claude Code and the dispatcher run names this server.py."""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="nouez-test-place-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.here = os.path.abspath(server.__file__)
+
+    def test_a_clone_in_the_temporary_or_downloads_folder(self):
+        temp = os.path.join(tempfile.gettempdir(), "nouez", "server.py")
+        self.assertIn("the temporary folder", server.clone_place_note(temp))
+        home = os.path.join(self.base, "home")
+        with mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}), \
+                mock.patch.object(server.tempfile, "gettempdir", lambda: os.path.join(self.base, "tmp")), \
+                mock.patch.object(server, "known_folder", side_effect=OSError("none")):
+            os.makedirs(os.path.join(home, "Downloads", "nouez"))
+            note = server.clone_place_note(os.path.join(home, "Downloads", "nouez", "server.py"))
+            self.assertIn("the Downloads folder", note)
+            self.assertIn("register it again", note)
+            self.assertIsNone(server.clone_place_note(os.path.join(home, "nouez", "server.py")))
+
+    def test_the_server_paths_a_command_names(self):
+        for command, want in (("Bash(python -I /home/me/nouez/server.py wait *)", ["/home/me/nouez/server.py"]),
+                              ('Bash(python -I "C:\\My Files\\nouez\\server.py" wait *)',
+                               ["C:\\My Files\\nouez\\server.py"]),
+                              ("python '/opt/n z/server.py' statusline", ["/opt/n z/server.py"]),
+                              ("python C:/n/server.py hook && echo /x/server.pyc", ["C:/n/server.py"]),
+                              ('python -I "C:\\Bob\'s Files\\nouez\\server.py" hook',
+                               ["C:\\Bob's Files\\nouez\\server.py"]),
+                              ("python '/opt/say \"hi\"/server.py' hook", ['/opt/say "hi"/server.py']),
+                              ("python server.py wait 1", []), (None, [])):
+            with self.subTest(command=command):
+                self.assertEqual(server.scripts_in(command), want)
+
+    def test_doctor_checks_the_stored_paths_name_this_server(self):
+        state = os.path.join(self.base, "claude.json")
+        here = self.here.replace("\\", "/")
+        other = os.path.join(self.base, "old", "server.py")
+
+        def report(settings, registered=(), running=None):
+            with open(state, "w", encoding="utf-8") as f:
+                json.dump({"mcpServers": {"consultants": {"command": "python", "args": ["-I", *registered]}}}, f)
+            with mock.patch.object(server, "claude_state_file", lambda env=None: state), \
+                    mock.patch.object(server, "dispatcher_status", lambda: (bool(running), running)):
+                return server.script_paths_report(settings)
+        self.assertIsNone(report({}))
+        rule = {"permissions": {"allow": [f"Bash(python -I {here} wait *)", "Bash(ls *)"]}}
+        self.assertEqual(report(rule, [self.here]),
+                         (True, "the `consultants` registration and a waiter allow rule name this server.py"))
+        self.assertEqual(report(rule), (True, "a waiter allow rule names this server.py"))
+        ok, text = report(dict(rule, statusLine={"command": f'python "{other}" statusline'}),
+                          running={"script": other})
+        self.assertIsNone(ok)
+        self.assertIn(f"the status line runs {other}", text)
+        self.assertIn(f"the running dispatcher runs {other}", text)
+        self.assertIn(f"not this nouez ({self.here})", text)
+        self.assertIn("change the path in Claude Code's settings.json", text)
+        self.assertIn("run `server.py dispatcher install` from here", text)
+        self.assertNotIn("register nouez again", text)
+        ok, text = report({"hooks": {"UserPromptSubmit": [{"hooks": [{"command": f"python -I {other} hook"}]}]}},
+                          [self.here])
+        self.assertIn("the prompt hook runs", text)
+        self.assertNotIn("registration", text)
+        text = report({}, [other])[1]
+        self.assertIn("the `consultants` registration runs", text)
+        self.assertIn("register nouez again from here (README, Setup).", text)
+        self.assertNotIn("settings.json", text)
 
 
 if __name__ == "__main__":

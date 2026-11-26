@@ -6,6 +6,23 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-11-26
+
+Projects in any folder: the phone dispatcher can have several projects folders, or none, and its folder no longer needs a `~/Projects`. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
+
+### Added
+
+- `dispatcher setup` and `install` take `--projects DIR`, once for each folder that holds your projects (up to 20, none inside another), or `--no-projects` to trust folders only at the computer. The phone records trust inside any of them. Without either, the folder that holds the dispatcher's is its projects folder, as before.
+- `install` run again without `--projects` keeps the projects folders the running dispatcher was given, and says so. `dispatcher status` and doctor show them.
+- `ListProjects` lists each projects folder in the dispatcher, and with `recent` up to 20 trusted folders Claude Code was used in lately, from anywhere on the computer, newest first.
+- doctor says when Claude Code's registration, the waiter's allow rules, the status line, the prompt hook or the running dispatcher name another copy of `server.py`, and doctor, `setup` and `install` warn when nouez runs from the temporary or Downloads folder, which may be emptied.
+
+### Changed
+
+- Without a `~/Projects`, the dispatcher's folder is `~/.nouez/dispatcher`, which `setup` makes; it then needs `--projects` or `--no-projects`. When only one of the two is set up, that one is the default; when both are, `~/Projects/dispatcher`, as before.
+- The dispatcher's `CLAUDE.md` no longer names a folder: it tells the dispatcher to decline trust outside the projects folders `ListProjects` names. `setup` keeps a `CLAUDE.md` already there, so delete yours and run `setup` again for the new one.
+- The sign-in start's command carries the projects folders, and is refused past 8,000 characters.
+
 ## [0.26.4] - 2026-11-26
 
 One reader for each subscription's usage, shared by the consultant suggestion, `ConsultantBudget`, the status screen, the usage log and `doctor`, so they no longer disagree. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version; an open status screen restarts on it by itself.
@@ -734,7 +751,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.26.4...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/jibarix/nouez/compare/v0.26.4...v0.27.0
 [0.26.4]: https://github.com/jibarix/nouez/compare/v0.26.3...v0.26.4
 [0.26.3]: https://github.com/jibarix/nouez/compare/v0.26.2...v0.26.3
 [0.26.2]: https://github.com/jibarix/nouez/compare/v0.26.1...v0.26.2

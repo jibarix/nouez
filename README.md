@@ -65,7 +65,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.26.4 |
+| nouez | 0.27.0 |
 | Claude Code | 2.1.332 |
 | Codex CLI | 0.170.0 |
 | Codex app-server daemon | 0.172.0 |
@@ -93,13 +93,13 @@ claude mcp add --scope user consultants -- python "/absolute/path/to/nouez/serve
 
 On Windows, use a path like `"C:/Users/you/nouez/server.py"`. The setup guide shows how to add a key for [model scores](docs/consultants.md#choosing-a-consultant), and how to register it for one project only, which leaves the phone without nouez's tools elsewhere.
 
-**3. Set up the phone dispatcher,** a Remote Control server in a folder of its own, `~/Projects/dispatcher` by default, beside your projects. With the `python` and path you registered:
+**3. Set up the phone dispatcher,** a Remote Control server in a folder of its own, `~/Projects/dispatcher` by default, beside your projects (`~/.nouez/dispatcher` when there is no `~/Projects`). With the `python` and path you registered:
 
 ```sh
 python "/absolute/path/to/nouez/server.py" dispatcher setup
 ```
 
-It makes the folder (its parent, such as `~/Projects`, must exist; `--folder` picks another), writes a `CLAUDE.md` there that gives the dispatcher its job, and adds allow rules for nouez's session tools to the folder's `.claude/settings.json` (`--dry-run` shows what it would change). Then, once, in a terminal in that folder:
+It makes the folder (`--folder` picks another), writes a `CLAUDE.md` there that gives the dispatcher its job, and adds allow rules for nouez's session tools to the folder's `.claude/settings.json` (`--dry-run` shows what it would change). The phone can trust projects only inside the dispatcher's projects folders, by default the one that holds its folder (`~/Projects`): if your projects are elsewhere, or in several places, name each folder that holds them with `--projects DIR`, or pass `--no-projects` to trust folders only at the computer, and give `install` the same. Then, once, in a terminal in that folder:
 
 ```sh
 claude remote-control --name dispatcher --spawn same-dir
