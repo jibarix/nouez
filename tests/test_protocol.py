@@ -10945,6 +10945,23 @@ class ClonePlaceTest(unittest.TestCase):
             self.assertIn("register it again", note)
             self.assertIsNone(server.clone_place_note(os.path.join(home, "nouez", "server.py")))
 
+    def test_a_known_folder_without_windows_libraries_is_an_oserror(self):
+        real = __import__
+
+        def no_ctypes(name, *args, **kwargs):
+            if name.startswith("ctypes"):
+                raise ImportError("cannot import name 'FormatError' from '_ctypes'")
+            return real(name, *args, **kwargs)
+        with mock.patch("builtins.__import__", no_ctypes):
+            with self.assertRaises(OSError):
+                server.known_folder(server.FOLDERID_DOWNLOADS)
+        if os.name != "nt":
+            with self.assertRaises(OSError):  # ctypes without WinDLL
+                server.known_folder(server.FOLDERID_DOWNLOADS)
+        with mock.patch.object(server.os, "name", "nt"), mock.patch("builtins.__import__", no_ctypes), \
+                mock.patch.object(server.tempfile, "gettempdir", lambda: os.path.join(self.base, "tmp")):
+            self.assertIsNone(server.clone_place_note(os.path.join(self.base, "nouez", "server.py")))
+
     def test_the_server_paths_a_command_names(self):
         for command, want in (("Bash(python -I /home/me/nouez/server.py wait *)", ["/home/me/nouez/server.py"]),
                               ('Bash(python -I "C:\\My Files\\nouez\\server.py" wait *)',

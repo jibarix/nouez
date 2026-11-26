@@ -11541,16 +11541,22 @@ FOLDERID_DOWNLOADS = ("Downloads", 0x374DE290, 0x123F, 0x4565, (0x91, 0x64, 0x39
 
 def known_folder(known):
     """Windows: one of the user's folders (FOLDERID_*) as the system knows it (SHGetKnownFolderPath),
-    not as the environment says. OSError if it can't be had."""
-    import ctypes
-    from ctypes import wintypes
+    not as the environment says. OSError if it can't be had, Windows' libraries included."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except (ImportError, ValueError) as e:  # not Windows' ctypes
+        raise OSError(f"no Windows libraries for the {known[0]} folder: {e}") from e
 
     class GUID(ctypes.Structure):
         _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
                     ("Data4", ctypes.c_ubyte * 8)]
     name, data1, data2, data3, data4 = known
     folder_id = GUID(data1, data2, data3, (ctypes.c_ubyte * 8)(*data4))
-    shell32, ole32 = ctypes.WinDLL("shell32"), ctypes.WinDLL("ole32")
+    try:
+        shell32, ole32 = ctypes.WinDLL("shell32"), ctypes.WinDLL("ole32")
+    except AttributeError as e:  # no WinDLL off Windows
+        raise OSError(f"no Windows libraries for the {name} folder") from e
     shell32.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
                                              ctypes.POINTER(ctypes.c_void_p)]
     shell32.SHGetKnownFolderPath.restype = ctypes.c_long
