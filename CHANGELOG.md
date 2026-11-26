@@ -6,6 +6,15 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.28.3] - 2026-11-26
+
+Consultants found with the usage log off, and a send's reason that names the effort it ran at. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
+
+### Fixed
+
+- With the usage log off (`NOUEZ_NO_USAGE_LOG=1`), a Codex consultant the daemon had unloaded and that was past Codex's 50 most recent sessions was lost: `StartConsultant` started a second one beside it, a message by its name was refused and the consultations page left it out. Unloaded consultants are now found in Codex's own index of sessions, with the log on or off, among its 2,000 newest sessions not archived. Only the sessions Codex says nouez started are read, rather than each of the 50 newest, the user's own included, so listing is quicker too. A Codex whose index can't answer is checked in its 50 most recent sessions, as before, and a name the index doesn't hold is looked up once more on disk, as is a project the index shows no consultant in. A message to a name that matches none now says to look in `ListConsultants` rather than list the sessions it happened to read
+- A send's result gave the pick's first reason, which named the suggested effort ("at xhigh ...") even when the week was tight and the turn ran one level down. It now adds "one level down while its week is tight" when it did
+
 ## [0.28.2] - 2026-11-26
 
 A truer forecast for a week's first hours, and usage-log readings that say which week they belong to. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
@@ -798,7 +807,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.2...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.3...HEAD
+[0.28.3]: https://github.com/jibarix/nouez/compare/v0.28.2...v0.28.3
 [0.28.2]: https://github.com/jibarix/nouez/compare/v0.28.1...v0.28.2
 [0.28.1]: https://github.com/jibarix/nouez/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/jibarix/nouez/compare/v0.27.0...v0.28.0

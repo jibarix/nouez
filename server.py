@@ -69,7 +69,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.28.2"
+SERVER_VERSION = "0.28.3"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -85,7 +85,9 @@ MODERN_META_KEYS = (META_VERSION, META_CAPS, META_CLIENT, META_LOG_LEVEL)
 POLL_SECONDS = 1.5
 CONTINUATION_GRACE = 15  # seconds to wait for Codex to carry on an interrupted turn (a restarted daemon took 8s)
 MAX_FRAME_BYTES = 64 * 1024 * 1024
-RECENT_SAVED_THREADS = 50  # how far back to look for unloaded bridge consultants
+RECENT_SAVED_THREADS = 50  # how far back to look when Codex's index can't answer (saved_summaries)
+SAVED_PAGE = 100  # sessions on each page of Codex's index that saved_summaries asks for
+SAVED_PAGES = 20  # pages at most: 2,000 sessions not archived, about a second at worst
 REPLY_LOOKBACK = 100  # how many recent turns GetConsultantReply searches for a turn id
 MAX_WAIT_SECONDS = 4 * 60 * 60  # ceiling on any wait, wait="done" included, so a hung turn can't pin a call
 MAX_REPLY_CHARS = 60_000  # longer replies are cut here; the full text is saved to a file
@@ -98,6 +100,7 @@ SEND_WAIT_SECONDS = 5  # SendConsultantMessage's default wait: a quick answer fi
 PARTIAL_CHARS = 4_000  # how much of a still-running turn's output a timeout shows (the most recent part)
 PROGRESS_SECONDS = 10  # least time between two progress notifications for one call
 BRIDGE_SOURCE = "nouez"  # threadSource tag on sessions started by StartConsultant
+CLIENT_NAME = "nouez"  # the clientInfo name nouez gives Codex, which Codex records as a session's originator
 SANDBOX = "read-only"
 RELEASES_URL = "https://api.github.com/repos/jibarix/nouez/releases/latest"
 RELEASE_PAGE = "https://github.com/jibarix/nouez/releases/tag/v{}"
@@ -352,7 +355,7 @@ class CodexClient:
         try:
             threading.Thread(target=self._reader, daemon=True).start()
             # userAgent carries the daemon's version and codexHome its install root.
-            self.info = self.request("initialize", {"clientInfo": {"name": "nouez", "version": SERVER_VERSION}})
+            self.info = self.request("initialize", {"clientInfo": {"name": CLIENT_NAME, "version": SERVER_VERSION}})
             self.notify("initialized")
         except Exception:
             self.close()
@@ -569,15 +572,45 @@ def saved_consultant(client, tid, root=None):
     return None
 
 
-def logged_ids():
-    """The Codex consultants in the usage log (none when logging is off)."""
-    return [] if usage_log_off() else logged_codex_threads(read_usage_log())
+def saved_summaries(client, fast=True):
+    """Codex's sessions that aren't archived, newest first, as thread/list sums them up. fast: page
+    through Codex's index (useStateDbOnly), SAVED_PAGES pages at most, so Dana's consultant from last
+    week is found behind hundreds of her own sessions. Otherwise, or when the index refuses the
+    request or holds nothing, the RECENT_SAVED_THREADS most recent as Codex finds them on disk. A
+    Codex that doesn't say who started each session gets one page (each then needs a read)."""
+    out = []
+    if fast:
+        cursor, cursors = None, set()
+        try:
+            for _ in range(SAVED_PAGES):
+                page = client.request("thread/list", {"limit": SAVED_PAGE, "useStateDbOnly": True,
+                                                      **({"cursor": cursor} if cursor else {})})
+                data = [s for s in page.get("data") or [] if isinstance(s, dict)]
+                out += data
+                cursor = page.get("nextCursor")
+                if not cursor or cursor in cursors or any("originator" not in s for s in data):
+                    break
+                cursors.add(cursor)
+        except BridgeError:
+            if out:  # a later page failed: the search isn't whole, so StartConsultant mustn't start a second one
+                raise
+            # an older Codex that doesn't know the index: the fallback below
+        if any("originator" not in s for s in out):
+            out = out[:RECENT_SAVED_THREADS]
+    return out or client.request("thread/list", {"limit": RECENT_SAVED_THREADS}).get("data") or []
 
 
-def load_consultants(client, include_all=False, extra_ids=(), root=None):
-    """Sessions loaded on the daemon, plus recent bridge consultants the daemon has unloaded, plus
-    the bridge consultants among extra_ids (older ones the recent list no longer reaches). The
-    daemon unloads idle sessions with no subscriber after about a minute."""
+def started_by_nouez(summary):
+    """Whether a thread/list summary may be a consultant: Codex records the client that started it
+    (CLIENT_NAME for nouez's, codex-tui for the user's own). Only a read's threadSource proves it."""
+    return summary.get("originator", CLIENT_NAME) == CLIENT_NAME
+
+
+def load_consultants(client, include_all=False, root=None, saved=True, want=None, fast=True):
+    """Sessions loaded on the daemon, plus the consultants nouez started that the daemon has unloaded
+    (it unloads idle sessions with no subscriber after about a minute), found in Codex's own list of
+    sessions, never in the usage log: they are found the same with the log off. saved False: loaded
+    ones only. want(id): read only the unloaded ones it accepts (resolve, looking for one name)."""
     ids = loaded_ids(client)
     consultants = []
     for tid in ids:
@@ -589,35 +622,20 @@ def load_consultants(client, include_all=False, extra_ids=(), root=None):
             continue
         thread["_loaded"] = True
         consultants.append(thread)
-    # thread/list omits threadSource, so read each recent unloaded session to find ours.
-    saved = client.request("thread/list", {"limit": RECENT_SAVED_THREADS}).get("data", [])
+    if not saved:
+        return consultants
+    # thread/list omits threadSource: read the unloaded sessions nouez may have started to find ours.
     seen = set(ids)
-    if root:
-        seen.update(t["id"] for t in saved if t.get("cwd") and not in_repo(t, root))
-    for tid in [summary["id"] for summary in saved] + list(extra_ids):
-        if tid in seen:
+    for summary in saved_summaries(client, fast):
+        tid = summary.get("id")
+        if (not isinstance(tid, str) or tid in seen or not started_by_nouez(summary)
+                or (root and summary.get("cwd") and not in_repo(summary, root)) or (want and not want(tid))):
             continue
         seen.add(tid)
         thread = saved_consultant(client, tid, root)
         if thread:
             consultants.append(thread)
     return consultants
-
-
-LOGGED_CONSULTANTS = 100  # the most Codex consultants the consultations page looks up from the usage log
-
-
-def logged_codex_threads(events):
-    """The Codex consultants messaged in the usage log, most recent first, at most LOGGED_CONSULTANTS."""
-    out = []
-    for e in reversed(events):
-        tid = e.get("thread")
-        if (e.get("event") == "send" and e.get("provider") in (None, "codex") and not e.get("user_session")
-                and isinstance(tid, str) and FULL_ID.fullmatch(tid) and tid not in out):
-            out.append(tid)
-            if len(out) == LOGGED_CONSULTANTS:
-                break
-    return out
 
 
 FULL_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -632,16 +650,19 @@ def resolve(client, target, exact_only=False):
         if thread:
             thread["_loaded"] = thread["id"] in loaded_ids(client)
             return thread
-    threads = load_consultants(client, include_all=True)
-    # Older consultants the recent list no longer reaches, named as ListConsultants shows them. Looked
-    # up even after a recent match: two consultants can share a name, and a stop must not pick one.
+    # Unloaded consultants are read only when their id could match: a name keeps the id's last six
+    # characters. All of them are looked at, not the first match: two can share a name, and a stop
+    # must not pick one. A miss looks once more as Codex finds sessions on disk, for one its index lacks.
     suffix = target.rsplit("-", 1)[-1] if target.startswith("codex-") else target
-    known = {t["id"] for t in threads}
-    for tid in logged_ids():
-        if tid not in known and (tid.endswith(suffix) or tid.startswith(target)):
-            thread = saved_consultant(client, tid)
-            if thread:
-                threads.append(thread)
+
+    def want(tid):
+        tid = tid.lower()
+        return tid.endswith(suffix) or tid.startswith(target) or tid.endswith(target)
+    threads = load_consultants(client, include_all=True, want=want)
+    if not any(want(t["id"]) for t in threads):
+        known = {t["id"] for t in threads}
+        threads += [t for t in load_consultants(client, include_all=True, want=want, fast=False)
+                    if t["id"] not in known]
     exact = [t for t in threads if target in (t["id"].lower(), short_name(t))]
     if len(exact) == 1:
         return exact[0]
@@ -660,9 +681,8 @@ def resolve(client, target, exact_only=False):
     if thread:
         thread["_loaded"] = False
         return thread
-    names = ", ".join(short_name(t) for t in threads) or "none"
     exact_note = " Use its exact name or full thread id." if exact_only else ""
-    raise BridgeError(f"No Codex session named '{target}'.{exact_note} Sessions: {names}")
+    raise BridgeError(f"No Codex session named '{target}'.{exact_note} ListConsultants shows each consultant's name.")
 
 
 def ensure_loaded(client, thread):
@@ -5078,9 +5098,19 @@ def in_repo(thread, root):
     return bool(cwd) and is_under(cwd, root)
 
 
+def with_disk_look(client, threads, root=None):
+    """threads, plus the consultants Codex finds on disk when threads holds none of nouez's: Lee
+    restored his sessions without Codex's index, and StartConsultant must reuse his consultant rather
+    than start a second one. It costs a second or two, only for a project with no consultant yet."""
+    if any(is_bridge(t) for t in threads):
+        return threads
+    known = {t["id"] for t in threads}
+    return threads + [t for t in load_consultants(client, root=root, fast=False) if t["id"] not in known]
+
+
 def repo_consultants(client, cwd):
     root = repo_root(cwd)
-    return root, [t for t in load_consultants(client, extra_ids=logged_ids(), root=root) if in_repo(t, root)]
+    return root, [t for t in with_disk_look(client, load_consultants(client, root=root), root) if in_repo(t, root)]
 
 
 def default_cwd():
@@ -5131,7 +5161,7 @@ def list_consultants(args, cancel=None, progress=None):
     else:
         try:
             with contextlib.closing(CodexClient()) as client:
-                threads = load_consultants(client, include_all and not root, logged_codex_threads(events), root=root)
+                threads = with_disk_look(client, load_consultants(client, include_all and not root, root=root), root)
                 latest = codex_overview_turns(client, threads)
         except BridgeError as e:
             if not agy:
@@ -6080,7 +6110,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                 if overrides:
                     mode += f" on {settings}, which the consultant keeps for later messages until changed"
                     if routed:
-                        mode += f" (nouez's pick for a {kind}: {routed['why'][0]}; pass model or effort to choose)"
+                        mode += f" (nouez's pick for a {kind}: {pick_reason(routed)}; pass model or effort to choose)"
                 else:
                     mode += running_on(thread, " on ")
                 mode += round_mode(chain)
@@ -7220,9 +7250,18 @@ def suggest_consultant(kind, state, now, only=None, revision=False):
     eased = eased_effort(best["provider"], best["model"], best["effort"], outlook[0], state[best["provider"]])
     if eased != best["effort"]:
         best["effort"] = eased
-        best["why"].append("one level down while its week is tight")
+        best["why"].append(EASED)
     best["notes"] = best["notes"] + ([CONSULT_NOTES[kind]] if kind in CONSULT_NOTES else [])
     return best
+
+
+EASED = "one level down while its week is tight"
+
+
+def pick_reason(routed):
+    """The pick's first reason for a send's result, and the step down when it took one: Lee reads
+    "at xhigh ..." only when the turn runs at xhigh."""
+    return routed["why"][0] + (f"; {EASED}" if EASED in routed["why"] else "")
 
 
 # What to hand to a consultant at each Claude Code pace: the goal is Claude Code's own weekly usage
@@ -9307,7 +9346,7 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
     mode = f"started a new turn on {model}" + (
         "" if not changed else ", which the consultant keeps for later messages until changed" if kept
         else f", but nouez couldn't save it as {name}'s model, so later messages use the one it had") + (
-        f" (nouez's pick for a {kind}: {routed['why'][0]}; pass model or effort to choose)" if routed else ""
+        f" (nouez's pick for a {kind}: {pick_reason(routed)}; pass model or effort to choose)" if routed else ""
     ) + round_mode(chain)
     if not usage_log_off():
         event = {"event": "send", "consultant": name, "thread": cid, "turn": turn_id, "provider": "antigravity",
@@ -10131,7 +10170,7 @@ class ConsultationFeed:
         if codex_installed():
             try:
                 client = self._codex()
-                threads = load_consultants(client, extra_ids=logged_codex_threads(events))
+                threads = load_consultants(client, saved=details)  # the Usage page counts busy ones: all loaded
                 if details:
                     latest = codex_overview_turns(client, threads)
                 home = (client.info or {}).get("codexHome")

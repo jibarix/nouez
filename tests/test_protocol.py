@@ -1752,6 +1752,10 @@ class FakeDaemon:
         self.fail_after_start = fail_after_start
         self.calls = []
         self.info = {}
+        # thread/list: the summaries a test lists, newest first. "_disk_only" ones are missing from
+        # Codex's index (useStateDbOnly); no_state_db: an older Codex that refuses useStateDbOnly.
+        self.listed, self.lists, self.read_ids = [], [], []
+        self.no_state_db = self.stuck_cursor = False
 
     def __call__(self, on_spawn=None):  # as CodexClient(): a ConsultationFeed passes on_spawn
         return self
@@ -1764,11 +1768,23 @@ class FakeDaemon:
         if method == "thread/loaded/list":
             return {"data": list(self.threads)}
         if method == "thread/read":
+            self.read_ids.append(params["threadId"])
             if params["threadId"] not in self.threads:
                 raise server.BridgeError(f"thread not found: {params['threadId']}")
             return {"thread": dict(self.threads[params["threadId"]])}
         if method == "thread/list":
-            return {"data": []}
+            self.lists.append(dict(params))
+            db = params.get("useStateDbOnly")
+            if db and self.no_state_db:
+                raise server.BridgeError("thread/list failed: unknown field `useStateDbOnly`")
+            rows = [{k: v for k, v in s.items() if k != "_disk_only"} for s in self.listed
+                    if not (db and s.get("_disk_only"))]
+            limit = params.get("limit") or 25
+            if self.stuck_cursor:
+                return {"data": rows[:limit], "nextCursor": "again"}
+            start = int(params.get("cursor") or 0)
+            more = start + limit < len(rows)
+            return {"data": rows[start:start + limit], "nextCursor": str(start + limit) if more else None}
         if method == "thread/start":
             self.thread_started = params
             thread = {"id": "0199ffff-0000-0000-0000-000000new001", "threadSource": "nouez", **params}
@@ -5606,6 +5622,8 @@ class SuggestTest(unittest.TestCase):
         got = server.suggest_consultant("review", {"codex": tight}, self.NOW)
         self.assertEqual((got["model"], got["effort"]), ("gpt-6.2-astra", "medium"))
         self.assertIn("one level down while its week is tight", got["why"])
+        # and a send's result says so beside the first reason, not "at high" alone
+        self.assertEqual(server.pick_reason(got), got["why"][0] + "; one level down while its week is tight")
         # 0.26.1: a model that doesn't list the level below keeps its effort
         tight["models"] = {m: (("low", "high", "xhigh"), "low", i == 0)
                            for i, m in enumerate(["gpt-6.2-sol", "gpt-6.2-astra"])}
@@ -8359,22 +8377,30 @@ class ConsultationsPageTest(unittest.TestCase):
         self.assertEqual(server.wrap_cells("漢字" * 6, 5), ["漢字", "漢字", "漢字", "漢字", "漢字", "漢字"])
         self.assertEqual(server.wrap_cells("", 10), [""])
 
-    def test_older_consultants_from_the_usage_log(self):
+    @staticmethod
+    def summary(thread, originator="nouez"):  # as thread/list sums a session up
+        return {"id": thread["id"], "cwd": thread["cwd"], "originator": originator}
+
+    def test_older_consultants_with_the_log_off(self):
+        # Dana turned the usage log off and runs Codex a lot herself: last week's consultant is behind
+        # 150 of her own sessions. The screen, a send by name and StartConsultant's reuse still find
+        # it, in Codex's own list and never in the log, and none of her sessions is read to do it.
         old = self.CODEX[:-4] + "0010"
-        stopped = self.CODEX[:-4] + "0012"  # StopConsultant archived it; thread/read still returns it
-        daemon = FakeDaemon([self.thread(self.CODEX, ROOT), self.thread(old, ROOT),
-                             dict(self.thread(stopped, ROOT), path=os.path.join("codex", "archived_sessions", "r.jsonl"))], {})
-        events = [{"event": "send", "thread": stopped, "turn": "t"},
-                  {"event": "send", "thread": old, "turn": "t"}, {"event": "send", "thread": "agy-x", "provider": "antigravity"},
-                  {"event": "send", "thread": self.CODEX[:-4] + "0011", "user_session": True}]
-        self.assertEqual(server.logged_codex_threads(events), [old, stopped])
-        with mock.patch.object(server, "CodexClient", daemon), mock.patch.object(server, "read_usage_log", return_value=events), \
-             mock.patch.object(server, "RECENT_SAVED_THREADS", 0), mock.patch.object(server, "loaded_ids", return_value=[]), \
+        stopped = self.CODEX[:-4] + "0012"  # StopConsultant archived it: Codex lists it no more
+        hers = [self.thread(f"0199cccc-0000-0000-0000-{i:012d}", ROOT, bridge=False) for i in range(150)]
+        daemon = FakeDaemon(hers + [self.thread(old, ROOT),
+                                    dict(self.thread(stopped, ROOT), path=os.path.join("codex", "archived_sessions", "r.jsonl"))], {})
+        daemon.listed = [self.summary(t, "codex-tui") for t in hers] + [self.summary(daemon.threads[old])]
+        with mock.patch.object(server, "CodexClient", daemon), \
+             mock.patch.object(server, "read_usage_log", side_effect=AssertionError("the log is off")), \
+             mock.patch.object(server, "loaded_ids", return_value=[]), \
              mock.patch.object(server, "agy_consultants", return_value=[]), \
-             mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": ""}):
+             mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": "1"}):
             feed = server.ConsultationFeed()
             feed.show(None, True)
             feed._list()
+            self.assertEqual([p.get("cursor") for p in daemon.lists], [None, "100"])  # two pages of 100
+            self.assertEqual(daemon.read_ids, [old])
             self.assertEqual(server.resolve(daemon, server.short_name(daemon.threads[old]))["id"], old)
             with self.assertRaises(server.BridgeError):
                 server.resolve(daemon, server.short_name(daemon.threads[stopped]))
@@ -8382,8 +8408,67 @@ class ConsultationsPageTest(unittest.TestCase):
                 server.resolve(daemon, stopped)  # nor by its full id
             # StartConsultant reuses the consultant the list shows, rather than starting a second one.
             self.assertEqual([t["id"] for t in server.repo_consultants(daemon, ROOT)[1]], [old])
-        self.assertEqual([r["id"] for r in feed.state()[0]], [old])  # past the recent list, still shown
-        self.assertTrue(feed.state()[0][0]["command"].startswith(f"codex resume {old}"))
+            self.assertNotIn(hers[0]["id"], daemon.read_ids)
+            self.assertEqual([r["id"] for r in feed.state()[0]], [old])  # past the recent list, still shown
+            self.assertTrue(feed.state()[0][0]["command"].startswith(f"codex resume {old}"))
+            # the Usage page only counts busy consultants, which are all loaded: it lists nothing
+            daemon.lists.clear()
+            feed.show(None, False)
+            feed._list()
+            self.assertEqual(daemon.lists, [])
+
+    def test_finding_consultants_on_any_codex(self):
+        old = self.CODEX[:-4] + "0010"
+        daemon = FakeDaemon([self.thread(old, ROOT)], {})
+        with mock.patch.object(server, "loaded_ids", return_value=[]):
+            # an older Codex that refuses the index: its recent sessions, as before
+            daemon.listed, daemon.no_state_db = [{"id": old, "cwd": ROOT}], True
+            self.assertEqual([t["id"] for t in server.load_consultants(daemon)], [old])
+            self.assertEqual(daemon.lists[-1], {"limit": server.RECENT_SAVED_THREADS})
+            # one that doesn't say who started each session: one page, and at most 50 of them read
+            daemon.no_state_db, daemon.lists = False, []
+            daemon.listed = [{"id": f"0199dddd-0000-0000-0000-{i:012d}", "cwd": ROOT} for i in range(250)]
+            self.assertEqual(len(server.saved_summaries(daemon)), server.RECENT_SAVED_THREADS)
+            self.assertEqual(len(daemon.lists), 1)
+            # a cursor that comes back again ends the paging; so does the page cap
+            daemon.listed, daemon.lists, daemon.stuck_cursor = [{"id": old, "cwd": ROOT, "originator": "nouez"}], [], True
+            server.saved_summaries(daemon)
+            self.assertEqual(len(daemon.lists), 2)
+            daemon.stuck_cursor, daemon.lists = False, []
+            daemon.listed = [{"id": f"0199dddd-0000-0000-0000-{i:012d}", "cwd": ROOT, "originator": "codex-tui"}
+                             for i in range(30)]
+            with mock.patch.object(server, "SAVED_PAGE", 1):
+                self.assertEqual(len(server.saved_summaries(daemon)), server.SAVED_PAGES)
+            # Lee synced his Codex sessions from his other computer, without Codex's index: a send by
+            # name doesn't find the consultant in the index, so it looks once on disk, and finds it
+            daemon.listed, daemon.lists = [dict(self.summary(daemon.threads[old]), _disk_only=True)], []
+            self.assertEqual(server.resolve(daemon, server.short_name(daemon.threads[old]))["id"], old)
+            self.assertEqual([p.get("useStateDbOnly", False) for p in daemon.lists], [True, False])
+            # and with another session in the index, StartConsultant reuses it rather than start a
+            # second one beside it, and ListConsultants shows it
+            other = self.thread("0199eeee-0000-0000-0000-000000000001", ROOT, bridge=False)
+            daemon.threads[other["id"]] = other
+            daemon.listed.insert(0, self.summary(other, "codex-tui"))
+            self.assertEqual([t["id"] for t in server.repo_consultants(daemon, ROOT)[1]], [old])
+            with mock.patch.object(server, "CodexClient", lambda: daemon), \
+                 mock.patch.object(server, "agy_repo_consultants", return_value=(ROOT, [])):
+                self.assertIn(server.short_name(daemon.threads[old]), server.list_consultants({"cwd": ROOT}))
+            # Dana's consultant is on page two: a second page that fails is an error, never a
+            # search that found nothing, after which StartConsultant would start a second one
+            daemon.listed = [self.summary(other, "codex-tui")] * 3 + [self.summary(daemon.threads[old])]
+            real = daemon.request
+
+            def second_page_fails(method, params=None):
+                if method == "thread/list" and params.get("cursor"):
+                    raise server.BridgeError("timed out")
+                return real(method, params)
+            with mock.patch.object(server, "SAVED_PAGE", 2), mock.patch.object(daemon, "request", second_page_fails):
+                with self.assertRaisesRegex(server.BridgeError, "timed out"):
+                    server.repo_consultants(daemon, ROOT)
+            # Sam mistypes a name: the error doesn't call the consultants he has "none"
+            with self.assertRaisesRegex(server.BridgeError, r"No Codex session named 'codex-nouez-00001x'\. "
+                                        r"ListConsultants shows each consultant's name\.$"):
+                server.resolve(daemon, "codex-nouez-00001x")
 
     def test_a_name_shared_with_an_older_consultant(self):
         # Names keep the id's last six characters: a recent consultant and a logged older one can
@@ -8392,10 +8477,8 @@ class ConsultationsPageTest(unittest.TestCase):
         daemon = FakeDaemon([self.thread(self.CODEX, ROOT), self.thread(twin, ROOT)], {})
         name = server.short_name(daemon.threads[self.CODEX])
         self.assertEqual(name, server.short_name(daemon.threads[twin]))
-        with mock.patch.object(server, "read_usage_log", return_value=[{"event": "send", "thread": twin, "turn": "t"}]), \
-             mock.patch.object(server, "RECENT_SAVED_THREADS", 0), \
-             mock.patch.object(server, "loaded_ids", return_value=[self.CODEX]), \
-             mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": ""}):
+        daemon.listed = [self.summary(daemon.threads[twin])]
+        with mock.patch.object(server, "loaded_ids", return_value=[self.CODEX]):
             with self.assertRaisesRegex(server.BridgeError, "names more than one session"):
                 server.resolve(daemon, name, exact_only=True)
             self.assertEqual(server.resolve(daemon, twin)["id"], twin)

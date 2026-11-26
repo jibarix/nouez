@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.28.2\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.28.3\\[0.3em]\large Architecture and message reference}
 \date{November 26, 2026}
 \author{}
 
@@ -290,7 +290,7 @@ the folder the call names, never in a workspace above it.
   "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
   "ttlMs": 0, "cacheScope": "private",
-  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.28.2"}}}}
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.28.3"}}}}
 \end{wire}
 
 Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
@@ -691,7 +691,7 @@ sends a continuation, so it can't refuse one.
 initialize & \code{clientInfo} & \code{userAgent}, \code{codexHome} & every connection \\
 thread/loaded/list & \code{\{\}} or \code{\{cursor\}} & \code{data}: ids, \code{nextCursor} & finding sessions, the consultations page \\
 thread/read & \code{threadId} & \code{thread} & finding sessions \\
-thread/list & \code{limit: 50} & \code{data}: summaries & finding unloaded consultants \\
+thread/list & \code{limit}, \code{useStateDbOnly}, \code{cursor} & \code{data}, \code{nextCursor} & finding unloaded consultants \\
 thread/start & \code{cwd}, \code{sandbox}, \code{approvalPolicy}, \code{threadSource}, opt.\ \code{model}, \code{developerInstructions} & \code{thread} & StartConsultant \\
 thread/name/set & \code{threadId}, \code{name} & -- & StartConsultant \code{title} \\
 thread/resume & \code{threadId}, \code{excludeTurns: true} & -- & SendConsultantMessage \\
@@ -717,8 +717,8 @@ permissions changed in a \code{codex resume} the user ran would otherwise carry 
 
 A \code{to} that is a full thread id is read directly with one \code{thread/read}, plus
 \code{thread/loaded/list} to know whether it is loaded. Every other \code{to} first lists
-sessions, then matches. Listing costs one request per session, because \code{thread/list} omits
-\code{threadSource}:
+sessions, then matches. Listing reads each loaded session, and each unloaded one that Codex says
+nouez started, because \code{thread/list} omits \code{threadSource}:
 
 \begin{wire}[1. Sessions loaded in the daemon (paged)]
 -> {"id": 2, "method": "thread/loaded/list", "params": {}}
@@ -728,14 +728,25 @@ sessions, then matches. Listing costs one request per session, because \code{thr
 -> {"id": 3, "method": "thread/read", "params": {"threadId": "01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17"}}
 <- {"id": 3, "result": {"thread": {"id": "01a1f3c2-...", "cwd": "C:\\Users\\you\\Projects\\nouez", "threadSource": "nouez", "status": {"type": "idle"}, ...}}}
 \end{wire}
-\begin{wire}[3. One page of up to 50 saved sessions, to find consultants the daemon has unloaded]
--> {"id": 5, "method": "thread/list", "params": {"limit": 50}}
-<- {"id": 5, "result": {"data": [{"id": "01a1d9b7-...", "status": {"type": "notLoaded"}, ...}, ...], "nextCursor": "..."}}
+\begin{wire}[3. Codex's index of saved sessions, 100 a page, to find consultants the daemon has unloaded]
+-> {"id": 5, "method": "thread/list", "params": {"limit": 100, "useStateDbOnly": true}}
+<- {"id": 5, "result": {"data": [{"id": "01a1d9b7-...", "originator": "nouez", "cwd": "...", ...}, ...], "nextCursor": "100"}}
 -> {"id": 6, "method": "thread/read", "params": {"threadId": "01a1d9b7-..."}}     // kept only if threadSource == "nouez"
 \end{wire}
 
-Only that one page is read, so a consultant unloaded and older than the 50 sessions it holds is
-not listed. Then \code{to} is matched, case-insensitively: an exact name or id first; otherwise a
+Codex records, as each session's \code{originator}, the \code{clientInfo} name of the client that
+started it (\code{CLIENT\_NAME}, \code{"nouez"}; \code{"codex-tui"} for the user's own), so only
+the sessions nouez started are read, and those outside the project when one is asked for are
+skipped. Pages follow \code{nextCursor}, \code{SAVED\_PAGES} (20) at most, 2,000 sessions not
+archived; a cursor that comes back again ends them. The usage log plays no part, so consultants are
+found the same with it off. A Codex that refuses \code{useStateDbOnly}, or whose index returns
+nothing, gets one \code{thread/list} of 50 without it, as Codex finds sessions on disk; one whose
+summaries have no \code{originator} gets one page, its first 50 read. When the index holds no
+session that \code{to} could name (a name keeps the id's last six characters, so only those are
+read), the lookup is made once more on disk, for sessions copied from another computer without
+Codex's index; so is \code{StartConsultant}'s and \code{ListConsultants}'s when they find none of
+nouez's consultants. A later page that fails is an error, never a shorter list, so a consultant on
+page two is not taken for missing and a second one started. Then \code{to} is matched, case-insensitively: an exact name or id first; otherwise a
 unique id prefix or suffix (except for \code{StopConsultant}, which accepts only exact matches);
 otherwise a direct \code{thread/read} of \code{to} as a full id, which reaches older consultants.
 A name keeps only the id's last six characters, so two sessions can share one; such a name is
@@ -744,8 +755,8 @@ refused, and the full id has to be used.
 \begin{plain}[Matching failures (isError results)]
 'codex-nouez-4d9f17' names more than one session. Use the full thread id: 01a1f3c2-5e7b-7c41-9a0d-2b6e8c4d9f17, 01a20b55-0c9e-7a13-b6f1-77e0aa4d9f17
 '01a1' is ambiguous. Matches: codex-nouez-4d9f17, codex-nouez-77c2e0
-No Codex session named 'codex-nouez-4d9f1'. Sessions: codex-nouez-4d9f17, codex-api-0b13aa
-No Codex session named '4d9f17'. Use its exact name or full thread id. Sessions: codex-nouez-4d9f17
+No Codex session named 'codex-nouez-4d9f1'. ListConsultants shows each consultant's name.
+No Codex session named '4d9f17'. Use its exact name or full thread id. ListConsultants shows each consultant's name.
 \end{plain}
 
 % =============================================================================
@@ -1603,9 +1614,9 @@ mode inside the block that restores it, so an interrupt at any point leaves it a
 consultant (up to 0.22.0 it opened a Codex pane, Section~\ref{sec:old-panes}); this page shows all of
 them in one place instead. A \code{ConsultationFeed} reads its data in a thread of its own, so the
 screen keeps answering keys: \code{load\_consultants} over one \code{CodexClient} kept open while the
-screen runs, with the Codex consultants of the last \code{LOGGED\_CONSULTANTS} (100) sends in the usage
-log that the 50 newest saved sessions no longer reach (\code{logged\_codex\_threads}, passed as
-\code{extra\_ids}), and the Antigravity records in nouez's cache folder, every \code{TOP\_LIST\_SECONDS}
+screen runs, the unloaded ones found in Codex's index as Section~\ref{sec:resolve} describes (on
+the usage page, which counts only busy consultants, the loaded ones alone), and the Antigravity
+records in nouez's cache folder, every \code{TOP\_LIST\_SECONDS}
 (12); and, only while the page is shown, the selected consultant's latest turn
 (\code{thread/turns/list} with \code{limit} 1, or the last \code{agy/<id>/turns/} entry), every
 \code{TOP\_TURN\_SECONDS} (1.5) while it runs. A turn that has ended is read once more and then not
