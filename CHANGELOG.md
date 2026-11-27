@@ -6,6 +6,14 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.30.3] - 2026-11-27
+
+nouez's review advice no longer sets a bar for which findings count; your own instructions and skills do. With the plugin, update with `claude plugin update nouez@nouez`, then start a Claude Code session or run `/reload-plugins` in one; the other open sessions then move to the new version by themselves once idle. With a clone, pull, then reconnect `consultants` with `/mcp` in each open Claude Code session, and run `server.py dispatcher install` again the way you first did, to restart the dispatcher.
+
+### Changed
+
+- **Review advice stays neutral.** Sam has review skills of their own that set which findings matter. nouez's advice for a review, re-check, bug hunt or plan critique used to tell the consultant to keep only findings a user in a normal setup would meet, and to give CHANGES only for those, which Sam's skills then had to argue with. It now asks only for every finding in the first round, each with the scenario where a user meets it, and the verdict, OK or CHANGES, on the reply's first line, where nouez reads it; how much a finding must matter is left to the user's own instructions and skills. The round count and the stop after three rounds of changes stay ([kind advice](docs/rules.md#rule-kind-advice)).
+
 ## [0.30.2] - 2026-11-27
 
 An update no longer asks a trust question twice, and projects-folder messages promise only what can happen. With the plugin, update with `claude plugin update nouez@nouez`, then start a Claude Code session or run `/reload-plugins` in one; the other open sessions then move to the new version by themselves once idle. With a clone, pull, then reconnect `consultants` with `/mcp` in each open Claude Code session, and run `server.py dispatcher install` again the way you first did, to restart the dispatcher.
@@ -919,7 +927,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.30.2...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.30.3...HEAD
+[0.30.3]: https://github.com/jibarix/nouez/compare/v0.30.2...v0.30.3
 [0.30.2]: https://github.com/jibarix/nouez/compare/v0.30.1...v0.30.2
 [0.30.1]: https://github.com/jibarix/nouez/compare/v0.30.0...v0.30.1
 [0.30.0]: https://github.com/jibarix/nouez/compare/v0.29.0...v0.30.0

@@ -74,7 +74,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.30.2"
+SERVER_VERSION = "0.30.3"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -7673,21 +7673,21 @@ CONSULT_PICKS = {
               ("antigravity", None, None, "the provider's default model")),
 }
 CONSULT_NOTES = {
-    "review": "Ask for every finding in the first round. Ask it to weigh each finding itself before giving it: work out the scenario (the user's setup and what "
-              "they do, what goes wrong, and where they would notice it: a command, a tool result, a screen, a file) "
-              "and whether a user in a normal setup would meet it. It gives as findings only those, each with its "
-              "scenario, and its verdict is CHANGES only for them; the rest it leaves out or lists as not blocking. Later rounds that only check named fixes are re-checks. "
+    "review": "Ask for every finding in the first round, each with the scenario where a user meets it (their setup "
+              "and what they do, what goes wrong, and where they would notice it: a command, a tool result, a "
+              "screen, a file), and \"Verdict: OK\" or \"Verdict: CHANGES\" on its first line, where nouez reads it. "
+              "Later rounds that only check named fixes are "
+              "re-checks. "
               "nouez counts the rounds and says when to show the user the open points.",
-    "re-check": "Ask it to weigh any new finding as in a review: only one a user in a normal setup would meet, "
-                "with its scenario, makes the verdict CHANGES. When new work comes up for review, send the "
+    "re-check": "Ask for the verdict on its first line and any new finding with its scenario, as in a review. "
+                "When new work comes up for review, send the "
                 "review's model and effort again.",
     "bug-hunt": "Give it the failing command, its output and what you have ruled out, and ask for the cause with the "
-                "scenario where a user meets it, and whether one in a normal setup would. For a hard problem whose fix "
+                "scenario where a user meets it. For a hard problem whose fix "
                 "is small, ask it to draft the fix as a unified diff in its reply; check it, then apply it with "
                 "git apply.",
     "plan-critique": "In the brief, ask it first to say whether any premise, assumption or framing is wrong, and "
-                     "to weigh each objection by the scenario where a user would be affected, giving only those a "
-                     "user in a normal setup would meet.",
+                     "to give each objection with the scenario where a user would be affected.",
     "research": "Also for reading many files or long logs, and audits. Ask for a short answer with its sources.",
     "draft": "Consultants can't write files: ask for the change as a unified diff in its reply, naming the files. "
              "Check it, apply it with git apply, run the tests, and have the change reviewed as usual.",
