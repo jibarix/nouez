@@ -12530,7 +12530,11 @@ class PhoneProjectsFoldersTest(unittest.TestCase):
                 call(work)
             self.assertIn("phone dispatcher's", str(e.exception))
         self.assertFalse(os.path.lexists(server.settings_path()))
-        with self.phone():
+        config = tempfile.mkdtemp()  # a state file of its own, not this computer's, outside every root
+        self.addCleanup(shutil.rmtree, config, True)
+        with open(os.path.join(config, ".claude.json"), "w", encoding="utf-8") as f:
+            json.dump({"projects": {}}, f)
+        with self.phone(), mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": config}):
             out = self.add(work)
             self.assertIn(f"Added {work} to the projects folders", out)
             self.assertIn("trust covers settings a project adds later", out)
