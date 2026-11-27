@@ -69,7 +69,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.28.5"
+SERVER_VERSION = "0.28.6"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -5786,7 +5786,6 @@ def send_route(kind, provider, client=None, now=None, revision=False, usage=None
     suggestion did. A `usage` dict gets the usage read, for send_check."""
     if kind in (None, "other"):
         return None
-    only = provider if named_provider(kind, provider) else None
     now = now or time.time()
     state = {"claude": {}, provider: {}}
     try:
@@ -5800,8 +5799,29 @@ def send_route(kind, provider, client=None, now=None, revision=False, usage=None
         return None
     if usage is not None:
         usage.update(state)
+    return route_pick(kind, provider, state, now, revision)
+
+
+def route_pick(kind, provider, state, now, revision=False):
+    """send_route's pick from the usage it read (`state`)."""
+    only = provider if named_provider(kind, provider) else None
     pick = suggest_consultant(kind, state, now, only, revision)
     return pick if "none" not in pick and pick["provider"] == provider else None
+
+
+def independent_pick(kind, agy_state, known, now=None):
+    """The Antigravity model and effort for independent work (`kind`, or a diff) that its consultant
+    would run on a Claude model: ConsultantBudget's pick with revision=true, from the models alone
+    when the usage can't be read or none has room (the same send naming it would run; the usage
+    note says it may fail), as (model, effort); None for kind other and kinds with no pick. The
+    send paths take routing from here and send_route, never from suggest_consultant itself."""
+    if kind not in CONSULT_PICKS or kind == "other":
+        return None
+    now = now or time.time()
+    pick = suggest_consultant(kind, {"antigravity": agy_state or {"models": known, "groups": {}}}, now, None, True)
+    if "none" in pick:
+        pick = suggest_consultant(kind, {"antigravity": {"models": known, "groups": {}}}, now, None, True)
+    return None if "none" in pick else (pick["model"] or AGY_MODEL, pick["effort"])
 
 
 def peek_agy_usage():
@@ -5830,7 +5850,8 @@ def peek_agy_usage():
 def send_usage(provider, client=None, now=None):
     """The addressed provider's usage for a send that named its model or effort (send_route reads it
     for the others), without making the send wait: Codex's from the client already open,
-    Antigravity's only when a reading is cached. {} when it can't be had."""
+    Antigravity's when a reading is cached, else only the quota failures nouez saw (a partial state,
+    which the send reads again under its lock). {} when it can't be had."""
     now = now or time.time()
     state = {provider: {}}
     try:
@@ -5840,12 +5861,37 @@ def send_usage(provider, client=None, now=None):
             codex_budget(client, now, state["codex"])
         else:
             live = peek_agy_usage()
-            if not live or not agy_budget(now, live, state["antigravity"]):
-                return {}
+            if live:
+                if not agy_budget(now, live, state["antigravity"]):
+                    return {}
+            else:  # no reading cached: the quota failures nouez saw still say where a turn would fail
+                state["antigravity"].update(partial=True, reported=None, members={}, names={}, models=None,
+                                            known=agy_known_groups(), live=None, marks=[], groups={})
+                agy_refresh_marks(state["antigravity"], now)
     except Exception as e:  # the checks are a convenience: the send goes ahead without them
         log("usage at send:", repr(e))
         return {}
     return state
+
+
+def agy_refresh_marks(st, now):
+    """Read the quota failures again into an Antigravity usage state (agy_budget's or send_usage's),
+    keeping the windows agy reported: a turn read since may have failed on its quota or ended a
+    mark. Whether the marks changed (a mark's time of reading aside)."""
+    old = list(st.get("marks") or ())
+    for group, window in old:
+        windows = st["groups"].get(group) or []
+        if window in windows:
+            windows.remove(window)
+        if not windows:
+            st["groups"].pop(group, None)
+    st["marks"] = []
+    for q in agy_hit_windows(st.get("live"), now):
+        if q["group"] is not None:
+            window = (q["length"], q["used"], q["resets_at"], q["sampled"])
+            st["groups"].setdefault(q["group"], []).append(window)
+            st["marks"].append((q["group"], window))
+    return [(g, w[:3]) for g, w in st["marks"]] != [(g, w[:3]) for g, w in old]
 
 
 def send_elsewhere(kind, provider, model, usage, now, revision=False, blind=False, only=None, refused=False):
@@ -5903,7 +5949,12 @@ def send_check(kind, provider, model, usage, now, revision=False, blind=False, o
     st = (usage or {}).get(provider)
     if not st:
         return None, ""
-    windows = provider_windows(provider, model, st) or []
+    windows = provider_windows(provider, model, st)
+    if windows is None and provider == "antigravity" and st.get("groups") and not st.get("partial"):
+        # 0.28.6: a group nouez can't match (with only the quota failures known, the rest isn't news)
+        return None, (f"{quota_title(provider, model, st)}: usage not known, so nouez can't say whether this "
+                      "turn has room.")
+    windows = windows or []
     state, why, _ = usage_outlook_detail(windows, now)
     limit = st.get("limit") if provider == "codex" else None
     reported = limit or any(number(w[1]) is not None and number(w[1]) >= 100 and (number(w[2]) or 0) > now
@@ -6509,6 +6560,7 @@ def agy_windows(live, now):
     """Antigravity's quota windows from read_agy_usage's {"groups": [...]}, each with its quota
     group's name ("group": None when agy gave none), read when `live` says ("read_at", else now). The
     percent used is rounded once, here, so 99.96 is used up for routing and the screen alike.
+    A group a recent turn hit its quota on gets agy_hit_windows' mark too.
     Never changes `live`: it is agy's cache."""
     windows = []
     groups = live.get("groups") if isinstance(live, dict) else None
@@ -6528,7 +6580,168 @@ def agy_windows(live, now):
                              live.get("read_at"), now, group=name)
             if q:
                 windows.append(q)
+    if isinstance(groups, list):
+        windows += agy_hit_windows(live, now)
     return windows
+
+
+# 0.28.6 (step D): agy's /usage can lag its own limit. When a turn fails with "... quota reached ...
+# Resets in 162h49m57s", nouez's picks skip that model's quota group until then, in every session,
+# though a send that names the model still goes (AI credits may cover it). A later turn that
+# succeeds in the group ends it sooner (an upgrade, or credits).
+AGY_QUOTA_HIT = re.compile(r"quota reached\b.*?\bResets in ((?:\d+h)?(?:\d+m)?(?:\d+s)?)\b", re.I | re.S)
+_agy_hits_guard = threading.Lock()
+
+
+def agy_hits_path():
+    return os.path.join(agy_root(), "quota-hits.json")
+
+
+def agy_reset_seconds(error):
+    """The seconds a quota error says are left before its reset ("Resets in 162h49m57s"), or None."""
+    m = AGY_QUOTA_HIT.search(error) if isinstance(error, str) else None
+    if not m or not m.group(1):
+        return None
+    parts = dict((u, int(n)) for n, u in re.findall(r"(\d+)([hms])", m.group(1)))
+    secs = 3600 * parts.get("h", 0) + 60 * parts.get("m", 0) + parts.get("s", 0)
+    return secs if 0 < secs <= 8 * 86400 else None
+
+
+AGY_OK_SECONDS = 8 * 86400  # a success is kept as long as a reset can be away (agy_reset_seconds)
+
+
+def agy_reported_names(live):
+    """The names of the quota groups agy's /usage reported, with a current window or not; None
+    without a reading."""
+    groups = live.get("groups") if isinstance(live, dict) and not live.get("error") else None
+    if not isinstance(groups, list):
+        return None
+    return [g["name"] for g in groups if isinstance(g, dict) and isinstance(g.get("name"), str)] or None
+
+
+def agy_quota_group(model, members=None, names=None, reported=None, known=None):
+    """The quota group `model` runs on, the one answer for quota failures, successes, sends and the
+    screen: with a reading that lists its groups' models and `agy models`' names, agy_group_of's
+    (None when no group or several list the model); without them, the group a turn on the model was
+    last seen in (`known`, agy_known_groups) while the reading, if any, still reports it, else
+    agy_group_of's guess, else that last group."""
+    if members and names:
+        return agy_group_of(model, members, names, reported)
+    base = agy_base(model) if isinstance(model, str) and model else None
+    group = (known or {}).get(base) if base else None
+    group = group if isinstance(group, str) else None
+    if group and (reported is None or group in reported):
+        return group
+    return agy_group_of(model, None, None, reported) or group
+
+
+def agy_hits_file():
+    """agy/quota-hits.json as a dict, {} when missing or not one."""
+    path = agy_hits_path()
+    data = read_json_file(path) if os.path.exists(path) else None
+    return data if isinstance(data, dict) else {}
+
+
+def agy_known_groups():
+    """The quota group each model with a kept turn was last seen in, from agy/quota-hits.json."""
+    groups = agy_hits_file().get("groups")
+    return {m: g for m, g in groups.items() if isinstance(g, str)} if isinstance(groups, dict) else {}
+
+
+def agy_cached_usage():
+    """The last /usage reading this process has, however old, without starting one: enough to name a
+    quota group."""
+    with _agy_guard:
+        return _agy_usage["value"]
+
+
+def note_agy_turn_end(turn_id, model, ok, error, ended, now=None):
+    """Keep what an ended Antigravity turn says about its quota: a failure that names its reset
+    marks the model's group as reached until then (once per turn, timed from when the turn ended,
+    so reading it again later changes nothing); a success is kept AGY_OK_SECONDS by model, and ends
+    a mark on its group that began before it, in whatever order the turns are read. The group the
+    model is in, when this process's reading and `agy models` say, is kept with them, so a process
+    without them (a new session, a failed reading, `top`) finds the same group. Every server writes
+    under one file lock."""
+    base = agy_base(model) if isinstance(model, str) and model else None
+    ended, now = number(ended), now or time.time()
+    if not base or ended is None:
+        return
+    secs = None if ok else agy_reset_seconds(error)
+    if (ok and ended <= now - AGY_OK_SECONDS) or (not ok and (secs is None or ended + secs <= now)):
+        return
+    live = agy_cached_usage()
+    reported = agy_reported_names(live)
+    members = agy_members(live) if reported is not None else {}
+    # Saved only from a fresh reading: by its model lists, or else by the group names it reports.
+    group = (agy_group_of(base, members, agy_model_names(), reported) if members
+             else agy_group_of(base, None, None, reported) if reported is not None else None)
+    path = agy_hits_path()
+
+    def merged():
+        """The file's content with this turn in, and whether that changes it."""
+        data = agy_hits_file()
+        raw_hits = data.get("hits") if isinstance(data.get("hits"), dict) else {}
+        raw_oks = data.get("ok") if isinstance(data.get("ok"), dict) else {}
+        raw_groups = data.get("groups") if isinstance(data.get("groups"), dict) else {}
+        hits = {t: h for t, h in raw_hits.items() if isinstance(h, dict) and (number(h.get("until")) or 0) > now}
+        oks = {m: t for m, t in raw_oks.items() if (number(t) or 0) > now - AGY_OK_SECONDS}
+        if ok and (number(oks.get(base)) or 0) < ended:
+            oks[base] = ended
+        elif not ok and turn_id not in hits:
+            hits[turn_id] = {"model": base, "ended": ended, "until": ended + secs}
+        kept = set(oks) | {h.get("model") for h in hits.values()}
+        groups = {m: g for m, g in raw_groups.items() if m in kept and isinstance(g, str)}
+        if group:
+            groups[base] = group
+        value = {"hits": hits, "ok": oks, "groups": groups}
+        return value, (hits != raw_hits or oks != raw_oks or groups != raw_groups)
+
+    if not merged()[1]:  # read without the lock: most reads of a turn change nothing
+        return
+    try:
+        lock = FileLock(os.path.join(checked_folder(agy_root(), create=True), "quota-hits.lock"), 2,
+                        "another nouez server is writing the quota hits")
+        with _agy_hits_guard, lock:  # REVIEW.md item 13: checked_folder refuses a link there
+            value, changed = merged()
+            if changed:
+                write_json_atomic(path, value)
+    except (OSError, BridgeError) as e:
+        log("quota hits:", repr(e))
+
+
+def agy_hit_windows(live, now):
+    """A "quota reached" window, 100% used until the reset its error named, for each Antigravity
+    quota group a recent turn failed on and no later turn succeeded in, each model's group found by
+    agy_quota_group from `live` (None or an error: no reading)."""
+    data = agy_hits_file()
+    if not isinstance(data.get("hits"), dict):
+        return []
+    reported = agy_reported_names(live)
+    members = agy_members(live) if reported is not None else {}
+    names = agy_model_names() if members else {}
+    known = agy_known_groups()
+
+    def group_of(m):
+        return agy_quota_group(m, members, names, reported, known)
+    oks = data.get("ok") if isinstance(data.get("ok"), dict) else {}
+    cleared = {}
+    for m, t in oks.items():
+        g = group_of(m) if isinstance(m, str) else None
+        if g and number(t) is not None:
+            cleared[g] = max(cleared.get(g, 0), number(t))
+    until = {}
+    for h in data["hits"].values():
+        if not isinstance(h, dict) or not isinstance(h.get("model"), str):
+            continue
+        g = group_of(h["model"])
+        ended, end = number(h.get("ended")), number(h.get("until"))
+        if not g or ended is None or end is None or end <= now or cleared.get(g, 0) > ended:
+            continue
+        if end > until.get(g, (0, 0))[0]:
+            until[g] = (end, ended)
+    return [q for g, (end, ended) in sorted(until.items())
+            for q in [quota_window("reached", "quota reached", None, 100, end, now, now, group=g)] if q]
 
 
 def codex_budget(client, now, state=None):
@@ -6974,7 +7187,7 @@ def usage_outlook_detail(windows, now):
         seen = True
         label = window_label(length) if length else "usage"
         if judged["level"] == "used up":
-            return ("blocked", f"its {label} window is used up"
+            return ("blocked", (f"its {label} window is used up" if length else "its quota is used up")
                     + (" (an old reading)" if judged["basis"] == "old" else ""), None)
         if judged["level"] == "runs out":
             return ("blocked", f"its {label} window runs out before its reset at this rate"
@@ -7107,17 +7320,26 @@ def agy_display(model, names):
     return found.pop() if len(found) == 1 else None
 
 
-def agy_group_of(model, members=None, names=None):
+def agy_group_of(model, members=None, names=None, groups=None):
     """The Antigravity quota group a model runs on: when agy's /usage lists its groups' models
     (agy_members), the one group listing the model's display name from `agy models`, or None when
-    none or several do; only when no group lists its models, nouez's own guess."""
+    none or several do; only when no group lists its models, nouez's own guess. Given the `groups`
+    agy reported (0.28.6), the guess is one of them: the guessed name when agy reports it, else the
+    one group whose name has the model's family word ("Claude" or "GPT", "Argon", "Gemini"), else None."""
     if members:
         display = agy_display(model, names) if model else None
         found = [g for g, m in members.items() if display in m] if display else []
         return found[0] if len(found) == 1 else None
     if model and model.startswith(("claude-", "gpt-")):
-        return "Claude and GPT models"
-    return "Gemini 4 Argon" if model and "argon" in model else "Gemini Models"
+        guess, words = "Claude and GPT models", ("claude", "gpt")
+    elif model and "argon" in model:
+        guess, words = "Gemini 4 Argon", ("argon",)
+    else:
+        guess, words = "Gemini Models", ("gemini",)
+    if groups is None or guess in groups:
+        return guess
+    found = [g for g in groups if isinstance(g, str) and any(w in g.lower() for w in words)]
+    return found[0] if len(found) == 1 else None
 
 
 AGY_GROUP_UNKNOWN = "Antigravity (its quota group not known)"
@@ -7127,7 +7349,8 @@ def quota_title(provider, model, st=None):
     """The usage a pick spends, by name: Codex, or the Antigravity quota group of its model."""
     if provider == "codex":
         return "Codex"
-    group = agy_group_of(model, (st or {}).get("members"), (st or {}).get("names"))
+    st = st or {}
+    group = agy_quota_group(model, st.get("members"), st.get("names"), agy_reported(st), st.get("known"))
     return f"Antigravity's {group}" if group else AGY_GROUP_UNKNOWN
 
 
@@ -7152,7 +7375,19 @@ def behind_schedule(windows, now):
 def provider_windows(provider, model, st):
     if provider == "codex":
         return st.get("windows")
-    return (st.get("groups") or {}).get(agy_group_of(model, st.get("members"), st.get("names")))
+    return (st.get("groups") or {}).get(
+        agy_quota_group(model, st.get("members"), st.get("names"), agy_reported(st), st.get("known")))
+
+
+def agy_reported(st):
+    """The quota groups an Antigravity reading reported, with a current window or not (agy_budget's
+    "reported"), else those it has windows for; None without a reading (then a model's group is
+    nouez's guess alone)."""
+    st = st or {}
+    if "reported" in st:
+        return st["reported"]
+    groups = st.get("groups")
+    return list(groups) if groups else None
 
 
 def eased_effort(provider, model, effort, level, st):
@@ -7221,9 +7456,7 @@ def suggest_consultant(kind, state, now, only=None, revision=False):
     # The first choice first, so another week takes its place only by resetting sooner.
     soonest = min(([best] if best["outlook"][0] == "spare" else []) + spare,
                   key=lambda o: o["resets"] or float("inf"), default=None)
-    if best["title"] == AGY_GROUP_UNKNOWN and calm:  # usage known to have room comes first
-        best = {**calm[0], "why": calm[0]["why"] + [first]}
-    elif best["outlook"][0] == "tight" and calm:
+    if best["outlook"][0] == "tight" and calm:
         best = {**calm[0], "why": calm[0]["why"] + [first]}
     elif best["outlook"][0] == "busy" and spare and kind != "fact-check":
         best = {**spare[0], "why": spare[0]["why"] + [first]}
@@ -7237,6 +7470,8 @@ def suggest_consultant(kind, state, now, only=None, revision=False):
         # Interchangeable work goes to the subscription furthest behind its schedule.
         best = {**ahead, "why": ahead["why"] + [first, f"{ahead['title']} is {ahead['behind']:.0f} points behind "
                                                 "an even pace through its week"]}
+    elif best["outlook"][0] == "unknown" and calm:  # usage known to have room comes first (0.28.6: any unknown)
+        best = {**calm[0], "why": calm[0]["why"] + [first]}
     else:
         best = {**best, "why": list(best["why"])}
     outlook, title = best["outlook"], best["title"]
@@ -7308,14 +7543,14 @@ def claude_outlook(claude_state, now):
 def hook_text(now, path=None):
     """What `server.py hook` adds to each prompt: the hand-out line when Claude Code's saved usage is
     on pace past 70% of its week, or a window is used up or runs out; from a reading older than
-    CLAUDE_USAGE_STALE, only when the share already used is past 90%, the least the week will reach,
-    saying it is an old reading; "" otherwise."""
+    CLAUDE_USAGE_STALE, by the share already used, the least the week will reach (0.28.6: past 70%
+    too, as ConsultantBudget and the screen say), saying it is an old reading; "" otherwise."""
     if auto_consult_off():
         return ""
     state = {}
     claude_budget(now, path, state)
     pace, at = claude_pace(state, now)
-    if pace not in ("busy", "tight") or (pace == "busy" and usage_outlook_detail(state["windows"], now)[2] == "old"):
+    if pace not in ("busy", "tight"):
         return ""
     return (f"nouez: Claude Code is {at}. Before doing this prompt's work yourself: {HAND_OUT[pace]} "
             f"{HAND_OUT_LOCAL} Call ConsultantBudget with the kind first.")
@@ -8345,7 +8580,8 @@ def painted_bar(scr, pct, width, colour, mark=None):
 def window_state(used, resets_at, length, now, sampled=None):
     """A usage window's numbers and outlook, or None if they can't be used. A reading saved at
     `sampled` gives its pace as of then; an old one gives none. `rank` orders how pressing it is:
-    0 fine, 1 on pace past 90%, 2 runs out before the reset, 3 used up."""
+    0 fine, 1 on pace past 90%, 2 runs out before the reset, 3 used up. A week past 70% (busy)
+    says so in its long text, its colour green as before."""
     judged = window_level(used, resets_at, length, now, sampled)
     if judged is None:
         return None
@@ -8369,6 +8605,11 @@ def window_state(used, resets_at, length, now, sampled=None):
         outlook = (f"too early for a pace: at least {pct:.0f}% by the reset", f"early, ≥{pct:.0f}%", "33", 1)
     else:
         outlook = ("too early for a pace", "early", "32", 0)
+    if level == "busy" and length and length >= 7 * 86400:  # 0.28.6: why routing sends work elsewhere
+        # A card has 11 characters: a first-day estimate keeps its "~84% day 1" (status-screen.md).
+        short = ("old, busy" if outlook[1] == "old reading" else "early, busy" if outlook[1] == "early"
+                 else outlook[1] if judged["basis"] == "first day" else f"~{pct:.0f}% busy")
+        outlook = (f"{outlook[0]}, busy", short) + outlook[2:]
     left = resets_at - now
     gone = (length - left) / length if length and 0 < left <= length else None
     return {"used": used, "resets_at": resets_at, "long": outlook[0], "short": outlook[1],
@@ -8521,7 +8762,11 @@ def agy_group(now, agy_live):
     if agy_live.get("checking"):
         return {**group, "checking": True, "empty": "checking (agy -p /usage takes a while)…"}
     if not isinstance(agy_live.get("groups"), list):
-        return {**group, "empty": f"usage not known: {agy_live.get('error') or 'agy gave no quota'}"}
+        unknown = f"usage not known: {agy_live.get('error') or 'agy gave no quota'}"
+        for q in agy_hit_windows(None, now):  # the quota failures nouez saw still hold, as for the picks
+            group["entries"].append((AGY_GROUPS.get(q["group"], f"AG {q['group']}")[3:][:13], q["label"],
+                                     window_state(q["used"], q["resets_at"], q["length"], now, q["sampled"])))
+        return {**group, "empty": unknown, **({"note": unknown, "short": unknown} if group["entries"] else {})}
     for q in agy_windows(agy_live, now):
         name = q["group"] if q["group"] is not None else "?"
         group["entries"].append((AGY_GROUPS.get(name, f"AG {name}")[3:][:13], q["label"],
@@ -8999,6 +9244,12 @@ def agy_turn(cid, turn_id, now=None):
         text = result.get("response") if isinstance(result.get("response"), str) else ""
         turn["items"].append({"type": "agentMessage", "text": text, "phase": "final_answer"})
         ok = result.get("status") == "SUCCESS"
+        try:  # a turn cut off at nouez's limit is shown as interrupted: it says nothing of the quota
+            if not (ok and result.get("finished_reason") == "print_timeout"):
+                note_agy_turn_end(turn_id, meta.get("model"), ok, result.get("error"),
+                                  os.path.getmtime(os.path.join(folder, turn_id + ".jsonl")), now)
+        except Exception as e:  # what a turn says about its quota is a convenience: the reply comes first
+            log("quota hit:", repr(e))
         turn["status"] = "completed" if ok else ("interrupted" if meta.get("stopped") or meta.get("stopping") else "failed")
         if not ok:
             turn["error"] = {"message": f"Antigravity: {result.get('error') or result.get('status')}"}
@@ -9256,14 +9507,20 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
     given, given_effort = args.get("model"), args.get("effort")  # the caller's, not nouez's own pick below
     override = given or given_effort
     revision, usage = flag(args, "revision"), {}
+    try:  # the last turn read first: a quota failure it ended with counts for this send's pick
+        agy_turns(cid, 1)
+    except Exception as e:
+        log("last turn before the pick:", repr(e))
+    asked = args
     routed = None if override else send_route(kind, "antigravity", revision=revision, usage=usage)
+    routable = not override and "claude" in usage  # send_route read the usage, room or not
     if routed:  # neither named: the kind's suggestion, as ConsultantBudget gives it, within Antigravity
         args = {**args, "model": routed["model"], "effort": routed["effort"]}
         override = True
     usage = usage or send_usage("antigravity")
     # Work that checks Claude's own (an independent kind, or a diff) never runs on a Claude model.
     independent = kind in INDEPENDENT_KINDS or revision
-    known = (agy_models() if override or (independent and (rec.get("model") or "").startswith("claude-"))
+    known = (agy_models() if override or routable or (independent and (rec.get("model") or "").startswith("claude-"))
              else None)  # can take seconds, so read before taking the lock
     # 0.28: an Antigravity consultant runs no git, so it gets the diff text unless attach_diff=false.
     stamp, patch, digest = (revision_for(args, rec.get("cwd"), take=flag(args, "attach_diff", True),
@@ -9281,6 +9538,14 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
         rec = read_json_file(os.path.join(agy_folder(cid), "consultant.json"))
         if not rec or rec.get("id") != cid or rec.get("stopped"):
             raise BridgeError(f"{name} was stopped; nothing was sent. Start a consultant again with StartConsultant.")
+        current = agy_turns(cid, 1)
+        # A turn that ended since the first read (a send with wait 0 before this one) may have failed on
+        # its quota or ended a mark: the pick (even one that found no room) and the usage note are made
+        # again from the usage read.
+        if usage.get("antigravity") and agy_refresh_marks(usage["antigravity"], time.time()) and routable:
+            routed = route_pick(kind, "antigravity", usage, time.time(), revision)
+            args = {**asked, "model": routed["model"], "effort": routed["effort"]} if routed else asked
+            override = bool(routed or given or given_effort)
         model = rec.get("model") or f"{AGY_MODEL}-{AGY_EFFORT}"
         if override:
             model = agy_model_id(model, args.get("model"), args.get("effort"), known)
@@ -9291,16 +9556,9 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
         switched = ""
         if independent and model.startswith("claude-"):
             what = f"a {kind}" if kind in INDEPENDENT_KINDS else "a message with revision=true"
-            # ConsultantBudget's own pick for it (revision=true), from the models alone when the usage
-            # can't be read: never a Claude model.
-            # Kind other has no pick, here as in ConsultantBudget: refused, naming the model to pass.
-            pickable = kind in CONSULT_PICKS and kind != "other"
-            pick = suggest_consultant(kind, {"antigravity": usage.get("antigravity") or {"models": known, "groups": {}}},
-                                      time.time(), None, True) if pickable else {"none": ""}
-            if pickable and "none" in pick:  # none with room: the best of another family all the same, as
-                # the same send naming it would run; the usage note below says it may fail
-                pick = suggest_consultant(kind, {"antigravity": {"models": known, "groups": {}}}, time.time(), None, True)
-            pick = None if "none" in pick else (pick["model"] or AGY_MODEL, pick["effort"])
+            # Never a Claude model; kind other has no pick, here as in ConsultantBudget: refused,
+            # naming the model to pass.
+            pick = independent_pick(kind, usage.get("antigravity"), known)
             if given or not pick:
                 raise BridgeError(
                     f"{model} is a Claude model, and {what} goes to a model of another family: a Claude "
@@ -9316,7 +9574,6 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
                               args.get("second_opinion_of") not in (None, ""),
                               "antigravity" if named_provider(kind, "antigravity") else None)
         switched += f" (Usage: {quota})" if quota else ""
-        current = agy_turns(cid, 1)
         if current and current[0]["status"] == "inProgress":
             raise BridgeError(
                 f"{name} is still working on turn {current[0]['id']}. An Antigravity turn can't take a "
@@ -9573,16 +9830,28 @@ def agy_budget(now, agy_live=None, state=None):
         return []
     models = agy_models()
     state = {} if state is None else state
-    state.update(groups={}, models=models, members=agy_members(live), names=agy_model_names() if models else {})
+    state.update(groups={}, models=models, members=agy_members(live), names=agy_model_names() if models else {},
+                 reported=agy_reported_names(live), known=agy_known_groups(),
+                 live=None if live.get("error") else live, marks=[])
     tail = ([f"  Models (model for StartConsultant with provider antigravity, effort the level): "
              f"{agy_model_families(models)}"] if models else [])
-    if live.get("error"):
-        return [f"Antigravity: usage not known ({live['error']})."] + tail
+    error = live.get("error")
     lines = []
-    for q in agy_windows(live, now):
-        if q["group"] is not None:
+    # A failed reading still has the quota failures nouez saw (agy_hit_windows): picks skip them.
+    for q in (agy_hit_windows(None, now) if error else agy_windows(live, now)):
+        if q["group"] is not None and q["key"] == "reached":
+            lines.append(f"  - {q['group']}: a turn failed on its quota limit, which agy says resets "
+                         f"{time.strftime('%a %b %d %H:%M', time.localtime(q['resets_at']))} "
+                         f"(in {span_text(q['resets_at'] - now)}); nouez's picks skip it till then")
+        elif q["group"] is not None:
             lines.append(f"  - {q['group']}: {window_text(q['label'], q['used'], q['resets_at'], q['length'], now, q['sampled'])}")
-            state["groups"].setdefault(q["group"], []).append((q["length"], q["used"], q["resets_at"], q["sampled"]))
+        if q["group"] is not None:
+            window = (q["length"], q["used"], q["resets_at"], q["sampled"])
+            state["groups"].setdefault(q["group"], []).append(window)
+            if q["key"] == "reached":
+                state["marks"].append((q["group"], window))
+    if error:
+        return [f"Antigravity: usage not known ({error})."] + lines + tail
     head = ("Antigravity (Google; the Claude and GPT models group runs those models on Google's quota, "
             "not Claude Code's):")
     return [head] + (lines or ["  - no current quota window reported"]) + tail
@@ -11062,14 +11331,16 @@ INSTRUCTIONS_HEAD = (
 )
 # What a clone gets with no CLAUDE.md or skill of the user's: consulting at the points where a
 # second opinion pays, without being asked. Left out when no consultant CLI is installed, or with
-# NOUEZ_NO_AUTO_CONSULT=1. Kept to about 1,000 characters with the rest: the moments to consult,
-# and what to call; how each tool works is in its description.
+# NOUEZ_NO_AUTO_CONSULT=1. Kept short with the rest (a test sets the cap): the moments to consult,
+# and what to call; how each tool works is in its description. 0.28.6: the review is tied to the
+# diff being committed, the critique to a choice the request leaves open.
 AUTO_CONSULT = (
     "Unless the user's own instructions say otherwise, also consult unasked:\n"
-    "- before committing a change to behavior, to several files or to anything risky: a review "
-    "(revision=true), then commit after its verdict;\n"
-    "- before the first edit built on a consequential plan, design, formula or rule of your own: a "
-    "critique; show the draft, and build on it only after the verdict;\n"
+    "- before a commit whose diff changes behavior, even by one line, or is risky: a review of that "
+    "diff (revision=true), then commit after its verdict;\n"
+    "- before the first edit, when the request leaves you a consequential choice (design, formula, "
+    "rule): a critique of your draft; build on it only after the verdict. Not when the request spells "
+    "the change out;\n"
     "- when a failure's cause isn't obvious after a first look: a bug hunt;\n"
     "- for research across sources (instead of searching the web yourself), an audit spanning many "
     "files, or a consequential claim still uncertain: hand it out, for a short answer.\n"

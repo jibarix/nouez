@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 *.bak
 .venv/
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc

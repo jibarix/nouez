@@ -169,7 +169,7 @@ class ProtocolTest(unittest.TestCase):
         self.assertIn("unless the user named others or the user's own instructions route otherwise", text)
         self.assertIn("which applies the suggested model and effort", text)
         self.assertIn("never take a 'still working' result for one", text)
-        self.assertLess(len(text), 1500)  # the moments to consult and what to call; the rest is in the tools
+        self.assertLess(len(text), 1600)  # the moments to consult and what to call; the rest is in the tools (0.28.6: was 1,500)
 
     def test_only_claude_code_is_offered_the_background_waiter(self):
         # A client that says it is another program reads replies with GetConsultantReply; Claude Code,
@@ -389,6 +389,10 @@ class ProtocolTest(unittest.TestCase):
         self.assertIn("own instructions say otherwise", server.AUTO_CONSULT)
         self.assertIn("ConsultantBudget", server.AUTO_CONSULT)
         self.assertIn("Skip one, saying so, when ConsultantBudget says none has room", server.AUTO_CONSULT)
+        # 0.28.6: the review follows the diff being committed, the critique a choice the request leaves open.
+        self.assertIn("before a commit whose diff changes behavior, even by one line", server.AUTO_CONSULT)
+        self.assertIn("when the request leaves you a consequential choice", server.AUTO_CONSULT)
+        self.assertIn("Not when the request spells the change out", server.AUTO_CONSULT)
 
     def test_initialize_with_the_release_check_on(self):
         # The check runs, but a cached failed lookup from just now keeps it off the network.
@@ -702,9 +706,9 @@ class ReplyTest(unittest.TestCase):
 
 
 class DaemonStartTest(unittest.TestCase):
-    def connect(self, failures):
-        """A CodexClient whose first `failures` connections find no daemon (None: none ever does);
-        returns start_daemon's mock."""
+    def connect(self, failures, seconds=0.01):
+        """A CodexClient whose first `failures` connections find no daemon (None: none ever does),
+        waiting `seconds` for it to come up; returns start_daemon's mock."""
         attempts = (iter(lambda: server.DaemonDown("down"), None) if failures is None
                     else iter([server.DaemonDown("down")] * failures))
 
@@ -718,7 +722,7 @@ class DaemonStartTest(unittest.TestCase):
                    mock.patch.object(server.CodexClient, "_reader"),
                    mock.patch.object(server.CodexClient, "request", return_value={}),
                    mock.patch.object(server.CodexClient, "notify"),
-                   mock.patch.object(server, "DAEMON_START_SECONDS", 0.01),
+                   mock.patch.object(server, "DAEMON_START_SECONDS", seconds),
                    mock.patch.object(server.time, "sleep"))
         for patch in patches:
             patch.start()
@@ -733,7 +737,9 @@ class DaemonStartTest(unittest.TestCase):
         start.assert_not_called()
 
     def test_missing_daemon_is_started_once_then_retried(self):
-        start = self.connect(2)
+        # A wait the retries can't outlast: Windows' clock moves in ~15 ms steps, and a step under
+        # load could end a 0.01 s wait before the second retry.
+        start = self.connect(2, seconds=5)
         server.CodexClient()
         start.assert_called_once_with("codex")
 
@@ -4273,7 +4279,7 @@ class BudgetTest(unittest.TestCase):
         self.assertIn("about 84% by the reset (a first-day estimate", server.window_text("weekly", 7.8, resets, week, now))
         self.assertIn("(a first-day estimate)", server.pace_words(judged["pct"], judged["basis"]))
         shown = server.window_state(7.8, resets, week, now)
-        self.assertEqual((shown["long"][-20:], shown["short"]), ("(first-day estimate)", "~84% day 1"))
+        self.assertEqual((shown["long"][-26:], shown["short"]), ("(first-day estimate), busy", "~84% day 1"))
         # Dana, 30% a day from the reset: at hour 9 the first-day pace still runs out
         resets = now + week - 9 * h
         self.assertEqual(server.window_level(11.25, resets, week, now)["level"], "runs out")
@@ -4408,8 +4414,8 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(server.codex_budget(client, self.NOW), ["Codex:", "  - no usage windows reported"])
 
     def test_the_prompt_hook_speaks_only_when_claude_code_is_busy(self):
-        """0.26.0: `server.py hook` adds the hand-out line to each prompt past 70% on pace, from a
-        fresh reading only, and says nothing otherwise; it never fails a prompt."""
+        """0.26.0: `server.py hook` adds the hand-out line to each prompt past 70% on pace (0.28.6: or
+        an old reading past 70% used), and says nothing otherwise; it never fails a prompt."""
         path = os.path.join(self.dir, "claude-usage.json")
 
         def save(used, days_left, age=0):
@@ -4425,7 +4431,11 @@ class BudgetTest(unittest.TestCase):
         self.assertIn(server.HAND_OUT["busy"], text)
         save(80, 1)  # past 90%
         self.assertIn(server.HAND_OUT["tight"], server.hook_text(self.NOW, path))
-        save(80, 1, age=server.CLAUDE_USAGE_STALE + 60)  # an old reading at 80% says nothing
+        save(80, 1, age=server.CLAUDE_USAGE_STALE + 60)  # 0.28.6: an old reading at 80% is busy, said to be old
+        text = server.hook_text(self.NOW, path)
+        self.assertIn("at 80% of its week or more (an old reading)", text)
+        self.assertIn(server.HAND_OUT["busy"], text)
+        save(60, 1, age=server.CLAUDE_USAGE_STALE + 60)  # and at 60% it says nothing
         self.assertEqual(server.hook_text(self.NOW, path), "")
         save(93, 1, age=server.CLAUDE_USAGE_STALE + 60)  # 0.28.1: at 93% it is tight however old, as the screen says
         text = server.hook_text(self.NOW, path)
@@ -5239,7 +5249,7 @@ class UsageLogTest(HandlerTest):
         frame = server.top_frame(scr, now, 7, None, {}, [], False, 200, live)
         self.assertIn("● Gemini 75%", frame[0])  # the weekly window is the most used
         self.assertRegex("\n".join(frame), r"│ Gemini +│")  # a quota group's name on its own line in the card
-        self.assertRegex("\n".join(frame), r"│ weekly  .* 75%  ~8[78]% pace ")
+        self.assertRegex("\n".join(frame), r"│ weekly  .* 75%  ~8[78]% busy ")
 
     def test_screen_parts(self):
         """0.17.0: cell widths, the gauge's marker, the badges, panels, the help view and --once."""
@@ -5418,6 +5428,21 @@ class SuggestTest(unittest.TestCase):
             routed = server.usage_outlook_detail([(week, used, reset, old)], self.NOW)[0]
             self.assertEqual(routed, {"used up": "blocked", "fine": "ok"}.get(level, level))
         self.assertIn("at least 95% by the reset", server.window_state(95, reset, week, self.NOW, old)["long"])
+        # 0.28.6: a busy week says so on the screen, still green; a 5-hour window never does.
+        self.assertTrue(server.window_state(80, reset, week, self.NOW, old)["long"].endswith(", busy"))
+        self.assertFalse(server.window_state(95, reset, week, self.NOW, old)["long"].endswith(", busy"))
+        busy = server.window_state(80, reset, week, self.NOW, old)  # the wide screen's cards show the short text
+        self.assertEqual(busy["short"], "old, busy")
+        self.assertIn("old, busy", server.ANSI.sub("", server.compact_row(server.Screen(False), "weekly", busy)))
+        # A fresh forecast says busy on the card too; a first-day one keeps its "day 1" there, and says
+        # busy in its long text and on the top bar.
+        start = self.NOW + 7 * 86400 - 12 * 3600  # half a day into the week: a first-day estimate
+        for used, ends, short in ((45.7, reset, "~80% busy"), (7.5, start, "~81% day 1")):
+            state = server.window_state(used, ends, week, self.NOW)
+            self.assertEqual(state["level"], "busy", state)
+            self.assertEqual(state["short"], short)
+            self.assertIn(short, server.ANSI.sub("", server.compact_row(server.Screen(False), "weekly", state)))
+        self.assertNotIn("busy", server.window_state(40, self.NOW + 3600, 5 * 3600, self.NOW - 3 * 3600)["long"])
         self.assertIsNone(server.window_level(50, self.NOW - 1, week, self.NOW))  # reset: counts nowhere
         five = 5 * 3600  # a 5-hour window on pace past 90% is named on Claude Code's line, as the screen's amber
         hot = [(week, 20, self.NOW + 4 * self.DAY, self.NOW), (five, 76, self.NOW + 3600, self.NOW)]
@@ -5458,6 +5483,16 @@ class SuggestTest(unittest.TestCase):
         twice = {**members, "Other": {"Gemini 4 Neon"}}
         self.assertIsNone(server.agy_group_of("gemini-4-neon", twice, names))
         self.assertEqual(server.agy_group_of("claude-opus-5-5"), "Claude and GPT models")  # no lists: the guess
+        # 0.28.6: with no lists but the groups agy reported, the guess is one of them, by a unique family word.
+        renamed = ["Gemini Models", "Third-party models (Claude, GPT)"]
+        self.assertEqual(server.agy_group_of("claude-opus-5-5", {}, {}, renamed), "Third-party models (Claude, GPT)")
+        self.assertEqual(server.agy_group_of("gemini-4-neon", {}, {}, ["Gemini Models", "Gemini 4 Argon"]), "Gemini Models")
+        self.assertIsNone(server.agy_group_of("gemini-4-neon", {}, {}, ["Gemini Flash", "Gemini Pro"]))
+        self.assertIsNone(server.agy_group_of("claude-opus-5-5", {}, {}, ["Gemini Models"]))
+        st = {"groups": {"Gemini Models": [(7 * 86400, 10, time.time() + 86400)]}, "members": members, "names": names}
+        refusal, note = server.send_check("research", "antigravity", "gemini-9-new", {"antigravity": st}, time.time())
+        self.assertIsNone(refusal)
+        self.assertIn("Antigravity (its quota group not known): usage not known", note)
 
     def test_a_refusal_names_only_room_it_knows(self):
         """Codex 0.28.1 review: only a limit Codex reported refuses (a share at 100% alone is a note); a
@@ -5488,6 +5523,11 @@ class SuggestTest(unittest.TestCase):
         got = server.suggest_consultant("draft", {"antigravity": st}, self.NOW)
         self.assertTrue(got["model"].startswith("gemini-4-neon"), got)
         self.assertIn("Antigravity (its quota group not known): usage not known", got["why"])
+        # 0.28.6: any pick whose usage isn't known gives way, here with agy's /usage not read at all.
+        unread = {**self.agy(), "groups": {}, "members": {}, "names": {}}
+        got = server.suggest_consultant("research", {"codex": self.codex(), "antigravity": unread}, self.NOW)
+        self.assertEqual(got["provider"], "codex", got)
+        self.assertIn("Antigravity's Claude and GPT models: usage not known", got["why"])
         lines = "\n".join(server.suggestion_lines("review", {"codex": self.codex(),
                                                               "antigravity": self.agy(gemini=55, days_left=3)}, self.NOW))
         self.assertIn('effort "high", one level down while its week is tight.', lines)
@@ -5846,6 +5886,297 @@ class SuggestTest(unittest.TestCase):
         schema = next(t for t in server.TOOLS if t["name"] == "ConsultantBudget")["inputSchema"]["properties"]
         self.assertEqual(schema["kind"]["enum"], list(server.CONSULT_KINDS))
         self.assertEqual(schema["provider"]["enum"], list(server.PROVIDERS))
+
+
+class AgyQuotaHitTest(unittest.TestCase):
+    """0.28.6: a turn that fails with "quota reached ... Resets in 162h49m57s" makes nouez's picks skip
+    that model's Antigravity quota group until then, though agy's /usage still shows room."""
+
+    NAMES = {"claude-opus-5-5-high": "Claude Opus 5.5 (High)", "claude-sonnet-5-5-high": "Claude Sonnet 5.5 (High)",
+             "gemini-4-neon-high": "Gemini 4 Neon (High)", "gemini-4-argon-high": "Gemini 4 Argon (High)"}
+    ERROR = ("Third-party quota reached. Please switch to Gemini models or upgrade your subscription to increase "
+             "your limits. Resets in 162h49m57s.")
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="nouez-test-hits-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        for patch in (mock.patch.object(server, "agy_root", lambda: self.root),
+                      mock.patch.object(server, "agy_model_names", lambda: dict(self.NAMES)),
+                      mock.patch.object(server, "agy_cached_usage", lambda: self.live)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.now = time.time()
+        reset = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now + 6.8 * 86400))  # too early in the week for a forecast
+        self.live = {"read_at": self.now, "groups": [
+            {"name": "Gemini Models", "description": "Models within this group: Gemini 4 Neon",
+             "buckets": [{"window": "weekly", "remaining_fraction": 0.9, "reset_time": reset}]},
+            {"name": "Claude and GPT models", "description": "Models within this group: Claude Opus 5.5, Claude Sonnet 5.5",
+             "buckets": [{"window": "weekly", "remaining_fraction": 0.5, "reset_time": reset}]}]}
+
+    def reached(self, now=None):
+        return [q for q in server.agy_windows(self.live, now or self.now) if q["key"] == "reached"]
+
+    def test_a_failure_marks_its_group_until_the_reset_it_names(self):
+        self.assertEqual(server.agy_reset_seconds(self.ERROR), 162 * 3600 + 49 * 60 + 57)
+        ended = self.now - 60
+        server.note_agy_turn_end("t1", "claude-opus-5-5-high", False, self.ERROR, ended, self.now)
+        got = self.reached()
+        self.assertEqual([(q["group"], q["used"]) for q in got], [("Claude and GPT models", 100)])
+        self.assertAlmostEqual(got[0]["resets_at"], ended + 162 * 3600 + 49 * 60 + 57)
+        windows = [q for q in server.agy_windows(self.live, self.now) if q["group"] == "Claude and GPT models"]
+        self.assertEqual(server.usage_outlook_detail([(q["length"], q["used"], q["resets_at"], q["sampled"])
+                                                      for q in windows], self.now)[0], "blocked")
+        # Reading the same turn again a day later changes nothing; past its reset the mark is gone.
+        server.note_agy_turn_end("t1", "claude-opus-5-5-high", False, self.ERROR, ended, self.now + 86400)
+        self.assertAlmostEqual(self.reached()[0]["resets_at"], got[0]["resets_at"])
+        self.assertEqual(self.reached(self.now + 7 * 86400), [])
+
+    def test_picks_skip_the_group_and_a_named_send_still_goes(self):
+        server.note_agy_turn_end("t1", "claude-opus-5-5-high", False, self.ERROR, self.now - 60, self.now)
+        st = {}
+        with mock.patch.object(server, "agy_models", lambda: list(self.NAMES)):
+            lines = "\n".join(server.agy_budget(self.now, self.live, st))
+        self.assertIn("Claude and GPT models: a turn failed on its quota limit", lines)
+        got = server.suggest_consultant("research", {"antigravity": st}, self.now)
+        self.assertTrue(got["model"].startswith("gemini-"), got)
+        refusal, note = server.send_check("research", "antigravity", "claude-opus-5-5-high", {"antigravity": st}, self.now)
+        self.assertIsNone(refusal)
+        self.assertIn("its quota is used up: this turn may fail unless your plan has AI credits", note)
+
+    def test_a_later_success_in_the_group_ends_the_mark(self):
+        server.note_agy_turn_end("t1", "claude-opus-5-5-high", False, self.ERROR, self.now - 60, self.now)
+        server.note_agy_turn_end("t0", "claude-sonnet-5-5-high", True, None, self.now - 120, self.now)
+        self.assertEqual(len(self.reached()), 1)  # it ended before the failure
+        server.note_agy_turn_end("t2", "claude-sonnet-5-5-high", True, None, self.now - 30, self.now)
+        self.assertEqual(self.reached(), [])
+        server.note_agy_turn_end("t3", "gemini-4-neon-high", False, "quota reached", self.now, self.now)
+        self.assertEqual(self.reached(), [])  # no reset named: no mark
+
+    def test_a_mark_is_kept_only_after_a_quota_error(self):
+        server.note_agy_turn_end("t1", "gemini-4-neon-high", True, None, self.now, self.now)
+        server.note_agy_turn_end("t2", "gemini-4-neon-high", False, "Internal error", self.now, self.now)
+        self.assertEqual(server.read_json_file(server.agy_hits_path())["hits"], {})
+
+    def test_turns_read_in_either_order_give_the_same_mark(self):
+        """Two consultants: a failure ends at 1000, a success in its group at 1020, and Claude reads the
+        success first. The failure read next mustn't block the group for days."""
+        server.note_agy_turn_end("ok", "claude-sonnet-5-5-high", True, None, self.now - 40, self.now)
+        server.note_agy_turn_end("hit", "claude-opus-5-5-high", False, self.ERROR, self.now - 60, self.now)
+        self.assertEqual(self.reached(), [])
+
+    def test_an_expired_failure_is_not_written_again(self):
+        """Reopening the history of a failure whose reset has passed leaves nothing in the file, and the
+        next write drops what has expired."""
+        long_ago = self.now - 8 * 86400
+        server.note_agy_turn_end("old", "claude-opus-5-5-high", False, self.ERROR, long_ago, self.now)
+        self.assertFalse(os.path.exists(server.agy_hits_path()))
+        server.write_json_atomic(server.agy_hits_path(), {"hits": {"old": {
+            "model": "claude-opus-5-5", "ended": long_ago, "until": long_ago + 3600}}, "ok": {}})
+        server.note_agy_turn_end("new", "claude-opus-5-5-high", False, self.ERROR, self.now - 60, self.now)
+        self.assertEqual(list(server.read_json_file(server.agy_hits_path())["hits"]), ["new"])
+
+    def test_a_mark_holds_without_a_fresh_reading(self):
+        """Lee's Opus turn failed on its quota; days later, in another session, agy's reading isn't
+        cached or fails. A send naming Opus still gets the note, and the picks still skip the group."""
+        server.note_agy_turn_end("t1", "claude-opus-5-5-high", False, self.ERROR, self.now - 60, self.now)
+        with mock.patch.object(server, "peek_agy_usage", lambda: None):
+            usage = server.send_usage("antigravity", now=self.now)
+        refusal, note = server.send_check("research", "antigravity", "claude-opus-5-5-high", usage, self.now)
+        self.assertIsNone(refusal)
+        self.assertIn("this turn may fail unless your plan has AI credits", note)
+        self.assertEqual(server.send_check("research", "antigravity", "gemini-4-neon-high", usage, self.now), (None, ""))
+        st = {}
+        with mock.patch.object(server, "agy_models", lambda: list(self.NAMES)):
+            lines = "\n".join(server.agy_budget(self.now, {"error": "agy didn't answer"}, st))
+        self.assertIn("usage not known (agy didn't answer)", lines)
+        self.assertIn("Claude and GPT models: a turn failed on its quota limit", lines)
+        self.assertTrue(server.suggest_consultant("research", {"antigravity": st}, self.now)["model"].startswith("gemini-"))
+
+    def test_the_screen_without_model_names_shows_the_mark(self):
+        """`top` runs in a process of its own, with no `agy models` list read: the mark still shows."""
+        server.note_agy_turn_end("t1", "claude-opus-5-5-high", False, self.ERROR, self.now - 60, self.now)
+        with mock.patch.object(server, "agy_model_names", lambda: {}):
+            self.assertEqual([q["group"] for q in self.reached()], ["Claude and GPT models"])
+
+    def test_a_reported_group_without_a_window_still_counts(self):
+        """Around a reset agy lists "Gemini Models" with no current window: Neon's usage is unknown,
+        never another group's."""
+        live = {"read_at": self.now, "groups": [
+            {"name": "Gemini Models", "buckets": []},
+            {"name": "Gemini 4 Argon", "buckets": self.live["groups"][0]["buckets"]}]}
+        st = {}
+        with mock.patch.object(server, "agy_models", lambda: list(self.NAMES)):
+            server.agy_budget(self.now, live, st)
+        self.assertEqual(server.quota_title("antigravity", "gemini-4-neon-high", st), "Antigravity's Gemini Models")
+        self.assertIsNone(server.provider_windows("antigravity", "gemini-4-neon-high", st))
+
+    def rename(self, old, new, members=None):
+        """agy's report as it would be with the group `old` named `new` (and listing `members`)."""
+        for g in self.live["groups"]:
+            if g["name"] == old:
+                g["name"] = new
+                if members is not None:
+                    g["description"] = "Models within this group: " + members
+
+    def test_a_renamed_group_is_found_the_same_everywhere(self):
+        """agy renames its Claude and GPT group "Third-party models (Claude, GPT)". Lee's Opus turn fails
+        on it; later, in a new session with no reading, and with agy's report failing, the send naming
+        Opus gets the note, the pick skips the group, and an Opus turn that then succeeds ends the mark."""
+        self.rename("Claude and GPT models", "Third-party models (Claude, GPT)")
+        server.note_agy_turn_end("t1", "claude-opus-5-5-high", False, self.ERROR, self.now - 60, self.now)
+        self.live = None  # the new session: no reading of its own
+        with mock.patch.object(server, "peek_agy_usage", lambda: None):
+            usage = server.send_usage("antigravity", now=self.now)
+        self.assertIn("this turn may fail unless your plan has AI credits",
+                      server.send_check("research", "antigravity", "claude-opus-5-5-high", usage, self.now)[1])
+        st = {}
+        with mock.patch.object(server, "agy_models", lambda: list(self.NAMES)):
+            lines = "\n".join(server.agy_budget(self.now, {"error": "agy didn't answer"}, st))
+        self.assertIn("Third-party models (Claude, GPT): a turn failed on its quota limit", lines)
+        self.assertTrue(server.suggest_consultant("research", {"antigravity": st}, self.now)["model"].startswith("gemini-"))
+        server.note_agy_turn_end("t2", "claude-opus-5-5-high", True, None, self.now - 30, self.now)
+        self.assertEqual(server.agy_hit_windows(None, self.now), [])
+
+    def test_a_renamed_group_without_model_lists_is_kept_and_followed(self):
+        """agy's report lists no models in its groups and calls the Claude and GPT group "Third-party
+        models (Claude, GPT)". Lee's Opus turn fails on it: a new session with no reading finds the same
+        group, and when a later report renames it again, the mark follows the new name."""
+        for g in self.live["groups"]:
+            g.pop("description")
+        self.rename("Claude and GPT models", "Third-party models (Claude, GPT)")
+        server.note_agy_turn_end("t1", "claude-opus-5-5-high", False, self.ERROR, self.now - 60, self.now)
+        self.assertEqual([q["group"] for q in self.reached()], ["Third-party models (Claude, GPT)"])
+        self.assertEqual([q["group"] for q in server.agy_hit_windows(None, self.now)],
+                         ["Third-party models (Claude, GPT)"])
+        self.rename("Third-party models (Claude, GPT)", "Partner models (Claude, GPT)")
+        self.assertEqual([q["group"] for q in self.reached()], ["Partner models (Claude, GPT)"])
+
+    def test_the_screen_shows_the_marks_when_agys_report_fails(self):
+        """Lee's Opus turn failed on its quota, and agy's report now fails: `top`'s Antigravity card
+        says the usage isn't known and still shows the group's mark, as the picks still skip it."""
+        server.note_agy_turn_end("t1", "claude-opus-5-5-high", False, self.ERROR, self.now - 60, self.now)
+        group = server.agy_group(self.now, {"error": "agy didn't answer"})
+        scr = server.Screen(False)
+        for rows in (server.card_rows(scr, group), server.group_rows(scr, self.now, group)):
+            text = server.ANSI.sub("", "\n".join(rows))
+            self.assertIn("usage not known: agy didn't answer", text)
+            self.assertIn("Claude+GPT", text)
+            self.assertIn("100%", text)
+        self.assertEqual(server.agy_group(self.now, {"error": "x"})["entries"][0][0], "Claude+GPT")
+        os.remove(server.agy_hits_path())
+        self.assertEqual(server.agy_group(self.now, {"error": "x"})["entries"], [])
+
+    def test_a_moved_model_shows_in_its_reported_group_on_the_screen(self):
+        """agy's report lists Argon under "Gemini Models" and still shows an empty "Gemini 4 Argon"
+        group. An Argon turn fails on its quota; `top`, with no `agy models` names, marks Gemini Models."""
+        self.rename("Gemini Models", "Gemini Models", "Gemini 4 Neon, Gemini 4 Argon")
+        self.live["groups"].append({"name": "Gemini 4 Argon", "buckets": []})
+        server.note_agy_turn_end("t1", "gemini-4-argon-high", False, self.ERROR, self.now - 60, self.now)
+        self.assertEqual([q["group"] for q in self.reached()], ["Gemini Models"])
+        with mock.patch.object(server, "agy_model_names", lambda: {}):
+            self.assertEqual([q["group"] for q in self.reached()], ["Gemini Models"])
+
+    def test_an_old_success_is_not_written_again(self):
+        """Reading a nine-day-old turn's history keeps nothing: successes are kept 8 days."""
+        server.note_agy_turn_end("old", "claude-opus-5-5-high", True, None, self.now - 9 * 86400, self.now)
+        self.assertFalse(os.path.exists(server.agy_hits_path()))
+
+    def test_a_turn_that_ends_during_the_route_counts_for_the_send(self):
+        """Lee sends with wait 0, then sends again while the first Opus turn is finishing. It fails on
+        its quota while nouez reads the usage for the second send's pick: the send, read again under
+        its lock, goes to Gemini instead, as its pick would have."""
+        for picked in ("opus", None):  # None: nouez's pick found no room, and the consultant's own model was next
+            with self.subTest(picked=picked):
+                self.check_route_race(picked)
+
+    def check_route_race(self, picked):
+        if os.path.exists(server.agy_hits_path()):
+            os.remove(server.agy_hits_path())
+        st = {}
+        with mock.patch.object(server, "agy_models", lambda: list(self.NAMES)):
+            server.agy_budget(self.now, self.live, st)
+        opus = {"provider": "antigravity", "model": "claude-opus-5-5", "effort": "high", "why": [], "notes": []}
+
+        def route(kind, provider, revision=False, usage=None):
+            usage.update({"claude": {}, "antigravity": st})
+            return opus if picked else None
+        reads = []
+
+        def turns(cid, n):  # the second read, under the lock, finds the turn ended with the failure
+            reads.append(cid)
+            if len(reads) == 2:
+                server.note_agy_turn_end("t1", "claude-opus-5-5-high", False, self.ERROR, self.now - 1, self.now)
+            return []
+        started = {}
+
+        class Stop(Exception):
+            pass
+
+        def start(rec, text, model, conversation, shown):
+            started["model"] = model
+            raise Stop
+        os.makedirs(os.path.join(self.root, "c1"), exist_ok=True)
+        server.write_json_atomic(os.path.join(self.root, "c1", "consultant.json"),
+                                 {"id": "c1", "name": "agy-x", "model": "claude-opus-5-5-high", "cwd": self.root})
+        with mock.patch.object(server, "send_route", route), mock.patch.object(server, "agy_turns", turns), \
+                mock.patch.object(server, "agy_models", lambda: list(self.NAMES)), \
+                mock.patch.object(server, "agy_start_turn", start):
+            with self.assertRaises(Stop):
+                server.send_agy_message({"id": "c1", "name": "agy-x"}, {}, "m", "Claude Code", None, 0,
+                                        "research", None, None, None)
+        self.assertTrue(started["model"].startswith("gemini-"), started)
+        self.assertFalse(server.agy_refresh_marks(st, self.now))  # read again: nothing new
+
+    def test_a_first_mark_found_under_the_lock_gives_a_named_send_its_note(self):
+        """A new session, with no usage reading and no marks yet: Lee sends to Opus by name while the
+        last Opus turn is ending, and it ends on its quota. The send still goes, with the note."""
+        self.live = None
+        reads, notes = [], []
+
+        def turns(cid, n):
+            reads.append(cid)
+            if len(reads) == 2:
+                server.note_agy_turn_end("t1", "claude-opus-5-5-high", False, self.ERROR, self.now - 1, self.now)
+            return []
+        real = server.send_check
+
+        def check(*a, **k):
+            got = real(*a, **k)
+            notes.append(got[1])
+            return got
+
+        class Stop(Exception):
+            pass
+
+        def start(*a):
+            raise Stop
+        os.makedirs(os.path.join(self.root, "c1"))
+        server.write_json_atomic(os.path.join(self.root, "c1", "consultant.json"),
+                                 {"id": "c1", "name": "agy-x", "model": "claude-opus-5-5-high", "cwd": self.root})
+        with mock.patch.object(server, "peek_agy_usage", lambda: None), mock.patch.object(server, "agy_turns", turns), \
+                mock.patch.object(server, "agy_models", lambda: list(self.NAMES)), \
+                mock.patch.object(server, "send_check", check), mock.patch.object(server, "agy_start_turn", start):
+            with self.assertRaises(Stop):
+                server.send_agy_message({"id": "c1", "name": "agy-x"}, {"model": "claude-opus-5-5"}, "m",
+                                        "Claude Code", None, 0, "research", None, None, None)
+        self.assertIn("this turn may fail unless your plan has AI credits", notes[-1])
+
+    def test_a_send_reads_the_last_turn_before_its_pick(self):
+        """A send with wait 0, then another: the first turn's quota failure is read before the second's pick."""
+        calls = []
+
+        class Stop(Exception):
+            pass
+
+        def route(*a, **k):
+            calls.append("route")
+            raise Stop
+        with mock.patch.object(server, "agy_turns", lambda cid, n: calls.append("turns") or []), \
+                mock.patch.object(server, "send_route", route):
+            with self.assertRaises(Stop):
+                server.send_agy_message({"id": "c1", "name": "agy-x"}, {}, "m", "Claude Code", None, 0,
+                                        "research", None, None, None)
+        self.assertEqual(calls, ["turns", "route"])
 
 
 class AgyTest(unittest.TestCase):
@@ -7634,7 +7965,7 @@ class ConfigReportTest(unittest.TestCase):
                                   "apiKeyHelper": "echo \x1b]8;;evil\u202e"},
                         mcp={"mcpServers": {"db": {"command": "npx", "args": ["db", "--api-key", "sk-live-1"],
                                                    "env": {"DB_PASSWORD": "hunter2"}},
-                                            "web": {"type": "http", "url": "https://u:pw@x.test/mcp?key=k1",
+                                            "web": {"type": "http", "url": "https://u:pw@x.test/mcp?key=kq7zx9-secret",
                                                     "headers": {"Authorization": "Bearer t"}}}})
         report = server.config_review([d])[0]
         for part in ("PreToolUse [Bash]: check.sh --token ***", "good@market (on)", "bad@market (off)",
@@ -7642,7 +7973,7 @@ class ConfigReportTest(unittest.TestCase):
                      "web: http https://***@x.test/mcp?key=***", "headers Authorization", "\\u001b", "\\u202e",
                      "shown as ***"):
             self.assertIn(part, report)
-        for secret in ("abc123", "sk-live-1", "hunter2", "pw@", "k1", "Bearer", "\x1b", "\u202e"):
+        for secret in ("abc123", "sk-live-1", "hunter2", "pw@", "kq7zx9-secret", "Bearer", "\x1b", "\u202e"):
             self.assertNotIn(secret, report)
 
     def test_a_long_report_says_it_is_a_summary(self):

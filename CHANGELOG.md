@@ -6,6 +6,23 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.28.6] - 2026-11-26
+
+Antigravity quota failures are remembered, usage nouez can't place gives way to usage known to have room, and Claude is told more plainly when to get a review. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version.
+
+### Changed
+
+- **An Antigravity turn that fails on its quota is remembered.** agy's usage report can lag its own limit: a research turn went to Opus while the report still showed its Claude and GPT group at half its week, and failed with "Third-party quota reached ... Resets in 162h49m57s". nouez now marks that group used up until the reset the error names, timed from when the turn ended, in every session, so its own picks go elsewhere and `ConsultantBudget` says when the group comes back. A later turn that succeeds in the group ends the mark sooner (an upgrade, or AI credits), whichever is read first. The marks hold in a session with no usage reading yet, or when agy's report fails, and show on the `top` screen, beside a failed reading too, each model in the group agy last listed it in. A send made while the consultant's previous turn is ending reads that turn again before it goes. A send that names a model in the group still goes, with a note that it may fail without credits, and nouez never resends a failed turn itself ([quota failures](docs/rules.md#rule-quota-hit)).
+- **Usage nouez can't place gives way to known room.** Any first pick whose usage isn't known, not only an unmatched Antigravity group, now yields to a quota known to have room, after the rules that spend a week about to reset or behind pace. When agy lists no group members and renames a group, a model's group is the one reported group whose name has its family word (Claude or GPT, Argon, Gemini), never a guess when several or none match; a send to a model nouez still can't place says its usage isn't known ([quota groups](docs/rules.md#rule-quota-groups)).
+- **The prompt hook speaks on an old busy reading.** When Claude Code's saved reading is over 30 minutes old and already past 70% of its week, each prompt now gets the hand-out line, saying the reading is old (before, only past 90%). `ConsultantBudget` and the status screen already counted it as busy ([Claude Code's workload](docs/rules.md#rule-claude-workload)).
+- **The usage screen says "busy".** A week on pace past 70% now adds `busy` to its row and to a wide screen's card, still green, so a green row whose work goes elsewhere says why ([busy week](docs/rules.md#rule-busy-week)).
+- **Clearer points for an unasked review and critique.** The review now follows the diff being committed: one that changes behavior, even by one line, gets one, so a one-line fix is no longer taken as too small. The critique comes before the first edit when your request leaves Claude a consequential choice, and not when the request spells the change out. The eval: reviews before a commit 8 of 8 (0.28.5: 7 of 8); the plan case is still missed, under three wordings ([automatic consultation](docs/rules.md#rule-automatic-consultation)). nouez's instructions are about 1,550 characters, against a test limit raised from 1,500 to 1,600.
+
+### Internal
+
+- Both send paths take their routing only from `send_route`, `send_check` and the new `independent_pick`, which moves a review off a Claude model; nothing a user sees changes.
+- The consult eval adds a one-line change that alters behavior (should get a review) and a change to three files spelled out edit by edit (should get no critique).
+
 ## [0.28.5] - 2026-11-26
 
 The rulebook is complete, and the other docs link to it instead of keeping copies that drift. Nothing nouez does changes. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version.
@@ -833,7 +850,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.5...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.6...HEAD
+[0.28.6]: https://github.com/jibarix/nouez/compare/v0.28.5...v0.28.6
 [0.28.5]: https://github.com/jibarix/nouez/compare/v0.28.4...v0.28.5
 [0.28.4]: https://github.com/jibarix/nouez/compare/v0.28.3...v0.28.4
 [0.28.3]: https://github.com/jibarix/nouez/compare/v0.28.2...v0.28.3

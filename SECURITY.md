@@ -99,6 +99,7 @@ Below that folder, nouez refuses to write, delete or lock any file through a lin
 | `review-rounds/` | For each consultant's latest review chain, bug hunt or plan critique: the kind, the round count, its turn ids, the commit, the repository folder, the SHA-256 of the diff sent with it, and the first round's message (the brief, up to 200,000 characters), kept for a blind second opinion | 14 days after the last round |
 | `agy/<id>/turns/` | Each Antigravity turn's message (with an attached diff), output and errors | Until 90 days after you stop the consultant |
 | `agy/<id>/consultant.json` | The consultant's folder, name, model, standing instructions and agy conversation id | Until you delete it |
+| `agy/quota-hits.json` | For each Antigravity turn that failed on its quota: its turn id, model, when it ended and the reset its error named; when a turn last succeeded on each model; and the quota group each of those models was last seen in. Never message or reply text. `quota-hits.lock` is held while it is written | Each failure until the reset it names, each success 8 days, removed at the next write; the file is replaced on each write |
 | `dispatcher-claude.log`, `dispatcher.log` | What the dispatcher's `claude remote-control` printed (connection messages, the session link it shows), and the supervisor's own starts and exits | Each moved to `.1` past 1 MB, replacing the one before |
 | `claude-json-backups/` (`$XDG_STATE_HOME/nouez` or `~/.local/state/nouez` on macOS and Linux) | Copies of `~/.claude.json` | The newest 20 |
 

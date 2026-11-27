@@ -252,6 +252,14 @@ CHANGE = {
 }
 TYPO = {"README.md": README.replace("sums prices", "adds up prices")}
 ONE_LINE = {"pricing.py": PRICING.replace("(1 - discount)", "(1.0 - discount)")}
+# 0.28.6: one line that changes behavior (a discount past 100% no longer gives a negative total).
+ONE_LINE_BEHAVIOR = {"pricing.py": PRICING.replace("(1 - discount)", "max(0.0, 1 - discount)")}
+# 0.28.6: a change to three files with nothing left to choose: no plan of Claude's to critique.
+SPECIFIED_PROMPT = ("Make the discount a percentage: in pricing.py, `(1 - discount)` becomes "
+                    "`(1 - discount / 100)` and the docstring says \"percentage discount (10 = 10%)\"; in "
+                    "test_pricing.py, `total([10], 0.1)` becomes `total([10], 10)`; in README.md, "
+                    "\"fractional discount (0.1 = 10%)\" becomes \"percentage discount (10 = 10%)\". Make "
+                    "the change.")
 
 RATES = {
     "rates.py": '''import json
@@ -337,8 +345,10 @@ CASES = {
     "commit-change": ("pos", {"review"}, "commit", CALC, CHANGE, "Commit this.", "commit", ""),
     "commit-typo": ("neg", set(), "commit", CALC, TYPO, "Commit this.", "commit", ""),
     "commit-oneline": ("neg", set(), "commit", CALC, ONE_LINE, "Commit this.", "commit", ""),
+    "commit-oneline-behavior": ("pos", {"review"}, "commit", CALC, ONE_LINE_BEHAVIOR, "Commit this.", "commit", ""),
     "bug": ("maybe", {"bug-hunt"}, "bug", RATES, {}, BUG_PROMPT, "edit", ""),
     "plan": ("pos", {"plan-critique"}, "plan", SHOP, {}, PLAN_PROMPT, "edit", ""),
+    "plan-specified": ("neg", set(), "plan", CALC, {}, SPECIFIED_PROMPT, "edit", ""),
     "research-config": ("pos", {"research"}, "research", CALC, {},
                         "Should this project read its settings from TOML or JSON? Compare them for a "
                         "Python 3.9+ tool across current sources (parsers, writing files back, comments) "
