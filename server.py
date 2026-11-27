@@ -4600,7 +4600,7 @@ def open_claude_session(args, cancel=None, progress=None):
         parent = os.path.dirname(cwd)
         if not os.path.isdir(parent):
             raise BridgeError(f"Can't create {cwd}: its parent folder {parent} doesn't exist.")
-        if flag(args, "trust"):  # again, as the folders stand after any prompt: a link may have been put in
+        if flag(args, "trust"):  # again, as the folders stand now: a link may have been put in since
             refuse_new_folder()
         os.mkdir(cwd)
         created = True

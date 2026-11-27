@@ -1622,21 +1622,25 @@ class TrustTest(unittest.TestCase):
 
     def test_a_new_folder_is_checked_again_just_before_it_is_made(self):
         """0.26.3: in the dispatcher, create=true with trust checks where the folder would go again
-        right before making it, as the folders stand after the user's prompt: a link put in meanwhile
-        is refused and nothing is made through it."""
+        right before making it: Ana's phone asks for Projects/swap/new, and a link to a folder outside
+        her projects folders put in for `swap` after the first check is refused, nothing made through it."""
         outside = os.path.join(self.tmp, "outside")
         os.mkdir(outside)
         parent = os.path.join(self.projects, "swap")
         os.mkdir(parent)
         new = os.path.join(parent, "new")
+        real, swapped = server.refuse_dispatcher_trust, []
 
-        def approve_and_swap(*args, **kwargs):
-            os.rename(parent, os.path.join(self.projects, "moved"))
-            dir_link(outside, parent)
-        with phone_roots(self.projects, env={"NOUEZ_ASK_TRUST": "1"}), \
-                mock.patch.object(server, "user_approves", approve_and_swap):
+        def check_then_swap(folder):
+            real(folder)
+            if not swapped:  # after the first check passes
+                swapped.append(folder)
+                os.rename(parent, os.path.join(self.projects, "moved"))
+                dir_link(outside, parent)
+        with phone_roots(self.projects), mock.patch.object(server, "refuse_dispatcher_trust", check_then_swap):
             with self.assertRaisesRegex(server.BridgeError, "phone dispatcher"):
                 self.open({"cwd": new, "create": True, "trust": True})
+        self.assertEqual(swapped, [new])
         self.assertEqual(os.listdir(outside), [])
         os.rmdir(parent) if os.name == "nt" else os.unlink(parent)
 
@@ -10991,12 +10995,13 @@ class DispatcherTest(unittest.TestCase):
 
     def test_install_on_each_system(self):
         self.setup()
-        code, out, ran, _ = self.install("win32", "nt")
-        self.assertEqual(code, 0, out)
-        self.assertEqual(ran[0][:5], ["schtasks.exe", "/Create", "/TN", "nouez dispatcher", "/XML"])
-        self.assertEqual(ran[1], ["schtasks.exe", "/Run", "/TN", "nouez dispatcher"])
-        self.assertRegex(os.path.basename(ran[0][5]), r"^dispatcher-task-.+\.xml$")
-        self.assertFalse(os.path.exists(ran[0][5]), "the task's XML is deleted after")
+        if os.name == "nt":  # a faked Windows reads this system's projects folders as not absolute
+            code, out, ran, _ = self.install("win32", "nt")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(ran[0][:5], ["schtasks.exe", "/Create", "/TN", "nouez dispatcher", "/XML"])
+            self.assertEqual(ran[1], ["schtasks.exe", "/Run", "/TN", "nouez dispatcher"])
+            self.assertRegex(os.path.basename(ran[0][5]), r"^dispatcher-task-.+\.xml$")
+            self.assertFalse(os.path.exists(ran[0][5]), "the task's XML is deleted after")
         plist = os.path.join(self.home, "LA", "agent.plist")
         code, out, ran, _ = self.install("darwin")
         self.assertEqual(code, 0, out)
@@ -12354,13 +12359,14 @@ class PhoneProjectsFoldersTest(unittest.TestCase):
 
     def home_folder(self):
         """self.home as the home folder, with Claude Code's settings folder, nouez's cache and the
-        temporary folder inside it, as on Windows."""
+        temporary folder inside it, as on Windows (on macOS and Linux the cache is ~/.cache/nouez)."""
         local = os.path.join(self.home, "AppData", "Local")
         temp = os.path.join(local, "Temp")
         os.makedirs(temp, exist_ok=True)
         stack = self.phone()
         stack.enter_context(self.home_at(self.home))
-        stack.enter_context(mock.patch.dict(os.environ, {"LOCALAPPDATA": local, "CLAUDE_CONFIG_DIR": ""}))
+        stack.enter_context(mock.patch.dict(os.environ, {"LOCALAPPDATA": local, "CLAUDE_CONFIG_DIR": "",
+                                                         "XDG_CACHE_HOME": os.path.join(self.home, ".cache")}))
         stack.enter_context(mock.patch.object(server.tempfile, "gettempdir", lambda: temp))
         return stack
 
@@ -12406,7 +12412,11 @@ class PhoneProjectsFoldersTest(unittest.TestCase):
         settings folder, ~/.nouez, nouez's cache or the temporary folder."""
         tool = os.path.join(self.home, "Downloads", "tool")
         claude = os.path.join(self.home, ".claude")
-        cache = os.path.join(self.home, "AppData", "Local", "nouez")
+        if os.name == "nt":
+            cache, holder = os.path.join(self.home, "AppData", "Local", "nouez"), os.path.join(self.home, "AppData")
+        else:
+            cache = os.path.join(self.home, ".cache", "nouez")
+            holder = os.path.dirname(cache)
         for folder in (tool, os.path.join(claude, "skills"), os.path.join(self.home, ".nouez", "dispatcher"), cache):
             os.makedirs(folder, exist_ok=True)
         with self.home_folder():
@@ -12418,7 +12428,7 @@ class PhoneProjectsFoldersTest(unittest.TestCase):
                                  (os.path.join(self.home, ".nouez"), "nouez's own folder"),
                                  (os.path.join(self.home, ".nouez", "dispatcher"), "nouez's own folder"),
                                  (cache, "nouez's cache folder"),
-                                 (os.path.join(self.home, "AppData"), "nouez's cache folder"),
+                                 (holder, "nouez's cache folder"),
                                  (os.path.join(self.home, "AppData", "Local", "Temp"), "the temporary folder")):
                 with self.subTest(folder=folder):
                     problem = server.dispatcher_trust_problem(folder)
