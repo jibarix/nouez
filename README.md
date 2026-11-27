@@ -77,88 +77,36 @@ Run `claude --version`, `codex --version` and `agy --version` to see your versio
 
 ## Setup
 
-Run each command in a terminal. Where a path appears, use the absolute path to your copy of nouez, in quotes if it contains a space. On macOS and Linux, use `python3` wherever this says `python` if `python` isn't on your `PATH`. First check that `python --version` prints 3.9 or later. On Windows, if it opens the Microsoft Store or prints nothing, install Python from python.org (or use `py -3` wherever this says `python`). Run the commands outside any virtual environment, unless you mean nouez to run on that environment's Python. [The setup guide](docs/setup.md) has each step in full: what it checks and changes, and the choices it offers.
+nouez installs as a Claude Code plugin on Windows. The plugin starts it with the Python launcher (`py -3`), which comes with python.org's Python for Windows. To run nouez from a clone instead (macOS, Linux, or to change the code), see [the setup guide](docs/setup.md#from-a-clone).
 
-### As a Claude Code plugin (Windows)
-
-The plugin runs nouez with the Python launcher (`py -3`, part of python.org's Python for Windows). In a terminal:
+**1. Install the plugin.** In a terminal:
 
 ```sh
 claude plugin marketplace add jibarix/nouez
 claude plugin install nouez@nouez
 ```
 
-Then, in a new Claude Code session, run `/nouez:setup`. It shows what it would add to Claude Code's settings (the waiter's allow rules and, if you want it, nouez's status line), asks, then runs `doctor` and offers to set up the phone dispatcher. Do step 4 below for a consultant CLI. After an update, run `/reload-plugins` in one session (or start a new one): that puts the new version in place, and the other open sessions move to it by themselves, the next time nouez has nothing running there ([the plugin](docs/rules.md#rule-plugin-launcher)). With the plugin, a protection can change from a session after a yes in Claude Code's own prompt ([protections](docs/rules.md#rule-protections-behind-the-prompt)). `/nouez:uninstall` takes out what setup added and the dispatcher's sign-in start; `claude plugin uninstall nouez@nouez` removes the plugin. Already registered nouez from a clone? `/nouez:setup` offers to remove that registration, so nouez doesn't run twice, and then takes the clone's waiter rules out of your settings; sessions opened before that keep the clone's nouez until you reopen them.
+From the next Claude Code session on, every session has nouez's tools.
 
-### From a clone
-
-**1. Get the code.**
-
-```sh
-git clone https://github.com/jibarix/nouez.git
-```
-
-**2. Register the server with Claude Code,** for every project, so the dispatcher and each session it opens have nouez's tools:
-
-```sh
-claude mcp add --scope user consultants -- python "/absolute/path/to/nouez/server.py"
-```
-
-On Windows, use a path like `"C:/Users/you/nouez/server.py"`. The setup guide shows how to add a key for [model scores](docs/consultants.md#choosing-a-consultant), and how to register it for one project only, which leaves the phone without nouez's tools elsewhere.
-
-**3. Set up the phone dispatcher,** a Remote Control server in a folder of its own, `~/.nouez/dispatcher` by default (a dispatcher already set up in `~/Projects/dispatcher` stays there). With the `python` and path you registered:
-
-```sh
-python "/absolute/path/to/nouez/server.py" dispatcher setup
-```
-
-It makes the folder (`--folder` picks another), writes a `CLAUDE.md` there that gives the dispatcher its job, and adds allow rules for nouez's session tools to the folder's `.claude/settings.json` (`--dry-run` shows what it would change). The phone can trust projects only inside the dispatcher's projects folders. You pick them from the phone the first time you open the dispatcher there ([Setting up the phone](docs/phone.md#setting-up-the-phone)); `setup` lists the folders that look like they hold your projects to help. To pick them at the computer instead, pass `--projects DIR` once for each, or `--no-projects` to trust folders only at the computer, and give `install` the same. At its end, when Claude Code has no status line, `setup` offers nouez's, which lets nouez see Claude Code's usage, and adds it only on your yes (`--statusline` says yes ahead). Then, once, in a terminal in that folder:
-
-```sh
-claude remote-control --name dispatcher --spawn same-dir
-```
-
-Answer Claude Code's question about trusting the folder, and any question Remote Control asks the first time. Check that the Claude app lists the computer as `dispatcher`, then stop it with Ctrl+C. A server started at sign-in has no one to answer those questions. Last:
-
-```sh
-python "/absolute/path/to/nouez/server.py" dispatcher install
-```
-
-It checks the folder and its trust, then has the dispatcher start, hidden, at each sign-in (a Task Scheduler task on Windows, a launch agent on macOS, a desktop autostart entry on Linux) and starts it now. `server.py dispatcher status` shows whether it runs and is connected; `server.py dispatcher uninstall` removes the sign-in start and stops it.
-
-**4. Install and sign in to a consultant CLI** (optional: skip it to use only the phone and session tools). Either one is enough; with both, Codex is the default.
+**2. Sign in to a consultant CLI** (optional: skip it to use only the phone and session tools). Either one is enough; with both, Codex is the default. Do it before step 3, so setup's check finds it. If installing changed your `PATH`, reopen the terminal and Claude Code.
 
 - **Codex:** install the [Codex CLI](https://developers.openai.com/codex/cli/), run `codex login`, then check with `codex login status`.
 - **Antigravity:** install the [Antigravity CLI](https://antigravity.google/docs/cli-getting-started), run `agy` once in a terminal and sign in with your Google account, then check with `agy models`.
 
-If installing changed your `PATH`, quit and restart Claude Code (and the terminal it runs in).
+**3. Run `/nouez:setup` in a new Claude Code session.** A plugin can't change Claude Code's settings or Windows by itself, so setup does it once, for every session. It shows each change before making it, asks, and backs up a file before changing it. In this order:
 
-**5. Let Claude run the waiter** (skip it if you installed no consultant CLI). Claude doesn't wait for a consultant's reply: a small command it runs in the background brings the reply when it is ready. To let it run without asking, print its permission rules:
+| Step | What it's for | If you say no |
+|---|---|---|
+| **The waiter's allow rules** | After Claude sends a consultant a question, it runs a small command in the background, the waiter, which brings the reply when it's ready. The rules let it run without asking. | Claude Code asks before each waiter, and auto mode may block it. If the waiter can't run, Claude reads the reply only when you ask. |
+| **nouez's status line**, asked with the rules, only when you have none | Claude Code tells only its status line how much of your usage is left. nouez's saves it, for the status screen and for handing work to consultants before Claude Code runs out. A status line of your own is kept, and setup says what to add to it. | nouez can't see Claude Code's usage. |
+| **Removing a clone's registration**, only if you registered nouez from a clone before | So nouez doesn't run twice. Setup then takes the clone's waiter rules out too. | Both copies run. |
+| **The phone dispatcher** (optional) | The session the Claude app talks to: it opens, lists and closes sessions in your projects. Setup prepares its folder; you run it once in a terminal to answer Claude Code's first questions; then setup installs it to start at each Windows sign-in. With one installed, setup offers to update it instead. | The phone reaches only sessions you start with Remote Control at the computer. Declining an update leaves the installed dispatcher running as it is. |
 
-```sh
-python "/absolute/path/to/nouez/server.py" allow-rule
-```
+Between the clone question and the dispatcher, setup runs `doctor`, which asks nothing: it checks Python, `claude`, the settings above, the dispatcher and each consultant CLI (installed, signed in, answering), and says what to fix.
 
-Add them to `permissions.allow` in the file it names, keeping anything already there, then start a new Claude Code session.
+**4. Run `/reload-plugins`** in that session, or start a new one.
 
-**6. Check it.**
-
-```sh
-python "/absolute/path/to/nouez/server.py" doctor
-```
-
-It checks Claude Code's side, the phone dispatcher and each consultant CLI, and says what to fix; a CLI you didn't install is a note, not a problem. Then `/mcp` inside Claude Code should show `consultants` connected. Sessions that were already open keep the old server until you reconnect `consultants` there with `/mcp`; do the same after [updating nouez](docs/setup.md#nouez-updates).
-
-### What nouez changes in your Claude Code setup
-
-- **The MCP entry** for `consultants`, made by Claude Code's own `claude mcp add` in step 2, or the plugin, which Claude Code installs.
-- **One trust mark in `~/.claude.json`** for each folder you trust a session in, only after nouez reports what the folder's settings would run and you say yes (Claude passes your yes on; `NOUEZ_ASK_TRUST=1` makes nouez ask you in its own prompt). A folder nouez creates outside git, in the same call that marks it, has no settings, so it needs no report. Before changing the file, nouez makes a dated backup. `doctor` reports the backup folder, counts this profile's copies, names the newest and says how to restore one. See [which trust backups nouez keeps](docs/rules.md#rule-trust-backups). `NOUEZ_NO_TRUST_WRITE=1` turns this off.
-- **An MCP server added back to `~/.claude.json`**, only when you run `server.py restore ID` at the computer for one that `RestoreClaudeConfig` found in nouez's copies and missing now; nothing else in the file changes, and it is copied first.
-- **The dispatcher folder's own files:** its `CLAUDE.md`, and allow rules for nouez's session tools in its `.claude/settings.json`, copied first.
-- **The sign-in start** that `dispatcher install` adds, which `dispatcher uninstall` removes.
-- **nouez's status line** in Claude Code's own `settings.json`, only on your yes and only when it has none, copied first.
-
-nouez changes nothing else in your Claude Code settings. The waiter's allow rules (step 5) are yours to add; with the plugin, `/nouez:setup` adds them on your yes, copied first.
+Updating and uninstalling nouez, and everything nouez changes on your computer, are in [the setup guide](docs/setup.md#as-a-plugin).
 
 ## From your phone
 
