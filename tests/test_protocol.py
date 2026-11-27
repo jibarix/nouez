@@ -3,6 +3,7 @@
 Run from the repo root: python -m unittest discover tests
 """
 
+import ast
 import contextlib
 import glob
 import hashlib
@@ -10648,6 +10649,86 @@ class DispatcherTest(unittest.TestCase):
             self.assertEqual(deny, [server.PLUGIN_PREFIX + "CloseClaudeSession", "Bash(rm *)"], "a block the user set stays")
             self.assertEqual(server.dispatcher_rules_note(self.folder), "")
 
+    def test_setup_replaces_an_earlier_nouezs_claude_md(self):
+        """0.30.1: Robin's dispatcher folder has the CLAUDE.md nouez 0.29.0 wrote, which says
+        protections change only at the computer. setup replaces it with this nouez's, after a copy;
+        one 0.24.0 wrote, with its projects folder filled in, too. One Robin edited is kept."""
+        plain = "Protections change only at the computer.\n"
+        template = "New project: only directly inside `{projects}`, with create.\nNever above `{projects}`.\n"
+        sha = lambda t: hashlib.sha256(t.encode("utf-8")).hexdigest()  # noqa: E731
+        md = os.path.join(self.folder, "CLAUDE.md")
+        with mock.patch.object(server, "DISPATCHER_MD_EARLIER", {sha(plain): "0.29.0", sha(template): "0.24.0"}):
+            for version, text in (("0.29.0", plain), ("0.24.0", template.replace("{projects}", self.projects))):
+                with self.subTest(version=version):
+                    if os.path.isdir(self.folder):
+                        shutil.rmtree(self.folder)
+                    os.makedirs(self.folder)
+                    with open(md, "w", encoding="utf-8", newline="\r\n") as f:
+                        f.write(text)
+                    self.assertEqual(server.dispatcher_md_state(self.folder), ("earlier", version))
+                    self.assertIn("`server.py dispatcher setup` replaces it", server.dispatcher_md_note(self.folder))
+                    code, out = self.setup(dry_run=True)
+                    self.assertIn(f"Would replace {md}, which nouez {version} wrote", out)
+                    with open(md, encoding="utf-8") as f:
+                        self.assertEqual(f.read(), text)
+                    code, out = self.setup()
+                    self.assertEqual(code, 0, out)
+                    with open(md, encoding="utf-8") as f:
+                        self.assertEqual(f.read(), server.DISPATCHER_CLAUDE_MD)
+                    backups = glob.glob(md + ".nouez-*.bak")
+                    self.assertEqual(len(backups), 1, out)
+                    with open(backups[0], encoding="utf-8") as f:
+                        self.assertEqual(f.read(), text)
+                    self.assertEqual(server.dispatcher_md_state(self.folder), ("current", None))
+            for mine in (plain + "My own line.\n", template.replace("{projects}", r"D:\ClientProjects")):
+                with self.subTest(mine=mine):
+                    with open(md, "w", encoding="utf-8") as f:
+                        f.write(mine)
+                    code, out = self.setup()
+                    self.assertIn("it was edited. It is kept", out)
+                    with open(md, encoding="utf-8") as f:
+                        self.assertEqual(f.read(), mine)
+
+    def test_the_earlier_texts_are_what_those_versions_wrote(self):
+        """Each hash in DISPATCHER_MD_EARLIER is that release's DISPATCHER_CLAUDE_MD (needs the tags)."""
+        for digest, version in server.DISPATCHER_MD_EARLIER.items():
+            with self.subTest(version=version):
+                src = subprocess.run(["git", "show", f"v{version}:server.py"], cwd=ROOT, capture_output=True,
+                                     encoding="utf-8").stdout
+                if not src:
+                    self.skipTest("needs a git checkout with the release tags")
+                text = next(ast.literal_eval(node.value) for node in ast.parse(src).body
+                            if isinstance(node, ast.Assign)
+                            and any(getattr(x, "id", None) == "DISPATCHER_CLAUDE_MD" for x in node.targets))
+                self.assertEqual(hashlib.sha256(text.encode("utf-8")).hexdigest(), digest)
+
+    def test_a_refused_write_names_the_sandbox(self):
+        """0.30.1: inside a Claude Code session with its sandbox on, the change to the dispatcher
+        folder's settings.json is refused: setup says the sandbox may be why."""
+        with mock.patch.object(server.SettingsFolder, "replace", side_effect=PermissionError(13, "Access is denied")):
+            code, out = self.setup()
+        self.assertEqual(code, 1, out)
+        self.assertIn("outside the sandbox", out)
+        self.assertEqual(server.sandbox_hint(OSError("other")), "")
+        shutil.rmtree(self.folder, ignore_errors=True)
+        with mock.patch.object(server.os, "mkdir", side_effect=PermissionError(13, "Access is denied")):
+            code, out = self.setup()
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"Couldn't make {self.folder}", out)
+        self.assertIn("outside the sandbox", out)
+        os.makedirs(self.folder)
+        real_open = open
+
+        def refused(path, *a, **k):
+            if str(path).endswith("CLAUDE.md"):
+                raise PermissionError(13, "Access is denied")
+            return real_open(path, *a, **k)
+        with mock.patch("builtins.open", refused):
+            code, out = self.setup()
+        self.assertEqual(code, 1, out)
+        self.assertIn("Couldn't write", out)
+        self.assertIn("outside the sandbox", out)
+
     def test_setup_says_when_nouez_isnt_registered(self):
         with mock.patch.object(server, "consultants_registered", lambda folder: False):
             code, out = self.setup()
@@ -11973,6 +12054,27 @@ class ClonePlaceTest(unittest.TestCase):
         self.assertIn("the `consultants` registration runs", text)
         self.assertIn("register nouez again from here (README, Setup).", text)
         self.assertNotIn("settings.json", text)
+        # With the plugin and no clone registered, setup takes out a clone's waiter rule, but not one
+        # naming a server.py that is gone.
+        clone = os.path.join(self.base, "clone", "server.py")
+        os.makedirs(os.path.dirname(clone))
+        with open(clone, "wb") as f:
+            f.write(server.NOUEZ_HEAD)
+        with open(state, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        for script, fix in ((clone, "run /nouez:setup again"), (other, "change the path in Claude Code's settings.json")):
+            with self.subTest(script=script), \
+                    mock.patch.object(server, "claude_state_file", lambda env=None: state), \
+                    mock.patch.object(server, "dispatcher_status", lambda: (False, None)), \
+                    mock.patch.object(server, "plugin_marker", lambda: {"id": "nouez@nouez"}):
+                ok, text = server.script_paths_report({"permissions": {"allow": [f"Bash(python -I {script.replace(chr(92), '/')} wait *)"]}})
+            self.assertIsNone(ok)
+            self.assertIn("To fix it: " + fix, text)
+        tool = os.path.join(self.base, "buildtools", "server.py")
+        os.makedirs(os.path.dirname(tool))
+        with open(tool, "wb") as f:
+            f.write(b"import sys\n")
+        self.assertIsNone(report({"permissions": {"allow": [f"Bash(python -I {tool.replace(chr(92), '/')} wait *)"]}}))
 
 
 class CwdDefaultTest(unittest.TestCase):
@@ -13287,6 +13389,42 @@ class PluginSetupTest(unittest.TestCase):
         self.write({"statusLine": {"type": "command", "command": f'"C:/Old Python/python.exe" {here} statusline'}})
         self.assertEqual(server.run_setup(["--remove"], out.append), 0)
         self.assertNotIn("statusLine", self.read())
+
+    def test_setup_takes_out_the_clones_waiter_rules(self):
+        """0.30.1: Robin moved from a clone to the plugin and removed the clone's registration. setup
+        takes the clone's waiter rules out of the user settings, after a copy, keeping their own; while
+        the clone is still registered, they stay. A build tool's `server.py wait` rule, and one for a
+        server.py that is gone, are not nouez's: they stay too."""
+        where = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, where, True)
+        scripts = {}
+        for name, head in (("nouez", server.NOUEZ_HEAD), ("buildtools", b"import sys\n")):
+            os.makedirs(os.path.join(where, name))
+            scripts[name] = os.path.join(where, name, "server.py").replace("\\", "/")
+            with open(scripts[name], "wb") as f:
+                f.write(head)
+        clone = [f"Bash(C:/Python311/python.exe -I {scripts['nouez']} wait *)",
+                 f"PowerShell(C:/Python311/python.exe -I {scripts['nouez']} wait *)"]
+        others = [f"Bash(C:/Python311/python.exe -I {scripts['buildtools']} wait *)",
+                  f"Bash(C:/Python311/python.exe -I {where}/gone/server.py wait *)".replace("\\", "/")]
+        self.write({"permissions": {"allow": ["Bash(git status)"] + others + clone + self.rules}})
+        out = []
+        with mock.patch.object(server, "plugin_marker", lambda: {"id": "nouez@nouez"}), \
+                mock.patch.object(server, "clone_registered", lambda: True):
+            self.assertEqual(server.run_setup([], out.append), 0)
+            self.assertEqual(self.read()["permissions"]["allow"], ["Bash(git status)"] + others + clone + self.rules)
+        with mock.patch.object(server, "plugin_marker", lambda: {"id": "nouez@nouez"}), \
+                mock.patch.object(server, "clone_registered", lambda: False):
+            self.assertEqual(server.run_setup(["--dry-run"], out.append), 0)
+            self.assertEqual(len(self.read()["permissions"]["allow"]), 6)
+            out = []
+            self.assertEqual(server.run_setup([], out.append), 0)
+        self.assertEqual(self.read()["permissions"]["allow"], ["Bash(git status)"] + others + self.rules)
+        self.assertTrue(any("waiter rules of a clone of nouez" in m and "until it is reopened" in m for m in out), out)
+        self.assertTrue(any(m.startswith("Backed up") for m in out), out)
+        self.write({"permissions": {"allow": clone}})  # a clone with no plugin: they are its own
+        self.assertEqual(server.run_setup([], out.append), 0)
+        self.assertEqual(self.read()["permissions"]["allow"][:2], clone)
 
     def test_the_clones_registration_and_where_the_plugin_is_on(self):
         """The clone's registration sets a switch and a key: setup names both, the switch's value but

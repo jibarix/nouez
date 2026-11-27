@@ -114,6 +114,6 @@ When each goes:
 
 `OpenClaudeSession` also passes a first prompt through a private temporary file, which the new window deletes once read.
 
-Outside the cache folder, `dispatcher setup` leaves the dispatcher folder's `CLAUDE.md`, its `.claude/settings.json` and a dated copy of that file from before nouez changed it, until you delete them. With your yes (at the terminal, or `--statusline`), it also adds nouez's status line to Claude Code's own `settings.json`, only when that has none, and leaves a dated copy of it from before.
+Outside the cache folder, `dispatcher setup` leaves the dispatcher folder's `CLAUDE.md`, its `.claude/settings.json`, a dated copy of that file from before nouez changed it, and a dated copy of a `CLAUDE.md` an earlier nouez wrote that it replaced, until you delete them. With your yes (at the terminal, or `--statusline`), it also adds nouez's status line to Claude Code's own `settings.json`, only when that has none, and leaves a dated copy of it from before.
 
 You can delete any of these sooner; nouez works without them. Deleting a consultant's turns while you still use it loses the conversation id nouez resumes it with, so stop it first. Codex, Antigravity and Claude Code keep their own histories in their own folders, under their own rules; nouez doesn't change those.

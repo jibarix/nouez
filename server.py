@@ -74,7 +74,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.30.0"
+SERVER_VERSION = "0.30.1"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -15358,23 +15358,108 @@ def add_missing_dispatcher_rules_locked(folder, out):
     return missing
 
 
-def dispatcher_md_note(folder):
-    """A note when the dispatcher folder's CLAUDE.md isn't the one this nouez writes: an older
-    nouez's, or edited. None when it is, or when it can't be read."""
+# The dispatcher CLAUDE.md texts earlier nouez versions wrote (sha256 of the text, read with any line
+# ends), with the version that wrote each: one of these is nouez's own, not the user's, so setup replaces
+# it. 0.23.0 and 0.24.0 filled in the projects folder, the one above the dispatcher folder; it is put
+# back as `{projects}` before hashing (dispatcher_md_kind).
+DISPATCHER_MD_EARLIER = {
+    "269eb4fb3da1bdf3ddf11bdbc03ffd46389701f475c1c4855fe0281e8446271e": "0.23.0",
+    "8467ecb7a48db91311069b5ba6238470b89625535407386cacb83b774bb63633": "0.24.0",
+    "8bf07ee88bf7b6e2c56b43de77c7dd5acf584e54476bca6b1038d0fb4e2c68f2": "0.27.0",
+    "6cd0790250364271ca351d8fc2bd6a43261d25e763d3b1ee5a6570a8e344e3a6": "0.29.0",
+}
+DISPATCHER_MD_PROJECTS = "only directly inside `"  # what came before the projects folder in 0.23.0 and 0.24.0
+
+
+def dispatcher_md_kind(text, projects=None):
+    """What a dispatcher CLAUDE.md's text is: ("current", None) when it is the one this nouez
+    writes, ("earlier", version) when an earlier nouez wrote it and nothing was changed since
+    (DISPATCHER_MD_EARLIER), ("edited", None) otherwise. Line ends don't count. `projects`: the
+    folder above the dispatcher folder, which 0.23.0 and 0.24.0 filled in; a text naming another
+    projects folder was edited."""
+    text = text.replace("\r\n", "\n")
+    if text == DISPATCHER_CLAUDE_MD:
+        return "current", None
+    texts = [text]
+    at = text.find(DISPATCHER_MD_PROJECTS)
+    end = text.find("`", at + len(DISPATCHER_MD_PROJECTS)) if at >= 0 else -1
+    if end > at >= 0 and projects:
+        named = text[at + len(DISPATCHER_MD_PROJECTS):end]
+        if named and "\n" not in named and same_folder(named, projects):
+            texts.append(text.replace(f"`{named}`", "`{projects}`"))
+    for t in texts:
+        version = DISPATCHER_MD_EARLIER.get(hashlib.sha256(t.encode("utf-8")).hexdigest())
+        if version:
+            return "earlier", version
+    return "edited", None
+
+
+def dispatcher_md_state(folder):
+    """dispatcher_md_kind of the dispatcher folder's CLAUDE.md; (None, None) when there is none, or
+    it can't be read or isn't a regular file."""
     path = os.path.join(folder, "CLAUDE.md")
     try:
         if not regular_file(path):
-            return None
+            return None, None
         with open(path, encoding="utf-8") as f:
-            text = f.read()
+            return dispatcher_md_kind(f.read(), os.path.dirname(folder))
     except (OSError, UnicodeDecodeError):
+        return None, None
+
+
+def dispatcher_md_note(folder):
+    """A note when the dispatcher folder's CLAUDE.md isn't the one this nouez writes: an earlier
+    nouez's, which `dispatcher setup` replaces, or edited, which it keeps. None when it is, or when
+    there is none or it can't be read."""
+    state, version = dispatcher_md_state(folder)
+    path = os.path.join(folder, "CLAUDE.md")
+    if state == "earlier":
+        return (f"{path} is the one nouez {version} wrote, so the dispatcher follows that version's "
+                "instructions: `server.py dispatcher setup` replaces it with this nouez's (backed up first), "
+                "then `dispatcher install` restarts the dispatcher.")
+    if state != "edited":
         return None
-    if text == DISPATCHER_CLAUDE_MD:  # read with any line ends
-        return None
-    return (f"{path} isn't the one this nouez writes: it may be from an older nouez, or edited. It is kept "
+    return (f"{path} isn't the one this nouez writes, or one an earlier nouez wrote: it was edited. It is kept "
             "as it is. For the current one, rename it (to CLAUDE.md.old, say), run `server.py dispatcher "
             "setup` again, copy back any lines of your own, and run `dispatcher install` again to restart "
             "the dispatcher.")
+
+
+def replace_dispatcher_md(folder, out):
+    """Put this nouez's DISPATCHER_CLAUDE_MD in place of the folder's CLAUDE.md, which an earlier
+    nouez wrote, through a new file beside it, after a checked copy (backup_file). Never through a
+    link; OSError, changing nothing, if the file changed since it was read. That is checked just
+    before the replace: an edit saved in that instant isn't caught."""
+    with SettingsFolder(os.path.dirname(folder), name=os.path.basename(folder)) as here:
+        raw = here.read("CLAUDE.md")
+        try:
+            earlier = raw is not None and dispatcher_md_kind(raw.decode("utf-8"), os.path.dirname(folder))[0] == "earlier"
+        except UnicodeDecodeError:
+            earlier = False
+        if not earlier:
+            raise OSError(f"{os.path.join(folder, 'CLAUDE.md')} changed while setup ran; it was left as it is")
+        out(f"Backed up {os.path.join(folder, 'CLAUDE.md')} to {backup_file(here, raw, 'CLAUDE.md')}.")
+        tmp, made = f"CLAUDE.{uuid.uuid4().hex[:12]}.tmp", False
+        try:
+            with here.create(tmp) as f:
+                made = True
+                f.write(DISPATCHER_CLAUDE_MD.encode("utf-8"))
+            if here.read("CLAUDE.md") != raw:
+                raise OSError(f"{os.path.join(folder, 'CLAUDE.md')} changed while setup ran; it was left as it is")
+            here.replace(tmp, "CLAUDE.md")
+            made = False
+        finally:
+            if made:
+                here.remove(tmp)
+
+
+def sandbox_hint(e):
+    """For a write that was refused: Claude Code's sandbox, when a session runs this with it on, can
+    refuse changes to a .claude/settings.json and the like. "" for other errors."""
+    if not isinstance(e, PermissionError):
+        return ""
+    return (". If this ran from a Claude Code session with its sandbox on, run it again outside the sandbox: "
+            "the sandbox can refuse changes to these files.")
 
 
 def dispatcher_flags(folder):
@@ -15439,7 +15524,7 @@ def statusline_offer(dry_run, add, out=print, ask=None):
         try:
             write_settings(settings, data, raw, out)
         except OSError as e:
-            out(f"Couldn't change {path}: {e}")
+            out(f"Couldn't change {path}: {e}{sandbox_hint(e)}")
             return
         out(f"Added nouez's status line to {path}; a new Claude Code session shows it.")
     finally:
@@ -15502,15 +15587,26 @@ def dispatcher_setup(folder, dry_run=False, out=print, projects=None, statusline
         claude_md = os.path.join(folder, "CLAUDE.md")
         if dry_run:
             out("Dry run: nothing is changed.")
-        if make_above:
-            out(f"{act} make {above}.")
+        for make, need in ((above, make_above), (folder, not os.path.isdir(folder))):
+            if need:
+                out(f"{act} make {make}.")
+                if not dry_run:
+                    try:
+                        os.mkdir(make)
+                    except OSError as e:
+                        out(f"Couldn't make {make}: {e}{sandbox_hint(e)}")
+                        return 1
+        md_state, md_version = dispatcher_md_state(folder) if os.path.lexists(claude_md) else (None, None)
+        if md_state == "earlier":
+            out(f"{act} replace {claude_md}, which nouez {md_version} wrote, with this nouez's instructions "
+                "for the dispatcher, after a copy beside it.")
             if not dry_run:
-                os.mkdir(above)
-        if not os.path.isdir(folder):
-            out(f"{act} make {folder}.")
-            if not dry_run:
-                os.mkdir(folder)
-        if os.path.lexists(claude_md):
+                try:
+                    replace_dispatcher_md(folder, out)
+                except OSError as e:
+                    out(f"Couldn't replace {claude_md}: {e}{sandbox_hint(e)}")
+                    return 1
+        elif os.path.lexists(claude_md):
             out(dispatcher_md_note(folder) or f"{claude_md} is already there; it is kept as it is.")
         else:
             out(f"{act} write {claude_md}: the dispatcher's instructions.")
@@ -15518,8 +15614,12 @@ def dispatcher_setup(folder, dry_run=False, out=print, projects=None, statusline
                 if not plain_folder(folder):
                     out(f"{folder} became a link; nouez doesn't write through it.")
                     return 1
-                with open(claude_md, "x", encoding="utf-8", newline="\n") as f:
-                    f.write(DISPATCHER_CLAUDE_MD)
+                try:
+                    with open(claude_md, "x", encoding="utf-8", newline="\n") as f:
+                        f.write(DISPATCHER_CLAUDE_MD)
+                except OSError as e:
+                    out(f"Couldn't write {claude_md}: {e}{sandbox_hint(e)}")
+                    return 1
         try:
             record = settle_roots(folder, config_dir, projects, dry_run)
         except BridgeError as e:
@@ -15548,7 +15648,7 @@ def dispatcher_setup(folder, dry_run=False, out=print, projects=None, statusline
                         settings = SettingsFolder(folder, create=True)
                     write_settings(settings, data, raw, out)
                 except OSError as e:
-                    out(f"Couldn't change {path}: {e}")
+                    out(f"Couldn't change {path}: {e}{sandbox_hint(e)}")
                     return 1
     finally:
         settings.close()
@@ -16689,7 +16789,8 @@ def scripts_in(command):
 def script_paths_report(settings):
     """doctor's line on whether what Claude Code and the dispatcher run names this server.py: the
     MCP registration, the waiter's allow rules and the status line and prompt hook in `settings`
-    (Claude Code's user settings, read), and the running dispatcher. Places that name none are
+    (Claude Code's user settings, read; a waiter rule for another program's server.py isn't one), and
+    the running dispatcher. Places that name none are
     left out, and the text names those it checked, with a repair for each that names another.
     (ok, text), or None when none names one."""
     here = os.path.abspath(__file__)
@@ -16708,8 +16809,9 @@ def script_paths_report(settings):
         pass
     permissions = settings.get("permissions") if isinstance(settings.get("permissions"), dict) else {}
     allow = permissions.get("allow") if isinstance(permissions.get("allow"), list) else []
+    # A rule naming a server.py that is there but isn't nouez's belongs to another program.
     places += [("a waiter allow rule", m) for r in allow if isinstance(r, str) and " wait *)" in r
-               for m in scripts_in(r)]
+               for m in scripts_in(r) if nouez_script(m) or not os.path.lexists(m)]
     line = settings.get("statusLine") if isinstance(settings.get("statusLine"), dict) else {}
     places += [("the status line", m) for m in scripts_in(line.get("command"))]
     hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
@@ -16735,9 +16837,15 @@ def script_paths_report(settings):
         return True, f"{listed} {'names' if len(names) == 1 else 'name'} this server.py"
     repairs = {"the `consultants` registration": "register nouez again from here (README, Setup)",
                "the running dispatcher": "run `server.py dispatcher install` from here"}
-    fixes = dict.fromkeys(repairs.get(what, "change the path in Claude Code's settings.json") for what, _ in other)
+    # No clone is registered with the plugin (that returned above), so setup takes out the waiter
+    # rules of a clone that is still there (clone_waiter_rules).
+    setup_fixes = "run /nouez:setup again, which takes out a clone's waiter rules"
+    fixes = dict.fromkeys(
+        setup_fixes if what == "a waiter allow rule" and plugin_marker() and nouez_script(path)
+        else repairs.get(what, "change the path in Claude Code's settings.json") for what, path in other)
     return None, ("; ".join(dict.fromkeys(f"{what} runs {path}" for what, path in other))
-                  + f", not this nouez ({here}). If this is the clone you use: " + "; ".join(fixes) + ".")
+                  + f", not this nouez ({here}). " + ("To fix it" if plugin_marker() else "If this is the clone you use")
+                  + ": " + "; ".join(fixes) + ".")
 
 
 def run_dispatcher(argv):
@@ -16763,6 +16871,27 @@ def run_dispatcher(argv):
     if sub == "uninstall":
         return dispatcher_uninstall(opts["dry-run"])
     return dispatcher_status_text()
+
+
+# A waiter allow rule as allow_rules writes it, for any Python and server.py.
+WAITER_RULE = re.compile(r"(?:Bash|PowerShell)\(.+ -I .+ wait \*\)")
+
+
+def clone_waiter_rules(allow):
+    """The waiter allow rules in `allow` that run a clone's server.py, not this one, when this nouez
+    is the plugin and no clone is registered as `consultants` (none is left to use them); [] otherwise.
+    Only a server.py that is still there and is nouez's (nouez_script): another program's stays."""
+    if not plugin_marker() or clone_registered() is not False:
+        return []
+    here = os.path.abspath(__file__)
+
+    def other(path):
+        try:
+            return not os.path.samefile(path, here)
+        except (OSError, ValueError):
+            return not same_folder(path, here)
+    return [r for r in allow if isinstance(r, str) and WAITER_RULE.fullmatch(r)
+            and len(scripts_in(r)) == 1 and other(scripts_in(r)[0]) and nouez_script(scripts_in(r)[0])]
 
 
 SETUP_USAGE = "usage: server.py setup [--dry-run] [--statusline | --remove]"
@@ -16833,18 +16962,25 @@ def run_setup(argv, out=print):
                     out(f"{path} has none of this nouez's allow rules and no status line that runs it.")
             else:
                 missing = [r for r in rules if r not in allow]
+                stale = clone_waiter_rules(allow)
                 if missing:
                     out(f"{would} add to permissions.allow in {path}, so the waiter that brings a consultant's "
                         "reply runs without asking: " + ", ".join(missing))
-                    data.setdefault("permissions", {})["allow"] = allow + missing
                 else:
                     out(f"{path} already lets the waiter run without asking.")
-                changed = bool(missing)
+                if stale:
+                    out(f"{would} take out of permissions.allow in {path} the waiter rules of a clone of nouez, "
+                        "which isn't registered any more: " + ", ".join(stale) + ". A session opened before the "
+                        "clone's registration was removed still runs the clone, and asks before each wait until "
+                        "it is reopened.")
+                if missing or stale:
+                    data.setdefault("permissions", {})["allow"] = [r for r in allow if r not in stale] + missing
+                changed = bool(missing or stale)
             if changed and not dry_run:
                 try:  # the folder is there (checked above), so settings.json is written in it
                     write_settings(settings, data, raw, out)
                 except OSError as e:
-                    out(f"Couldn't change {path}: {e}")
+                    out(f"Couldn't change {path}: {e}{sandbox_hint(e)}")
                     return 1
         finally:
             settings.close()

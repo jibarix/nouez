@@ -65,7 +65,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.30.0 |
+| nouez | 0.30.1 |
 | Claude Code | 2.1.332 |
 | Codex CLI | 0.172.0 |
 | Codex app-server daemon | 0.172.0 |
@@ -88,7 +88,7 @@ claude plugin marketplace add jibarix/nouez
 claude plugin install nouez@nouez
 ```
 
-Then, in a new Claude Code session, run `/nouez:setup`. It shows what it would add to Claude Code's settings (the waiter's allow rules and, if you want it, nouez's status line), asks, then runs `doctor` and offers to set up the phone dispatcher. Do step 4 below for a consultant CLI. After an update, run `/reload-plugins` in one session (or start a new one): that puts the new version in place, and the other open sessions move to it by themselves, the next time nouez has nothing running there ([the plugin](docs/rules.md#rule-plugin-launcher)). With the plugin, a protection can change from a session after a yes in Claude Code's own prompt ([protections](docs/rules.md#rule-protections-behind-the-prompt)). `/nouez:uninstall` takes out what setup added and the dispatcher's sign-in start; `claude plugin uninstall nouez@nouez` removes the plugin. Already registered nouez from a clone? `/nouez:setup` offers to remove that registration, so nouez doesn't run twice.
+Then, in a new Claude Code session, run `/nouez:setup`. It shows what it would add to Claude Code's settings (the waiter's allow rules and, if you want it, nouez's status line), asks, then runs `doctor` and offers to set up the phone dispatcher. Do step 4 below for a consultant CLI. After an update, run `/reload-plugins` in one session (or start a new one): that puts the new version in place, and the other open sessions move to it by themselves, the next time nouez has nothing running there ([the plugin](docs/rules.md#rule-plugin-launcher)). With the plugin, a protection can change from a session after a yes in Claude Code's own prompt ([protections](docs/rules.md#rule-protections-behind-the-prompt)). `/nouez:uninstall` takes out what setup added and the dispatcher's sign-in start; `claude plugin uninstall nouez@nouez` removes the plugin. Already registered nouez from a clone? `/nouez:setup` offers to remove that registration, so nouez doesn't run twice, and then takes the clone's waiter rules out of your settings; sessions opened before that keep the clone's nouez until you reopen them.
 
 ### From a clone
 

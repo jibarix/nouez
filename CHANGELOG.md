@@ -6,6 +6,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.30.1] - 2026-11-27
+
+Fixes from moving this laptop from a clone to the plugin. With the plugin, update with `claude plugin update nouez@nouez`, then `/reload-plugins` and `/nouez:setup` in a Claude Code session at the computer. With a clone, pull, then reconnect `consultants` with `/mcp` in each open Claude Code session; for the phone dispatcher, run `server.py dispatcher setup` and `install` again the way you first did.
+
+### Fixed
+
+- **The dispatcher step of `/nouez:setup` no longer stops at "Access is denied".** Robin runs `/nouez:setup` and says yes to the phone dispatcher: Claude Code's sandbox refused the change to the dispatcher folder's `.claude/settings.json`. The setup skill now says so first and runs that step outside the sandbox, and a refused write names the sandbox as a likely cause.
+- **The phone dispatcher gets this version's instructions.** Robin's dispatcher folder still had the `CLAUDE.md` nouez 0.29.0 wrote, which says protections change only at the computer, so the phone kept refusing a change the plugin allows. `dispatcher setup` now recognises a `CLAUDE.md` an earlier nouez wrote word for word and replaces it, after a dated copy beside it; one the user edited is kept, with the note as before ([dispatcher setup](docs/rules.md#rule-dispatcher-setup)).
+- **The clone's waiter rules go with the clone.** After the clone's registration is removed, `setup` takes the waiter allow rules that run the clone's `server.py` out of Claude Code's user settings (backed up first; another program's `server.py` rule stays), so `doctor` no longer suggests a hand edit ([plugin setup](docs/rules.md#rule-plugin-setup)).
+- **Setup no longer says that sessions on the clone switch by themselves.** Open sessions on the plugin move to a new version by themselves; sessions opened while the clone was registered keep the clone's nouez until reopened, and setup and the README now say so.
+
 ## [0.30.0] - 2026-11-27
 
 nouez installs as a Claude Code plugin, on Windows: `claude plugin marketplace add jibarix/nouez`, `claude plugin install nouez@nouez`, then `/nouez:setup` in a new session. Installed that way, an update reaches open sessions by itself, and a protection can change from the phone after a yes in Claude Code's own prompt. A clone keeps working as before: reconnect `consultants` with `/mcp` in each open session to load 0.30.0.
@@ -895,7 +906,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.30.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.30.1...HEAD
+[0.30.1]: https://github.com/jibarix/nouez/compare/v0.30.0...v0.30.1
 [0.30.0]: https://github.com/jibarix/nouez/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/jibarix/nouez/compare/v0.28.6...v0.29.0
 [0.28.6]: https://github.com/jibarix/nouez/compare/v0.28.5...v0.28.6
