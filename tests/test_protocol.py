@@ -45,6 +45,11 @@ def setUpModule():
 os.environ["NOUEZ_NO_USAGE_LOG"] = "1"
 # Nor run `claude auth status`: whether this machine's sign-in ends soon mustn't change a result.
 os.environ["NOUEZ_NO_LOGIN_CHECK"] = "1"
+# The other switches are set too, off, so no test reads them from a settings file (an environment
+# variable that is set wins); the settings file's own tests clear them.
+SWITCHES_OFF = {spec[0]: "0" for name, spec in server.SWITCHES.items()
+                if name not in ("no_usage_log", "no_login_check")}
+os.environ.update(SWITCHES_OFF)
 
 # Tests never see the user's own Antigravity consultants; AgyTest points this at its own folder.
 _AGY_EMPTY = tempfile.mkdtemp(prefix="nouez-test-agy-")
@@ -87,6 +92,43 @@ def _no_real_window(real):
 server.launch = _no_real_window(server.launch)
 server.launch_console = _no_real_window(server.launch_console)
 
+
+# Nor this computer's own trusted folders, which setup lists when it leaves the projects folders
+# unpicked; the tests of the list use the real one with a state file of their own.
+_REAL_CANDIDATES = server.projects_folder_candidates
+server.projects_folder_candidates = lambda state_file=None: []
+
+_REAL_LOCK, _HOST_OS = server.FileLock._lock, os.name
+
+
+def host_lock(self, fd, on):
+    """FileLock's lock as this computer takes it, in a test that pretends to be another system."""
+    with mock.patch.object(server.os, "name", _HOST_OS):
+        return _REAL_LOCK(self, fd, on)
+
+
+def write_settings(value):
+    """Write nouez's settings file (in the tests' dispatcher folder) as `value`, None to remove it."""
+    path = server.settings_path()
+    if value is None:
+        if os.path.lexists(path):
+            os.remove(path)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(value if isinstance(value, str) else json.dumps(value))
+    server._settings_seen.clear()
+
+
+@contextlib.contextmanager
+def phone_roots(*paths, source="projects", locked=False, env=None, dispatcher=True):
+    """The phone dispatcher (with `dispatcher`), its projects folders `paths` in nouez's settings file,
+    each from `source`, and `env` set; the file is removed after."""
+    write_settings({"roots": {"folders": [{"path": p, "from": source} for p in paths], "locked": locked}})
+    try:
+        with mock.patch.dict(server.os.environ, {**({"NOUEZ_DISPATCHER": "1"} if dispatcher else {}), **(env or {})}):
+            yield
+    finally:
+        write_settings(None)
 
 
 def dir_link(target, link):
@@ -247,7 +289,7 @@ class ProtocolTest(unittest.TestCase):
             self.assertIn("Consult whenever the user asks", result["instructions"])
             result, error = call("tools/list", {"_meta": modern})
             self.assertEqual((result["resultType"], result["ttlMs"]), ("complete", 0))
-            self.assertEqual(result["tools"], server.TOOLS)
+            self.assertEqual(result["tools"], server.listed_tools())
             # The legacy path is unchanged: no resultType, and initialize never offers 2026-07-28.
             self.assertNotIn("resultType", call("tools/list")[0])
             self.assertEqual(call("initialize", {"protocolVersion": "2026-07-28"})[0]["protocolVersion"],
@@ -475,7 +517,7 @@ class ProtocolTest(unittest.TestCase):
     def test_tools_list_schemas_are_objects(self):
         self.handshake()
         tools = self.server.request(7, "tools/list")["result"]["tools"]
-        self.assertEqual({t["name"] for t in tools}, set(server.HANDLERS))
+        self.assertEqual({t["name"] for t in tools}, set(server.HANDLERS) - set(server.DISPATCHER_ONLY_TOOLS))
         for tool in tools:
             self.assertEqual(tool["inputSchema"]["type"], "object")
 
@@ -484,7 +526,7 @@ class ProtocolTest(unittest.TestCase):
         tools = {t["name"]: t["annotations"] for t in self.server.request(8, "tools/list")["result"]["tools"]}
         read_only = {name for name, a in tools.items() if a.get("readOnlyHint")}
         self.assertEqual(read_only, {"ListConsultants", "GetConsultantReply", "GetConsultantHistory", "ListClaudeSessions",
-                                     "ListProjects", "ConsultantBudget"})
+                                     "ListProjects", "ConsultantBudget", "NouezStatus"})
         destructive = {name for name, a in tools.items() if a.get("destructiveHint")}
         self.assertEqual(destructive, {"StopConsultant", "CloseClaudeSession"})
 
@@ -1126,8 +1168,8 @@ class NouezUpdateTest(unittest.TestCase):
 
     def test_opt_out(self):
         for value, off in (("", False), ("0", False), ("false", False), ("1", True), ("yes", True)):
-            self.assertEqual(server.update_check_off({"NOUEZ_NO_UPDATE_CHECK": value}), off)
-        self.assertFalse(server.update_check_off({}))
+            with mock.patch.dict(os.environ, {"NOUEZ_NO_UPDATE_CHECK": value}):
+                self.assertEqual(server.update_check_off(), off)
         with mock.patch.dict(os.environ, {"NOUEZ_NO_UPDATE_CHECK": "1"}), \
              mock.patch.object(server, "latest_release") as latest, \
              mock.patch.object(server.threading, "Thread") as thread:
@@ -1353,9 +1395,10 @@ class TrustTest(unittest.TestCase):
             os.rename(self.repo, os.path.join(self.projects, "moved"))
             dir_link(outside, self.repo)
             return done
-        with mock.patch.dict(server.os.environ, {"NOUEZ_DISPATCHER": "1", "NOUEZ_DISPATCHER_PROJECTS": self.projects}):
+        with phone_roots(self.projects, source="default"):  # not trusted unasked (quiet_trust_root)
             self.open({"cwd": self.repo})  # the report, then the yes
-            with mock.patch.object(server, "trust_folder", swap_after),                     self.assertRaisesRegex(server.BridgeError, "taken back.*backed up in"):
+            with mock.patch.object(server, "trust_folder", swap_after), \
+                    self.assertRaisesRegex(server.BridgeError, "taken back.*backed up in"):
                 self.open({"cwd": self.repo, "trust": True})
         data = self.read()
         self.assertIs(data["projects"][self.slash(self.repo)]["hasTrustDialogAccepted"], False)
@@ -1365,7 +1408,8 @@ class TrustTest(unittest.TestCase):
     def test_the_user_can_turn_trust_writing_off(self):
         """0.22.0: with NOUEZ_NO_TRUST_WRITE=1, nouez never records trust, asked or not."""
         for value, off in (("", False), ("0", False), ("no", False), ("1", True), ("yes", True)):
-            self.assertEqual(server.trust_write_off({"NOUEZ_NO_TRUST_WRITE": value}), off)
+            with mock.patch.dict(os.environ, {"NOUEZ_NO_TRUST_WRITE": value}):
+                self.assertEqual(server.trust_write_off(), off)
         with open(self.state, encoding="utf-8") as f:
             before = f.read()
         with mock.patch.dict(server.os.environ, {"NOUEZ_NO_TRUST_WRITE": "1"}):
@@ -1572,8 +1616,8 @@ class TrustTest(unittest.TestCase):
             with mock.patch.object(server.tempfile, "gettempdir", lambda: fallback),                     mock.patch.object(server, "nouez_cache_dir", side_effect=AssertionError("makes the folder")):
                 self.assertIn("the temporary folder nouez's cache can fall back to", problem(self.projects))
             os.rmdir(linked_config) if os.name == "nt" else os.unlink(linked_config)
-            self.assertIn("records no trust at all", server.dispatcher_trust_problem(
-                self.repo, {"NOUEZ_DISPATCHER": "1", "NOUEZ_DISPATCHER_PROJECTS": self.tmp}))
+            with phone_roots(self.tmp):
+                self.assertIn("records no trust at all", server.dispatcher_trust_problem(self.repo))
             os.rmdir(link) if os.name == "nt" else os.unlink(link)
 
     def test_a_new_folder_is_checked_again_just_before_it_is_made(self):
@@ -1589,8 +1633,7 @@ class TrustTest(unittest.TestCase):
         def approve_and_swap(*args, **kwargs):
             os.rename(parent, os.path.join(self.projects, "moved"))
             dir_link(outside, parent)
-        with mock.patch.dict(server.os.environ, {"NOUEZ_DISPATCHER": "1", "NOUEZ_DISPATCHER_PROJECTS": self.projects,
-                                                 "NOUEZ_ASK_TRUST": "1"}), \
+        with phone_roots(self.projects, env={"NOUEZ_ASK_TRUST": "1"}), \
                 mock.patch.object(server, "user_approves", approve_and_swap):
             with self.assertRaisesRegex(server.BridgeError, "phone dispatcher"):
                 self.open({"cwd": new, "create": True, "trust": True})
@@ -8177,6 +8220,8 @@ class ApprovalRetryTest(unittest.TestCase):
 
     def test_an_update_notice_waits_for_a_result_it_can_go_in(self):
         # Neon N1: an input_required result carries no text, so the notice isn't marked as given.
+        # 0.29.0: in the dispatcher the approval is refused at once instead, and no notice goes with
+        # the refusal; outside it the question is asked as before.
         kept = []
 
         def notice(pending=None):
@@ -8186,17 +8231,22 @@ class ApprovalRetryTest(unittest.TestCase):
         def ask(args, cancel, progress):
             server.user_approves("Go?", "NOUEZ_ASK_TRUST", cancel)
             return "went"
-        with mock.patch.object(server, "in_dispatcher", lambda: True), \
-                mock.patch.object(server, "safe_nouez_update_notice", notice), \
+        with mock.patch.object(server, "safe_nouez_update_notice", notice), \
                 mock.patch.object(server, "start_release_check", lambda *a, **k: None), \
-                mock.patch.dict(server.HANDLERS, {"Ask": ask}), \
-                mock.patch.object(server, "DISPATCHER_TOOLS", ("Ask",)):
+                mock.patch.dict(server.HANDLERS, {"Ask": ask, "Go": lambda a, c, p: "went"}), \
+                mock.patch.object(server, "DISPATCHER_TOOLS", ("Ask", "Go")):
+            with mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER": "1"}):
+                first = self.call("Ask", {})
+                self.assertTrue(first["isError"])
+                self.assertIn("phone dispatcher has none", first["content"][0]["text"])
+                self.assertEqual(kept, [])
+                done = self.call("Go", {})
+                self.assertEqual(done["content"][0]["text"], "went\n\nnouez 9.9 is out")
+                self.assertEqual(kept, [1])
             first = self.call("Ask", {})
             self.assertEqual(first["resultType"], "input_required")
-            self.assertEqual(kept, [])
             done = self.answer(first, "accept", "Ask", {})
-            self.assertEqual(done["content"][0]["text"], "went\n\nnouez 9.9 is out")
-            self.assertEqual(kept, [1])
+            self.assertEqual(done["content"][0]["text"], "went")  # the notice is the dispatcher's
 
 
 class TrustReportFirstTest(unittest.TestCase):
@@ -8246,21 +8296,29 @@ class TrustReportFirstTest(unittest.TestCase):
         self.dir = os.path.join(parent, "repo")
         other = tempfile.mkdtemp(prefix="nouez-test-elsewhere-")
         self.addCleanup(shutil.rmtree, other, True)
-        mark = {"NOUEZ_DISPATCHER": "1"}
         os.mkdir(os.path.join(self.dir, "x"))  # macOS and Linux go through it for `x/..`
-        self.assertIsNone(server.dispatcher_trust_problem(self.dir, {"NOUEZ_DISPATCHER_PROJECTS": other}))
-        self.assertIsNone(server.dispatcher_trust_problem(self.dir, {**mark, "NOUEZ_DISPATCHER_PROJECTS": parent}))
-        for env, says in (({**mark, "NOUEZ_DISPATCHER_PROJECTS": other}, "isn't one"),
-                          ({**mark, "NOUEZ_DISPATCHER_PROJECTS": self.dir}, "isn't one"),
-                          ({**mark, "NOUEZ_DISPATCHER_PROJECTS": os.path.join(self.dir, "x", "..", "..")}, None),
-                          (mark, "can't tell which folder"),
-                          ({**mark, "NOUEZ_DISPATCHER_PROJECTS": "relative"}, "can't tell which folder")):
-            with self.subTest(env=env):
-                problem = server.dispatcher_trust_problem(self.dir, env)
+
+        def problem(folder, *roots, **kw):  # 0.29.0: the projects folders nouez's settings file keeps
+            with phone_roots(*roots, **kw):
+                return server.dispatcher_trust_problem(folder)
+        self.assertIsNone(problem(self.dir, other, dispatcher=False))
+        self.assertIsNone(problem(self.dir, parent))
+        for roots, says in (((other,), "isn't one"), ((self.dir,), "isn't one"),
+                            ((os.path.join(self.dir, "x", "..", ".."),), None),
+                            ((), "no projects folders are picked yet")):
+            with self.subTest(roots=roots):
+                found = problem(self.dir, *roots)
                 if says is None:  # a folder further up still holds it
-                    self.assertIsNone(problem)
+                    self.assertIsNone(found)
                     continue
-                self.assertIn(says, problem)
+                self.assertIn(says, found)
+        self.assertIn("--no-projects", problem(self.dir, locked=True))
+        with mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER": "1"}):
+            for damaged in ("{", json.dumps({"roots": {"folders": [{"path": "relative", "from": "projects"}],
+                                                       "locked": False}})):
+                write_settings(damaged)
+                self.assertIn("can't be read", server.dispatcher_trust_problem(self.dir))
+            write_settings(None)
         # Inside means both as written and with links resolved: a link from outside into the
         # projects folder isn't inside (trust would be kept for the link's path), nor one leading out.
         inner = os.path.join(other, "inner")
@@ -8268,32 +8326,30 @@ class TrustReportFirstTest(unittest.TestCase):
         into, out_of = os.path.join(self.dir, "into"), os.path.join(other, "out-of")
         dir_link(inner, into)
         dir_link(self.dir, out_of)
-        boxed = {**mark, "NOUEZ_DISPATCHER_PROJECTS": other}
-        self.assertIsNone(server.dispatcher_trust_problem(inner, boxed))
-        self.assertIn("isn't one", server.dispatcher_trust_problem(into, boxed))
-        self.assertIn("isn't one", server.dispatcher_trust_problem(out_of, boxed))
+        self.assertIsNone(problem(inner, other))
+        self.assertIn("isn't one", problem(into, other))
+        self.assertIn("isn't one", problem(out_of, other))
         # 0.26.1: spelled exactly as the projects folder is, with no link below it, even one that
         # leads inside, since it could be pointed elsewhere once the trust is kept for its path.
         within = os.path.join(other, "within")
         dir_link(inner, within)
-        self.assertIn("no link below it", server.dispatcher_trust_problem(within, boxed))
-        self.assertIn("isn't one", server.dispatcher_trust_problem(os.path.join(within, "sub"), boxed))
+        self.assertIn("no link below it", problem(within, other))
+        self.assertIn("isn't one", problem(os.path.join(within, "sub"), other))
         # 0.26.3: spelled in another case with no link above it (git keeps a worktree's main checkout
         # as it was typed), the folder on disk counts: on Windows, where case doesn't count, inside.
         respelled = other.replace("nouez-test-elsewhere", "NOUEZ-test-elsewhere")
-        problem = server.dispatcher_trust_problem(os.path.join(respelled, "inner"), boxed)
+        found = problem(os.path.join(respelled, "inner"), other)
         if os.name == "nt":
-            self.assertIsNone(problem)
+            self.assertIsNone(found)
         else:  # realpath keeps the case as written there, and Linux tells the two apart
-            self.assertIn("isn't one", problem)
-        lower = {**mark, "NOUEZ_DISPATCHER_PROJECTS": other[0].lower() + other[1:]}  # a drive letter's case is no spelling
-        self.assertIsNone(server.dispatcher_trust_problem(inner, lower))
+            self.assertIn("isn't one", found)
+        self.assertIsNone(problem(inner, other[0].lower() + other[1:]))  # a drive letter's case is no spelling
         for link in (into, out_of, within):  # the links only, not what they lead to
             os.rmdir(link) if os.name == "nt" else os.unlink(link)
         self.assertTrue(os.path.isdir(inner))
         with mock.patch.object(server, "trust_folder", return_value=(self.dir, None)) as trust, \
                 mock.patch.object(server, "open_window"):
-            with mock.patch.dict(os.environ, {**mark, "NOUEZ_DISPATCHER_PROJECTS": other}):
+            with phone_roots(other):
                 report = server.open_claude_session({"cwd": self.dir})  # the report alone is still given
                 self.assertIn("phone dispatcher", report)
                 self.assertIn("open_untrusted=true", report)
@@ -8305,7 +8361,7 @@ class TrustReportFirstTest(unittest.TestCase):
                     server.open_claude_session({"cwd": new, "create": True, "trust": True})
                 self.assertFalse(os.path.exists(new))  # refused before the folder was made
                 trust.assert_not_called()
-            with mock.patch.dict(os.environ, {**mark, "NOUEZ_DISPATCHER_PROJECTS": parent}):
+            with phone_roots(parent):
                 server.open_claude_session({"cwd": self.dir, "trust": True})
             trust.assert_called_once()
         # A worktree's trust is kept for its main checkout, which is checked too: here the worktree
@@ -8314,7 +8370,7 @@ class TrustReportFirstTest(unittest.TestCase):
         os.mkdir(worktree)
         with mock.patch.object(server, "trust_key", return_value=(self.dir, True)), \
                 mock.patch.object(server, "trust_folder") as trust, \
-                mock.patch.dict(os.environ, {**mark, "NOUEZ_DISPATCHER_PROJECTS": other}):
+                phone_roots(other):
             with self.assertRaisesRegex(server.BridgeError, "isn't one"):
                 server.open_claude_session({"cwd": worktree, "trust": True})
             new = os.path.join(worktree, "new")  # a new folder in it is trusted with that checkout too
@@ -9932,15 +9988,11 @@ class DispatcherTest(unittest.TestCase):
         env = server.dispatcher_env(exe, None, {"PATH": os.path.dirname(exe)})
         self.assertEqual(env["PATH"], os.path.dirname(exe))
         self.assertNotIn("CLAUDE_CONFIG_DIR", env)
+        # 0.29.0: the projects folders are in nouez's settings file, not the environment
         self.assertNotIn("NOUEZ_DISPATCHER_PROJECTS", env)
-        env = server.dispatcher_env(exe, None, {"PATH": ""}, projects=[self.home])
-        self.assertEqual((env["NOUEZ_DISPATCHER"], env["NOUEZ_DISPATCHER_PROJECTS"]), ("1", self.home))
-        # 0.27.0: several, or none, as a JSON list; one stays its path, as a 0.26 supervisor passes it.
-        two = [self.home, self.cache]
-        self.assertEqual(server.dispatcher_env(exe, None, {"PATH": ""}, projects=two)["NOUEZ_DISPATCHER_PROJECTS"],
-                         json.dumps(two))
-        self.assertEqual(server.dispatcher_env(exe, None, {"PATH": ""}, projects=[])["NOUEZ_DISPATCHER_PROJECTS"],
-                         "[]")
+        self.assertEqual(env["NOUEZ_DISPATCHER"], "1")
+        env = server.dispatcher_env(exe, None, {"PATH": "", "NOUEZ_DISPATCHER_PROJECTS": self.home})
+        self.assertNotIn("NOUEZ_DISPATCHER_PROJECTS", env, "one left from an older supervisor isn't passed on")
         # Neither reaches a session the dispatcher opens.
         self.assertFalse({"NOUEZ_DISPATCHER", "NOUEZ_DISPATCHER_PROJECTS"} & set(server.fresh_claude_env(env)))
 
@@ -10039,8 +10091,9 @@ class DispatcherTest(unittest.TestCase):
                                                          new_job=lambda: jobs.append(NoJob()) or jobs[-1]))
         self.assertTrue(claude.ended)
         self.assertTrue(jobs[0].closed)
-        # 0.26.1: its nouez learns the projects folder, the only place it records trust.
-        self.assertEqual(envs[0]["NOUEZ_DISPATCHER_PROJECTS"], os.path.dirname(self.folder))
+        # 0.29.0: its nouez reads the projects folders from nouez's settings file, not the environment.
+        self.assertEqual(envs[0]["NOUEZ_DISPATCHER"], "1")
+        self.assertNotIn("NOUEZ_DISPATCHER_PROJECTS", envs[0])
 
     def test_each_run_has_its_own_job(self):
         jobs = []
@@ -10343,13 +10396,13 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(add(), [])  # no file
         write([])
         self.assertEqual(add(), [])  # never set up
-        new = "mcp__consultants__ListConsultants"
-        earlier = [r for r in server.dispatcher_rules() if r != new]
+        new = [f"mcp__consultants__{t}" for t in server.DISPATCHER_TOOLS_ADDED]  # 0.24.0's and 0.29.0's
+        earlier = [r for r in server.dispatcher_rules() if r not in new]
         write(earlier[1:])
         self.assertEqual(add(), [])  # the user took one out: left to setup
         write(earlier)
-        self.assertEqual(add(), [new])
-        self.assertEqual(allowed(), ["Bash(git status)"] + earlier + [new])
+        self.assertEqual(add(), new)
+        self.assertEqual(allowed(), ["Bash(git status)"] + earlier + new)
         backups = [n for n in os.listdir(os.path.dirname(settings)) if n.endswith(".bak")]
         self.assertEqual(len(backups), 1, backups)
         self.assertEqual(add(), [])  # nothing more to add
@@ -10357,7 +10410,7 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(add(), [])
         self.assertEqual(allowed(), ["Bash(git status)"] + earlier)
         key = server.folder_identity(self.folder)
-        self.assertEqual(json.loads(self.read("dispatcher-rules.json")), {key: [new]})
+        self.assertEqual(json.loads(self.read("dispatcher-rules.json")), {key: new})
         record = os.path.join(self.cache, "dispatcher-rules.json")
         with open(record, "w", encoding="utf-8") as f:
             f.write("{not json")  # notes it can't read: nothing is added, never "no notes"
@@ -10365,9 +10418,9 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(allowed(), ["Bash(git status)"] + earlier)
         self.assertTrue(any("delete it to start again" in line for line in out), out)
         os.remove(record)
-        write(earlier + [new])  # granted by setup or the user: noted, so never added back
+        write(earlier + new)  # granted by setup or the user: noted, so never added back
         self.assertEqual(add(), [])
-        self.assertEqual(json.loads(self.read("dispatcher-rules.json")), {key: [new]})
+        self.assertEqual(json.loads(self.read("dispatcher-rules.json")), {key: new})
         write(earlier)
         self.assertEqual(add(), [])
         os.remove(record)
@@ -10381,13 +10434,14 @@ class DispatcherTest(unittest.TestCase):
         takes it out."""
         code, out = self.setup()
         self.assertEqual(code, 0, out)
-        new = "mcp__consultants__ListConsultants"
+        new = [f"mcp__consultants__{t}" for t in server.DISPATCHER_TOOLS_ADDED]
         self.assertEqual(json.loads(self.read("dispatcher-rules.json")),
-                         {server.folder_identity(self.folder): [new]})
+                         {server.folder_identity(self.folder): new})
         settings = os.path.join(self.folder, ".claude", "settings.json")
         with open(settings, encoding="utf-8") as f:
             data = json.load(f)
-        data["permissions"]["allow"].remove(new)
+        for rule in new:
+            data["permissions"]["allow"].remove(rule)
         with open(settings, "w", encoding="utf-8") as f:
             json.dump(data, f)
         self.assertEqual(server.add_missing_dispatcher_rules(self.folder, lambda line: None), [])
@@ -10400,21 +10454,22 @@ class DispatcherTest(unittest.TestCase):
         return code, "\n".join(out)
 
     def test_setup_and_install_refuse_a_projects_folder_holding_claude_codes_settings(self):
-        """0.26.3: the folder that holds the dispatcher's is where the phone can record trust, so
-        setup refuses one that holds Claude Code's settings folder, and install lists it as a problem."""
+        """0.26.3: a projects folder holding Claude Code's settings folder could let the phone trust
+        that settings folder, so setup and install refuse one named with --projects. 0.29.0: when the
+        folder above the dispatcher's holds it, a bare setup sets up with no projects folders picked."""
         settings = os.path.join(self.projects, ".claude")
         with mock.patch.object(server, "claude_config_dir", lambda: settings):
+            code, out = self.setup(projects=[self.projects])
+            self.assertEqual(code, 1, out)
+            self.assertIn("Claude Code's settings folder", out)
+            self.assertFalse(os.path.exists(self.folder))
             code, out = self.setup()
+            self.assertEqual(code, 0, out)
+            self.assertIn("No projects folders are picked yet", out)
+            self.assertEqual(server.recorded_roots(), {"folders": [], "locked": False})
+            code, out, ran, popen = self.install("linux", projects=[self.projects])
         self.assertEqual(code, 1, out)
         self.assertIn("Claude Code's settings folder", out)
-        self.assertIn("--projects DIR", out)
-        self.assertIn("--no-projects", out)
-        self.assertFalse(os.path.exists(self.folder))
-        self.assertEqual(self.setup()[0], 0)
-        with mock.patch.object(server, "claude_config_dir", lambda: settings):
-            code, out, ran, popen = self.install("linux")
-        self.assertEqual(code, 1, out)
-        self.assertIn("--projects", out)  # 0.27.0: names the folders, or --no-projects
         popen.assert_not_called()
 
     def test_setup_makes_the_folder_its_instructions_and_rules(self):
@@ -10425,7 +10480,7 @@ class DispatcherTest(unittest.TestCase):
         # 0.27.0: no folder in it; ListProjects names the projects folders.
         self.assertIn("directly inside one of the projects\n  folders `ListProjects` names", md)
         self.assertNotIn(self.projects, md)
-        self.assertIn(f"The phone can open and trust projects inside {self.projects}.", out)
+        self.assertIn(f"The phone can open and trust projects inside {self.projects} (the install default).", out)
         # 0.26.1: the rules the code doesn't hold, in the words the dispatcher gets.
         self.assertIn("If it isn't\ninside one of the projects folders `ListProjects` names, or nouez can't tell, "
                       "decline.", md)
@@ -10683,19 +10738,18 @@ class DispatcherTest(unittest.TestCase):
         for seen, stops, want, started in ((["other", True], True, True, 2), (["other"], False, None, 1),
                                            ([False, False, False], True, False, 3)):
             starts, out = [], []
-            with mock.patch.object(server, "wait_for_supervisor", lambda *a, others, projects: seen.pop(0)), \
+            with mock.patch.object(server, "wait_for_supervisor", lambda *a, others: seen.pop(0)), \
                     mock.patch.object(server, "stop_dispatcher", lambda out: stops):
                 result = server.start_new_supervisor(lambda: starts.append(7) or 7, self.folder, None, 0, False,
                                                      out.append)
             self.assertIs(result, want, out)
             self.assertEqual(len(starts), started)
-            self.assertEqual(any("set up differently (another folder, projects folders or profile) took the lock" in line for line in out), started < 3)
+            self.assertEqual(any("set up differently (another folder or profile) took the lock" in line for line in out), started < 3)
             self.assertEqual(any("that supervisor didn't stop" in line for line in out), not stops)
         self.assertIsNone(server.start_new_supervisor(lambda: False, self.folder, None, 0, False, print))
         # the one asked to stop leaves its record until the new one writes its own: it isn't stopped too
         other = {"pid": 5, "since": 100.0, "folder": self.home, "config_dir": None, "sign_in": True, "phase": "starting"}
-        new = dict(other, pid=7, since=101.0, folder=self.folder, projects=[os.path.dirname(self.folder)],
-                   projects_given=False, script=os.path.abspath(server.__file__))
+        new = dict(other, pid=7, since=101.0, folder=self.folder, script=os.path.abspath(server.__file__))
         records = iter([other, dict(other, phase="stopped"), other, new])
         stopped = []
         with mock.patch.object(server, "dispatcher_status", lambda: (True, next(records))), \
@@ -10910,6 +10964,7 @@ class DispatcherTest(unittest.TestCase):
                 mock.patch.object(server, "windows_account", lambda: ("S-1-5-21-1", "PC\\me")), \
                 mock.patch.object(server, "system_program", lambda name: name), \
                 mock.patch.object(server, "dispatcher_change_lock", lambda dry_run: contextlib.nullcontext()), \
+                mock.patch.object(server.FileLock, "_lock", host_lock), \
                 mock.patch.dict(server.os.environ, env, clear=True), \
                 mock.patch.object(server, "run_status", run_status), \
                 mock.patch.object(server.subprocess, "Popen") as popen, \
@@ -11359,13 +11414,15 @@ class ProjectsFoldersTest(unittest.TestCase):
         missing = problem(os.path.join(self.home, "nope", "dispatcher"), None)
         self.assertIn("doesn't exist", missing)
         self.assertIn("--projects", missing)
-        unfit = problem(os.path.join(tempfile.gettempdir(), "dispatcher"), None)
-        self.assertIn("Without --projects", unfit)
-        self.assertIn("--no-projects", unfit)
+        # 0.29.0: one that can't hold trust is no reason to refuse; setup records none picked
+        unfit = os.path.join(tempfile.gettempdir(), "dispatcher")
+        self.assertIsNone(problem(unfit, None))
+        self.assertEqual(server.initial_roots(unfit, None), {"folders": [], "locked": False})
 
     def test_without_a_projects_folder_the_dispatcher_goes_in_nouezs_own(self):
-        """No ~/Projects: the dispatcher's folder is ~/.nouez/dispatcher, setup asks for the
-        projects folders (or none) and makes ~/.nouez; a later ~/Projects doesn't move it."""
+        """No ~/Projects: the dispatcher's folder is ~/.nouez/dispatcher, and setup makes ~/.nouez; a
+        later ~/Projects doesn't move it. 0.29.0: a bare setup there sets up with no projects folders
+        picked, listing the folders that look like they hold projects."""
         home = os.path.join(self.home, "h")
         os.mkdir(home)
         a, = self.roots("work")
@@ -11373,37 +11430,32 @@ class ProjectsFoldersTest(unittest.TestCase):
             folder = self.real_default_folder()
             self.assertEqual(folder, os.path.join(home, ".nouez", "dispatcher"))
             out = []
-            self.assertEqual(server.dispatcher_setup(folder, out=out.append), 1)
-            self.assertIn("--projects", "\n".join(out))
-            self.assertFalse(os.path.exists(os.path.join(home, ".nouez")))
-            out = []
             self.assertEqual(server.dispatcher_setup(folder, dry_run=True, out=out.append, projects=[a]), 0, out)
             self.assertIn(f"Would make {os.path.join(home, '.nouez')}.", out)
             self.assertFalse(os.path.exists(os.path.join(home, ".nouez")))
+            self.assertIsNone(server.recorded_roots(), "a dry run records nothing")
             out = []
             self.assertEqual(server.dispatcher_setup(folder, out=out.append, projects=[a]), 0, out)
             self.assertTrue(os.path.isfile(os.path.join(folder, "CLAUDE.md")))
-            self.assertIn(f"The phone can open and trust projects inside {a}.", out)
-            self.assertTrue(any(server.shlex.join(["--projects", a]) in line for line in out), out)
+            self.assertIn(f"The phone can open and trust projects inside {a} (--projects).", out)
+            self.assertEqual(server.recorded_roots(), {"folders": [{"path": a, "from": "projects"}], "locked": False})
             os.mkdir(os.path.join(home, "Projects"))
             self.assertEqual(self.real_default_folder(), folder, "a dispatcher set up there stays the default")
             shutil.rmtree(os.path.join(home, ".nouez"))
-            # 0.28 (#2): a new install goes in ~/.nouez/dispatcher even with a ~/Projects, and a bare
-            # setup lists the folders that look like they hold projects, choosing none.
+            write_settings(None)
+            # 0.28 (#2): a new install goes in ~/.nouez/dispatcher even with a ~/Projects
             self.assertEqual(self.real_default_folder(), folder)
             out = []
-            self.assertEqual(server.dispatcher_setup(folder, out=out.append), 1)
+            with mock.patch.object(server, "projects_folder_candidates", _REAL_CANDIDATES), \
+                    mock.patch.object(server, "trusted_folders", lambda state_file=None: {}):
+                self.assertEqual(server.dispatcher_setup(folder, out=out.append), 0, out)
             said = "\n".join(out)
             self.assertNotIn("doesn't exist. Make it", said)  # Neon: ~/.nouez is made by setup, not the user
+            self.assertIn("No projects folders are picked yet", said)
             self.assertIn(f"  {os.path.join(home, 'Projects')} (0 trusted projects)", said)
-            self.assertFalse(os.path.exists(os.path.join(home, ".nouez")))
-            os.mkdir(os.path.join(home, ".nouez"))
-            os.mkdir(os.path.join(home, ".nouez", "dispatcher"))
+            self.assertEqual(server.recorded_roots(), {"folders": [], "locked": False})
             os.mkdir(os.path.join(home, "Projects", "dispatcher"))
             self.assertEqual(self.real_default_folder(), folder, "a folder that merely appears doesn't take its place")
-            with open(os.path.join(folder, "CLAUDE.md"), "w"):
-                pass
-            self.assertEqual(self.real_default_folder(), folder)
             with open(os.path.join(home, "Projects", "dispatcher", "CLAUDE.md"), "w"):
                 pass
             self.assertEqual(self.real_default_folder(), os.path.join(home, "Projects", "dispatcher"),
@@ -11427,9 +11479,10 @@ class ProjectsFoldersTest(unittest.TestCase):
         with open(state, "w", encoding="utf-8") as f:
             json.dump({"projects": {p: {"hasTrustDialogAccepted": True} for p in trusted}}, f)
         with mock.patch.object(server.os.path, "expanduser", side_effect=lambda p: p.replace("~", top)):
-            got = server.projects_folder_candidates(state)
+            got = _REAL_CANDIDATES(state)
         self.assertEqual(got, [(work, 3), (os.path.join(top, "code"), 2)])
-        text = server.pick_projects_text(os.path.join(top, ".nouez", "dispatcher"), state)
+        with mock.patch.object(server, "projects_folder_candidates", _REAL_CANDIDATES):
+            text = server.pick_projects_text(os.path.join(top, ".nouez", "dispatcher"), state)
         self.assertIn("nothing is chosen for you", text)
 
     def test_setup_offers_the_status_line_and_adds_it_only_on_a_yes(self):
@@ -11486,48 +11539,67 @@ class ProjectsFoldersTest(unittest.TestCase):
             server.dispatcher_options(["--statusline"], {"folder"})  # install has no --statusline
 
     def test_setup_and_install_with_several_projects_folders(self):
+        """0.29.0: setup records them in nouez's settings file, and install keeps them without the flags."""
         a, b = self.roots("work", "Mes projets \u00e9")
         code, out = self.setup(projects=[a, b])
         self.assertEqual(code, 0, out)
-        self.assertIn(f"The phone can open and trust projects inside {a}, {b}.", out)
-        self.assertIn(server.shlex.join(["server.py", "dispatcher", "install", "--projects", a, "--projects", b]),
-                      out)
+        self.assertIn(f"The phone can open and trust projects inside {a} (--projects), {b} (--projects).", out)
+        self.assertIn("Then: `server.py dispatcher install` starts it at sign-in.", out)
         with open(os.path.join(self.folder, "CLAUDE.md"), encoding="utf-8") as f:
             self.assertIsNone(server.dispatcher_md_note(self.folder), f.read())
-        code, out, ran, popen = self.install("linux", projects=[a, b])
+        both = {"folders": [{"path": a, "from": "projects"}, {"path": b, "from": "projects"}], "locked": False}
+        self.assertEqual(server.recorded_roots(), both)
+        code, out, ran, popen = self.install("linux")
         self.assertEqual(code, 0, out)
         argv = popen.call_args[0][0]
-        self.assertEqual(argv[argv.index("--folder") + 2:],
-                         ["--projects", a.replace("\\", "/"), "--projects", b.replace("\\", "/"), "--sign-in"])
+        self.assertEqual(argv[argv.index("--folder") + 2:], ["--sign-in"], "the command names no projects folders")
+        self.assertEqual(server.recorded_roots(), both)
         code, out, ran, popen = self.install("linux", projects=[a, a])
         self.assertEqual(code, 1, out)
         self.assertIn("the same folder as", out)
         popen.assert_not_called()
+        self.assertEqual(server.recorded_roots(), both)
 
     def test_setup_and_install_with_no_projects_folders(self):
         code, out = self.setup(projects=[])
         self.assertEqual(code, 0, out)
         self.assertIn("With --no-projects", out)
-        self.assertIn("server.py dispatcher install --no-projects", out)
-        code, out, ran, popen = self.install("linux", projects=[])
+        self.assertIn("Then: `server.py dispatcher install` starts it at sign-in.", out)
+        self.assertEqual(server.recorded_roots(), {"folders": [], "locked": True})
+        code, out, ran, popen = self.install("linux")
         self.assertEqual(code, 0, out)
-        self.assertEqual(popen.call_args[0][0][-2:], ["--no-projects", "--sign-in"])
+        self.assertIn("With --no-projects", out)
+        self.assertEqual(popen.call_args[0][0][-1:], ["--sign-in"])
+        self.assertNotIn("--no-projects", popen.call_args[0][0])
 
     def test_install_keeps_the_projects_folders_it_was_given(self):
+        """0.29.0: install without --projects or --no-projects keeps the projects folders nouez's
+        settings file records; with none recorded, copies those a running supervisor from before
+        0.29 was started with (its dispatcher.json), else the install default; the flags replace them."""
         a, b = self.roots("work", "more")
-        self.setup()
-        self.write_state(projects=[a], projects_given=True)
-        code, out, ran, popen = self.install_beside_running("linux")
+        self.setup(projects=[a])
+        one = {"folders": [{"path": a, "from": "projects"}], "locked": False}
+        code, out, ran, popen = self.install("linux")
         self.assertEqual(code, 0, out)
-        self.assertIn(f"keeps the projects folders it was given: {a}.", out)
-        self.assertEqual(popen.call_args[0][0][-3:], ["--projects", a.replace("\\", "/"), "--sign-in"])
+        self.assertIn(f"inside {a} (--projects).", out)
+        self.assertEqual(server.recorded_roots(), one)
         code, out, ran, popen = self.install("linux", projects=[b])  # named ones replace them
-        self.assertNotIn("keeps", out)
-        self.assertEqual(popen.call_args[0][0][-3:], ["--projects", b.replace("\\", "/"), "--sign-in"])
-        self.write_state(projects=[], projects_given=True)
-        code, out, ran, popen = self.install_beside_running("linux")
-        self.assertIn("it was given: none (--no-projects).", out)
-        self.assertEqual(popen.call_args[0][0][-2:], ["--no-projects", "--sign-in"])
+        self.assertIn(f"inside {b} (--projects).", out)
+        code, out, ran, popen = self.install("linux", projects=[])
+        self.assertEqual(server.recorded_roots(), {"folders": [], "locked": True})
+        self.assertIn("With --no-projects", self.install("linux")[1])
+        write_settings({"switches": {"no_usage_log": True}})  # a settings file that keeps no projects folders
+        for given, want in (([a], one), ([], {"folders": [], "locked": True}),
+                            ([self.projects], {"folders": [{"path": self.projects, "from": "projects"}],
+                                               "locked": False})):
+            with self.subTest(given=given):
+                write_settings({"switches": {"no_usage_log": True}})
+                self.write_state(projects=given, projects_given=True, script=os.path.abspath(server.__file__))
+                code, out, ran, popen = self.install_beside_running("linux")
+                self.assertEqual(code, 0, out)
+                self.assertEqual(server.recorded_roots(), want)
+                self.assertTrue(server.read_settings()[0]["switches"]["no_usage_log"], "the switches stay")
+        default = {"folders": [{"path": self.projects, "from": "default"}], "locked": False}
         for state in ({"projects": [self.projects], "projects_given": False},  # the folder above, as by default
                       {"projects": [a], "projects_given": True, "folder": os.path.join(a, "dispatcher")},
                       {"projects": ["relative"], "projects_given": True},
@@ -11536,35 +11608,26 @@ class ProjectsFoldersTest(unittest.TestCase):
                       {"projects": [a], "projects_given": True, "phase": "stopped"},
                       {"projects": [os.path.join(a, str(i)) for i in range(21)], "projects_given": True}):
             with self.subTest(state=state):
+                write_settings(None)
                 self.write_state(**state)
                 code, out, ran, popen = self.install_beside_running("linux")
                 self.assertEqual(code, 0, out)
-                self.assertNotIn("keeps", out)
-                self.assertNotIn("--projects", popen.call_args[0][0])
+                self.assertEqual(server.recorded_roots(), default)
+        write_settings(None)
         self.write_state(projects=[a], projects_given=True)
         code, out, ran, popen = self.install("linux")  # a supervisor that has stopped is no guide
         self.assertEqual(code, 0, out)
-        self.assertNotIn("--projects", popen.call_args[0][0])
-        code, out, ran, popen = self.install_beside_running("linux", changed={"projects": [b], "projects_given": True})
-        self.assertEqual(code, 1, out)
-        self.assertIn("the running dispatcher changed while install was checking", out)
-        popen.assert_not_called()
-        self.write_state(projects=[self.projects], projects_given=False)  # nothing to keep at first
-        code, out, ran, popen = self.install_beside_running("linux", changed={"projects": [], "projects_given": True})
-        self.assertEqual(code, 1, out)
-        self.assertIn("the running dispatcher changed while install was checking", out)
-        popen.assert_not_called()
+        self.assertEqual(server.recorded_roots(), default)
 
-    def install_beside_running(self, platform, changed=None, **kw):
-        """install while dispatcher.json's supervisor runs; `changed`: what it records once
-        install holds the lock, as when another install replaced it meanwhile."""
+    def install_beside_running(self, platform, **kw):
+        """install while dispatcher.json's supervisor runs, until install has asked once."""
         with open(os.path.join(self.cache, "dispatcher.json"), encoding="utf-8") as f:
             first = json.load(f)
         calls = []
 
         def status():
             calls.append(1)
-            return (True, first) if len(calls) == 1 else (len(calls) == 2, dict(first, **(changed or {})))
+            return len(calls) == 1, first
         with mock.patch.object(server, "dispatcher_status", status):
             return self.install(platform, **kw)
 
@@ -11575,21 +11638,15 @@ class ProjectsFoldersTest(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("longer than 40 characters", out)
         popen.assert_not_called()
-        long = [os.path.join("C:\\" if os.name == "nt" else "/", "p" * 200, str(i)) for i in range(20)]
-        argv = server.dispatcher_command(sys.executable, self.folder, None, long)
-        self.assertLess(len(subprocess.list2cmdline(argv)), server.DISPATCHER_COMMAND_MAX)
 
     def test_the_command_and_its_shape(self):
         a, b = self.roots("a", "b c")
         argv = server.dispatcher_command(sys.executable, self.folder, None, [a, b])
         self.assertEqual(argv[6:], [self.folder, "--projects", a, "--projects", b, "--sign-in"])
         self.assertTrue(server.dispatcher_argv_ours(argv))
-        self.assertEqual(server.command_projects(argv), [a, b])
         none = server.dispatcher_command(sys.executable, self.folder, self.home, [])
         self.assertEqual(none[7:], ["--no-projects", "--config-dir", self.home, "--sign-in"])
         self.assertTrue(server.dispatcher_argv_ours(none))
-        self.assertEqual(server.command_projects(none), [])
-        self.assertIsNone(server.command_projects(server.dispatcher_command(sys.executable, self.folder)))
         ours = server.dispatcher_argv_ours
         base = ["/usr/bin/python3", "-I", "/opt/nouez/server.py", "dispatcher", "run", "--folder",
                 "/home/me/Projects/dispatcher"]
@@ -11619,79 +11676,90 @@ class ProjectsFoldersTest(unittest.TestCase):
         self.assertFalse(ours(wbase + ["--projects", "\\work", "--sign-in"], windows=True))
 
     def test_the_environment_and_trust_with_several_roots(self):
+        """0.29.0: the dispatcher's projects folders come from nouez's settings file; outside the
+        dispatcher they play no part."""
         a, b, c = self.roots("a", "b", "c")
         inside = []
         for root in (a, b, c):
             inside.append(os.path.join(root, "p"))
             os.mkdir(inside[-1])
-        mark, var = {"NOUEZ_DISPATCHER": "1"}, "NOUEZ_DISPATCHER_PROJECTS"
-        env = {**mark, var: json.dumps([a, b])}
-        self.assertEqual(server.dispatcher_projects(env), [a, b])
-        self.assertEqual(server.dispatcher_projects({**mark, var: "[]"}), [])
-        self.assertIsNone(server.dispatcher_projects(mark))
-        self.assertIsNone(server.dispatcher_projects({**mark, var: ""}))
-        self.assertIsNone(server.dispatcher_projects({**mark, var: json.dumps([a, "relative"])}))
-        for bad in ("[", "[1]", '{"a": 1}', "relative"):
-            self.assertIsNone(server.dispatcher_projects({**mark, var: bad}), bad)
-        legacy = a + os.pathsep + b  # one folder, as a 0.26 supervisor passes it, never split
-        self.assertEqual(server.dispatcher_projects({**mark, var: legacy}), [legacy])
-        self.assertIsNone(server.dispatcher_projects({var: a}), "outside the dispatcher")
         trust = server.dispatcher_trust_problem
-        self.assertIsNone(trust(inside[0], env))
-        self.assertIsNone(trust(inside[1], env))
-        refused = trust(inside[2], env)
-        self.assertIn(f"one of {a}, {b}", refused)
-        self.assertIn("isn't one", refused)
-        self.assertIn("--no-projects", trust(inside[0], {**mark, var: "[]"}))
-        self.assertIn("isn't one", trust(inside[0], {**mark, var: legacy}), "a 0.26 folder isn't split in two")
-        self.assertIn("can't tell which folders those are", trust(inside[0], mark))
+        with phone_roots(a, b):
+            self.assertIsNone(trust(inside[0]))
+            self.assertIsNone(trust(inside[1]))
+            refused = trust(inside[2])
+            self.assertIn(f"one of {a}, {b}", refused)
+            self.assertIn("isn't one", refused)
+            with mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER_PROJECTS": c}):
+                self.assertIn("isn't one", trust(inside[2]), "the old variable plays no part")
+        with phone_roots(a, b, dispatcher=False):
+            self.assertIsNone(trust(inside[2]), "outside the dispatcher")
+        with phone_roots(locked=True):
+            self.assertIn("--no-projects", trust(inside[0]))
+        with phone_roots():
+            self.assertIn("no projects folders are picked yet", trust(inside[0]))
         temp = tempfile.gettempdir()
-        self.assertIsNone(trust(inside[0], {**mark, var: json.dumps([temp, a])}),
-                          "a projects folder that can't hold trust is passed over, not the others")
-        self.assertIn("isn't one", trust(os.path.join(self.home, "x"), {**mark, var: json.dumps([temp, a])}))
-        self.assertIn("records no trust at all", trust(inside[0], {**mark, var: temp}))
-        self.assertIn("none of whose projects folders",
-                      trust(inside[0], {**mark, var: json.dumps([temp, os.path.abspath(os.sep)])}))
+        with phone_roots(temp, a):
+            self.assertIsNone(trust(inside[0]), "a projects folder that can't hold trust is passed over, not the others")
+            self.assertIn("isn't one", trust(os.path.join(self.home, "x")))
+        with phone_roots(temp):
+            self.assertIn("records no trust at all", trust(inside[0]))
+        with phone_roots(temp, os.path.abspath(os.sep)):
+            self.assertIn("none of whose projects folders", trust(inside[0]))
 
-    def test_wait_for_supervisor_knows_it_by_its_projects_folders_too(self):
+    def test_wait_for_supervisor_knows_it_by_its_server(self):
+        """0.29.0: the projects folders are in nouez's settings file, not the supervisor's command, so
+        install knows the one it started by its folder, profile and server.py."""
         a, = self.roots("a")
         state = {"pid": 7, "since": 10.0, "folder": self.folder, "config_dir": None, "sign_in": True,
                  "phase": "running", "projects": [a], "projects_given": True,
                  "script": os.path.abspath(server.__file__)}
         with mock.patch.object(server, "dispatcher_status", lambda: (True, dict(state))):
             wait = server.wait_for_supervisor
-            self.assertIs(wait(self.folder, None, 5, projects=[a], seconds=0), True)
-            self.assertEqual(wait(self.folder, None, 5, projects=[], seconds=0), "other")
-            self.assertEqual(wait(self.folder, None, 5, seconds=0), "other")
-            state["projects"] = [self.projects]  # the folder above, but named: another command
-            self.assertEqual(wait(self.folder, None, 5, seconds=0), "other")
-            self.assertIs(wait(self.folder, None, 5, projects=[self.projects], seconds=0), True)
-            state["projects_given"] = False
             self.assertIs(wait(self.folder, None, 5, seconds=0), True)
+            del state["projects"]
+            self.assertIs(wait(self.folder, None, 5, seconds=0), True)
+            self.assertEqual(wait(self.folder, self.home, 5, seconds=0), "other")
             state["script"] = os.path.join(self.home, "old", "server.py")  # another clone's
-            self.assertEqual(wait(self.folder, None, 5, seconds=0), "other")
-            state["script"] = os.path.abspath(server.__file__)
-            del state["projects"]  # one from before 0.27
             self.assertEqual(wait(self.folder, None, 5, seconds=0), "other")
 
     def test_dispatcher_status_keeps_the_spelling_of_the_projects_folders(self):
         a, = self.roots("Mixed Case")
         out = []
-        with mock.patch.object(server, "dispatcher_status", lambda: (True, {"folder": self.folder, "projects": [a]})), \
+        with mock.patch.object(server, "dispatcher_status",
+                               lambda: (True, {"folder": self.folder, "projects": [a], "projects_given": True})), \
                 mock.patch.object(server, "dispatcher_installed", lambda check_off=True, want=None: "yes"):
             server.dispatcher_status_text(out=out.append)
-        self.assertIn(f"Projects folders (trust can be recorded inside): {a}", out)
+        self.assertIn(f"Projects folders (trust can be recorded inside): {a} (--projects)", out)
 
     def test_the_supervisor_records_its_projects_folders_and_its_server(self):
-        a, = self.roots("a")
-        value = server.DispatcherState(self.folder, projects=[a]).value
-        self.assertEqual((value["projects"], value["projects_given"]), ([a], True))
-        self.assertEqual(value["script"], os.path.abspath(server.__file__))
+        """0.29.0: the supervisor records its server.py in dispatcher.json, and the projects folders a
+        sign-in start from before 0.29 names in nouez's settings file, only when that keeps none."""
+        a, b = self.roots("a", "b")
         value = server.DispatcherState(self.folder).value
-        self.assertEqual((value["projects"], value["projects_given"]), ([self.projects], False))
-        self.assertIn(a, server.projects_text([a]))
-        self.assertIn("--no-projects", server.projects_text([]))
-
+        self.assertEqual(value["script"], os.path.abspath(server.__file__))
+        self.assertNotIn("projects", value)
+        one = {"folders": [{"path": a, "from": "projects"}], "locked": False}
+        with mock.patch.object(server, "supervisor_job", lambda: (None, None)), \
+                mock.patch.object(server, "dispatcher_may_start", lambda *args: False):
+            self.assertEqual(server.run_dispatcher_supervisor(self.folder, None, True, [a]), 0)
+            self.assertEqual(server.recorded_roots(), one)
+            self.assertEqual(server.run_dispatcher_supervisor(self.folder, None, True, [b]), 0)
+            self.assertEqual(server.recorded_roots(), one, "those the file keeps stay")
+            # Sam updates with git pull and signs in again before `install`: the 0.28 sign-in start
+            # names no --projects, and the last supervisor's dispatcher.json still says which it ran with
+            write_settings(None)
+            self.write_state(projects=[a], projects_given=True)
+            self.assertEqual(server.run_dispatcher_supervisor(self.folder, None, True, None), 0)
+            self.assertEqual(server.recorded_roots(), one, "copied before the new record replaces it")
+            write_settings(None)  # after `settings reset`, a 0.29 record holds none: they stay unpicked
+            self.assertEqual(server.run_dispatcher_supervisor(self.folder, None, True, None), 0)
+            self.assertIsNone(server.recorded_roots())
+            # after the reset, a sign-in start installed before 0.29 with --projects records them again, as reset says
+            self.assertEqual(server.run_dispatcher_supervisor(self.folder, None, True, [a]), 0)
+            self.assertEqual(server.recorded_roots(), one)
+        self.assertIn(a, server.projects_text(one))
+        self.assertIn("--no-projects", server.projects_text({"folders": [], "locked": True}))
 
 class ListProjectsFoldersTest(unittest.TestCase):
     """0.27.0: in the dispatcher, ListProjects lists each projects folder. 0.28: its `recent` list is
@@ -11712,10 +11780,14 @@ class ListProjectsFoldersTest(unittest.TestCase):
                       mock.patch.object(server, "claude_sessions", return_value=[]),
                       mock.patch.object(server, "claude_state_file", lambda env=None: self.state),
                       mock.patch.object(server, "claude_config_dir", lambda: os.path.join(self.base, "claude")),
-                      mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER": "1",
-                                                   "NOUEZ_DISPATCHER_PROJECTS": json.dumps([self.a, self.b])})):
+                      mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER": "1"})):
             patch.start()
             self.addCleanup(patch.stop)
+        self.roots(self.a, self.b)
+        self.addCleanup(write_settings, None)
+
+    def roots(self, *paths, locked=False):
+        write_settings({"roots": {"folders": [{"path": p, "from": "projects"} for p in paths], "locked": locked}})
 
     def chat(self, cwd, when, session="s1", ran_in=None):
         folder = server.transcript_folder(cwd)
@@ -11735,12 +11807,17 @@ class ListProjectsFoldersTest(unittest.TestCase):
             out = server.list_projects({})
         self.assertIn("- … and more, not listed", out)
         self.assertNotIn("- quiet [", out)
-        with mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER_PROJECTS": json.dumps([self.a, "/gone" if os.name != "nt" else "C:\\gone-nouez"])}):
-            out = server.list_projects({})
+        self.roots(self.a, "/gone" if os.name != "nt" else "C:\\gone-nouez")
+        out = server.list_projects({})
         self.assertIn("- alpha [", out)
         self.assertIn("isn't a folder", out)
-        with mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER_PROJECTS": "[]"}):
-            self.assertIn("set up with no projects folders", server.list_projects({}))
+        self.roots(locked=True)
+        self.assertIn("set up with no projects folders", server.list_projects({}))
+        self.roots()
+        self.assertIn("No projects folders are picked yet", server.list_projects({}))
+        write_settings("{")
+        self.assertIn("can't be read", server.list_projects({}))
+        self.roots(self.a, self.b)
         self.assertIn("- gamma [", server.list_projects({"folder": self.b}), "folder still lists one")
 
     def test_a_transcript_ran_in_the_same_folder_not_one_spelled_alike(self):
@@ -11933,6 +12010,875 @@ class CwdDefaultTest(unittest.TestCase):
                     self.assertEqual(daemon.calls.count("thread/start"), 1)
                     self.assertEqual(daemon.thread_started["cwd"], os.path.abspath(requested))
                     self.assertTrue(result.startswith("Started "), result)
+
+
+
+def tool_text(respond):
+    """The text of the tool result a mocked respond was given."""
+    return respond.call_args[0][1]["content"][0]["text"]
+
+
+def tool_call(name, arguments, msg_id=1):
+    return {"jsonrpc": "2.0", "id": msg_id, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+
+
+PROTECTIONS = ("no_trust_write", "ask_trust", "no_user_sessions", "ask_user_session")
+
+
+class SettingsFileTest(unittest.TestCase):
+    """0.29.0: nouez's settings file (docs/rules.md: settings-file, protections-at-the-computer). The
+    switches' environment variables, set for every other test, are cleared here so the file is read."""
+    dispatcher_setUp = DispatcherTest.setUp
+
+    def setUp(self):
+        self.dispatcher_setUp()
+        clear = mock.patch.dict(os.environ, {spec[0]: "" for spec in server.SWITCHES.values()})
+        clear.start()
+        self.addCleanup(clear.stop)
+        server._settings_seen.clear()
+        self.addCleanup(server._settings_seen.clear)
+        self.path = server.settings_path()
+
+    def saved(self):
+        with open(self.path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_settings_file_and_the_environment(self):
+        """Lee turns the usage log off from the phone, and the next consultation logs nothing. With
+        NOUEZ_NO_AUTO_CONSULT=0 in nouez's MCP registration, turning that switch on says the
+        environment wins and where to change it. The file is read again whenever it changes."""
+        self.assertEqual(server.switch_setting("no_usage_log"), (False, "default"))
+        self.assertFalse(os.path.lexists(self.path))
+        out = server.nouez_settings({"action": "set", "name": "no_usage_log", "on": True})
+        self.assertIn("no_usage_log is now on in nouez's settings file; it applies from the next call.", out)
+        self.assertNotIn("environment", out)
+        self.assertEqual(self.saved(), {"switches": {"no_usage_log": True}})
+        self.assertEqual(server.switch_setting("no_usage_log"), (True, "settings file"))
+        log = os.path.join(self.cache, "usage-test.jsonl")
+        server.record_usage({"event": "send"}, path=log)  # the next consultation
+        self.assertFalse(os.path.exists(log))
+        with open(self.path, "w", encoding="utf-8") as f:  # changed by hand: read again
+            json.dump({"switches": {"no_usage_log": False, "review_rounds_stop": True}}, f)
+        self.assertFalse(server.usage_log_off())
+        self.assertTrue(server.switch_on("review_rounds_stop"))
+        server.record_usage({"event": "send"}, path=log)
+        self.assertTrue(os.path.exists(log))
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_AUTO_CONSULT": "0"}):
+            out = server.nouez_settings({"action": "set", "name": "no_auto_consult", "on": True})
+            self.assertIn("it applies from conversations started after the change", out)
+            self.assertIn("But NOUEZ_NO_AUTO_CONSULT is set in this server's environment, which wins: no_auto_consult "
+                          "stays off until that variable is removed from nouez's MCP registration.", out)
+            self.assertEqual(server.switch_setting("no_auto_consult"), (False, "environment"))
+        self.assertTrue(self.saved()["switches"]["no_auto_consult"])
+        self.assertEqual(server.switch_setting("no_auto_consult"), (True, "settings file"))
+        for value, on in (("1", True), ("yes", True), ("0", False), ("no", False)):  # read as it always was
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"NOUEZ_NO_UPDATE_CHECK": value}):
+                self.assertEqual(server.switch_setting("no_update_check"), (on, "environment"))
+        with mock.patch.dict(os.environ, {"NOUEZ_REVIEW_ROUNDS_STOP": "yes"}):  # a "1" switch: only 1 is on
+            self.assertEqual(server.switch_setting("review_rounds_stop"), (False, "environment"))
+
+    def test_a_damaged_settings_file_keeps_the_protections_on(self):
+        """A settings file that can't be read is never taken for an empty one: a protection Lee turned
+        on stays on, the phone records no trust, nothing overwrites it, until `server.py settings reset`
+        moves it aside. A link at its place counts as damaged too, whether it leads to a file or nowhere."""
+        target = os.path.join(self.home, "elsewhere.json")
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump({"switches": {}}, f)
+        damaged = [("bad JSON", "{"), ("a switch that isn't true or false", json.dumps({"switches": {"ask_trust": "yes"}})),
+                   ("not an object", "[1]"), ("a relative projects folder",
+                                             json.dumps({"roots": {"folders": [{"path": "work", "from": "phone"}]}})),
+                   ("a link to a file", target), ("a link to nothing", os.path.join(self.home, "missing.json"))]
+        for what, value in damaged:
+            with self.subTest(what):
+                write_settings(None)
+                if what.startswith("a link"):
+                    file_link(self, value, self.path)
+                    server._settings_seen.clear()
+                else:
+                    write_settings(value)
+                self.assertEqual(server.read_settings(), ({}, "damaged"))
+                if what == "bad JSON":  # what a link or a pipe reads as, where links can't be made
+                    with mock.patch.object(server, "read_regular_file", lambda *a, **k: None):
+                        server._settings_seen.clear()
+                        self.assertEqual(server.read_settings(), ({}, "damaged"))
+                        self.assertEqual(server.switch_setting("ask_trust"), (True, "damaged settings file"))
+                    server._settings_seen.clear()
+                for name in server.SWITCHES:
+                    self.assertEqual(server.switch_setting(name), (name in PROTECTIONS, "damaged settings file"))
+                with self.assertRaises(server.BridgeError) as e:
+                    server.nouez_settings({"action": "set", "name": "no_usage_log", "on": True})
+                self.assertIn("can't be read", str(e.exception))
+                self.assertIn("`server.py settings reset`", str(e.exception))
+                with mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER": "1"}), \
+                        mock.patch.object(server, "dispatcher_status", lambda: (False, None)):
+                    self.assertIn("can't be read", server.dispatcher_trust_problem(self.projects))
+                    self.assertIn("can't be read", server.settings_text())
+                out = []
+                self.assertEqual(server.run_settings(["reset"], out.append), 0, out)
+                self.assertFalse(os.path.lexists(self.path))
+                self.assertTrue(any(n.startswith("settings.json.") and n.endswith(".old")
+                                    for n in os.listdir(self.cache)), out)
+                self.assertEqual(server.switch_setting("ask_trust"), (False, "default"))
+                for name in os.listdir(self.cache):
+                    if name.endswith(".old"):
+                        os.remove(os.path.join(self.cache, name))
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"switches": {}}, "the file a link led to is left alone")
+        out = []
+        self.assertEqual(server.run_settings(["reset"], out.append), 0)
+        self.assertIn("nothing to reset", out[0])
+
+    def test_settings_show_where_each_value_comes_from(self):
+        """`server.py settings` and NouezSettings show each switch's value, where it comes from and
+        when a change applies, and which change only at the computer."""
+        text = server.settings_text()
+        self.assertIn(f"nouez's settings file: {self.path} (not made yet: every switch reads its default)", text)
+        write_settings({"switches": {"no_usage_log": True}})
+        with mock.patch.dict(os.environ, {"NOUEZ_REVIEW_ROUNDS_STOP": "1"}):
+            text = server.nouez_settings({})
+            out = []
+            self.assertEqual(server.run_settings([], out.append), 0)
+            self.assertEqual(out, [text])
+        self.assertIn(f"nouez's settings file: {self.path}\n", text)
+        self.assertIn("- no_usage_log: on, from the settings file. When on, nouez keeps no usage log. A change "
+                      "applies from the next call.", text)
+        self.assertIn("- review_rounds_stop: on, from the environment (NOUEZ_REVIEW_ROUNDS_STOP).", text)
+        self.assertIn("- no_update_check: off, from the default.", text)
+        self.assertIn("A change applies from conversations started after the change.", text)
+        for name in PROTECTIONS:
+            self.assertRegex(text, rf"- {name}: off, from the default\. When on, [^\n]*\. Changes only at the "
+                                   r"computer \(`server\.py settings set`\)\.")
+        self.assertIn("Projects folders: none picked yet", text)
+        self.assertTrue(text.endswith("Phone setup: not done yet."), text)
+        for argv, code, says in ((["set", "no_usage_log"], 2, server.SETTINGS_USAGE),
+                                 (["set", "no_usage_log", "maybe"], 2, server.SETTINGS_USAGE),
+                                 (["show"], 2, server.SETTINGS_USAGE),
+                                 (["set", "nope", "on"], 1, "There is no switch 'nope'")):
+            with self.subTest(argv=argv):
+                out = []
+                self.assertEqual(server.run_settings(argv, out.append), code)
+                self.assertIn(says, out[0])
+        with self.assertRaises(server.BridgeError):
+            server.nouez_settings({"action": "unknown"})
+
+    def test_protections_change_only_at_the_computer(self):
+        """Lee asks the phone to turn on "ask for each trust": nouez refuses and gives the command, in
+        either direction for each of the four protections; at the computer the command changes it."""
+        self.assertEqual(tuple(name for name, spec in server.SWITCHES.items() if spec[2]), PROTECTIONS)
+        for name in PROTECTIONS:
+            for on in (True, False):
+                with self.subTest(name=name, on=on):
+                    with self.assertRaises(server.BridgeError) as e:
+                        server.nouez_settings({"action": "set", "name": name, "on": on})
+                    said = str(e.exception)
+                    self.assertIn(f"`server.py settings set {name} {'on' if on else 'off'}` in a terminal there", said)
+                    self.assertIn(server.SWITCHES[name][0], said)
+                    self.assertIn("Nothing was changed.", said)
+        self.assertFalse(os.path.lexists(self.path))
+        out = []
+        self.assertEqual(server.run_settings(["set", "ask_trust", "on"], out.append), 0, out)
+        self.assertIn("ask_trust is now on", out[0])
+        self.assertTrue(server.ask_trust())
+        with self.assertRaises(server.BridgeError):
+            server.nouez_settings({"action": "set", "name": "ask_trust", "on": False})
+        self.assertTrue(server.ask_trust(), "nor taken off from the phone")
+        self.assertEqual(server.run_settings(["set", "ask_trust", "off"], []. append), 0)
+        self.assertFalse(server.ask_trust())
+
+
+class PhoneProjectsFoldersTest(unittest.TestCase):
+    """0.29.0: the dispatcher's projects folders in nouez's settings file, and the home folder as one
+    (docs/rules.md: projects-folders-from-the-phone, home-as-projects-folder)."""
+    real_default_folder = staticmethod(_REAL_DEFAULT_FOLDER)
+    dispatcher_setUp = DispatcherTest.setUp
+    setup = DispatcherTest.setup
+    install = DispatcherTest.install
+    roots = ProjectsFoldersTest.roots
+    home_at = ProjectsFoldersTest.home_at
+
+    def setUp(self):
+        self.dispatcher_setUp()
+        for patch in (mock.patch.object(server, "_home_warned", []),
+                      mock.patch.object(server, "login_warning", lambda *a, **k: ""),
+                      mock.patch.object(server, "start_release_check", lambda again_after=None: None),
+                      mock.patch.object(server, "safe_nouez_update_notice", lambda pending=None: "")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(server._login_told.clear)
+
+    def phone(self, running=None):
+        """In the dispatcher's server, with no supervisor from before 0.29 to copy from (or `running`'s)."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER": "1"}))
+        stack.enter_context(mock.patch.object(server, "dispatcher_status",
+                                              lambda: (True, running) if running else (False, None)))
+        return stack
+
+    def add(self, folder):
+        return server.nouez_settings({"action": "add_folder", "folder": folder})
+
+    def remove(self, folder):
+        return server.nouez_settings({"action": "remove_folder", "folder": folder})
+
+    def test_projects_folders_live_in_the_settings_file(self):
+        """Lee upgrades: his default folder stays, and one he removed from the phone doesn't come back
+        when he reinstalls. --projects and --no-projects replace the list; a new install in
+        ~/.nouez/dispatcher starts with none picked."""
+        code, out = self.setup()
+        self.assertEqual(code, 0, out)
+        default = {"path": self.projects, "from": "default"}
+        self.assertEqual(server.recorded_roots(), {"folders": [default], "locked": False})
+        code, out, ran, popen = self.install("linux")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(server.recorded_roots(), {"folders": [default], "locked": False})
+        work, clones = self.roots("work", "clones")
+        with self.phone():
+            self.add(work)
+            self.add(clones)
+            self.remove(clones)
+        kept = {"folders": [default, {"path": work, "from": "phone"}], "locked": False}
+        self.assertEqual(server.recorded_roots(), kept)
+        code, out, ran, popen = self.install("linux")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(server.recorded_roots(), kept, "the folder removed from the phone stays out")
+        self.assertIn(f"{work} (picked on the phone)", out)
+        self.assertNotIn(clones, out)
+        self.install("linux", projects=[clones])
+        self.assertEqual(server.recorded_roots(), {"folders": [{"path": clones, "from": "projects"}], "locked": False})
+        self.install("linux", projects=[])
+        self.assertEqual(server.recorded_roots(), {"folders": [], "locked": True})
+        nouez = os.path.join(self.home, ".nouez", "dispatcher")
+        os.makedirs(nouez)
+        with self.home_at(self.home):
+            self.assertEqual(server.initial_roots(nouez, None), {"folders": [], "locked": False})
+            self.assertEqual(server.initial_roots(self.folder, None), {"folders": [default], "locked": False})
+
+    def test_projects_folders_are_copied_once_from_the_dispatcher(self):
+        """The first 0.29 nouez to need the projects folders copies them once from the running
+        dispatcher's record; later changes to that record, or a folder removed since, don't bring
+        them back. With no supervisor running there is nothing to copy, and no file is made."""
+        work, more = self.roots("work", "more")
+        running = {"folder": self.folder, "phase": "connected", "projects": [work], "projects_given": True}
+        want = {"folders": [{"path": work, "from": "projects"}], "locked": False}
+        with self.phone(running):
+            self.assertFalse(os.path.lexists(server.settings_path()))
+            self.assertEqual(server.dispatcher_roots_now(), want)
+            self.assertEqual(server.recorded_roots(), want, "written into the settings file")
+            running["projects"] = [more]
+            self.assertEqual(server.dispatcher_roots_now(), want)
+            self.remove(work)
+            self.assertEqual(server.dispatcher_roots_now(), {"folders": [], "locked": False})
+        write_settings(None)
+        with self.phone():
+            self.assertIsNone(server.dispatcher_roots_now())
+            self.assertFalse(os.path.lexists(server.settings_path()))
+            self.assertIn("no projects folders are picked yet", server.dispatcher_trust_problem(work))
+
+    def test_the_phone_adds_and_removes_projects_folders(self):
+        """From the dispatcher's chat, NouezSettings adds a folder (up to 20, none inside another,
+        refused where a projects folder is refused) or removes one; removing one stops new trust
+        there. Outside the dispatcher both are refused."""
+        work, clones = self.roots("work", "clones")
+        project = os.path.join(work, "project")
+        os.mkdir(project)
+        for call in (self.add, self.remove):
+            with self.assertRaises(server.BridgeError) as e:
+                call(work)
+            self.assertIn("phone dispatcher's", str(e.exception))
+        self.assertFalse(os.path.lexists(server.settings_path()))
+        with self.phone():
+            out = self.add(work)
+            self.assertIn(f"Added {work} to the projects folders", out)
+            self.assertIn("trust covers settings a project adds later", out)
+            self.assertIn("skills can run commands", out)
+            one = {"folders": [{"path": work, "from": "phone"}], "locked": False}
+            self.assertEqual(server.recorded_roots(), one)
+            self.assertIsNone(server.dispatcher_trust_problem(project))
+            for folder, says in ((work, "is a projects folder already (picked on the phone)"),
+                                 (os.path.join(project, ".."), "is a projects folder already"),
+                                 (project, "are one inside the other"),
+                                 (self.home, "are one inside the other"),
+                                 (os.path.join(self.home, "gone"), "isn't a folder on this computer"),
+                                 ("work", "folder must be an absolute path"),
+                                 (None, "folder must be an absolute path"),
+                                 (tempfile.gettempdir(), "can't be a projects folder: ")):
+                with self.subTest(folder=folder):
+                    with self.assertRaises(server.BridgeError) as e:
+                        self.add(folder)
+                    self.assertIn(says, str(e.exception))
+                    self.assertIn("Nothing was changed.", str(e.exception))
+                    self.assertEqual(server.recorded_roots(), one)
+            self.add(clones)
+            for name in self.roots(*(f"f{i}" for i in range(server.DISPATCHER_ROOTS_MAX - 2))):
+                self.add(name)
+            self.assertEqual(len(server.recorded_roots()["folders"]), 20)
+            (extra,) = self.roots("extra")
+            with self.assertRaises(server.BridgeError) as e:
+                self.add(extra)
+            self.assertIn("at most 20 projects folders", str(e.exception))
+            for folder in (extra, project):
+                with self.subTest(remove=folder), self.assertRaises(server.BridgeError) as e:
+                    self.remove(folder)
+                self.assertIn("isn't one of the projects folders", str(e.exception))
+            out = self.remove(work)
+            self.assertIn(f"Removed {work} from the projects folders: the phone records no new trust inside it. "
+                          "Trust already recorded there stays", out)
+            self.assertEqual(len(server.recorded_roots()["folders"]), 19)
+            self.assertIn("records trust only for a folder inside", server.dispatcher_trust_problem(project))
+            # Sam's projects are in the install default; in the phone setup Sam names it, and it counts
+            # as picked from then on, so quiet projects there are trusted at once
+            write_settings({"roots": {"folders": [{"path": work, "from": "default"}], "locked": False}})
+            out = self.add(work)
+            self.assertIn("now counts as picked", out)
+            self.assertEqual(server.recorded_roots(), one)
+
+    def test_no_projects_locks_them_to_the_computer(self):
+        """A dispatcher set up with --no-projects keeps the list to the computer: the phone can neither
+        add nor remove one, and records no trust; `dispatcher install --projects` there picks them."""
+        (work,) = self.roots("work")
+        code, out = self.setup(projects=[])
+        self.assertEqual(code, 0, out)
+        locked = {"folders": [], "locked": True}
+        self.assertEqual(server.recorded_roots(), locked)
+        with self.phone():
+            for call in (self.add, self.remove):
+                with self.subTest(call=call.__name__), self.assertRaises(server.BridgeError) as e:
+                    call(work)
+                self.assertEqual(str(e.exception), server.ROOTS_LOCKED)
+            self.assertIn("--no-projects", server.dispatcher_trust_problem(os.path.join(work, "x")))
+            self.assertIn("Projects folders: none (--no-projects)", server.settings_text())
+        self.assertEqual(server.recorded_roots(), locked)
+        code, out, ran, popen = self.install("linux", projects=[work])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(server.recorded_roots(), {"folders": [{"path": work, "from": "projects"}], "locked": False})
+
+    def home_folder(self):
+        """self.home as the home folder, with Claude Code's settings folder, nouez's cache and the
+        temporary folder inside it, as on Windows."""
+        local = os.path.join(self.home, "AppData", "Local")
+        temp = os.path.join(local, "Temp")
+        os.makedirs(temp, exist_ok=True)
+        stack = self.phone()
+        stack.enter_context(self.home_at(self.home))
+        stack.enter_context(mock.patch.dict(os.environ, {"LOCALAPPDATA": local, "CLAUDE_CONFIG_DIR": ""}))
+        stack.enter_context(mock.patch.object(server.tempfile, "gettempdir", lambda: temp))
+        return stack
+
+    def test_the_home_folder_needs_the_warning_first(self):
+        """Ana insists on her home folder: nouez adds it only once this server has given the user its
+        warning, counted only once the result carrying it was sent; a new server warns again."""
+        msg = tool_call("NouezSettings", {"action": "add_folder", "folder": self.home})
+        with self.home_folder():
+            with mock.patch.object(server, "respond", side_effect=OSError("pipe closed")), \
+                    self.assertRaises(OSError):
+                server.dispatch(msg, threading.Event())
+            self.assertEqual(server._home_warned, [], "a warning never sent wasn't given")
+            with mock.patch.object(server, "respond") as respond:
+                server.dispatch(msg, threading.Event())
+            text = tool_text(respond)
+            self.assertTrue(text.startswith(f"Not added yet. Show the user this warning first: The home folder "
+                                            f"({self.home}) as a projects folder"), text)
+            self.assertIn("Downloads and Desktop too", text)
+            self.assertIn("Only if they still want it, call NouezSettings again", text)
+            self.assertIsNone(server.recorded_roots())
+            with mock.patch.object(server, "respond") as respond:
+                server.dispatch(msg, threading.Event())
+            self.assertIn(f"Added {self.home} to the projects folders", tool_text(respond))
+            home = {"folders": [{"path": self.home, "from": "phone"}], "locked": False}
+            self.assertEqual(server.recorded_roots(), home)
+            self.assertNotIn("can't hold trust", server.projects_text(home))
+            self.remove(self.home)
+            server._home_warned.clear()  # another server, which hasn't warned
+            self.assertTrue(self.add(self.home).startswith("Not added yet."))
+            self.assertEqual(server.recorded_roots(), {"folders": [], "locked": False})
+        with self.home_folder(), mock.patch.dict(os.environ, {"NOUEZ_DISPATCHER": ""}):
+            with self.assertRaises(server.BridgeError):  # nor added outside the dispatcher
+                self.add(self.home)
+        with self.home_folder():  # --projects can't name it: only the phone, after the warning
+            write_settings({"roots": {"folders": [{"path": self.home, "from": "projects"}], "locked": False}})
+            self.assertIn("can't hold trust", server.projects_text(server.recorded_roots()))
+            self.assertIn("records no trust at all",
+                          server.dispatcher_trust_problem(os.path.join(self.home, "Downloads", "tool")))
+
+    def test_inside_the_home_folder_what_nouez_protects_stays_refused(self):
+        """With the home folder picked on the phone, `Downloads\\tool` can be trusted after its check,
+        but never the home folder itself, nor a folder that is, is inside or holds Claude Code's
+        settings folder, ~/.nouez, nouez's cache or the temporary folder."""
+        tool = os.path.join(self.home, "Downloads", "tool")
+        claude = os.path.join(self.home, ".claude")
+        cache = os.path.join(self.home, "AppData", "Local", "nouez")
+        for folder in (tool, os.path.join(claude, "skills"), os.path.join(self.home, ".nouez", "dispatcher"), cache):
+            os.makedirs(folder, exist_ok=True)
+        with self.home_folder():
+            write_settings({"roots": {"folders": [{"path": self.home, "from": "phone"}], "locked": False}})
+            self.assertIsNone(server.dispatcher_trust_problem(tool))
+            self.assertIsNotNone(server.dispatcher_trust_problem(self.home))
+            for folder, what in ((claude, "Claude Code's settings folder"),
+                                 (os.path.join(claude, "skills"), "Claude Code's settings folder"),
+                                 (os.path.join(self.home, ".nouez"), "nouez's own folder"),
+                                 (os.path.join(self.home, ".nouez", "dispatcher"), "nouez's own folder"),
+                                 (cache, "nouez's cache folder"),
+                                 (os.path.join(self.home, "AppData"), "nouez's cache folder"),
+                                 (os.path.join(self.home, "AppData", "Local", "Temp"), "the temporary folder")):
+                with self.subTest(folder=folder):
+                    problem = server.dispatcher_trust_problem(folder)
+                    self.assertIn(f"is, is inside or holds {what}", problem)
+                    with self.assertRaises(server.BridgeError) as e:
+                        server.refuse_dispatcher_trust(folder)
+                    self.assertIn("Not recording trust", str(e.exception))
+            self.assertIn("the home folder itself", server.home_target_problem(self.home))
+
+
+class PhoneSetupAndStatusTest(unittest.TestCase):
+    """0.29.0: PhoneSetup, NouezStatus and the sign-in warning in the dispatcher (docs/rules.md:
+    phone-setup, status, sign-in-in-the-dispatcher)."""
+    dispatcher_setUp = DispatcherTest.setUp
+    phone = PhoneProjectsFoldersTest.phone
+
+    def setUp(self):
+        self.dispatcher_setUp()
+        for patch in (mock.patch.object(server, "_home_warned", []),
+                      mock.patch.object(server, "_login_told", []),
+                      mock.patch.object(server, "start_release_check", lambda again_after=None: None),
+                      mock.patch.object(server, "safe_nouez_update_notice", lambda pending=None: ""),
+                      mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": os.path.join(self.home, "config"),
+                                                   "LOCALAPPDATA": os.path.join(self.home, "data"),
+                                                   "XDG_STATE_HOME": os.path.join(self.home, "data")})):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_phone_setup_steps_and_done(self):
+        """Kim goes through the phone setup: the folders that look like they hold projects, the home
+        folder last with its warning, what nouez changes in Claude Code and the switches; done=true
+        marks it done, and "set up this phone" goes through it again."""
+        with self.assertRaises(server.BridgeError) as e:
+            server.phone_setup({})
+        self.assertIn("PhoneSetup is the phone dispatcher's", str(e.exception))
+        candidates = [(self.projects, 6), (os.path.join(self.home, "src"), 1)]
+        with self.phone(), mock.patch.object(server, "projects_folder_candidates", lambda state_file=None: candidates):
+            out = server.phone_setup({})
+            self.assertTrue(out.startswith("Phone setup (not done yet)."), out)
+            steps = [out.index(s) for s in ("1. The folders that hold the user's projects. Now: projects folders: "
+                                            "none picked yet", "2. The home folder: offer it last",
+                                            "3. What nouez changes in Claude Code", "4. The switches:")]
+            self.assertEqual(steps, sorted(steps))
+            self.assertIn(f"   - {self.projects} (6 trusted projects)\n", out)
+            self.assertIn(f"(1 trusted project)\n", out)
+            self.assertIn(server.HOME_WARNING.format(home=os.path.expanduser("~")), out)
+            self.assertEqual(server._home_warned, [os.path.expanduser("~")], "its warning counts as given")
+            self.assertIn(f"one trust mark per folder in {server.claude_state_file()}", out)
+            self.assertIn(f"a copy of the file first in {server.trust_backup_dir()} (the newest 20 are kept)", out)
+            self.assertIn("settings.json): only `server.py dispatcher setup`, at the computer and on the user's yes", out)
+            self.assertIn("RestoreClaudeConfig lists the trust marks and MCP servers that are gone", out)
+            self.assertIn("- ask_trust: off", out)
+            self.assertIn("The four protections change only at the computer", out)
+            self.assertTrue(out.endswith("call PhoneSetup with done=true."), out)
+            self.assertFalse(server.setup_done())
+            self.assertIn("marked done", server.phone_setup({"done": True}))
+            self.assertTrue(server.setup_done())
+            self.assertTrue(server.phone_setup({}).startswith("Phone setup (done before; going through it again)."))
+        with self.phone(), mock.patch.object(server, "projects_folder_candidates", lambda state_file=None: []):
+            self.assertIn("   - none found: ask the user for the full path of the folder that holds their projects",
+                          server.phone_setup({}))
+
+    def test_the_dispatcher_offers_setup_until_done(self):
+        """Kim opens the dispatcher and says hi: until the setup is marked done, its server tells Claude
+        to offer it; PhoneSetup is listed only in the dispatcher."""
+        names = lambda: [t["name"] for t in server.listed_tools()]
+        self.assertNotIn(server.PHONE_SETUP_OFFER, server.server_instructions())
+        self.assertNotIn("PhoneSetup", names())
+        self.assertIn("NouezSettings", names())
+        with self.phone():
+            self.assertIn(server.PHONE_SETUP_OFFER, server.server_instructions())
+            self.assertIn("PhoneSetup", names())
+            server.phone_setup({"done": True})
+            self.assertNotIn(server.PHONE_SETUP_OFFER, server.server_instructions())
+            self.assertIn("PhoneSetup", names(), "still there for \"set up this phone\"")
+            (tool,) = [t for t in server.listed_tools() if t["name"] == "PhoneSetup"]
+            self.assertIn("says \"set up this phone\"", tool["description"])
+
+    def status(self, **kw):
+        patches = {"codex_installed": lambda: False, "claude_budget": lambda now: ["Claude Code: 10% of the week used."],
+                   "agy_command": lambda: None, "claude_sessions": lambda: [{"name": "nouez"}],
+                   "dispatcher_status": lambda: (False, None), "read_release_cache": lambda path, now: (None, None),
+                   "_nouez_latest": None, **kw}
+        with contextlib.ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(server, name, value))
+            return server.nouez_status({})
+
+    def test_status_says_what_it_knows_and_what_it_doesnt(self):
+        """Jo, on the train, asks "status?" and gets one short block, each line said to be unknown or
+        off rather than left out, with "sign-in: not checked (no_login_check is on)"."""
+        def broken(*a, **k):
+            raise RuntimeError("unreadable")
+        out = self.status(consultants_line=broken)
+        for line in ("- Sign-in: not checked (no_login_check is on).", "- Usage:", "  Codex: not installed.",
+                     "  Claude Code: 10% of the week used.", "  Antigravity: not installed.",
+                     "- Consultants: not known now (they couldn't be read).", "- Claude Code sessions open: 1 (nouez).",
+                     "- Phone dispatcher: not set up on this computer.",
+                     f"- nouez {server.SERVER_VERSION}; the latest release isn't known yet.",
+                     "- Switches on: no_usage_log, no_login_check.", "- Projects folders: none picked yet",
+                     "- Phone setup: not done yet."):
+            self.assertIn(line, out)
+        self.assertTrue(out.startswith("nouez status, "), out)
+        self.assertLess(len(out.splitlines()), 15)
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_LOGIN_CHECK": "0"}), \
+                mock.patch.object(server, "login_state", lambda wait=False: {"line": "signed in until Dec 3"}), \
+                mock.patch.object(server, "login_warning", lambda *a, **k: ""):
+            out = self.status(consultants_line=lambda client: "none started.",
+                              claude_sessions=broken, read_release_cache=lambda path, now: (None, "99.0.0"),
+                              dispatcher_status=lambda: (True, {"folder": self.folder, "phase": "waiting"}))
+        for line in ("- Sign-in: signed in until Dec 3.", "- Consultants: none started.",
+                     "- Claude Code sessions: not known now (they couldn't be listed).",
+                     "At the computer, `server.py dispatcher status` says more.",
+                     f"- nouez {server.SERVER_VERSION}; 99.0.0 is out", "- Switches on: no_usage_log."):
+            self.assertIn(line, out)
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_LOGIN_CHECK": "0"}), \
+                mock.patch.object(server, "login_state", broken), mock.patch.object(server, "login_warning", lambda *a, **k: ""):
+            self.assertIn("- Sign-in: not known (nouez reads it from `claude auth status`, which didn't say).",
+                          self.status(consultants_line=lambda client: "none started."))
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_UPDATE_CHECK": "1"}):
+            self.assertIn("no_update_check is on, so newer releases aren't looked for",
+                          self.status(consultants_line=lambda client: "none started."))
+
+    def test_the_dispatcher_warns_of_the_sign_in_once_a_day(self):
+        """Jo's sign-in ends on the 3rd. On the 27th she asks the phone for something: the reply carries
+        the warning once, not also from the tool itself, and her next request that day doesn't repeat
+        it; a reply that wasn't sent didn't tell her, and an error result carries it too."""
+        warning = "Claude Code's sign-in on this computer ends in 6 days (Dec 3). Tell the user."
+        listing = tool_call("RestoreClaudeConfig", {})
+
+        def call(msg, fails=False):
+            with mock.patch.object(server, "respond", side_effect=OSError("pipe closed") if fails else None) as respond:
+                server.dispatch(msg, threading.Event())
+            return tool_text(respond)
+        with mock.patch.object(server, "login_warning", lambda *a, **k: warning):
+            self.assertEqual(call(listing).count(warning), 1, "outside the dispatcher, from the tool itself")
+            self.assertEqual(server._login_told, [])
+            with self.phone():
+                with self.assertRaises(OSError):
+                    call(listing, fails=True)
+                self.assertEqual(server._login_told, [], "counted only once sent")
+                first = call(listing)
+                self.assertTrue(first.endswith("\n\n" + warning), first)
+                self.assertEqual(first.count(warning), 1)
+                self.assertEqual(server._login_told, [time.strftime("%Y-%m-%d")])
+                self.assertNotIn(warning, call(listing))
+                self.assertNotIn(warning, call(tool_call("NouezSettings", {})))
+                server._login_told[:] = ["2026-11-26"]  # the next day
+                error = call(tool_call("NouezSettings", {"action": "bogus"}))
+                self.assertIn("action must be one of", error)
+                self.assertIn(warning, error)
+                # the next day her first request is the budget, whose sign-in lines hold the warning
+                server._login_told[:] = ["2026-11-26"]
+                with mock.patch.dict(server.HANDLERS, {"ConsultantBudget": lambda *a, **k: f"Budget.\n  {warning}"}):
+                    budget = call(tool_call("ConsultantBudget", {}))
+                self.assertEqual(budget.count(warning), 1, budget)
+                self.assertEqual(server._login_told, [time.strftime("%Y-%m-%d")])
+        with self.phone(), mock.patch.object(server, "login_warning", lambda *a, **k: ""):
+            server._login_told.clear()
+            self.assertNotIn("sign-in", call(listing))
+            self.assertEqual(server._login_told, [], "nothing to tell, nothing counted")
+
+
+class DispatcherTrustRulesTest(unittest.TestCase):
+    """0.29.0: trust from the phone dispatcher, and RestoreClaudeConfig (docs/rules.md:
+    ask-in-the-dispatcher, trust-without-a-question, restore)."""
+    setUp = TrustTest.setUp
+    slash, write, read, open, backups = TrustTest.slash, TrustTest.write, TrustTest.read, TrustTest.open, TrustTest.backups
+
+    def make_repo(self, name, settings=None, mcp=None):
+        """A git repository in the projects folder, with project settings `settings` and .mcp.json `mcp`."""
+        folder = os.path.join(self.projects, name)
+        os.makedirs(os.path.join(folder, ".git"))
+        if settings is not None:
+            os.makedirs(os.path.join(folder, ".claude"))
+            with open(os.path.join(folder, ".claude", "settings.json"), "w", encoding="utf-8") as f:
+                json.dump(settings, f)
+        if mcp is not None:
+            with open(os.path.join(folder, ".mcp.json"), "w", encoding="utf-8") as f:
+                json.dump(mcp, f)
+        return folder
+
+    def trusted(self, folder):
+        return (self.read()["projects"].get(self.slash(folder)) or {}).get("hasTrustDialogAccepted") is True
+
+    def raw(self):
+        with open(self.state, encoding="utf-8") as f:
+            return f.read()
+
+    def test_asking_in_the_dispatcher_is_refused_at_once(self):
+        """Lee has ask_trust on and asks the phone dispatcher to trust a new project: he's told at once
+        that this needs the computer, before any folder is made or anything changed, instead of
+        waiting for a question nobody can see; a new folder inside a repository not trusted yet too,
+        before it and its CLAUDE.md are made. A folder already trusted opens as usual. With
+        ask_user_session on, a message with a revision to a Codex session he opened is refused before
+        its diff is saved."""
+        new = os.path.join(self.projects, "new")
+        sub = os.path.join(self.make_repo("held"), "sub")
+        before = self.raw()
+        with phone_roots(self.projects, env={"NOUEZ_ASK_TRUST": "1"}):
+            for args in ({"cwd": new, "create": True, "trust": True}, {"cwd": self.repo, "trust": True},
+                         {"cwd": sub, "create": True, "trust": True}):
+                with self.subTest(args=args):
+                    with self.assertRaises(server.BridgeError) as e:
+                        self.open(args)
+                    said = str(e.exception)
+                    self.assertIn("ask_trust is on", said)
+                    self.assertIn("the phone dispatcher has none. Nothing was done.", said)
+                    self.assertIn("`server.py settings set ask_trust off`", said)
+            self.assertFalse(os.path.exists(new))
+            self.assertFalse(os.path.exists(sub))
+            self.assertEqual(self.raw(), before)
+            self.assertEqual(self.backups(), [])
+            out, opened = self.open({"cwd": self.repo})
+            self.assertFalse(opened)
+            self.assertIn("ask_trust is on, so each trust needs a yes in a prompt that shows only on the computer's "
+                          "screen", out)
+            out, opened = self.open({"cwd": self.plain})
+            self.assertTrue(opened, out)
+        with phone_roots(self.projects, env={"NOUEZ_ASK_USER_SESSION": "1"}):
+            with self.assertRaises(server.BridgeError) as e:
+                server.user_approves("Send this to your Codex session?", "NOUEZ_ASK_USER_SESSION")
+            self.assertIn("ask_user_session is on", str(e.exception))
+            self.assertIn("phone dispatcher has none", str(e.exception))
+            client = mock.MagicMock()
+            client.__enter__.return_value = client
+            taken = mock.Mock(return_value=("", b"", "d" * 64))
+            with mock.patch.object(server, "CodexClient", lambda: client), \
+                    mock.patch.object(server, "resolve", lambda c, to: {"id": "t1", "cwd": self.repo}), \
+                    mock.patch.object(server, "is_bridge", lambda thread: False), \
+                    mock.patch.object(server, "agy_resolve", lambda to: None), \
+                    mock.patch.object(server, "revision_for", taken), \
+                    self.assertRaises(server.BridgeError) as e:
+                server.send_consultant_message({"to": "mine", "message": "Review this.", "revision": True, "kind": "review",
+                                     "allow_user_session": True})
+            self.assertIn("ask_user_session is on", str(e.exception))
+            taken.assert_not_called()
+
+    def test_trust_without_a_question_only_for_quiet_settings(self):
+        """Ana says "open fantasy_basket", which has no project settings: it opens, and the result says
+        it was trusted without a question and names the backup. Her clone cloned-tool pre-approves
+        Bash(*): she gets the report first. With ask_trust or no_trust_write on, or outside the
+        dispatcher, nothing is trusted unasked."""
+        quiet = [self.make_repo("fantasy_basket"),
+                 self.make_repo("denies", settings={"theme": "dark", "permissions": {"deny": ["Bash(rm:*)"], "ask": ["Bash"]}}),
+                 self.make_repo("no_servers", mcp={"mcpServers": {}})]
+        clone = self.make_repo("cloned-tool", settings={"permissions": {"allow": ["Bash(*)"]}})
+        unknown = self.make_repo("unknown", settings={"someNewSetting": True})
+        with phone_roots(self.projects):
+            for folder in quiet:
+                with self.subTest(folder=folder):
+                    out, opened = self.open({"cwd": folder})
+                    self.assertTrue(opened, out)
+                    self.assertIn(f"without a question: it is inside {self.projects}, a projects folder the user picked",
+                                  out)
+                    self.assertIn("the file as it was is backed up in", out)
+                    self.assertIn("Trust also covers settings the project adds later.", out)
+                    self.assertTrue(self.trusted(folder))
+            self.assertEqual(len(self.backups()), len(quiet))
+            for folder in (clone, unknown):
+                with self.subTest(folder=folder):
+                    out, opened = self.open({"cwd": folder})
+                    self.assertFalse(opened, out)
+                    self.assertIn("Not opened", out)
+                    self.assertNotIn("without a question", out)
+                    self.assertFalse(self.trusted(folder))
+            self.assertIn("Bash(*)", self.open({"cwd": clone})[0])
+        for env in ({"NOUEZ_ASK_TRUST": "1"}, {"NOUEZ_NO_TRUST_WRITE": "1"}, None):
+            folder = self.make_repo(f"quiet-{len(self.backups())}-{bool(env)}-{sorted(env or {})}"[:40].replace("'", "")
+                               .replace("[", "").replace("]", "").replace(" ", ""))
+            with self.subTest(env=env), phone_roots(self.projects, env=env, dispatcher=env is not None):
+                out, opened = self.open({"cwd": folder})
+                self.assertFalse(opened, out)
+                self.assertNotIn("without a question", out)
+                self.assertFalse(self.trusted(folder))
+        self.assertEqual(len(self.backups()), len(quiet))
+
+    def test_the_default_projects_folder_still_asks(self):
+        """The install default (the folder above the dispatcher's) wasn't picked by the user, so a
+        project in it gets its report and a yes first, even with no project settings."""
+        with phone_roots(self.projects, source="default"):
+            out, opened = self.open({"cwd": self.repo})
+            self.assertFalse(opened, out)
+            self.assertIn("No project settings", out)
+            self.assertFalse(self.trusted(self.repo))
+            out, opened = self.open({"cwd": self.repo, "trust": True})
+            self.assertTrue(opened, out)
+            self.assertIn("Recorded the user's trust in", out)
+            self.assertNotIn("without a question", out)
+            self.assertTrue(self.trusted(self.repo))
+
+    def copy(self, data, age=0):
+        """A copy of `data` as nouez makes one before it changes the state file, `age` seconds old."""
+        path = server.backup_claude_state(json.dumps(data), self.state)
+        if age:
+            os.utime(path, (time.time() - age, time.time() - age))
+        return path
+
+    # a credential the masks can't see: a cookie through mcp-remote, a token in the address's path
+    EDGAR = {"command": "npx", "args": ["edgar-mcp", "--api-key=abc123secretvalue", "--header", "Cookie: sid=zz-cookie-val"],
+             "env": {"EDGAR_KEY": "s3cr3t-env"}}
+    WEB = {"type": "http", "url": "https://user:pw123@example.test/mcp/tok-in-path-77",
+           "headers": {"Authorization": "Bearer tok-xyz"}}
+
+    def dana(self):
+        """Dana's state file after a Claude Code update: her trust in repo and her MCP servers are gone,
+        and nouez's copy from before still has them. Returns the folder trusted then, now removed."""
+        gone = os.path.join(self.tmp, "gone")
+        os.mkdir(gone)
+        now = self.read()
+        self.copy({**now, "mcpServers": {"edgar": self.EDGAR, "web": self.WEB, "kept": {"command": "kept"}},
+                   "projects": {**now["projects"],
+                                self.slash(self.repo): {"hasTrustDialogAccepted": True,
+                                                        "mcpServers": {"local": {"command": r"C:\Users\dana\vault-tools\node", "args": ["x.js"]}}},
+                                self.slash(gone): {"hasTrustDialogAccepted": True}}}, age=60)
+        os.rmdir(gone)
+        self.write({**now, "mcpServers": {"kept": {"command": "kept"}}})
+        return gone
+
+    def items(self):
+        return {(i["kind"], i["name"] or ""): i for i in server.missing_from_copies()[0]}
+
+    def test_restore_lists_what_is_gone(self):
+        """After a Claude Code update, Dana lists what's missing from the phone: the trust mark and the
+        MCP servers gone, each by the program it runs or the site it reaches, never an argument, an
+        address's path or a value, so a cookie or token in them stays off the phone; a folder that is
+        gone is only counted, and another profile's copy is left out."""
+        out = server.restore_claude_config({})
+        self.assertIn("nouez has no copy of this profile's Claude Code state file", out)
+        self.dana()
+        folder = server.trust_backup_dir()
+        with open(os.path.join(folder, ".claude.json.20260101-000000.0badc0de.x.bak"), "w", encoding="utf-8") as f:
+            json.dump({"mcpServers": {"other-profile": {"command": "x"}}}, f)
+        items = self.items()
+        self.assertEqual(sorted(items), [("mcp", "edgar"), ("mcp", "local"), ("mcp", "web"), ("trust", "")])
+        for item in items.values():
+            self.assertRegex(item["id"], r"^(trust|mcp)-[0-9a-f]{8}$")
+        self.assertEqual(items[("mcp", "local")]["path"], self.slash(self.repo))
+        self.assertEqual(server.missing_from_copies()[1:], (1, 1))
+        out = server.restore_claude_config({})
+        self.assertIn(f"Compared {self.state} with nouez's 1 copy of it.", out)
+        self.assertIn(f"- {items[('trust', '')]['id']}: {self.slash(self.repo)}", out)
+        self.assertIn(f"- {items[('mcp', 'edgar')]['id']}: edgar (user, every project): runs npx (4 arguments not shown)",
+                      out)
+        self.assertIn("web (user, every project): http https://example.test (the rest of the address not shown)", out)
+        self.assertIn("environment: EDGAR_KEY (values not shown)", out)
+        self.assertIn("headers: Authorization (values not shown)", out)
+        self.assertIn(f"local (project {self.slash(self.repo)}): runs node (1 argument not shown)", out)
+        self.assertIn("`server.py restore ID` in a terminal there", out)
+        self.assertIn("1 trust mark of folders that are gone now isn't listed.", out)
+        for secret in ("abc123secretvalue", "s3cr3t-env", "pw123", "tok-xyz", "zz-cookie-val", "tok-in-path-77",
+                       "other-profile", "kept", "vault-tools"):
+            self.assertNotIn(secret, out)
+        self.write(self.read() | {"mcpServers": {"edgar": {}, "web": {}, "kept": {}},
+                                  "projects": {**self.read()["projects"],
+                                               self.slash(self.repo): {"hasTrustDialogAccepted": True,
+                                                                       "mcpServers": {"local": {}}}}})
+        self.assertIn("Nothing in them is missing now", server.restore_claude_config({}))
+        with open(self.state, "w", encoding="utf-8") as f:
+            f.write("{")
+        with self.assertRaises(server.BridgeError) as e:
+            server.restore_claude_config({})
+        self.assertIn("couldn't read Claude Code's state file", str(e.exception))
+        # Dana's ~/.claude.json was deleted: compared with nothing, every copy would look lost, and
+        # `server.py restore` at the computer would have no file to add to
+        os.remove(self.state)
+        with self.assertRaises(server.BridgeError) as e:
+            server.restore_claude_config({})
+        self.assertIn("isn't there now. Start Claude Code once at the computer", str(e.exception))
+        out = []
+        self.assertNotEqual(server.run_restore([], out=out.append), 0)
+        self.assertIn("isn't there now. Start Claude Code once at the computer", "\n".join(out))
+
+    def test_restored_trust_goes_through_todays_checks(self):
+        """Dana brings back her trust marks from the phone: each goes through the checks new trust
+        does (the dispatcher's projects folders, the switches, the report first and a yes)."""
+        self.dana()
+        tid = self.items()[("trust", "")]["id"]
+        before = self.raw()
+        elsewhere = tempfile.mkdtemp(prefix="nouez-test-elsewhere-")
+        self.addCleanup(shutil.rmtree, elsewhere, True)
+        with phone_roots(elsewhere):
+            with self.assertRaises(server.BridgeError) as e:
+                server.restore_claude_config({"restore": tid})
+            self.assertIn("Not recording trust: This is the phone dispatcher", str(e.exception))
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_TRUST_WRITE": "1"}), self.assertRaises(server.BridgeError) as e:
+            server.restore_claude_config({"restore": tid})
+        self.assertEqual(str(e.exception), server.TRUST_WRITE_OFF)
+        out = server.restore_claude_config({"restore": tid})
+        self.assertIn("Not trusted yet", out)
+        self.assertIn(f"call RestoreClaudeConfig again with restore={tid}.", out)
+        self.assertEqual(self.raw(), before)
+        out = server.restore_claude_config({"restore": tid})
+        self.assertIn("Recorded the user's trust in", out)
+        self.assertTrue(self.trusted(self.repo))
+        self.assertNotIn(("trust", ""), self.items())
+        with self.assertRaises(server.BridgeError) as e:
+            server.restore_claude_config({"restore": tid})
+        self.assertIn("isn't in what is missing now", str(e.exception))
+        state = self.read()
+        state["projects"][self.slash(self.repo)]["hasTrustDialogAccepted"] = False
+        self.write(state)
+        server._trust_reports.clear()
+        with phone_roots(self.projects):  # quiet settings in a folder the user picked: no question
+            self.assertIn("without a question", server.restore_claude_config({"restore": tid}))
+        self.assertTrue(self.trusted(self.repo))
+        with self.assertRaises(server.BridgeError):
+            server.restore_claude_config({"restore": 7})
+
+    def test_mcp_servers_come_back_only_at_the_computer(self):
+        """Dana is told to run `server.py restore ID` at the computer for edgar: the tool refuses an MCP
+        server, the command adds that one entry back (rereading the file and copying it first), and
+        refuses when one of that name is there again or the copy it came from changed."""
+        self.dana()
+        items = self.items()
+        eid, lid, tid = items[("mcp", "edgar")]["id"], items[("mcp", "local")]["id"], items[("trust", "")]["id"]
+        before = self.raw()
+        with self.assertRaises(server.BridgeError) as e:
+            server.restore_claude_config({"restore": eid})
+        self.assertIn(f"only at the computer: `server.py restore {eid}` in a terminal there. Nothing was changed.",
+                      str(e.exception))
+        self.assertEqual(self.raw(), before)
+        out = []
+        self.assertEqual(server.run_restore([tid], out.append), 1)
+        self.assertIn("A trust mark comes back through the same checks as new trust", out[0])
+        backups = len(self.backups())
+        out = []
+        self.assertEqual(server.run_restore([eid], out.append), 0, out)
+        self.assertIn("Added the MCP server edgar (user, every project: runs npx (4 arguments not shown)", out[0])
+        self.assertNotIn("abc123secretvalue", out[0])
+        self.assertEqual(len(self.backups()), backups + 1)
+        state = self.read()
+        self.assertEqual(state["mcpServers"], {"kept": {"command": "kept"}, "edgar": self.EDGAR})
+        self.assertEqual((state["numStartups"], state["é"]), (3, "ü"), "nothing else in the file changes")
+        self.assertEqual(server.run_restore([lid], []. append), 0)
+        self.assertEqual(self.read()["projects"][self.slash(self.repo)]["mcpServers"],
+                         {"local": {"command": r"C:\Users\dana\vault-tools\node", "args": ["x.js"]}})
+        out = []
+        self.assertEqual(server.run_restore([eid], out.append), 1)
+        self.assertIn("isn't in what is missing now", out[0])
+        web = self.items()[("mcp", "web")]
+        self.write(self.read() | {"mcpServers": {**self.read()["mcpServers"], "web": {"command": "mine"}}})
+        with self.assertRaises(server.BridgeError) as e:  # added at the computer since it was listed
+            server.restore_mcp(web, out=lambda *a: None)
+        self.assertIn("An MCP server named web is there again", str(e.exception))
+        self.assertEqual(self.read()["mcpServers"]["web"], {"command": "mine"})
+        state = self.read()
+        del state["mcpServers"]["web"]
+        self.write(state)
+        self.copy({**state, "mcpServers": {"web": {**self.WEB, "url": "https://example.test/v2"}}})
+        self.assertNotEqual(self.items()[("mcp", "web")]["id"], web["id"], "a changed copy gives a new id")
+        out = []
+        self.assertEqual(server.run_restore([web["id"]], out.append), 1)
+        self.assertIn("isn't in what is missing now", out[0])
+        self.assertNotIn("web", self.read()["mcpServers"])
+        for argv in (["-h"], ["a", "b"]):
+            out = []
+            self.assertEqual(server.run_restore(argv, out.append), 2)
+            self.assertEqual(out, ["usage: server.py restore [ID]"])
+
 
 if __name__ == "__main__":
     unittest.main()

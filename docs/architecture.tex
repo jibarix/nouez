@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.28.6\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.29.0\\[0.3em]\large Architecture and message reference}
 \date{November 26, 2026}
 \author{}
 
@@ -290,7 +290,7 @@ the folder the call names, never in a workspace above it.
   "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
   "ttlMs": 0, "cacheScope": "private",
-  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.28.6"}}}}
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.29.0"}}}}
 \end{wire}
 
 Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
@@ -1364,7 +1364,7 @@ codex-nouez-77c2e0 was not started by StartConsultant. Close it from its own ter
 \code{ConsultantBudget} gathers the facts for choosing a consultant's model and effort, and changes
 nothing, except that a \code{kind} with a \code{provider} keeps nouez's pick for the next send of
 that kind to that provider on its models (see the
-\href{https://github.com/jibarix/nouez/blob/v0.28.6/docs/rules.md#rule-named-provider}{lifetime and scope of a named provider}). It makes two requests to the Codex daemon, reads one file the user's status line saves, and
+\href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-named-provider}{lifetime and scope of a named provider}). It makes two requests to the Codex daemon, reads one file the user's status line saves, and
 asks Artificial Analysis for model scores about once a week. Each part fails on its own: an
 unreachable daemon or a missing file is reported in its place, and the rest still shows.
 
@@ -1450,7 +1450,7 @@ The suggestion comes from \code{suggest\_consultant}. \code{ConsultantBudget} ta
 \code{kind} (one of the usage log's kinds) and \code{provider}; without a kind it gives one line per
 kind, and with a provider it considers only that one. \code{CONSULT\_PICKS} lists, for each kind,
 the (provider, model, effort) options in order of preference. The rulebook gives the
-\href{https://github.com/jibarix/nouez/blob/v0.28.6/docs/rules.md#rule-starting-picks}{starting order by kind};
+\href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-starting-picks}{starting order by kind};
 \code{docs/consultants.md} dates the benchmark rationale.
 
 \begin{itemize}
@@ -1460,25 +1460,25 @@ the (provider, model, effort) options in order of preference. The rulebook gives
   using its default. A substitution within a model family, a switch to the provider default
   for a missing model, or a change to an unavailable effort adds a note. Skipping a missing
   model in favor of another listed pick can be silent. See the
-  \href{https://github.com/jibarix/nouez/blob/v0.28.6/docs/rules.md#rule-catalogue-fallback}{model and effort fallbacks}.
+  \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-catalogue-fallback}{model and effort fallbacks}.
   Apply the named-provider restriction and exclude Claude models for work that requires an
-  \href{https://github.com/jibarix/nouez/blob/v0.28.6/docs/rules.md#rule-independent-review}{independent reviewer},
+  \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-independent-review}{independent reviewer},
   including any send with \code{revision: true}.
 \item Read the windows for the quota each remaining option spends. For Antigravity the
   \code{/usage} group lists identify the quota. Classify each option from those windows and
   discard blocked options. An old reading gives a lower bound on use. An Antigravity turn that
   failed on its quota marks its group used up until the reset it named
-  (\href{https://github.com/jibarix/nouez/blob/v0.28.6/docs/rules.md#rule-quota-hit}{quota failures}). The
-  \href{https://github.com/jibarix/nouez/blob/v0.28.6/docs/rules.md#rule-usage-forecast}{forecast rule}
+  (\href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-quota-hit}{quota failures}). The
+  \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-usage-forecast}{forecast rule}
   specifies when a reading supports a pace.
 \item Start with the first remaining option and compare options on other quotas. An option whose
   usage is unknown yields to known room, after the spare-week and pace comparisons below. A tight week can move the choice or lower its effort.
   A busy week can yield to spare quota except for a fact check. For eligible research and quick
   checks, compare spare weeks by reset time, keeping the first choice on a tie, then consider
   how far a week is behind pace if the earlier rules left the pick in place. See the
-  \href{https://github.com/jibarix/nouez/blob/v0.28.6/docs/rules.md#rule-tight-week}{tight-week rule},
-  \href{https://github.com/jibarix/nouez/blob/v0.28.6/docs/rules.md#rule-spare-week}{spare-week rule}
-  and \href{https://github.com/jibarix/nouez/blob/v0.28.6/docs/rules.md#rule-behind-pace}{final pace comparison}.
+  \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-tight-week}{tight-week rule},
+  \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-spare-week}{spare-week rule}
+  and \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-behind-pace}{final pace comparison}.
 \end{itemize}
 
 The same judgment of each window serves the send, the prompt hook and the status screen. At send, a
@@ -1498,7 +1498,7 @@ for a fact check), the blind second opinion with the other provider's own sugges
 Gemini~4 Neon scores best on when Neon is listed, its group has room and the choice isn't already
 a Gemini model, and that a reused consultant keeps its last model and effort. The hand-out line can recommend sending code to write as kind \code{draft}; Claude checks and
 applies the returned text locally. Research advice can name a second provider for reading a
-page. See the \href{https://github.com/jibarix/nouez/blob/v0.28.6/docs/rules.md#rule-research-and-drafts}{research and draft advice}.
+page. See the \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-research-and-drafts}{research and draft advice}.
 \code{tests/consult\_eval.py} checks in fresh \code{claude -p} sessions that Claude calls it and
 follows it.
 
@@ -2378,15 +2378,21 @@ connects out to Anthropic and nothing on it listens, but a \code{claude remote-c
 starts every session in its own folder. \code{server.py dispatcher} keeps one such server, named
 \code{dispatcher}, running in a folder of its own (\code{\textasciitilde/.nouez/dispatcher}, or
 \code{\textasciitilde/Projects/dispatcher} when that one is set up, as before 0.28, unless
-\code{-{}-folder}; without \code{-{}-projects} or \code{-{}-no-projects}, setup and install in
-\code{\textasciitilde/.nouez} are refused with the folders that look like they hold projects:
-\code{\textasciitilde/Projects}, and each folder holding two or more trusted folders, a folder in a
-git repository counting as the repository, those that could be projects folders, each once, with
-their counts; none is chosen), and that folder's sessions have nouez's session tools, so one server reaches
-every project (Figure~\ref{fig:dispatcher}). The supervisor gives \code{claude} the projects folders
-(those \code{-{}-projects} names, up to \code{DISPATCHER\_ROOTS\_MAX}, none inside another; by default
-the one that holds the dispatcher's) in \code{NOUEZ\_DISPATCHER\_PROJECTS}: one as its path, as
-before 0.27, several or none (\code{-{}-no-projects}) as a JSON list, and the dispatcher's
+\code{-{}-folder}), and that folder's sessions have nouez's session tools, so one server reaches
+every project (Figure~\ref{fig:dispatcher}). Its projects folders, up to \code{DISPATCHER\_ROOTS\_MAX},
+none inside another, are kept in nouez's settings file (\code{settings.json} beside \code{dispatcher.json}, below), each with where it came from: \code{default} (the folder above the dispatcher's, when
+that can be one), \code{projects} (\code{-{}-projects}) or \code{phone}. The first 0.29 nouez that needs
+them copies them once from the running supervisor's \code{dispatcher.json} (\code{projects},
+\code{projects\_given}), never from the environment; a supervisor started by a sign-in start from before
+0.29, with none recorded, copies them from the last supervisor's \code{dispatcher.json} before its own
+record replaces it, so an update followed by a restart before \code{install} keeps them; picking the
+install default on the phone makes it \code{phone}; \code{-{}-projects} or \code{-{}-no-projects} at
+setup or install replaces them, before anything else changes (so a running dispatcher uses them even if a
+later step fails), \code{-{}-no-projects} locking them to the computer, and an install with
+neither keeps them. A new install in \code{\textasciitilde/.nouez} with neither starts with none picked
+and lists the folders that look like they hold projects: \code{\textasciitilde/Projects}, and each
+folder holding two or more trusted folders, a folder in a git repository counting as the repository,
+those that could be projects folders, each once, with their counts; none is chosen. The dispatcher's
 nouez records trust only for a folder inside one of them, checked for the folder and for the one trust is
 kept for (a worktree's main checkout): spelled under it exactly as it is set, case included, with no
 link below it (on Windows, with no link on the way, as it is on disk too), and inside it with links
@@ -2394,8 +2400,10 @@ resolved, before a folder is made, again right before it is made, before the wri
 a failed check sets the trust back to false; without them, none, and never inside one that is a
 drive's root or is or holds the home folder, Claude Code's settings folder, nouez's cache or
 \code{\textasciitilde/.nouez} (where links take them too), or the temporary folder nouez's cache can
-fall back to (\code{projects\_folder\_problem}). Sessions it opens get neither that variable nor
-\code{NOUEZ\_DISPATCHER}. The one-time \code{claude remote-control} run that setup asks for, to
+fall back to (\code{projects\_folder\_problem}). The home folder itself is the one exception, and only
+when picked from the phone after nouez's warning; trust is then still never recorded for the home
+folder, nor for a folder that is, is inside or holds one of those it protects. Sessions it opens don't
+get \code{NOUEZ\_DISPATCHER}. The one-time \code{claude remote-control} run that setup asks for, to
 answer the trust question, is plain Claude Code and isn't covered.
 
 \begin{figure}[H]
@@ -2420,10 +2428,45 @@ computer accepts no connections.}
 \label{fig:dispatcher}
 \end{figure}
 
+\paragraph{Phone setup and the settings file.} The phone can't answer an MCP prompt: with Claude Code
+2.1.332 an elicitation form from a server in a Remote Control session shows only in the computer's
+terminal, while Claude Code's own permission prompt for a tool does reach the phone. So nothing on the
+phone depends on elicitation. nouez's switches can be set in \code{settings.json} beside
+\code{dispatcher.json} (in \code{\%LOCALAPPDATA\%\textbackslash nouez} on Windows), read again when it changes; a
+switch's environment variable, when set and not empty, wins, read as before. The file is written whole
+under a lock and never through a link; one that can't be read keeps every protection on (a set variable still wins) and the
+projects folders unknown until \code{server.py settings reset} moves it aside (after which they are unpicked, unless a sign-in
+start installed before 0.29 names \code{-{}-projects} or \code{-{}-no-projects}, recorded when it next starts). Four switches are
+protections (\code{no\_trust\_write}, \code{ask\_trust}, \code{no\_user\_sessions},
+\code{ask\_user\_session}): no nouez tool changes them, in either direction, so the phone can't turn one
+on and lock itself out of the approvals only the computer shows, nor turn one off on Claude's word;
+\code{server.py settings set} changes them at the computer. In the dispatcher, whose \code{claude} has
+no window, an operation needing \code{ask\_trust} or \code{ask\_user\_session} is refused before anything
+changes. \code{NouezSettings} shows each switch with its source and changes the others, and in the
+dispatcher adds or removes projects folders (the home folder only after the same server gave its
+warning). \code{PhoneSetup}, listed only in the dispatcher, is the guide; until it is marked done, the
+dispatcher's server instructions tell Claude to offer it, so an existing install, whose
+\code{CLAUDE.md} setup never rewrites, gets it too. Inside a projects folder from \code{projects} or
+\code{phone}, \code{OpenClaudeSession} records trust without the report and yes when every project
+settings file of the trust key, checkout and folder is absent or holds only quiet settings (the
+report's \code{QUIET\_SETTINGS}, deny or ask rules, an empty \code{.mcp.json}), none linked or
+unreadable, with neither \code{no\_trust\_write} nor \code{ask\_trust} on. \code{RestoreClaudeConfig}
+lists the trust marks and MCP servers present in nouez's copies of this profile's \code{\textasciitilde/.claude.json}
+and gone from it now, each MCP server by the program it runs or the site it reaches (never its
+arguments, the rest of its address or a value, where a credential can sit unmarked), and nothing while
+that file is missing; a trust mark comes back through the same checks as \code{OpenClaudeSession}'s
+trust, an MCP server only at the computer (\code{server.py restore}), since nothing yet makes the user
+approve a new command on the phone. \code{NouezStatus} sums up the sign-in, the subscriptions,
+consultants waiting, sessions, the dispatcher, the version and these settings, each said unknown or
+off rather than left out. In the dispatcher the sign-in warning rides on every nouez tool result
+once a day per server, counted when the result is sent; \code{ConsultantBudget}'s own sign-in lines,
+part of its report, show it whenever asked.
+
 \paragraph{Commands.} \code{setup} makes the folder (its parent must exist, except
 \code{\textasciitilde/.nouez}), checks the projects folders (\code{dispatcher\_roots\_problem}: each a
 folder, fit to hold trust, none the same as or inside another; without \code{-{}-projects}, the folder
-above the dispatcher's must be fit, or it asks for \code{-{}-projects} or \code{-{}-no-projects}), writes
+above the dispatcher's must exist, except \code{\textasciitilde/.nouez}, and when it can't hold trust none
+is picked, for the phone setup to pick), writes
 \code{CLAUDE.md} from \code{DISPATCHER\_CLAUDE\_MD} when there is none, and merges allow rules
 \code{mcp\_\_consultants\_\_}\textit{tool} for each of \code{DISPATCHER\_TOOLS} into
 \code{.claude/settings.json}. It reaches that file only through a \code{.claude} that is a
@@ -2454,7 +2497,7 @@ without waiting on a pipe, that begins with \code{NOUEZ\_HEAD}), \code{dispatche
 user's SID nor name (\code{windows\_user\_ids}), and on macOS a plist with a \code{Program}
 key. It registers the sign-in start, which runs
 \code{[python, -I, server.py, dispatcher, run, -{}-folder, }\textit{folder}\code{, -{}-sign-in]}, with
-the projects flags after the folder and \code{-{}-config-dir} before \code{-{}-sign-in} when
+\code{-{}-config-dir} before \code{-{}-sign-in} when
 \code{CLAUDE\_CONFIG\_DIR} is set (a command past \code{DISPATCHER\_COMMAND\_MAX} characters is refused), asks a running
 supervisor to stop, and starts the new one, checking within \code{DISPATCHER\_START\_WAIT} that it
 runs with that folder, projects folders, profile and \code{-{}-sign-in}, all while it holds
@@ -2561,8 +2604,8 @@ Only \code{claude}'s status line counts (\code{STATUS\_LINE}: a few symbols, the
 marks the link up; \code{Connecting}, \code{Reconnecting}, \code{Disconnected} or
 \code{Not connected} marks it down; a line that only mentions the word changes nothing. Each run is numbered, and a
 reader's change counts only for its own run. Each change is saved to
-\code{dispatcher.json}: the supervisor's and \code{claude}'s process ids, the folder, its projects
-folders and whether they were named, the \code{server.py} it runs, the phase, when it connected, and
+\code{dispatcher.json}: the supervisor's and \code{claude}'s process ids, the folder, the
+\code{server.py} it runs, the phase, when it connected, and
 the next start after an exit.
 
 A \code{claude} not connected within \code{DISPATCHER\_CONNECT\_WITHIN} is ended: it is most

@@ -6,6 +6,36 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-11-27
+
+The phone sets itself up. Open a chat with the dispatcher and it offers to walk you through picking your projects folders, what nouez changes in Claude Code and the switches, with no flags at the computer. Projects you picked open from the phone without the trust question when their settings run and allow nothing. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version. For the phone dispatcher, run `server.py dispatcher install` again the way you first did; the dispatcher then adds the allow rules for the new tools itself.
+
+### Added
+
+- **Phone setup.** Kim installs the dispatcher with no `--projects`, opens it on her phone and says hi: the first reply offers to set up the phone. `PhoneSetup`, listed only in the dispatcher, lists the folders that look like they hold projects, with their counts, offers the home folder last with its warning, says what nouez changes in Claude Code (one trust mark per folder in `~/.claude.json`, a copy first, the newest 20 kept; nothing from the phone changes your user settings) and shows the switches. Until it is marked done the dispatcher's server offers it, an existing install included; *"set up this phone"* starts it again at any time ([phone setup](docs/rules.md#rule-phone-setup)).
+- **Projects folders from the phone.** Lee adds `D:\work` from the phone and removes a folder he no longer uses; reinstalling doesn't bring it back. `NouezSettings` adds and removes projects folders (up to 20, none inside another). They are kept in nouez's settings file, copied once from a running 0.28 supervisor; `--projects` and `--no-projects` at the computer still replace them, and `--no-projects` locks them to the computer ([projects folders from the phone](docs/rules.md#rule-projects-folders-from-the-phone)).
+- **The home folder, only if you insist.** Ana asks for her home folder: nouez first gives the warning that every folder in it, Downloads and Desktop too, could then be trusted from the phone, and adds it only when asked again after that warning was sent. Even then the home folder itself, Claude Code's settings folder, `~/.nouez`, nouez's cache and the temporary folder are never trusted ([home folder](docs/rules.md#rule-home-as-projects-folder)).
+- **Trust without a question for quiet projects.** Ana says "open fantasy_basket", which has no project settings: it opens, and the result says it was trusted without a question and names the backup. Inside a projects folder you picked (from the phone or with `--projects`, not the install default), a project whose settings files are absent or hold only settings that run and allow nothing (deny or ask rules, a theme, an empty `.mcp.json`) needs no report and yes; her clone that pre-approves `Bash(*)` still gets the report first. `ask_trust` or `no_trust_write` turns this off ([trust without a question](docs/rules.md#rule-trust-without-a-question)).
+- **nouez's settings file.** Lee turns the usage log off from the phone, and the next consultation logs nothing. The switches can now be set in `settings.json` in nouez's folder (`%LOCALAPPDATA%\nouez` on Windows) as well as by environment variable, which still wins when set; `NouezSettings` and `server.py settings` show each switch, where its value comes from and when a change applies ([settings file](docs/rules.md#rule-settings-file)).
+- **Protections change only at the computer.** Asked from the phone to turn on "ask for each trust", nouez refuses and gives the command: `no_trust_write`, `ask_trust`, `no_user_sessions` and `ask_user_session` change only with `server.py settings set NAME on|off`, so the phone can't lock itself out of approvals only the computer shows, nor turn a protection off on Claude's word ([protections](docs/rules.md#rule-protections-at-the-computer)).
+- **What did I lose?** After a Claude Code update, Dana's sessions ask for trust again and her `edgar` MCP server is gone. `RestoreClaudeConfig` compares `~/.claude.json` with nouez's copies of it and lists the trust marks and MCP servers gone now, secrets masked and environment and header values never shown. Trust marks come back from the phone through the same checks as new trust; an MCP server starts a command, so it comes back only at the computer, with `server.py restore ID` ([restore](docs/rules.md#rule-restore)).
+- **Status on request.** Jo, on the train, asks "status?" and gets one short block: the sign-in's end, each subscription's use, consultants waiting, open sessions, the dispatcher, nouez's version and the settings, each line said to be unknown or off rather than left out (`NouezStatus`, [status](docs/rules.md#rule-status)).
+
+### Changed
+
+- **Asking in the dispatcher is refused at once.** With `ask_trust` or `ask_user_session` on, a phone request that needs that yes used to wait for a prompt only the computer's screen shows. It is now refused before any folder is made or anything changed, with the command that turns the switch off at the computer ([ask in the dispatcher](docs/rules.md#rule-ask-in-the-dispatcher)).
+- **The sign-in warning reaches the phone.** In the dispatcher, the warning that Claude Code's sign-in ends soon now rides on the first nouez tool result of the day, errors included, and is counted only once that result was sent, so a reply lost on the way doesn't use it up ([sign-in in the dispatcher](docs/rules.md#rule-sign-in-in-the-dispatcher)).
+- `dispatcher setup` and `install` in `~/.nouez/dispatcher` with neither `--projects` nor `--no-projects` are no longer refused: they list the folders that look like they hold projects and pick none, for the phone setup to pick.
+
+### Security
+
+- A settings file that can't be read, or a link in its place (to a file or to nothing), is never taken for an empty one: every protection reads on (but one whose environment variable is set) and the phone records no trust until `server.py settings reset` at the computer moves the file aside.
+
+### Documentation
+
+- The guides say why an Antigravity consultant's commands stay off even in agy's own sandbox: with agy 1.5.18 a turn whose command asked to run outside the sandbox ended with no reply, and agy offers no policy nouez could check.
+- The phone guide has a "Setting up the phone" section; the rulebook adds ten rows, each with its scenario and tests.
+
 ## [0.28.6] - 2026-11-26
 
 Antigravity quota failures are remembered, usage nouez can't place gives way to usage known to have room, and Claude is told more plainly when to get a review. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version.
@@ -850,7 +880,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.6...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/jibarix/nouez/compare/v0.28.6...v0.29.0
 [0.28.6]: https://github.com/jibarix/nouez/compare/v0.28.5...v0.28.6
 [0.28.5]: https://github.com/jibarix/nouez/compare/v0.28.4...v0.28.5
 [0.28.4]: https://github.com/jibarix/nouez/compare/v0.28.3...v0.28.4
