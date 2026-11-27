@@ -30,7 +30,7 @@ nouez itself makes two web requests, both through one function (`fetch_json`) th
 | GitHub, `api.github.com/repos/jibarix/nouez/releases/latest` | In the background when a server starts, and in the phone dispatcher after one of its tools is used, at most hourly: an answer is reused for a day, a failed lookup waits an hour | An HTTPS request with `nouez/<version>` as the client name; GitHub sees your IP address | `NOUEZ_NO_UPDATE_CHECK=1` |
 | Artificial Analysis, `artificialanalysis.ai/api/v2/language/models/free` | `ConsultantBudget`, only with a key set: about once a week, six hours after a failure, or with `refresh: true` once the scores are an hour old | Your key, the page number and the client name | Leave `ARTIFICIAL_ANALYSIS_API_KEY` unset, on Windows in your user environment variables too |
 
-Everything else goes through the CLIs you installed, as they would if you ran them yourself. With a consultant CLI installed, nouez's server instructions tell Claude to consult without being asked before committing a change to behavior, several files or anything risky, on a failure whose cause isn't obvious, and before building on a plan of its own, so the diff or question goes to that consultant's provider without your asking each time. Set `NOUEZ_NO_AUTO_CONSULT=1` in nouez's environment to turn that off.
+Everything else goes through the CLIs you installed, as they would if you ran them yourself. With a consultant CLI installed, Claude can send your diff or question to that provider without asking you each time, for example for a review before committing a behavior change. See [when Claude consults on its own](docs/rules.md#rule-automatic-consultation). Set `NOUEZ_NO_AUTO_CONSULT=1` in nouez's environment to turn that off.
 
 - **Codex** (the app-server daemon): a consultant's messages, and the files and command output it reads, go to OpenAI. nouez asks the daemon for your usage:
   - once a minute while `server.py top` runs;
@@ -104,7 +104,7 @@ Below that folder, nouez refuses to write, delete or lock any file through a lin
 
 When each goes:
 
-- Old replies, diffs, review chains and renamed usage logs go when a server starts and when a new one is saved.
+- Nouez checks for expired saved diffs at server startup and when it saves a diff. It checks replies and review chains at startup and when it saves a long reply. See [when saved work is removed](docs/rules.md#rule-saved-diff-cleanup). Renamed usage logs are checked at startup and during log rotation.
 - Old Antigravity turns go when a server starts.
 - Extra backups go when a new one is saved.
 

@@ -653,6 +653,69 @@ def link_problems(texts, names):
     return bad
 
 
+RULE_ANCHOR = re.compile(r"""<a\s+(?:name|id)=["'](rule-[^"']+)["']\s*></a>""")
+
+
+def rule_doc_problems(texts, tex):
+    bad = []
+    rules = texts.get("docs/rules.md", "")
+    rules = re.sub(r"<!--.*?(?:-->|\Z)", lambda m: "\n" * m[0].count("\n"), rules, flags=re.S)
+    headings = heading_anchors(RULE_ANCHOR.sub("", rules))
+    anchors = set()
+    for n, line in prose_lines(rules):
+        for anchor in RULE_ANCHOR.findall(line):
+            if anchor in anchors or anchor in headings:
+                bad.append(f"docs/rules.md:{n} duplicate anchor {anchor}")
+            anchors.add(anchor)
+            if not re.match(r"^\s*\|\s*" + re.escape('<a name="' + anchor + '"></a>'), line):
+                bad.append(f"docs/rules.md:{n} put {anchor} at the start of the Rule cell")
+
+    for name, source in texts.items():
+        for n, target in markdown_links(source):
+            path, _, frag = target.partition("#")
+            filename = posixpath.basename(urllib.parse.unquote(path.partition("?")[0]))
+            frag = urllib.parse.unquote(frag)
+            if filename != "rules.md":
+                continue
+            if re.match(r"[A-Za-z][A-Za-z0-9+.-]*:|/", path):
+                bad.append(f"{name}:{n} use a relative link to rules.md")
+            elif frag.startswith("rule-") and frag not in anchors:
+                bad.append(f"{name}:{n} no rule row for {frag}")
+
+    title = re.search(r"\\title\{\\textbf\{nouez\}\s+([0-9.]+)", tex)
+    for match in re.finditer(r"\\href\s*\{([^{}]+)\}", tex):
+        target = match[1].replace(r"\#", "#")
+        path, _, frag = target.partition("#")
+        if not frag.startswith("rule-") and not path.endswith("/docs/rules.md"):
+            continue
+        n = tex.count("\n", 0, match.start()) + 1
+        if not title or path != f"https://github.com/jibarix/nouez/blob/v{title[1]}/docs/rules.md":
+            bad.append(f"docs/architecture.tex:{n} use the rulebook at the PDF title's version")
+        if frag not in anchors:
+            bad.append(f"docs/architecture.tex:{n} no rule row for {frag}")
+
+    # Read the Rule cell. The example mentions three weeks, and the next
+    # sentence in the Rule cell gives a different lifetime for Antigravity.
+    retention = []
+    for _, line in prose_lines(rules):
+        cells = line.split("|")
+        if len(cells) > 2 and "rule-saved-diff-cleanup" in RULE_ANCHOR.findall(cells[1]):
+            retention.extend(re.findall(r"\bdiffs and review chains older than (\d+ days)\b", cells[1]))
+    if len(retention) != 1:
+        bad.append("docs/rules.md: expected one saved-diff lifetime in the cleanup rule")
+    else:
+        for name, key in (("SECURITY.md", "`patches/`"),
+                          ("docs/how-it-works.md", "`patches/<sha256>.patch`")):
+            kept = []
+            for _, line in prose_lines(texts.get(name, "")):
+                cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+                if len(cells) == 3 and cells[0] == key:
+                    kept.append(cells[2])
+            if kept != retention:
+                bad.append(f"{name}: expected one {key} row with Kept = {retention[0]}")
+    return bad
+
+
 def check_links():
     """Every relative link and #anchor in the Markdown files leads somewhere, checked on every run:
     the README's sections moved to docs/ in 0.23.0, and a moved heading breaks links silently.
@@ -668,7 +731,7 @@ def check_links():
         return
     names = {n for n in done.stdout.split("\0") if n and (head or os.path.isfile(os.path.join(ROOT, n)))}
     texts = {}
-    for name in sorted(n for n in names if n.endswith(".md")):
+    for name in sorted(n for n in names if n.endswith(".md") or n == "docs/architecture.tex"):
         if head:
             shown = subprocess.run(["git", "-C", ROOT, "show", f"{head}:{name}"], capture_output=True,
                                    text=True, encoding="utf-8")
@@ -679,8 +742,14 @@ def check_links():
             texts[name] = shown.stdout
         else:
             texts[name] = read(name)
+    tex = texts.pop("docs/architecture.tex", None)
     bad = link_problems(texts, names)
     report(not bad, "every link between the Markdown files leads somewhere", "; ".join(bad))
+    if tex is None:
+        report(False, "rule links and saved-diff lifetimes agree", "docs/architecture.tex is missing")
+    else:
+        bad = rule_doc_problems(texts, tex)
+        report(not bad, "rule links and saved-diff lifetimes agree", "; ".join(bad))
 
 
 # Variables nouez sets for its own processes, not settings a user changes.

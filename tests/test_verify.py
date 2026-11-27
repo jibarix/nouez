@@ -257,6 +257,27 @@ class LinkTest(unittest.TestCase):
                  "docs/phone.md": "# Phone\n\n## Fix (a `tool`), now!\n\nSetext\n------\n", **others}
         return verify.link_problems(texts, self.NAMES | set(others))
 
+    def test_rule_links_are_relative_and_reach_visible_rows(self):
+        row = '| <a name="rule-trust-backups"></a>Trust backups |'
+        relative = "docs/rules.md#rule-trust-backups"
+        rules = ('| Rule |\n|---|\n'
+                 '| <a name="rule-saved-diff-cleanup"></a>Remove diffs and review chains older than 14 days |\n'
+                 + row + '\n')
+        texts = {"README.md": f"[Backups]({relative})", "docs/rules.md": rules,
+                 "SECURITY.md": "| `patches/` | Saved diffs | 14 days |",
+                 "docs/how-it-works.md": "| `patches/<sha256>.patch` | Saved diffs | 14 days |"}
+        self.assertEqual(verify.rule_doc_problems(texts, ""), [])
+
+        stale = f"https://github.com/jibarix/nouez/blob/v0.28.4/{relative}"
+        absolute = {**texts, "README.md": f"[Backups]({stale})"}
+        self.assertEqual(verify.rule_doc_problems(absolute, ""),
+                         ["README.md:1 use a relative link to rules.md"])
+
+        hidden = rules.replace(row, f"<!--\n{row}\n-->")
+        commented = {**texts, "docs/rules.md": hidden}
+        self.assertEqual(verify.rule_doc_problems(commented, ""),
+                         ["README.md:1 no rule row for rule-trust-backups"])
+
     def test_links_that_resolve_pass(self):
         self.assertEqual(self.problems(
             "[a](docs/phone.md#fix-a-tool-now) [b](docs/phone.md#setext) [c](CHANGELOG.md#added-1)"

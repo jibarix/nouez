@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.28.4\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.28.5\\[0.3em]\large Architecture and message reference}
 \date{November 26, 2026}
 \author{}
 
@@ -290,7 +290,7 @@ the folder the call names, never in a workspace above it.
   "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
   "ttlMs": 0, "cacheScope": "private",
-  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.28.4"}}}}
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.28.5"}}}}
 \end{wire}
 
 Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
@@ -1363,7 +1363,8 @@ codex-nouez-77c2e0 was not started by StartConsultant. Close it from its own ter
 
 \code{ConsultantBudget} gathers the facts for choosing a consultant's model and effort, and changes
 nothing, except that a \code{kind} with a \code{provider} keeps nouez's pick for the next send of
-that kind to that provider on its models, for up to half an hour (below). It makes two requests to the Codex daemon, reads one file the user's status line saves, and
+that kind to that provider on its models (see the
+\href{https://github.com/jibarix/nouez/blob/v0.28.5/docs/rules.md#rule-named-provider}{lifetime and scope of a named provider}). It makes two requests to the Codex daemon, reads one file the user's status line saves, and
 asks Artificial Analysis for model scores about once a week. Each part fails on its own: an
 unreachable daemon or a missing file is reported in its place, and the rest still shows.
 
@@ -1448,39 +1449,34 @@ Suggested consultant (use it unless the user named a provider or model, or the u
 The suggestion comes from \code{suggest\_consultant}. \code{ConsultantBudget} takes an optional
 \code{kind} (one of the usage log's kinds) and \code{provider}; without a kind it gives one line per
 kind, and with a provider it considers only that one. \code{CONSULT\_PICKS} lists, for each kind,
-the (provider, model, effort) options in order of preference, from the public benchmarks dated in
-\code{docs/consultants.md}. Since 0.28, research and drafts (code as text, which Claude checks and
-applies itself, so it stays the only writer) go first to Antigravity's \code{claude-opus-5-5}, on
-Google's quota rather than Claude Code's or Codex's; for research the lines after the choice also
-name Codex's own pick for research that needs a page's text, since \code{agy} headless can search
-but not open a page. Each option is checked against what is installed and listed:
+the (provider, model, effort) options in order of preference. The rulebook gives the
+\href{https://github.com/jibarix/nouez/blob/v0.28.5/docs/rules.md#rule-starting-picks}{starting order by kind};
+\code{docs/consultants.md} dates the benchmark rationale.
 
 \begin{itemize}
-\item A provider that isn't installed is left out. A model that isn't listed becomes the newest
-  listed model of its family (the name with its version numbers taken out, compared by version),
-  else the provider's default model (the one it marks, else the first listed; for Antigravity
-  Gemini~4 Neon when listed, else a listed Gemini model). An effort the model doesn't list becomes
-  the closest listed level below it (the lowest listed one when all are above it), and a level is always named, since a reused consultant keeps
-  its last one; each fallback adds a note. With \code{provider} antigravity (``ask Gemini'')
-  only its Gemini models are options. A \code{kind} with a \code{provider} also holds the
-  send's own pick to that provider, for the next message of that kind that reaches it (unused, it
-  lapses after half an hour); the message after it gets the usual pick again.
-\item Each option's usage outlook comes from its windows (for Antigravity, the quota group whose
-  \code{/usage} list names its model; a model no group lists has its usage not known, and an option
-  with known room comes before it): \emph{blocked} when a window is used up or runs out before its reset at the current pace,
-  \emph{tight} over 90\% on pace at the weekly reset, \emph{busy} over 70\%, \emph{spare} under 60\%
-  with the reset within three days, otherwise ok, or unknown with no windows. A reading older than 30
-  minutes gives no pace: its percentage counts only as the least the week will reach, so it can
-  make an option tight or busy, never spare.
-\item Options trade by the quota they spend: Codex, or one of Antigravity's quota groups. Blocked
-  options are skipped. The first that is left is the choice, except that a tight one gives way to a
-  later ok or spare option on another quota, a busy one to a spare one on another quota (not for
-  fact checks), and a tight one that stays drops one effort level when its model lists that level. For research and quick checks,
-  a spare option on another quota also takes the place of an ok, spare or unknown first choice,
-  the one whose week resets first, the first choice winning a tie. Reviews, re-checks, bug hunts and
-  plan critiques never move this way, and a Claude model is never an option for them, nor for any
-  kind sent with the work's diff (\code{revision: true}), not even as Antigravity's default model: it
-  shares the blind spots of the Claude that wrote the work.
+\item Walk the options in order, skipping providers that are absent. Resolve each model and effort
+  against that provider's catalogue. Family matching compares names with the version numbers
+  removed, then orders matches by version. Try another listed pick for that provider before
+  using its default. A substitution within a model family, a switch to the provider default
+  for a missing model, or a change to an unavailable effort adds a note. Skipping a missing
+  model in favor of another listed pick can be silent. See the
+  \href{https://github.com/jibarix/nouez/blob/v0.28.5/docs/rules.md#rule-catalogue-fallback}{model and effort fallbacks}.
+  Apply the named-provider restriction and exclude Claude models for work that requires an
+  \href{https://github.com/jibarix/nouez/blob/v0.28.5/docs/rules.md#rule-independent-review}{independent reviewer},
+  including any send with \code{revision: true}.
+\item Read the windows for the quota each remaining option spends. For Antigravity the
+  \code{/usage} group lists identify the quota. Classify each option from those windows and
+  discard blocked options. An old reading gives a lower bound on use. The
+  \href{https://github.com/jibarix/nouez/blob/v0.28.5/docs/rules.md#rule-usage-forecast}{forecast rule}
+  specifies when a reading supports a pace.
+\item Start with the first remaining option and compare options on other quotas. An unknown
+  Antigravity group yields to known room. A tight week can move the choice or lower its effort.
+  A busy week can yield to spare quota except for a fact check. For eligible research and quick
+  checks, compare spare weeks by reset time, keeping the first choice on a tie, then consider
+  how far a week is behind pace if the earlier rules left the pick in place. See the
+  \href{https://github.com/jibarix/nouez/blob/v0.28.5/docs/rules.md#rule-tight-week}{tight-week rule},
+  \href{https://github.com/jibarix/nouez/blob/v0.28.5/docs/rules.md#rule-spare-week}{spare-week rule}
+  and \href{https://github.com/jibarix/nouez/blob/v0.28.5/docs/rules.md#rule-behind-pace}{final pace comparison}.
 \end{itemize}
 
 The same judgment of each window serves the send, the prompt hook and the status screen. At send, a
@@ -1498,10 +1494,9 @@ Antigravity consultant checks its starting model before the first message can ch
 the choice carry the kind's notes (rounds of a review, the premise question of a critique, sources
 for a fact check), the blind second opinion with the other provider's own suggestion when it has room, the subjects
 Gemini~4 Neon scores best on when Neon is listed, its group has room and the choice isn't already
-a Gemini model, and that a reused consultant keeps its last model and effort. Past 70\% of Claude
-Code's week the hand-out line adds that code to write can go out as a draft (kind \code{draft}).
-The rule that research starts an Antigravity week not yet begun is gone in 0.28: research goes to
-that group first anyway.
+a Gemini model, and that a reused consultant keeps its last model and effort. The hand-out line can recommend sending code to write as kind \code{draft}; Claude checks and
+applies the returned text locally. Research advice can name a second provider for reading a
+page. See the \href{https://github.com/jibarix/nouez/blob/v0.28.5/docs/rules.md#rule-research-and-drafts}{research and draft advice}.
 \code{tests/consult\_eval.py} checks in fresh \code{claude -p} sessions that Claude calls it and
 follows it.
 

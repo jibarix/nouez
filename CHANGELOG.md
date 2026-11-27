@@ -6,11 +6,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.28.5] - 2026-11-26
+
+The rulebook is complete, and the other docs link to it instead of keeping copies that drift. Nothing nouez does changes. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version.
+
 ### Documentation
 
-- The rulebook (`docs/rules.md`) now holds the rules that were written only in other docs or in the code: 39 new rows, each with an example of who meets it, what holds it and the test that checks it (or "none"), and 22 rows restated to match what nouez does.
+- The rulebook (`docs/rules.md`) adds 39 rows for rules previously stated only in other docs or in the code, and restates 25 existing rows to match what nouez does. Each new row gives an example, says what holds the rule and names its test (or "none").
 - Two rules got tests: which folder a consultant works in when Claude names none, and which consultant a folder outside git belongs to.
 - The README says which systems new work is tried on: macOS and Linux work as of 0.28.4 and keep their unit tests on every release; new features are built and tried on Windows.
+- The README, security notes, guides and architecture now state a rule briefly where you need it and link to its row in the rulebook for the full conditions. What you need to act stays in place: the security recipients and retention table, the table of files nouez keeps, the consultant-choice table, troubleshooting's error texts with their remedies, and the architecture's message formats.
+- `verify.py static` checks Markdown rulebook links for relative paths, checks their `rule-` fragments against row anchors, and checks the architecture's rule links against the tag in the PDF title. It also compares the saved-diff lifetime in both retained tables with the rulebook. The review checklist asks for a row link when guide prose adds or revises a rule.
 
 ## [0.28.4] - 2026-11-26
 
@@ -827,7 +833,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.4...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.5...HEAD
+[0.28.5]: https://github.com/jibarix/nouez/compare/v0.28.4...v0.28.5
 [0.28.4]: https://github.com/jibarix/nouez/compare/v0.28.3...v0.28.4
 [0.28.3]: https://github.com/jibarix/nouez/compare/v0.28.2...v0.28.3
 [0.28.2]: https://github.com/jibarix/nouez/compare/v0.28.1...v0.28.2

@@ -65,7 +65,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.28.4 |
+| nouez | 0.28.5 |
 | Claude Code | 2.1.332 |
 | Codex CLI | 0.172.0 |
 | Codex app-server daemon | 0.172.0 |
@@ -139,7 +139,7 @@ It checks Claude Code's side, the phone dispatcher and each consultant CLI, and 
 ### What nouez changes in your Claude Code setup
 
 - **The MCP entry** for `consultants`, made by Claude Code's own `claude mcp add` in step 2.
-- **One trust mark in `~/.claude.json`** for each folder you trust a session in, only after nouez reports what the folder's settings would run and you say yes (Claude passes your yes on; `NOUEZ_ASK_TRUST=1` makes nouez ask you in its own prompt). A folder nouez creates outside git, in the same call that marks it, has no settings, so it needs no report. It copies the file first and keeps the newest 20 copies, in `%LOCALAPPDATA%\nouez\claude-json-backups` on Windows and `~/.local/state/nouez/claude-json-backups` on macOS and Linux. `doctor` lists them and says how to put one back. `NOUEZ_NO_TRUST_WRITE=1` turns this off.
+- **One trust mark in `~/.claude.json`** for each folder you trust a session in, only after nouez reports what the folder's settings would run and you say yes (Claude passes your yes on; `NOUEZ_ASK_TRUST=1` makes nouez ask you in its own prompt). A folder nouez creates outside git, in the same call that marks it, has no settings, so it needs no report. Before changing the file, nouez makes a dated backup. `doctor` reports the backup folder, counts this profile's copies, names the newest and says how to restore one. See [which trust backups nouez keeps](docs/rules.md#rule-trust-backups). `NOUEZ_NO_TRUST_WRITE=1` turns this off.
 - **The dispatcher folder's own files:** its `CLAUDE.md`, and allow rules for nouez's session tools in its `.claude/settings.json`, copied first.
 - **The sign-in start** that `dispatcher install` adds, which `dispatcher uninstall` removes.
 - **nouez's status line** in Claude Code's own `settings.json`, only on your yes and only when it has none, copied first.
@@ -182,7 +182,7 @@ In any Claude Code session with nouez, from the phone or at the computer, ask fo
 
 Claude starts a background consultant in the project (Codex if it is installed, otherwise Antigravity), or reuses the one already working there, sends it the question and gets the answer back as a tool result, without a second terminal to copy text into. A consultant Claude starts is always read-only: it never edits your files.
 
-Claude also consults without being asked, while the subscription has room: a review before it commits a change to behavior, several files or anything risky, a bug hunt when a failure's cause isn't obvious, a critique of a plan or design of its own before it builds on it, and research across sources, audits spanning many files, and checks of consequential claims. nouez suggests the provider, model and effort for each from the usage left and public benchmarks. Your own `CLAUDE.md` can change that, and `NOUEZ_NO_AUTO_CONSULT=1` turns it off. [Consultants](docs/consultants.md) covers reusing one, your own Codex session, how nouez picks a model and effort, briefs and verdicts, and Antigravity.
+When a consultant has room, Claude can consult without being asked. For example, it asks for a review before committing a behavior change. See [when Claude consults on its own](docs/rules.md#rule-automatic-consultation). nouez suggests the provider, model and effort for each from the usage left and public benchmarks. Your own `CLAUDE.md` can change that, and `NOUEZ_NO_AUTO_CONSULT=1` turns it off. [Consultants](docs/consultants.md) covers reusing one, your own Codex session, how nouez picks a model and effort, briefs and verdicts, and Antigravity.
 
 ## Documentation
 
