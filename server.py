@@ -69,7 +69,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.28.3"
+SERVER_VERSION = "0.28.4"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -11153,7 +11153,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "cwd": {"type": "string", "description": "Absolute path of the project the consultant works in. Pass your working directory. Default: Claude Code's first workspace folder."},
+                "cwd": {"type": "string", "description": "Absolute path of the project the consultant works in. Pass your working directory. Default: the client's first workspace folder when it shares them, else the folder nouez started in."},
                 "model": {"type": "string", "description": "Model for a new consultant: a Codex model, or for provider antigravity an agy model such as gemini-4-neon (ConsultantBudget lists them). Default: the user's Codex config; for Antigravity, gemini-4-neon at level high. Ignored when an existing consultant is reused."},
                 "title": {"type": "string", "description": "Title for a new consultant (shown in Codex for a Codex one). Ignored when an existing consultant is reused."},
                 "instructions": {"type": "string", "description": "Standing instructions for a new consultant's role. Ignored when an existing consultant is reused."},
@@ -11179,7 +11179,7 @@ TOOLS = [
             "properties": {
                 "cwd": {
                     "type": "string",
-                    "description": "Only list consultants whose working directory is inside the git work tree containing this path (nested repos included). Outside git: inside the Claude Code workspace folder that contains it, or inside the path itself.",
+                    "description": "Only list consultants whose working directory is inside the git work tree containing this path (nested repos included). Outside git: inside the client's workspace folder that contains it, when it shares them, or inside the path itself.",
                 },
                 "include_all": {
                     "type": "boolean",

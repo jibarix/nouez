@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.28.3\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.28.4\\[0.3em]\large Architecture and message reference}
 \date{November 26, 2026}
 \author{}
 
@@ -290,7 +290,7 @@ the folder the call names, never in a workspace above it.
   "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
   "ttlMs": 0, "cacheScope": "private",
-  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.28.3"}}}}
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.28.4"}}}}
 \end{wire}
 
 Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
@@ -312,8 +312,9 @@ name and all its arguments), once, within 10 minutes, and otherwise asks again. 
 
 A client that sends \code{initialize} first, such as a Claude Code from before 2026-07-28, gets the
 legacy lifecycle, which lasts for the process. A request without the 2026-07-28 \code{\_meta} that
-comes before any \code{initialize}, other than \code{ping}, gets \code{-32600}, so a client that
-skips the handshake never runs under its rules.
+comes before any \code{initialize}, other than \code{ping} and \code{server/discover}, gets
+\code{-32600}, so a client that skips the handshake never runs under its rules; \code{server/discover}
+without that \code{\_meta} gets 2026-07-28's \code{-32602}.
 
 \begin{figure}[H]
 \centering
@@ -1051,7 +1052,8 @@ doesn't support. They
 go into \code{turn/start}, and Codex keeps them for the session's later turns as well, so the result
 says the setting stays until changed, after a quick reply too. A running turn can't change them:
 when nouez sees the session busy, a send with either is refused and nothing is sent, rather than
-steering the turn with them silently dropped. Like the choice between start and steer, this check
+steering the turn with them silently dropped; a value the running turn already has doesn't count,
+since \code{ConsultantBudget}'s suggestion is passed with every message. Like the choice between start and steer, this check
 is not atomic: a turn another client starts between it and \code{turn/start} is not seen.
 
 Before either check, a message this server already delivered to the running turn is not sent
@@ -1137,7 +1139,7 @@ Reply from codex-nouez-4d9f17:
 
 <first 60,000 characters>
 
-[Truncated: 18422 more characters. The full reply is saved in C:\Users\you\AppData\Local\Temp\nouez\01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31.md. Or read the rest with GetConsultantReply (turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31, offset 60000).]
+[Truncated: 18422 more characters. The full reply is saved in C:\Users\you\AppData\Local\nouez\replies\reply-01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31.md. Or read the rest with GetConsultantReply (turn_id 01a1f3c4-8b20-7d55-b1e3-6a9c0f2e7d31, offset 60000).]
 \end{plain}
 
 % -----------------------------------------------------------------------------
@@ -1360,7 +1362,8 @@ codex-nouez-77c2e0 was not started by StartConsultant. Close it from its own ter
 \label{sec:budget}
 
 \code{ConsultantBudget} gathers the facts for choosing a consultant's model and effort, and changes
-nothing. It makes two requests to the Codex daemon, reads one file the user's status line saves, and
+nothing, except that a \code{kind} with a \code{provider} keeps nouez's pick for the next send of
+that kind to that provider on its models, for up to half an hour (below). It makes two requests to the Codex daemon, reads one file the user's status line saves, and
 asks Artificial Analysis for model scores about once a week. Each part fails on its own: an
 unreachable daemon or a missing file is reported in its place, and the rest still shows.
 
@@ -1457,7 +1460,7 @@ but not open a page. Each option is checked against what is installed and listed
   listed model of its family (the name with its version numbers taken out, compared by version),
   else the provider's default model (the one it marks, else the first listed; for Antigravity
   Gemini~4 Neon when listed, else a listed Gemini model). An effort the model doesn't list becomes
-  the closest listed level below it, and a level is always named, since a reused consultant keeps
+  the closest listed level below it (the lowest listed one when all are above it), and a level is always named, since a reused consultant keeps
   its last one; each fallback adds a note. With \code{provider} antigravity (``ask Gemini'')
   only its Gemini models are options. A \code{kind} with a \code{provider} also holds the
   send's own pick to that provider, for the next message of that kind that reaches it (unused, it
@@ -1472,7 +1475,7 @@ but not open a page. Each option is checked against what is installed and listed
 \item Options trade by the quota they spend: Codex, or one of Antigravity's quota groups. Blocked
   options are skipped. The first that is left is the choice, except that a tight one gives way to a
   later ok or spare option on another quota, a busy one to a spare one on another quota (not for
-  fact checks), and a tight one that stays drops one effort level. For research and quick checks,
+  fact checks), and a tight one that stays drops one effort level when its model lists that level. For research and quick checks,
   a spare option on another quota also takes the place of an ok, spare or unknown first choice,
   the one whose week resets first, the first choice winning a tie. Reviews, re-checks, bug hunts and
   plan critiques never move this way, and a Claude model is never an option for them, nor for any
@@ -1482,10 +1485,12 @@ but not open a page. Each option is checked against what is installed and listed
 
 The same judgment of each window serves the send, the prompt hook and the status screen. At send, a
 new Codex turn is refused, with nothing sent, only when Codex reports its limit reached and no
-credits; the refusal names another quota with room, from readings already kept, or says why none
+credits, read with one request on the connection already open, whether nouez picked the model or
+Claude named it; the refusal names another quota with room, from readings already kept, or says why none
 can be named. Antigravity never says whether AI credits can be spent, so a used-up group there, and
 a forecast that a window runs out, only add a \code{(Usage: ...)} note naming where later turns can
-go. A message added to a running turn is never refused and reads no usage before it goes.
+go. A message added to a running turn is never refused for its usage and reads no usage before it
+goes; which turns take one is the steering rule above.
 
 With no option left, the text says to skip the consultation and tell the user why. For an
 Antigravity choice, \code{StartConsultant}'s part names the model and level as well, since a new
@@ -1928,8 +1933,8 @@ before trusting'', never left out.
 nouez keeps, per server process, a fingerprint of each report it gave, by trust folder: the
 checkout and \code{cwd} it covered, and a SHA-256 over each file's path and its state (absent,
 unreadable, or a SHA-256 of its bytes), so a change the report doesn't show, such as an
-\code{env} value, still counts. Each Claude Code session runs its own nouez, so that is per
-conversation. It is kept only when the response is sent, after the last cancellation check, so a
+\code{env} value, still counts. Each Claude Code session runs its own nouez, so in Claude Code that is per
+conversation; a client that shares one server between conversations shares the reports too. It is kept only when the response is sent, after the last cancellation check, so a
 cancelled call has shown nothing and remembers nothing. \code{trust: true} records trust only when the fingerprint
 taken now equals the one kept: on the first call, or after the files changed, it records nothing,
 keeps the new one and returns the report. When a file can't be read, nouez never records trust
@@ -2601,7 +2606,8 @@ systems only \code{ps}'s joined line is there, and only the process id is given.
 \code{MAX\_WAIT\_SECONDS} & 4 h & cap on polling for a turn, \code{wait: "done"} included \\
 \code{MAX\_REPLY\_CHARS} & 60,000 & longer replies are cut and saved to a file \\
 \code{PARTIAL\_CHARS} & 4,000 & output so far shown for a running turn (the end) \\
-\code{RECENT\_SAVED\_THREADS} & 50 & saved sessions checked for unloaded consultants \\
+\code{SAVED\_PAGES} & 20 $\times$ 100 & saved sessions searched for unloaded consultants \\
+\code{RECENT\_SAVED\_THREADS} & 50 & the same, when the index can't say who started one \\
 \code{REPLY\_LOOKBACK} & 100 & turns searched for a \code{turn\_id} \\
 \code{MAX\_FRAME\_BYTES} & 64 MiB & largest WebSocket message accepted \\
 Daemon request timeout & 15 s & per Codex request and for the handshake \\

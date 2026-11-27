@@ -6,6 +6,20 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.28.4] - 2026-11-26
+
+The docs say what nouez does. Nothing nouez does changes; two tool descriptions Claude reads are corrected. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version.
+
+### Fixed
+
+- `StartConsultant` told Claude that an omitted `cwd` means Claude Code's first workspace folder. A Claude Code that connects without the handshake shares no workspace folders, so it is the folder nouez started in; the description now says so, and the consultants guide says that outside git a subfolder then gets a consultant of its own. `ListConsultants`' description of a `cwd` filter outside git is corrected the same way.
+- The rule that a refusal never waits for a usage reading didn't hold for a new Codex turn whose model Claude named: nouez reads Codex's usage first, with one request on the connection already open (about half a second), so a turn Codex would refuse (its limit reported reached, with no credits) is refused before anything is sent. The rulebook and the consultants guide now say that, and what does wait: an Antigravity send on nouez's own pick reads agy's usage first when no reading from the last 90 seconds is kept.
+- Trust, corrected in the README, phone guide, tools reference and architecture: a report is kept per nouez server (in Claude Code, per conversation), Claude passes your yes on unless `NOUEZ_ASK_TRUST=1`, and a folder nouez creates outside git in the same call needs no report.
+- Security, corrected in SECURITY.md and the README: a routed send reads usage with the usage log off, `ListProjects` reads no transcripts, `NOUEZ_NO_USER_SESSIONS=1` refuses sends to your own Codex sessions, and `CloseClaudeSession` reaches only interactive sessions of nouez's own Claude Code profile, never its caller or the sessions above it.
+- Routing, corrected in the consultants guide, tools reference, limitations and architecture: effort fallbacks, kind `other` on a Claude model, `ConsultantBudget` holding a named provider for half an hour, and model ids in its suggestion.
+- Sends and replies, corrected in the tools reference and consultants guide: when a blind second opinion is refused, how review rounds are counted, a steer repeating the turn's own model or effort (Codex only), Antigravity reply lookup by id, and the waiter for an unnamed client.
+- Smaller corrections: `server/discover` without its `_meta` gets `-32602`, a `PATH` entry naming the project can supply `claude`, the saved-session search depth and the long-reply path in the architecture; and three rulebook rows (a reinstall keeping projects folders given explicitly, the prompt hook on a used-up window, `attach_diff: true` without a revision), plus a new one for an omitted `cwd`.
+
 ## [0.28.3] - 2026-11-26
 
 Consultants found with the usage log off, and a send's reason that names the effort it ran at. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version, and run `server.py dispatcher install` again, with the same `--folder` (and Claude Code profile) you installed it with, to restart the dispatcher.
@@ -807,7 +821,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.3...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.28.4...HEAD
+[0.28.4]: https://github.com/jibarix/nouez/compare/v0.28.3...v0.28.4
 [0.28.3]: https://github.com/jibarix/nouez/compare/v0.28.2...v0.28.3
 [0.28.2]: https://github.com/jibarix/nouez/compare/v0.28.1...v0.28.2
 [0.28.1]: https://github.com/jibarix/nouez/compare/v0.28.0...v0.28.1
