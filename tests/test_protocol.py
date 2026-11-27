@@ -8266,6 +8266,17 @@ class ApprovalRetryTest(unittest.TestCase):
             self.assertEqual(done["content"][0]["text"], "went")  # the notice is the dispatcher's
 
 
+@contextlib.contextmanager
+def idle_inputs():
+    """idle_reason with nothing else under way: no request, prompt, named provider, log write or
+    Codex turn other tests may have left in this process."""
+    with mock.patch.object(server, "_handlers", [0]), mock.patch.object(server, "_client_requests", {}), \
+            mock.patch.object(server, "_cancel_events", {}), mock.patch.object(server, "_asked", {}), \
+            mock.patch.object(server, "_named", {}), mock.patch.object(server, "_log_threads", []), \
+            mock.patch.object(server, "_live_turns", {}):
+        yield
+
+
 class TrustReportFirstTest(unittest.TestCase):
     """0.19.0: trust=true records trust only once nouez has given the folder's report."""
 
@@ -8302,6 +8313,54 @@ class TrustReportFirstTest(unittest.TestCase):
         self.assertIn("apiKeyHelper runs: key.sh", first)
         trust.assert_called_once()
         window.assert_not_called()  # folder_trusted still says no in this test
+
+    def test_a_report_waiting_for_the_users_yes_keeps_the_session_here(self):
+        """0.30.2: Ana gets a trust report on her phone. While she reads it, an update doesn't move her
+        session to a newer server, which hasn't given the report and would give it again. Her yes,
+        opening the folder untrusted, or the folder trusted at the computer ends the wait, and so do
+        AWAIT_SECONDS. Sam's report for a folder nouez can't trust from here asks no yes: no wait."""
+        def trust(*args, **kwargs):  # recorded: the folder is trusted from now on
+            server.folder_trusted.return_value = server.exactly_trusted.return_value = True
+            return self.dir, None
+        with mock.patch.object(server, "_awaiting", {}), mock.patch.object(server, "open_window"), \
+                mock.patch.object(server, "trust_folder", side_effect=trust):
+            self.assertIsNone(server.awaiting_answer())
+            server.open_claude_session({"cwd": self.dir})
+            self.assertEqual(server.awaiting_answer(), "report")
+            with idle_inputs():
+                self.assertEqual(server.idle_reason(), "a trust report waits for the user's answer")
+            server.open_claude_session({"cwd": self.dir, "trust": True})  # her yes
+            self.assertIsNone(server.awaiting_answer())
+            server.folder_trusted.return_value = server.exactly_trusted.return_value = False  # the next report
+            server.open_claude_session({"cwd": self.dir})
+            os.mkdir(os.path.join(self.dir, "b"))  # another folder of the same repository, opened untrusted
+            server.open_claude_session({"cwd": os.path.join(self.dir, "b"), "open_untrusted": True})
+            self.assertEqual(server.awaiting_answer(), "report", "the report for the repository's root still waits")
+            with mock.patch.object(server, "config_review_quiet", return_value=("unread", "f", False, False)):
+                out = server.open_claude_session({"cwd": os.path.join(self.dir, "b"), "trust": True})
+            self.assertIn(server.UNREAD_REPORT, out)
+            self.assertEqual(server.awaiting_answer(), "report", "a yes for another folder answers only that one")
+            server.open_claude_session({"cwd": self.dir, "open_untrusted": True})
+            self.assertIsNone(server.awaiting_answer())
+            server.open_claude_session({"cwd": self.dir})
+            with mock.patch.object(server, "ask_trust", return_value=True), \
+                    mock.patch.object(server, "user_approves", side_effect=server.BridgeError("declined")), \
+                    self.assertRaises(server.BridgeError):
+                server.open_claude_session({"cwd": self.dir, "trust": True})  # a yes, then no at the prompt
+            self.assertIsNone(server.awaiting_answer())
+            server.open_claude_session({"cwd": self.dir})
+            with mock.patch.object(server, "exactly_trusted", return_value=True):  # trusted at the computer
+                self.assertIsNone(server.awaiting_answer(), "no call needed")
+            server.open_claude_session({"cwd": self.dir})
+            for item, (deadline, folder) in server._awaiting.items():
+                server._awaiting[item] = (time.monotonic() - 1, folder)  # 15 minutes on
+            self.assertIsNone(server.awaiting_answer())
+            self.assertEqual(server._awaiting, {}, "a lapsed wait is dropped")
+            for env in ({"NOUEZ_NO_TRUST_WRITE": "1"}, {"NOUEZ_ASK_TRUST": "1", "NOUEZ_DISPATCHER": "1"}):
+                with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                    out = server.open_claude_session({"cwd": self.dir})
+                    self.assertIn("apiKeyHelper runs: key.sh", out)
+                    self.assertIsNone(server.awaiting_answer())
 
     def test_the_dispatcher_records_trust_only_inside_its_projects_folder(self):
         """0.26.1: in the phone dispatcher, code (not only its instructions) keeps trust inside its
@@ -12348,6 +12407,7 @@ class PhoneProjectsFoldersTest(unittest.TestCase):
     def setUp(self):
         self.dispatcher_setUp()
         for patch in (mock.patch.object(server, "_home_warned", []),
+                      mock.patch.object(server, "_awaiting", {}),
                       mock.patch.object(server, "login_warning", lambda *a, **k: ""),
                       mock.patch.object(server, "start_release_check", lambda again_after=None: None),
                       mock.patch.object(server, "safe_nouez_update_notice", lambda pending=None: "")):
@@ -12401,6 +12461,41 @@ class PhoneProjectsFoldersTest(unittest.TestCase):
         with self.home_at(self.home):
             self.assertEqual(server.initial_roots(nouez, None), {"folders": [], "locked": False})
             self.assertEqual(server.initial_roots(self.folder, None), {"folders": [default], "locked": False})
+
+    def test_adding_a_folder_promises_quiet_trust_only_when_it_can_happen(self):
+        """Ana has ask_trust on and adds her work folder from the phone: nouez doesn't tell her its quiet
+        projects are trusted at once, since every trust needs her yes at the computer. The same holds
+        for a promoted install default and the phone setup's guide, with no_trust_write on, and with
+        no Claude Code state file yet; with none of these it promises it, with both caveats."""
+        config = os.path.join(self.home, "config")
+        os.makedirs(config, exist_ok=True)
+        state = os.path.join(config, ".claude.json")
+        work, more, other, old = self.roots("work", "more", "other", "old")
+        cases = [({}, True, None), ({"NOUEZ_ASK_TRUST": "1"}, True, "ask_trust is on"),
+                 ({"NOUEZ_NO_TRUST_WRITE": "1"}, True, "no_trust_write is on"),
+                 ({}, False, "no state file yet")]
+        with self.phone(), mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": config}), \
+                mock.patch.object(server, "projects_folder_candidates", lambda state_file=None: []):
+            for env, has_state, why in cases:
+                with self.subTest(env=env, has_state=has_state), mock.patch.dict(os.environ, env):
+                    if has_state:
+                        with open(state, "w", encoding="utf-8") as f:
+                            json.dump({"projects": {}}, f)
+                    elif os.path.exists(state):
+                        os.remove(state)
+                    write_settings({"roots": {"folders": [{"path": old, "from": "default"}], "locked": False}})
+                    outs = [self.add(work), self.add(old), server.phone_setup({})]
+                    self.remove(work)
+                    for out in outs:
+                        if why is None:
+                            self.assertIn("trust covers settings", out)
+                            self.assertIn("skills can run", out)
+                        else:
+                            self.assertIn(why, out)
+                            self.assertNotIn("trusted at once.", out)
+                            self.assertNotIn("opens without the trust question", out)
+                            self.assertNotIn("(None)", out)
+        write_settings(None)
 
     def test_projects_folders_are_copied_once_from_the_dispatcher(self):
         """The first 0.29 nouez to need the projects folders copies them once from the running
@@ -12531,9 +12626,13 @@ class PhoneProjectsFoldersTest(unittest.TestCase):
             self.assertIn("Downloads and Desktop too", text)
             self.assertIn("Only if they still want it, call NouezSettings again", text)
             self.assertIsNone(server.recorded_roots())
+            self.assertEqual(server.awaiting_answer(), "home")
+            with idle_inputs():
+                self.assertEqual(server.idle_reason(), "the home folder's warning waits for the user's answer")
             with mock.patch.object(server, "respond") as respond:
                 server.dispatch(msg, threading.Event())
             self.assertIn(f"Added {self.home} to the projects folders", tool_text(respond))
+            self.assertIsNone(server.awaiting_answer(), "her answer ends the wait")
             home = {"folders": [{"path": self.home, "from": "phone"}], "locked": False}
             self.assertEqual(server.recorded_roots(), home)
             self.assertNotIn("can't hold trust", server.projects_text(home))
@@ -12549,6 +12648,17 @@ class PhoneProjectsFoldersTest(unittest.TestCase):
             self.assertIn("can't hold trust", server.projects_text(server.recorded_roots()))
             self.assertIn("records no trust at all",
                           server.dispatcher_trust_problem(os.path.join(self.home, "Downloads", "tool")))
+
+    def test_a_confirmed_home_folder_ends_its_wait_even_when_refused(self):
+        """0.30.2: Ana confirms her home folder after the warning, and nouez refuses it (the list is
+        locked at the computer): her answer still ends the warning's wait, so an update isn't held."""
+        with self.home_folder(), mock.patch.object(server, "update_settings",
+                                                   side_effect=server.BridgeError(server.ROOTS_LOCKED)):
+            server.home_warning()
+            self.assertEqual(server.awaiting_answer(), "home")
+            with self.assertRaises(server.BridgeError):
+                self.add(self.home)
+            self.assertIsNone(server.awaiting_answer())
 
     def test_inside_the_home_folder_what_nouez_protects_stays_refused(self):
         """With the home folder picked on the phone, `Downloads\\tool` can be trusted after its check,
@@ -12593,6 +12703,7 @@ class PhoneSetupAndStatusTest(unittest.TestCase):
         self.dispatcher_setUp()
         for patch in (mock.patch.object(server, "_home_warned", []),
                       mock.patch.object(server, "_login_told", []),
+                      mock.patch.object(server, "_awaiting", {}),
                       mock.patch.object(server, "start_release_check", lambda again_after=None: None),
                       mock.patch.object(server, "safe_nouez_update_notice", lambda pending=None: ""),
                       mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": os.path.join(self.home, "config"),
@@ -12629,7 +12740,9 @@ class PhoneSetupAndStatusTest(unittest.TestCase):
             self.assertIn("The four protections change only at the computer", out)
             self.assertTrue(out.endswith("call PhoneSetup with done=true."), out)
             self.assertFalse(server.setup_done())
+            self.assertEqual(server.awaiting_answer(), "home")
             self.assertIn("marked done", server.phone_setup({"done": True}))
+            self.assertIsNone(server.awaiting_answer(), "Kim never picked her home folder: done ends the wait")
             self.assertTrue(server.setup_done())
             self.assertTrue(server.phone_setup({}).startswith("Phone setup (done before; going through it again)."))
         with self.phone(), mock.patch.object(server, "projects_folder_candidates", lambda state_file=None: []):

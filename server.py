@@ -74,7 +74,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.30.1"
+SERVER_VERSION = "0.30.2"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -134,6 +134,9 @@ _request = threading.local()  # .client: the clientInfo the request being handle
 _client_roots = None  # Claude Code's workspace folders (roots/list), or None until fetched
 _initialized = threading.Event()  # set by a legacy initialize: before it, only 2026-07-28 requests run
 _trust_reports = {}  # trust folder (_trust_norm) -> (checkout, folder, fingerprint) of the report OpenClaudeSession last gave
+AWAIT_SECONDS = 900  # how long a report or warning that waits for the user's answer keeps the session on this server
+_awaiting = {}  # ("report", trust folder) or ("home", home folder), both _trust_norm -> (monotonic deadline, folder)
+_awaiting_guard = threading.Lock()
 _on_reply = threading.local()  # .pending: what a tool call keeps only once its response is sent
 _client_requests = {}  # id of a request we sent to Claude Code -> [Event, response]
 _client_guard = threading.Lock()
@@ -4670,13 +4673,43 @@ UNKNOWN_TRUST_KEY = ("Not recording trust: nouez can't tell which folder Claude 
                      "question on the computer.")
 
 
+def quiet_trust_off():
+    """Why no project is trusted without its report and a yes here, whatever its folder or
+    settings, or None when quiet trust can happen: outside the phone dispatcher, with no_trust_write
+    or ask_trust on, or with Claude Code's state file unreadable. Each reason says what the user can
+    do instead."""
+    if not in_dispatcher():
+        return "only the phone dispatcher trusts a project without a question"
+    if trust_write_off():
+        return ("no_trust_write is on, so nouez records no trust: Claude Code asks its own trust question when "
+                "the user opens the project at the computer")
+    if ask_trust():
+        return ("ask_trust is on, so each trust needs the user's yes in a Claude Code session at the computer, not "
+                "from the phone")
+    if state_unreadable():
+        return ("Claude Code's state file can't be read, so nouez records no trust: Claude Code asks its own trust "
+                "question when the user opens the project at the computer")
+    return None
+
+
+def quiet_trust_promised():
+    """For messages that describe quiet trust: quiet_trust_off's reason, or, when Claude Code has no
+    state file yet (the writer won't make one), that reason; None when the promise holds now.
+    quiet_trust_root itself keeps to quiet_trust_off, so a missing file gives the writer's error."""
+    off = quiet_trust_off()
+    if off or os.path.exists(claude_state_file()):
+        return off
+    return ("Claude Code has no state file yet, so nouez records no trust: Claude Code asks its own trust question "
+            "when the user opens the project at the computer")
+
+
 def quiet_trust_root(cwd, key, folders):
     """In the phone dispatcher, the projects folder in which `cwd` (trusted in `key`, its project
     settings in `folders`) is trusted without its report and a yes, or None: one the user picked
     (with --projects or from the phone, not the install default) holding both `cwd` and `key`,
     with every project settings file absent or quiet (config_review_quiet), the trust key known,
     Claude Code's state file readable, and neither no_trust_write nor ask_trust on."""
-    if not in_dispatcher() or key is None or trust_write_off() or ask_trust() or state_unreadable():
+    if key is None or quiet_trust_off():
         return None
     roots = [dispatcher_root_of(f) for f in (cwd, key)]
     if any(r is None or r.get("from") not in ("projects", "phone") for r in roots):
@@ -4735,16 +4768,93 @@ UNREAD_REPORT = ("Some of its project settings couldn't be read (below), so noue
                  "session for that).")
 
 
-def remember_report(key, launched, cwd, fingerprint, cancel=None):
+def hold_for_answer(what, folder, on=True):
+    """While the user answers a report or warning only this server gave (`what` "report" or "home",
+    for `folder`), launch.py keeps the session here rather than move it to a newer server, which
+    would ask again: up to AWAIT_SECONDS, or until the answer comes (on=False)."""
+    if folder is None:
+        return
+    item = (what, _trust_norm(folder))
+    with _awaiting_guard:
+        if on:
+            _awaiting[item] = (time.monotonic() + AWAIT_SECONDS, folder)
+        else:
+            _awaiting.pop(item, None)
+
+
+def answered_report(key, launched, cwd):
+    """The user answered the report this server gave for checkout `launched`, folder `cwd` (trust
+    folder `key`): its wait ends. A report for another folder with the same trust folder still waits."""
+    shown = _trust_reports.get(_trust_norm(key)) if key else None
+    if shown and shown[:2] == (_trust_norm(launched), _trust_norm(cwd)):
+        hold_for_answer("report", key, False)
+
+
+def awaiting_answer():
+    """What a hold_for_answer still waits for ("report" or "home"), or None. Lapsed waits are dropped,
+    and so is a report's once its folder is trusted, at the computer too: answered without a call."""
+    now = time.monotonic()
+    with _awaiting_guard:
+        waits = list(_awaiting.items())
+    answered = [item for item, (deadline, folder) in waits
+                if deadline <= now or (item[0] == "report" and exactly_trusted(folder))]
+    with _awaiting_guard:
+        for item in answered:
+            if _awaiting.get(item) == dict(waits)[item]:  # not one set again meanwhile
+                del _awaiting[item]
+        return next(iter(_awaiting), (None,))[0]
+
+
+def remember_report(key, launched, cwd, fingerprint, cancel=None, awaiting=True):
     """Keep the report given for `key` (its checkout `launched`, folder `cwd`, `fingerprint`), once the
-    result is going back: a cancelled call has shown the user nothing."""
+    result is going back: a cancelled call has shown the user nothing. `awaiting`: the result asks
+    the user's yes, so the session waits for it here (hold_for_answer); otherwise any wait ends."""
     check_cancel(cancel)
     entry = (_trust_norm(key), (_trust_norm(launched), _trust_norm(cwd), fingerprint))
-    pending = getattr(_on_reply, "pending", None)
-    if pending is None:  # called directly, not through dispatch
+
+    def keep():
         _trust_reports[entry[0]] = entry[1]
-    else:  # dispatch stores it when it sends the response, after its last cancellation check
-        pending.append(lambda: _trust_reports.__setitem__(*entry))
+        hold_for_answer("report", key, awaiting)
+    on_sent(keep)  # dispatch keeps it when it sends the response, after its last cancellation check
+
+
+def refuse_new_folder(cwd):
+    """Before OpenClaudeSession makes `cwd` to trust it: where a folder made there would be trusted,
+    checked before anything is made or asked, and again just before it is made (a link may have been
+    put in since). Raises the refusal trust_with_checks would give after the folder exists."""
+    if state_unreadable():
+        raise unreadable_state_error(cwd)
+    refuse_dispatcher_trust(cwd)
+    if os.path.isdir(os.path.dirname(cwd)):
+        parent_key, parent_in_git = trust_key(os.path.dirname(cwd))
+        if parent_in_git and not parent_key:  # refused later anyway: before the folder is made
+            raise BridgeError(UNKNOWN_TRUST_KEY)
+        if parent_in_git:  # a new folder in git is trusted with its repository
+            refuse_dispatcher_trust(parent_key)
+        if ask_trust() and not (parent_in_git and exactly_trusted(parent_key)):
+            refuse_asking_here("NOUEZ_ASK_TRUST")  # in the dispatcher: before the folder and its CLAUDE.md
+
+
+def before_new_folder(cwd, args, cancel=None):
+    """The trust gate OpenClaudeSession passes before it makes a folder (`args` its arguments):
+    True once the user approved making and trusting a new folder outside git in nouez's prompt
+    (ask_trust), else False. A refusal raises before anything is made, so a decline leaves nothing
+    behind; trust_with_checks takes the approval and checks the folder again once it exists."""
+    trust = flag(args, "trust")
+    if trust and trust_write_off() and not os.path.isdir(cwd):
+        raise BridgeError(TRUST_WRITE_OFF)  # before a folder is made for nothing, and before `create` is read
+    create = flag(args, "create")
+    if trust and create and not os.path.exists(cwd):
+        refuse_new_folder(cwd)
+    if create and trust and ask_trust() and not os.path.exists(cwd) \
+            and os.path.isdir(os.path.dirname(cwd)) and not git_root(os.path.dirname(cwd)):
+        # A new folder outside git, trusted on its own: asked before it is made, so a decline (or a
+        # 2026-07-28 prompt the user never answers) leaves nothing behind.
+        user_approves(f"Create {cwd} and record that you trust it? It is a new, empty folder with no project "
+                      "settings yet; trusting it lets settings added there later run without Claude Code asking "
+                      "first. This approves this one time only.", "NOUEZ_ASK_TRUST", cancel)
+        return True
+    return False
 
 
 def trust_with_checks(cwd, key, launched, folders, notes, auto, exact, created=False, approved=False,
@@ -4825,42 +4935,14 @@ def open_claude_session(args, cancel=None, progress=None):
         # Checked before anything is created, and so claude can never read the name as an option.
         raise BridgeError(f"name {given!r} isn't usable: use letters, digits, spaces, '.', '_' and '-', "
                           "starting with a letter or digit, up to 64 characters. Nothing was opened.")
-    created = approved = False
-    if flag(args, "trust") and trust_write_off() and not os.path.isdir(cwd):
-        raise BridgeError(TRUST_WRITE_OFF)  # before a folder is made for nothing
-
-    def unreadable_state():
-        return unreadable_state_error(cwd)
-
-    def refuse_new_folder():
-        # Where a folder made here would be trusted, checked before anything is made or asked.
-        if state_unreadable():
-            raise unreadable_state()
-        refuse_dispatcher_trust(cwd)
-        if os.path.isdir(os.path.dirname(cwd)):
-            parent_key, parent_in_git = trust_key(os.path.dirname(cwd))
-            if parent_in_git and not parent_key:  # refused later anyway: before the folder is made
-                raise BridgeError(UNKNOWN_TRUST_KEY)
-            if parent_in_git:  # a new folder in git is trusted with its repository
-                refuse_dispatcher_trust(parent_key)
-            if ask_trust() and not (parent_in_git and exactly_trusted(parent_key)):
-                refuse_asking_here("NOUEZ_ASK_TRUST")  # in the dispatcher: before the folder and its CLAUDE.md
-    if flag(args, "trust") and flag(args, "create") and not os.path.exists(cwd):
-        refuse_new_folder()
-    if flag(args, "create") and flag(args, "trust") and ask_trust() and not os.path.exists(cwd) \
-            and os.path.isdir(os.path.dirname(cwd)) and not git_root(os.path.dirname(cwd)):
-        # A new folder outside git, trusted on its own: asked before it is made, so a decline (or a
-        # 2026-07-28 prompt the user never answers) leaves nothing behind.
-        user_approves(f"Create {cwd} and record that you trust it? It is a new, empty folder with no project "
-                      "settings yet; trusting it lets settings added there later run without Claude Code asking "
-                      "first. This approves this one time only.", "NOUEZ_ASK_TRUST", cancel)
-        approved = True
+    created = False
+    approved = before_new_folder(cwd, args, cancel)
     if flag(args, "create") and not os.path.exists(cwd):
         parent = os.path.dirname(cwd)
         if not os.path.isdir(parent):
             raise BridgeError(f"Can't create {cwd}: its parent folder {parent} doesn't exist.")
         if flag(args, "trust"):  # again, as the folders stand now: a link may have been put in since
-            refuse_new_folder()
+            refuse_new_folder(cwd)
         os.mkdir(cwd)
         created = True
     starts = start_project(cwd) if created else []  # before the trust check: .git makes it a repo's top
@@ -4891,14 +4973,16 @@ def open_claude_session(args, cancel=None, progress=None):
     inherited = bool(trusted) and bool(key) and not exact and any(
         os.path.isfile(os.path.join(f, ".claude", "settings.json")) for f in (launched, cwd))
 
-    def remember(fingerprint):
-        remember_report(key, launched, cwd, fingerprint, cancel)
+    def remember(fingerprint, awaiting):
+        remember_report(key, launched, cwd, fingerprint, cancel, awaiting)
 
     auto = None  # in the dispatcher, the projects folder a folder with quiet settings is trusted in unasked
     if not exact and not flag(args, "open_untrusted") and (flag(args, "trust") or trusted is False or inherited):
         auto = quiet_trust_root(cwd, key, folders)
     unread = UNREAD_REPORT
     if (flag(args, "trust") or auto) and not exact:
+        if flag(args, "trust"):  # the user's answer, whatever comes of it; a report given again holds anew once sent
+            answered_report(key, launched, cwd)
         stop = trust_with_checks(cwd, key, launched, folders, notes, auto, exact, created=created,
                                  approved=approved, cancel=cancel,
                                  again="call OpenClaudeSession again with trust=true")
@@ -4908,8 +4992,10 @@ def open_claude_session(args, cancel=None, progress=None):
         exact, inherited = bool(key) and exactly_trusted(key), False
     if (trusted is False or inherited) and not flag(args, "open_untrusted"):
         report, fingerprint, complete = config_review(folders)
+        no_yes = (trust_write_off() or (ask_trust() and in_dispatcher())
+                  or bool(dispatcher_trust_problem(cwd) or (key and dispatcher_trust_problem(key))))
         if complete:
-            remember(fingerprint)
+            remember(fingerprint, not no_yes)  # wait for the user's yes only when one can record trust
         if inherited:
             why = (f"Not opened: {_escaped(key)} is trusted only through a folder above it, and its .claude/settings.json "
                    "can make Claude Code ask the trust question for the folder itself, so a session there "
@@ -4939,6 +5025,10 @@ def open_claude_session(args, cancel=None, progress=None):
                    "computer, and open_untrusted=true opens the session for that.")
         return with_login_warning(" ".join(notes + [why, ask]) + "\n\n" + report
                                   + (report_tag(fingerprint) if complete else ""))
+    if exact:
+        hold_for_answer("report", key, False)  # trusted now: every report for it is answered
+    else:
+        answered_report(key, launched, cwd)  # the reported folder opened untrusted
     asks = []
     if trusted and key:
         if inherited:
@@ -6280,6 +6370,23 @@ def route_pick(kind, provider, state, now, revision=False):
     only = provider if named_provider(kind, provider) else None
     pick = suggest_consultant(kind, state, now, only, revision)
     return pick if "none" not in pick and pick["provider"] == provider else None
+
+
+def independent_work(kind, revision):
+    """Work that checks Claude's own: an independent kind, or a message carrying the work's diff."""
+    return kind in INDEPENDENT_KINDS or bool(revision)
+
+
+def model_refusal(model, independent, gemini_only):
+    """Why `model` may not take this work, or None: "gemini" when the user named Gemini and it isn't
+    a Gemini model, "claude" when the work checks Claude's own (`independent`) and it is a Claude
+    model. The one rule ConsultantBudget's picks and the sends both apply."""
+    model = model or ""
+    if gemini_only and not model.startswith("gemini-"):
+        return "gemini"
+    if independent and model.startswith("claude-"):
+        return "claude"
+    return None
 
 
 def independent_pick(kind, agy_state, known, now=None):
@@ -7883,10 +7990,10 @@ def suggest_consultant(kind, state, now, only=None, revision=False):
     and "antigravity" to what codex_budget and agy_budget gathered (missing or None: not installed).
     `only`: the provider the user named; for Antigravity ("ask Gemini") only its Gemini models.
     `revision`: the message carries the work's diff, so, as for a review, never a Claude model."""
-    independent = kind in INDEPENDENT_KINDS or revision
+    independent = independent_work(kind, revision)
     picks = CONSULT_PICKS.get(kind) or CONSULT_PICKS["other"]
     if only == "antigravity":
-        picks = tuple(p for p in picks if p[0] != "antigravity" or not p[1] or p[1].startswith("gemini-"))
+        picks = tuple(p for p in picks if p[0] != "antigravity" or not p[1] or not model_refusal(p[1], False, True))
     options, blocked = [], []
     for rank, (provider, model, effort, why) in enumerate(picks):
         st = state.get(provider)
@@ -7900,10 +8007,11 @@ def suggest_consultant(kind, state, now, only=None, revision=False):
                     any(p[0] == provider for p in picks[:rank]):
                 continue  # the default is added once, for the provider's first pick
             got = provider_default(provider, st) + (f"{model} isn't listed, so the default model",)
-        if only == "antigravity" == provider and not (got[0] or "").startswith("gemini-"):
+        refused = model_refusal(got[0], independent, only == "antigravity" == provider)
+        if refused == "gemini":
             blocked.append("Antigravity lists no Gemini model")  # "ask Gemini": never a Claude or GPT one
             continue
-        if independent and (got[0] or "").startswith("claude-"):
+        if refused == "claude":
             blocked.append(f"{PROVIDER_TITLES[provider]} {got[0]}: a Claude model shares the author's blind spots")
             continue
         windows = provider_windows(provider, got[0], st)
@@ -8091,7 +8199,7 @@ def suggestion_lines(kind, state, now, only=None, revision=False):
         if not kind or "none" in best:
             continue
         lines += [f"  {n}" for n in best["notes"]]
-        if not revision and k not in INDEPENDENT_KINDS and (best["model"] or "").startswith("claude-"):
+        if not independent_work(k, revision) and model_refusal(best["model"], True, False):
             lines.append("  With the work's diff (revision=true) it goes to a model of another family: call "
                          "ConsultantBudget with revision=true for that pick.")
         if k in ("review", "bug-hunt", "plan-critique"):
@@ -9997,8 +10105,8 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
         override = True
     usage = usage or send_usage("antigravity")
     # Work that checks Claude's own (an independent kind, or a diff) never runs on a Claude model.
-    independent = kind in INDEPENDENT_KINDS or revision
-    known = (agy_models() if override or routable or (independent and (rec.get("model") or "").startswith("claude-"))
+    independent = independent_work(kind, revision)
+    known = (agy_models() if override or routable or model_refusal(rec.get("model"), independent, False)
              else None)  # can take seconds, so read before taking the lock
     # 0.28: an Antigravity consultant runs no git, so it gets the diff text unless attach_diff=false.
     stamp, patch, digest = (revision_for(args, rec.get("cwd"), take=flag(args, "attach_diff", True),
@@ -10027,12 +10135,12 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
         model = rec.get("model") or f"{AGY_MODEL}-{AGY_EFFORT}"
         if override:
             model = agy_model_id(model, args.get("model"), args.get("effort"), known)
-        if not given and named_provider(kind, "antigravity") and not model.startswith("gemini-"):
+        if not given and named_provider(kind, "antigravity") and model_refusal(model, False, True):
             raise BridgeError(
                 f"The user named Gemini for this {kind}, and {name} is on {model}, with no Gemini model that "
                 "has room to move it to. Nothing was sent. Tell the user, or pass a Gemini model they accept.")
         switched = ""
-        if independent and model.startswith("claude-"):
+        if model_refusal(model, independent, False):
             what = f"a {kind}" if kind in INDEPENDENT_KINDS else "a message with revision=true"
             # Never a Claude model; kind other has no pick, here as in ConsultantBudget: refused,
             # naming the model to pass.
@@ -11914,7 +12022,11 @@ def home_warning():
     """The home folder's warning, counted as given (NouezSettings then adds the home folder) once
     the result carrying it is sent."""
     home = os.path.expanduser("~")
-    on_sent(lambda: _home_warned.append(home))
+
+    def keep():
+        _home_warned.append(home)
+        hold_for_answer("home", home)
+    on_sent(keep)
     return HOME_WARNING.format(home=home)
 
 
@@ -11955,6 +12067,7 @@ def add_projects_folder(folder):
         if not any(same_folder(h, home) for h in _home_warned):
             return ("Not added yet. Show the user this warning first: " + home_warning() + " Only if they still "
                     "want it, call NouezSettings again with action add_folder and this folder.")
+        hold_for_answer("home", home, False)  # the user's answer, whatever comes of it
     else:
         problem = projects_folder_problem(folder)
         if problem:
@@ -11986,13 +12099,18 @@ def add_projects_folder(folder):
         s["roots"] = roots
     promoted = []
     update_settings(change)
+    caveat = ("Tell the user that trust covers settings a project adds later, and that a project's skills can run "
+              "commands when used.")
+    off = quiet_trust_promised()  # the trust policy's answer, as it stands now
     if promoted:
-        return (f"{promoted[0]} was a projects folder already, as the install default; it now counts as picked, so a "
-                "project inside it whose settings run and allow nothing is trusted at once. Tell the user that "
-                "trust covers settings a project adds later, and that a project's skills can run commands when used.")
+        return (f"{promoted[0]} was a projects folder already, as the install default; it now counts as picked, so "
+                + (f"a project inside it whose settings run and allow nothing is trusted at once. {caveat}" if not off
+                   else f"it would be trusted at once when its settings run and allow nothing, but not now: {off}."))
+    if off:
+        return (f"Added {folder} to the projects folders: the phone can open projects inside it. No project there is "
+                f"trusted without a question now: {off}.")
     return (f"Added {folder} to the projects folders: the phone can open and trust projects inside it, each "
-            "after its report and a yes, or at once when its settings run and allow nothing. Tell the user that "
-            "trust covers settings a project adds later, and that a project's skills can run commands when used.")
+            f"after its report and a yes, or at once when its settings run and allow nothing. {caveat}")
 
 
 def remove_projects_folder(folder):
@@ -12044,6 +12162,7 @@ def phone_setup(args, cancel=None, progress=None):
                           "Here, NouezSettings shows nouez's settings.")
     if flag(args, "done"):
         update_settings(lambda s: s.__setitem__("setup_done", True))
+        hold_for_answer("home", os.path.expanduser("~"), False)  # the setup's warning is answered
         return ("The phone setup is marked done, so the dispatcher stops offering it. \"Set up this phone\" goes "
                 "through it again at any time.")
     value, state = read_settings()
@@ -12053,6 +12172,7 @@ def phone_setup(args, cancel=None, progress=None):
     found = ([f"   - {f} ({n} trusted project{'s' if n != 1 else ''})" for f, n in candidates] if candidates else
              ["   - none found: ask the user for the full path of the folder that holds their projects"])
     state_file = claude_state_file()
+    quiet_off = quiet_trust_promised()  # once, so the guide can't say two things
     lines = ([settings_damaged(), ""] if state == "damaged" else []) + [
         "Phone setup (" + ("done before; going through it again" if value.get("setup_done") is True
                            else "not done yet") + "). Go through these with the user one at a time, in plain words; "
@@ -12062,11 +12182,13 @@ def phone_setup(args, cancel=None, progress=None):
         "   Folders that look like they hold projects:",
         *found,
         "   Add each one the user picks with NouezSettings (action add_folder), up to "
-        f"{DISPATCHER_ROOTS_MAX}, none inside another. Inside a folder the user picked, a project with no "
-        "project settings, or only settings that run and allow nothing, opens without the trust question: "
-        "nouez records the trust and says so. Any other gets its report and the user's yes first, once. Tell "
-        "the user that trust covers settings the project adds later, and that a project's skills can run "
-        "commands when they are used.",
+        f"{DISPATCHER_ROOTS_MAX}, none inside another. "
+        + (f"No project is trusted without a question now: {quiet_off}." if quiet_off else
+           "Inside a folder the user picked, a project with no "
+           "project settings, or only settings that run and allow nothing, opens without the trust question: "
+           "nouez records the trust and says so. Any other gets its report and the user's yes first, once. Tell "
+           "the user that trust covers settings the project adds later, and that a project's skills can run "
+           "commands when they are used."),
         "2. The home folder: offer it last, and only if the user insists, with this warning: " + home_warning(),
         f"3. What nouez changes in Claude Code: one trust mark per folder in {state_file}, the same one its trust "
         f"question writes, with a copy of the file first in {trust_backup_dir()} (the newest {TRUST_BACKUPS_KEPT} "
@@ -12243,6 +12365,7 @@ def restore_trust(item, cancel=None):
     launched = git_root(cwd) or cwd
     folders = [key, launched, cwd]
     exact = exactly_trusted(key)
+    answered_report(key, launched, cwd)  # a report given again holds anew once it is sent
     if exact:
         return with_login_warning(f"{key} is trusted already; nothing was changed.")
     notes = []
@@ -13613,7 +13736,7 @@ def set_switch(name, on, from_tool=False):
     update_settings(lambda s: s.setdefault("switches", {}).__setitem__(name, bool(on)))
     now, source = switch_setting(name)
     note = f"{name} is now {'on' if on else 'off'} in nouez's settings file; it applies from {applies}."
-    if from_tool and name == "ask_trust" and on and in_dispatcher():
+    if from_tool and name == "ask_trust" and on and now and in_dispatcher():
         note += " From now on this dispatcher can't record trust: each folder is trusted at the computer."
     if source == "environment" and now != bool(on):
         note += (f" But {var} is set in this server's environment, which wins: {name} stays "
@@ -17223,8 +17346,9 @@ def idle_reason():
     under way that a new server process wouldn't know about (launch.py then starts one in this one's
     place): a request or notification being handled, a request to Claude Code open, a cancellation
     pending, a prompt not yet answered, a provider the user named still waiting for its message, a
-    usage-log write, or a Codex turn this server started or steered that may still run (asked of the
-    daemon, never started for it: one that can't be reached counts as running)."""
+    trust report or the home folder's warning this server gave still waiting for the user's answer
+    (hold_for_answer), a usage-log write, or a Codex turn this server started or steered that may
+    still run (asked of the daemon, never started for it: one that can't be reached counts as running)."""
     with _handlers_guard:
         if _handlers[0]:
             return "a request is being answered"
@@ -17241,6 +17365,11 @@ def idle_reason():
     with _named_guard:
         if any(deadline > now for _, deadline in _named.values()):
             return "a provider the user named waits for its message"
+    waiting = awaiting_answer()
+    if waiting == "report":
+        return "a trust report waits for the user's answer"
+    if waiting == "home":
+        return "the home folder's warning waits for the user's answer"
     if any(t.is_alive() for t in _log_threads):
         return "the usage log is being written"
     if not _live_turns:

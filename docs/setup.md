@@ -6,7 +6,36 @@ nouez installs two ways: as a Claude Code plugin on Windows, or from a clone (ma
 
 ## As a plugin
 
-[The README's steps](../README.md#setup) are the whole install: install the plugin, optionally sign in to a consultant CLI (step 4 of [From a clone](#from-a-clone) has the details), run `/nouez:setup`, then `/reload-plugins`. `/nouez:setup` writes the waiter's allow rules and, on your yes, nouez's status line into Claude Code's settings, runs `doctor`, and sets up or updates the phone dispatcher, asking before each change. The plugin ships the prompt hook, so the clone steps' settings edits don't apply.
+The plugin starts nouez with the Python launcher (`py -3`), which comes with python.org's Python for Windows.
+
+**1. Install the plugin.** In any terminal (Claude Code installed), from any folder; it installs nouez for every project:
+
+```sh
+claude plugin marketplace add jibarix/nouez
+claude plugin install nouez@nouez
+```
+
+From the next Claude Code session on, every session has nouez's tools.
+
+**2. Sign in to a consultant CLI**, for consultants (skip it to use only the phone and session tools). Either one is enough; with both, Codex is the default. Do it before step 3, so setup's check finds it. If installing changed your `PATH`, reopen the terminal and Claude Code.
+
+- **Codex:** install the [Codex CLI](https://developers.openai.com/codex/cli/), run `codex login`, then check with `codex login status`.
+- **Antigravity:** install the [Antigravity CLI](https://antigravity.google/docs/cli-getting-started), run `agy` once in a terminal and sign in with your Google account, then check with `agy models`.
+
+Step 4 of [From a clone](#from-a-clone) has more on each: an API key for Codex, and where `agy` is installed on Windows.
+
+**3. Run `/nouez:setup` in a new Claude Code session.** A plugin can't change Claude Code's settings or Windows by itself, so setup does it once, for every session. It shows each change before making it, asks, and backs up a file before changing it. In this order:
+
+| Step | What it's for | If you say no |
+|---|---|---|
+| **The waiter's allow rules** | After Claude sends a consultant a question, it runs a small command in the background, the waiter, which brings the reply when it's ready. The rules let it run without asking. | Claude Code asks before each waiter, and auto mode may block it. If the waiter can't run, Claude reads the reply only when you ask. |
+| **nouez's status line**, asked with the rules, only when you have none | Claude Code tells only its status line how much of your usage is left. nouez's saves it, for the status screen and for handing work to consultants before Claude Code runs out. A status line of your own is kept, and setup says what to add to it. | nouez can't see Claude Code's usage. |
+| **Removing a clone's registration**, only if you registered nouez from a clone before | So nouez doesn't run twice. Setup then takes the clone's waiter rules out too. | Both copies run. |
+| **The phone dispatcher** (recommended) | nouez's main feature: a session that stays running on your computer, starting at each sign-in, so the Claude app on your phone can open a session in any project, make a folder for a new one, and list and close sessions, with nothing started by hand at the computer. Setup prepares its folder; you run it once in a terminal to answer Claude Code's first questions; then setup installs it to start at each Windows sign-in. With one installed, setup offers to update it instead. | The phone reaches only the Remote Control sessions and servers you start at the computer, each in its own project, and none after a restart. Declining an update leaves the installed dispatcher running as it is. |
+
+Between the clone question and the dispatcher, setup runs `doctor`, which asks nothing: it checks Python, `claude`, the settings above, the dispatcher and each consultant CLI (installed, signed in, answering), and says what to fix. The plugin ships the prompt hook, so the clone steps' settings edits don't apply.
+
+**4. Run `/reload-plugins`** in that session, or start a new one.
 
 - **Updating:** see [nouez updates](#nouez-updates). After `/reload-plugins` in one session, the other open sessions move to the new version by themselves, the next time they call nouez while nothing of nouez's runs there ([the plugin](rules.md#rule-plugin-launcher)).
 - **Protections:** with the plugin, a protection can change from a session after a yes in Claude Code's own prompt ([protections](rules.md#rule-protections-behind-the-prompt)).

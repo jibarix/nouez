@@ -6,6 +6,19 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.30.2] - 2026-11-27
+
+An update no longer asks a trust question twice, and projects-folder messages promise only what can happen. With the plugin, update with `claude plugin update nouez@nouez`, then start a Claude Code session or run `/reload-plugins` in one; the other open sessions then move to the new version by themselves once idle. With a clone, pull, then reconnect `consultants` with `/mcp` in each open Claude Code session, and run `server.py dispatcher install` again the way you first did, to restart the dispatcher.
+
+### Fixed
+
+- **Adding a projects folder no longer promises trust that can't happen.** Ana has `ask_trust` on and adds her work folder from the phone: nouez used to say its quiet projects were trusted at once, then asked for her yes at the computer anyway. Adding or promoting a projects folder, and the phone setup's guide, now say quiet trust happens only when it can: not with `ask_trust` or `no_trust_write` on ([trust without a question](docs/rules.md#rule-trust-without-a-question)).
+- **An update no longer asks the same trust question twice.** Ana's phone shows a trust report for a folder while a plugin update lands. Her session used to move to the new version at once, which hadn't given that report, so her yes brought the report back. Now a session stays on its version while a trust report or the home folder's warning it gave waits for the user's answer, for up to 15 minutes; an answer nouez receives (her yes, opening the folder untrusted, finishing the phone setup) or the folder trusted at the computer ends the wait, and a report that can't be answered with a yes doesn't wait ([plugin launcher](docs/rules.md#rule-plugin-launcher)).
+
+### Changed
+
+- **Internal: three design loops broken, no other change in behavior.** Which model may take a piece of work is one rule that both ConsultantBudget's picks and the Antigravity send apply; the checks before a new folder is made and trusted live with the trust code; and the projects-folder messages ask the trust code what quiet trust can do now.
+
 ## [0.30.1] - 2026-11-27
 
 Fixes from moving this laptop from a clone to the plugin. With the plugin, update with `claude plugin update nouez@nouez`, then `/reload-plugins` and `/nouez:setup` in a Claude Code session at the computer. With a clone, pull, then reconnect `consultants` with `/mcp` in each open Claude Code session; for the phone dispatcher, run `server.py dispatcher setup` and `install` again the way you first did.
@@ -906,7 +919,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.30.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.30.2...HEAD
+[0.30.2]: https://github.com/jibarix/nouez/compare/v0.30.1...v0.30.2
 [0.30.1]: https://github.com/jibarix/nouez/compare/v0.30.0...v0.30.1
 [0.30.0]: https://github.com/jibarix/nouez/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/jibarix/nouez/compare/v0.28.6...v0.29.0

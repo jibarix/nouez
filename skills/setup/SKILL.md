@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Set up nouez after installing or updating the plugin - the waiter's allow rules, the status line, and optionally the phone dispatcher. Run when the user types /nouez:setup.
+description: Set up nouez after installing or updating the plugin - the waiter's allow rules, the status line, and the phone dispatcher (recommended). Run when the user types /nouez:setup.
 disable-model-invocation: true
 ---
 
@@ -35,9 +35,14 @@ updates. Below, `NOUEZ` stands for `py -3 -I "${CLAUDE_PLUGIN_DATA}/app/server.p
    outside it (the shell tool's option to run a command without the sandbox). If setup says the
    folder's CLAUDE.md was edited, show the user that note and offer its steps: the dispatcher's
    instructions then say what the plugin allows from the phone.
-   If none is installed, ask whether they want one (it lets the Claude app on the phone open, list
-   and close Claude Code sessions on this computer). On a yes, run `NOUEZ dispatcher setup --dry-run`,
-   show it, then `NOUEZ dispatcher setup` (outside the sandbox, as above) and follow the steps it
+   If none is installed, recommend one and ask whether to set it up: it is nouez's main feature, a
+   session that stays running on this computer from each sign-in, so the Claude app on the phone can
+   open a session in any project, make a folder for a new one, and list and close sessions, with
+   nothing started by hand at the computer. Without it, the phone reaches only Remote Control
+   sessions and servers the user starts at the computer, each in its own project, and none after a
+   restart.
+   It is asked, not done, because it needs one run in a terminal by the user and then starts at each
+   sign-in. On a yes, run `NOUEZ dispatcher setup --dry-run`, show it, then `NOUEZ dispatcher setup` (outside the sandbox, as above) and follow the steps it
    prints: the one-time run in a terminal is for the user, since only they can answer Claude Code's
    questions there.
 5. Tell the user to run /reload-plugins in this session, or start a new one: that puts the new
