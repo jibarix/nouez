@@ -71,7 +71,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 | Codex app-server daemon | 0.172.0 |
 | Antigravity CLI (optional: Antigravity consultants, its quota) | 1.5.18 |
 | Python | 3.11.9 |
-| OS | Windows 11 (the dispatcher's sign-in start on macOS and Linux is covered by tests, not yet run on those systems) |
+| OS | Windows 11. macOS and Linux work as of 0.28.4, and the unit tests still run on them for every release, but new features are built and tried on Windows only; macOS and Linux changes come on request or by a pull request. The dispatcher's sign-in start on macOS and Linux is covered by tests, not yet run on those systems. |
 
 Run `claude --version`, `codex --version` and `agy --version` to see your versions, or `server.py doctor`, which also shows the version of the Codex daemon that is running. Codex updates its daemon by itself, so the daemon can be newer than the CLI.
 

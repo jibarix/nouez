@@ -11520,5 +11520,88 @@ class ClonePlaceTest(unittest.TestCase):
         self.assertNotIn("settings.json", text)
 
 
+class CwdDefaultTest(unittest.TestCase):
+    """Which folder a consultant uses when Claude names none, and which consultant a folder outside
+    git belongs to (docs/rules.md, "An omitted `cwd`")."""
+
+    def setUp(self):
+        self.top = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.top, True)
+        self.sub = os.path.join(self.top, "drafts")
+        os.mkdir(self.sub)
+        for patch in (mock.patch.object(server, "git_root", lambda path: None),
+                      mock.patch.object(server, "_client_caps", {"roots": {}}),
+                      mock.patch.object(server._request, "modern", False, create=True)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def roots(self, roots):
+        patch = mock.patch.object(server, "_client_roots", roots)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_an_omitted_cwd_is_the_first_shared_workspace_folder(self):
+        other = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, other, True)
+        self.roots([self.top, other])
+        self.assertEqual(server.default_cwd(), self.top)
+
+    def test_an_omitted_cwd_without_shared_folders_is_where_nouez_started(self):
+        self.roots([])
+        self.assertEqual(server.default_cwd(), os.getcwd())
+        self.roots([self.top])
+        with mock.patch.object(server._request, "modern", True, create=True):
+            self.assertEqual(server.default_cwd(), os.getcwd())  # a 2026-07-28 client shares none
+
+    def test_outside_git_a_subfolder_gets_its_own_consultant_without_shared_folders(self):
+        # Lee's Claude Code shares no workspace folders: notes/drafts doesn't reuse the notes consultant.
+        self.roots([])
+        root = server.repo_root(self.sub)
+        self.assertEqual(root, os.path.abspath(self.sub))
+        self.assertFalse(server.in_repo({"cwd": self.top}, root))
+        self.assertTrue(server.in_repo({"cwd": self.sub}, root))
+
+    def test_outside_git_a_subfolder_finds_the_consultant_at_its_shared_workspace_folder(self):
+        inner = os.path.join(self.sub, "inner")
+        os.mkdir(inner)
+        self.roots([self.top, self.sub])
+        self.assertEqual(server.repo_root(inner), os.path.abspath(self.sub))  # the innermost shared folder
+        self.roots([self.top])
+        root = server.repo_root(inner)
+        self.assertEqual(root, os.path.abspath(self.top))
+        self.assertTrue(server.in_repo({"cwd": self.top}, root))
+
+    def test_inside_git_the_project_is_the_work_tree(self):
+        self.roots([self.sub])
+        with mock.patch.object(server, "git_root", lambda path: self.top):
+            self.assertEqual(server.repo_root(self.sub), self.top)
+
+    def test_start_without_cwd_sends_the_shared_folder_to_codex(self):
+        self.roots([self.top])
+        self.assertFalse(os.path.samefile(self.top, os.getcwd()))
+        daemon = FakeDaemon([])
+        with mock.patch.object(server, "CodexClient", daemon):
+            server.start_consultant({"provider": "codex"})
+        self.assertEqual(daemon.calls.count("thread/start"), 1)
+        self.assertEqual(daemon.thread_started["cwd"], os.path.abspath(self.top))
+
+    def test_start_outside_git_reuses_a_child_from_its_parent_only(self):
+        self.roots([])
+        for existing, requested, reuse in ((self.top, self.sub, False),
+                                           (self.sub, self.top, True)):
+            with self.subTest(existing=existing, requested=requested):
+                thread = {"id": "0199aaaa-0000-0000-0000-000000000001",
+                          "cwd": existing, "threadSource": "nouez"}
+                daemon = FakeDaemon([thread])
+                with mock.patch.object(server, "CodexClient", daemon):
+                    result = server.start_consultant({"provider": "codex", "cwd": requested})
+                if reuse:
+                    self.assertNotIn("thread/start", daemon.calls)
+                    self.assertTrue(result.startswith(f"Using {server.short_name(thread)},"), result)
+                else:
+                    self.assertEqual(daemon.calls.count("thread/start"), 1)
+                    self.assertEqual(daemon.thread_started["cwd"], os.path.abspath(requested))
+                    self.assertTrue(result.startswith("Started "), result)
+
 if __name__ == "__main__":
     unittest.main()

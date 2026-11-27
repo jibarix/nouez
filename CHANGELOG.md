@@ -6,6 +6,12 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Documentation
+
+- The rulebook (`docs/rules.md`) now holds the rules that were written only in other docs or in the code: 39 new rows, each with an example of who meets it, what holds it and the test that checks it (or "none"), and 22 rows restated to match what nouez does.
+- Two rules got tests: which folder a consultant works in when Claude names none, and which consultant a folder outside git belongs to.
+- The README says which systems new work is tried on: macOS and Linux work as of 0.28.4 and keep their unit tests on every release; new features are built and tried on Windows.
+
 ## [0.28.4] - 2026-11-26
 
 The docs say what nouez does. Nothing nouez does changes; two tool descriptions Claude reads are corrected. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version.
