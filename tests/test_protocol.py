@@ -40,6 +40,12 @@ def setUpModule():
     # would be; the test of requests before it uses an Event of its own.
     server._initialized.set()
     unittest.addModuleCleanup(server._initialized.clear)
+    # Launch records go to a folder of the tests' own, never the user's cache folder.
+    launches = tempfile.mkdtemp(prefix="nouez-test-launches-")
+    unittest.addModuleCleanup(shutil.rmtree, launches, True)
+    real_launches = server.launches_folder
+    server.launches_folder = lambda create=False: launches
+    unittest.addModuleCleanup(setattr, server, "launches_folder", real_launches)
 
 # Tests never write to the user's usage log; the log's own tests turn it back on for a temp file.
 os.environ["NOUEZ_NO_USAGE_LOG"] = "1"
@@ -3338,7 +3344,8 @@ class OpenClaudeSessionTests(unittest.TestCase):
     def test_resume_is_passed_as_a_checked_id(self):
         sid = "4b4f3c8c-0010-4e93-a427-9db7032f2be3"
         argv, _ = self.run_helper("hi", extra={"resume": sid})
-        self.assertEqual(argv, ["claude", "--remote-control", "n", "--name", "n", "--resume", sid, "--", "hi"])
+        self.assertEqual(argv, ["claude", "--remote-control", "n", "--name", "n", "--resume", sid, "--fork-session",
+                                "--", "hi"])
         fd, spec = tempfile.mkstemp(prefix="nouez-claude-", suffix=".json")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({"cwd": ROOT, "name": "n", "prompt": "", "resume": "--dangerously-skip-permissions"}, f)
@@ -3358,6 +3365,8 @@ class OpenClaudeSessionTests(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             spec = json.load(f)
         os.remove(path)
+        self.assertTrue(server.LAUNCH_FILE.fullmatch(spec["launch"] + ".json"))
+        server.remove_file(os.path.join(server.launches_folder(), spec["launch"] + ".json"))  # its window has ended
         return spec, out
 
     def test_transcript_labels_read_only_complete_records_at_the_edges(self):
@@ -3546,9 +3555,10 @@ class OpenClaudeSessionTests(unittest.TestCase):
         argv = open_window.call_args[0][1]
         self.assertEqual(argv[-2], "claude")
         with open(argv[-1], encoding="utf-8") as f:
-            self.assertEqual(json.load(f), {"cwd": os.path.abspath(ROOT), "name": os.path.basename(ROOT),
-                                            "prompt": "a; b \"c\"", "model": "opus", "effort": "medium",
-                                            "arrange": True})
+            spec = json.load(f)
+        self.assertTrue(server.LAUNCH_FILE.fullmatch(spec.pop("launch") + ".json"))
+        self.assertEqual(spec, {"cwd": os.path.abspath(ROOT), "name": os.path.basename(ROOT),
+                                "prompt": "a; b \"c\"", "model": "opus", "effort": "medium", "arrange": True})
         os.remove(argv[-1])
         self.assertIn("Remote Control", out)
 
@@ -3682,7 +3692,7 @@ class OpenClaudeSessionTests(unittest.TestCase):
                 server.close_claude_session({"name": "x"})
             out = server.close_claude_session({"name": "x", "pid": 61})
         self.assertIn("pid 61) and its window", out)
-        self.assertIn("claude --resume s61", out)
+        self.assertIn("resume s61 opens it again, as a fork", out)
         end.assert_called_once_with(running[1])
         with mock.patch.object(server, "claude_sessions", return_value=running), \
                 mock.patch.object(server, "own_claude_pids", return_value=set()), \
@@ -4252,7 +4262,8 @@ class HardeningTest(unittest.TestCase):
 
 class OpenedSessionCheckTest(unittest.TestCase):
     def open(self, sessions_seen, tmp):
-        with mock.patch.object(server, "open_window", return_value="a window") as open_window, \
+        # No launch record: the check takes any new session in the folder (LaunchRecordTest has the binding)
+        with mock.patch.object(server, "open_window", return_value="a window") as open_window,              mock.patch.object(server, "new_launch", return_value=None), \
              mock.patch.object(server, "folder_trusted", return_value=True), \
              mock.patch.object(server, "trust_key", return_value=(tmp, False)), \
              mock.patch.object(server, "exactly_trusted", return_value=True), \
@@ -4276,9 +4287,10 @@ class OpenedSessionCheckTest(unittest.TestCase):
             out = self.open([[], [self.session(2, tmp, False)]], tmp)
             self.assertIn("hadn't connected to Remote Control", out)
             self.assertNotIn("already running", out)
-            self.assertNotIn("trusted devices", out)  # only said of a resumed conversation
-            with mock.patch.object(server, "claude_sessions", return_value=[self.session(2, tmp, False)]),                     mock.patch.object(server, "CONNECT_SECONDS", 0):
-                self.assertIn("typing /remote-control in that window", server.connection_note(set(), tmp, resumed=True))
+            with mock.patch.object(server, "claude_sessions", return_value=[self.session(2, tmp, False)]), \
+                    mock.patch.object(server, "CONNECT_SECONDS", 0):
+                # 0.30.0: a resume is a fork with a new Remote Control session; nothing to type in the window
+                self.assertNotIn("/remote-control", server.connection_note(set(), tmp, resumed=True))
             out = self.open([[], []], tmp)
             self.assertIn("hadn't shown up as a running session", out)
 
@@ -10606,6 +10618,36 @@ class DispatcherTest(unittest.TestCase):
         self.assertIn("Would make", out)
         self.assertFalse(os.path.exists(self.folder))
 
+    def test_setup_moves_the_rules_to_the_plugins_names(self):
+        """0.30.0: Robin moves from a clone to the plugin and removes the clone's registration. setup
+        gives the dispatcher's folder the plugin's names for nouez's tools, the one Robin granted
+        too, and takes out the clone's; install says when they are missing."""
+        code, out = self.setup()
+        self.assertEqual(code, 0, out)
+        settings = os.path.join(self.folder, ".claude", "settings.json")
+        with open(settings, encoding="utf-8") as f:
+            data = json.load(f)
+        data["permissions"]["allow"] = ["Bash(git status)"] + data["permissions"]["allow"] + [
+            "mcp__consultants__StartConsultant"]
+        data["permissions"]["deny"] = ["mcp__consultants__CloseClaudeSession", "Bash(rm *)"]
+        with open(settings, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        with mock.patch.object(server, "plugin_marker", lambda: {"id": "nouez@nouez"}), \
+                mock.patch.object(server, "clone_registered", lambda: False), \
+                mock.patch.object(server, "consultants_registered", lambda folder: True):
+            self.assertIn("doesn't allow nouez's session tools", server.dispatcher_rules_note(self.folder))
+            code, out = self.setup()
+            self.assertEqual(code, 0, out)
+            self.assertIn("the clone's names", out)
+            with open(settings, encoding="utf-8") as f:
+                allow = json.load(f)["permissions"]["allow"]
+            self.assertEqual(allow, ["Bash(git status)"] + [server.PLUGIN_PREFIX + t for t in server.DISPATCHER_TOOLS]
+                             + [server.PLUGIN_PREFIX + "StartConsultant"])
+            with open(settings, encoding="utf-8") as f:
+                deny = json.load(f)["permissions"]["deny"]
+            self.assertEqual(deny, [server.PLUGIN_PREFIX + "CloseClaudeSession", "Bash(rm *)"], "a block the user set stays")
+            self.assertEqual(server.dispatcher_rules_note(self.folder), "")
+
     def test_setup_says_when_nouez_isnt_registered(self):
         with mock.patch.object(server, "consultants_registered", lambda folder: False):
             code, out = self.setup()
@@ -11526,7 +11568,7 @@ class ProjectsFoldersTest(unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             self.assertEqual(data["model"], "opus")
-            self.assertTrue(server.ours_statusline(data["statusLine"]))
+            self.assertTrue(server.ours_statusline(data.get("statusLine")), out)
             self.assertEqual(data["statusLine"]["command"], server.usage_command("statusline"))
             self.assertEqual(len(glob.glob(os.path.join(config, "settings.json.nouez-*.bak"))), 1)
             offer(False, True, out.append)
@@ -12478,7 +12520,8 @@ class PhoneSetupAndStatusTest(unittest.TestCase):
             self.assertEqual(server._home_warned, [os.path.expanduser("~")], "its warning counts as given")
             self.assertIn(f"one trust mark per folder in {server.claude_state_file()}", out)
             self.assertIn(f"a copy of the file first in {server.trust_backup_dir()} (the newest 20 are kept)", out)
-            self.assertIn("settings.json): only `server.py dispatcher setup`, at the computer and on the user's yes", out)
+            self.assertIn("settings.json): only nouez's setup at the computer (/nouez:setup with the plugin; `server.py "
+                      "setup` or `dispatcher setup` from a clone), on the user's yes", out)
             self.assertIn("RestoreClaudeConfig lists the trust marks and MCP servers that are gone", out)
             self.assertIn("- ask_trust: off", out)
             self.assertIn("The four protections change only at the computer", out)
@@ -12888,6 +12931,649 @@ class DispatcherTrustRulesTest(unittest.TestCase):
             out = []
             self.assertEqual(server.run_restore(argv, out.append), 2)
             self.assertEqual(out, ["usage: server.py restore [ID]"])
+
+
+
+FAKE_SERVER = r"""SERVER_VERSION = "{version}"
+import json, os, sys
+here = os.path.dirname(os.path.abspath(__file__))
+for line in sys.stdin:
+    msg = json.loads(line)
+    method, mid = msg.get("method"), msg.get("id")
+    if method == "initialize" and os.path.exists(os.path.join(here, "refuse")):
+        out = {{"id": mid, "error": {{"code": -32600, "message": "no"}}}}
+    elif method == "initialize":
+        out = {{"id": mid, "result": {{"capabilities": {{}}, "serverInfo": {{"version": "{version}"}}}}}}
+    elif method == "nouez/idle":
+        if os.path.exists(os.path.join(here, "old")):
+            out = {{"id": mid, "error": {{"code": -32601, "message": "Method not found"}}}}
+        else:
+            out = {{"id": mid, "result": {{"idle": not os.path.exists(os.path.join(here, "busy"))}}}}
+    elif method == "ask":
+        out = {{"id": "nouez-1", "method": "roots/list"}}
+    elif method is None:
+        out = {{"id": "after-ask", "result": {{"got": msg}}}}
+    elif mid is None:
+        with open(os.path.join(here, "notes-{version}"), "a") as f:
+            f.write(method + "\n")
+        continue
+    else:
+        out = {{"id": mid, "result": {{"version": "{version}"}}}}
+    print(json.dumps({{"jsonrpc": "2.0", **out}}), flush=True)
+"""
+
+
+class PluginLaunchTest(unittest.TestCase):
+    """0.30.0: launch.py, the plugin's MCP server: it keeps one copy of server.py in the plugin's data
+    folder, only ever moved to a higher version, and moves an open session to a newer copy when the
+    server says it is idle (docs/rules.md: plugin-launcher)."""
+
+    def setUp(self):
+        import launch
+        self.launch = launch
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.app = os.path.join(self.home, "app")
+        os.makedirs(self.app)
+        self.script = os.path.join(self.app, "server.py")
+        self.writes = 0
+        self.write_server("1.0.0")
+
+    def write_server(self, version):
+        with open(self.script, "w", encoding="utf-8", newline="\n") as f:
+            f.write(FAKE_SERVER.format(version=version))
+        self.writes += 1  # each write a second apart, so a clock's coarse step can't hide it
+        os.utime(self.script, (1_800_000_000 + self.writes, 1_800_000_000 + self.writes))
+
+    def proxy(self):
+        out = io.BytesIO()
+        proxy = self.launch.Proxy(self.script, out=out)
+        real_start = proxy.start
+
+        def start():  # each server it starts is ended and its pipes closed after the test
+            real_start()
+            child = proxy.child
+            self.addCleanup(lambda: (proxy.stop(child), child.stdout.close()))
+        proxy.start = start
+        proxy.start()
+        return proxy, out
+
+    def send(self, proxy, msg):
+        proxy.events.put(("client", None, (json.dumps(msg) + "\n").encode()))
+
+    def until(self, proxy, out, test, seconds=20):
+        """Step the proxy until test(messages sent to the client) holds; those messages."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            proxy.step(timeout=0.2)
+            sent = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+            if test(sent):
+                return sent
+        self.fail(f"not seen: {out.getvalue()!r}")
+
+    def answered(self, mid):
+        return lambda sent: any(m.get("id") == mid and "method" not in m for m in sent)
+
+    def reply(self, sent, mid):
+        return next(m for m in sent if m.get("id") == mid and "method" not in m)
+
+    def test_install_moves_only_up(self):
+        """Dana updates the plugin: the copy in the data folder moves to the new version, and a
+        session still on the old plugin starting later doesn't take it back. With --plugin-dir (a
+        data folder ending in -inline), the same version with other bytes is copied too. Nothing is
+        written through a link, nor run from one."""
+        root, data = os.path.join(self.home, "root"), os.path.join(self.home, "nouez-market")
+        os.makedirs(root)
+
+        def plugin(version, extra=""):
+            with open(os.path.join(root, "server.py"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(f'SERVER_VERSION = "{version}"\n{extra}')
+        plugin("0.30.0")
+        target = self.launch.install(root, data)
+        self.assertEqual(target, os.path.join(data, "app", "server.py"))
+        with open(os.path.join(data, "app", "plugin.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"id": "nouez@market"})
+        plugin("0.31.0")
+        self.launch.install(root, data)
+        plugin("0.30.0", "# older")
+        self.launch.install(root, data)
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(f.read(), 'SERVER_VERSION = "0.31.0"\n')
+        inline = os.path.join(self.home, "nouez-inline")
+        plugin("0.31.0", "# a")
+        self.launch.install(root, inline)
+        plugin("0.31.0", "# b")
+        self.launch.install(root, inline)
+        with open(os.path.join(inline, "app", "server.py"), encoding="utf-8") as f:
+            self.assertIn("# b", f.read())
+        plugin("not nouez")
+        with self.assertRaises(OSError):
+            self.launch.install(root, data)
+        plugin("0.40.0")
+        linked = os.path.join(self.home, "nouez-linked")
+        os.makedirs(linked)
+        dir_link(os.path.join(data, "app"), os.path.join(linked, "app"))
+        with self.assertRaises(OSError):
+            self.launch.install(root, linked)
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(f.read(), 'SERVER_VERSION = "0.31.0"\n', "nothing is written through a link")
+        junction = os.path.join(self.home, "nouez-junction")
+        dir_link(data, junction)
+        with self.assertRaises(self.launch.LinkRefused):
+            self.launch.install(root, junction)
+        self.assertEqual(self.launch.main([junction]), 1, "nothing runs through a link")
+
+    def test_a_session_moves_to_a_newer_copy_when_idle(self):
+        """Lee's session is open when the plugin updates. Its next request finds the newer copy, the
+        server says it is idle, and the request is answered by the new version, which was given the
+        session's initialize again; Claude Code hears the tools may have changed."""
+        proxy, out = self.proxy()
+        self.send(proxy, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        sent = self.until(proxy, out, self.answered(1))
+        self.assertEqual(self.reply(sent, 1)["result"]["capabilities"], {"tools": {"listChanged": True}})
+        self.send(proxy, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.send(proxy, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        sent = self.until(proxy, out, self.answered(2))
+        self.assertEqual(self.reply(sent, 2)["result"], {"version": "1.0.0"})
+        self.write_server("2.0.0")
+        self.send(proxy, {"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+        sent = self.until(proxy, out, self.answered(3))
+        self.assertEqual(self.reply(sent, 3)["result"], {"version": "2.0.0"})
+        self.assertIn({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}, sent)
+        self.assertEqual([m.get("id") for m in sent if "method" not in m], [1, 2, 3],
+                         "the replayed initialize's answer isn't passed on")
+        notes = os.path.join(self.app, "notes-2.0.0")
+        deadline = time.monotonic() + 10
+        while not os.path.exists(notes) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        with open(notes, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "notifications/initialized\n")
+
+    def test_a_failed_move_says_to_reconnect(self):
+        """The new version refuses the session's initialize: the request held meanwhile gets an error
+        that says to reconnect with /mcp, no tool-list change is announced, and the launcher ends."""
+        proxy, out = self.proxy()
+        self.send(proxy, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        self.until(proxy, out, self.answered(1))
+        open(os.path.join(self.app, "refuse"), "w").close()
+        self.write_server("2.0.0")
+        self.send(proxy, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        sent = self.until(proxy, out, self.answered(2))
+        self.assertIn("reconnect it with /mcp", self.reply(sent, 2)["error"]["message"])
+        self.assertNotIn("notifications/tools/list_changed", [m.get("method") for m in sent])
+        self.assertEqual(proxy.code, 1)
+        self.assertIsNotNone(proxy.step(timeout=0.2), "the launcher ends")
+
+    def test_a_busy_server_keeps_the_session(self):
+        """Something of nouez's still runs: the request goes to the running server, and the question
+        isn't asked again for ASK_EVERY. A server from before nouez/idle is never asked again."""
+        proxy, out = self.proxy()
+        self.send(proxy, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        self.until(proxy, out, self.answered(1))
+        open(os.path.join(self.app, "busy"), "w").close()
+        self.write_server("2.0.0")
+        self.send(proxy, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        sent = self.until(proxy, out, self.answered(2))
+        self.assertEqual(self.reply(sent, 2)["result"], {"version": "1.0.0"})
+        self.assertGreater(proxy.next_ask, time.monotonic() + self.launch.ASK_EVERY - 2)
+        proxy.next_ask = 0
+        open(os.path.join(self.app, "old"), "w").close()
+        self.send(proxy, {"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+        self.until(proxy, out, self.answered(3))
+        self.assertEqual(proxy.next_ask, float("inf"))
+
+    def test_requests_to_the_client_and_cancels(self):
+        """The server's own request to Claude Code (roots/list) goes out under a launcher id and its
+        answer comes back under the server's. A request Claude Code cancels while it is held for the
+        idle question is dropped, never sent."""
+        proxy, out = self.proxy()
+        self.send(proxy, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        self.until(proxy, out, self.answered(1))
+        self.send(proxy, {"jsonrpc": "2.0", "id": 2, "method": "ask"})
+        sent = self.until(proxy, out, lambda sent: any(m.get("method") == "roots/list" for m in sent))
+        asked = next(m for m in sent if m.get("method") == "roots/list")
+        self.assertEqual(asked["id"], "launch1-nouez-1")
+        self.send(proxy, {"jsonrpc": "2.0", "id": asked["id"], "result": {"roots": []}})
+        sent = self.until(proxy, out, self.answered("after-ask"))
+        self.assertEqual(self.reply(sent, "after-ask")["result"]["got"]["id"], "nouez-1")
+        open(os.path.join(self.app, "busy"), "w").close()
+        self.write_server("2.0.0")
+        self.send(proxy, {"jsonrpc": "2.0", "id": 5, "method": "tools/list"})
+        proxy.step(timeout=1)
+        self.assertEqual(proxy.state, "asking")
+        self.send(proxy, {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 5}})
+        proxy.step(timeout=1)
+        self.assertEqual(proxy.held, [])
+        self.send(proxy, {"jsonrpc": "2.0", "id": 6, "method": "ping"})
+        sent = self.until(proxy, out, self.answered(6))
+        self.assertFalse(any(m.get("id") == 5 for m in sent))
+
+
+class PluginGuardTest(unittest.TestCase):
+    """0.30.0: with the plugin, a protection changes from a session only after a yes in Claude Code's
+    own prompt, which the plugin's PreToolUse hook asks for and records (docs/rules.md:
+    protections-behind-the-prompt)."""
+
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.data, True)
+        self.who = [4242, 1234]
+        for patch in (mock.patch.object(server, "plugin_marker", lambda: {"id": "nouez@t", "data": self.data}),
+                      mock.patch.object(server, "session_claude", lambda: self.who)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def guard(self, mode="default", **tool_input):
+        return server.guard_decision({"permission_mode": mode, "tool_input": tool_input})
+
+    def approvals(self):
+        with open(os.path.join(self.data, server.APPROVALS_FILE), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_the_prompt_approves_one_change_once(self):
+        """Sam, on the phone, asks to turn ask_trust off. The hook asks Claude Code to ask, and the yes
+        serves that change once, in that session only: not the other way, not in another session,
+        not a second time, not after ASK_SECONDS."""
+        answer = self.guard(action="set", name="ask_trust", on=False)["hookSpecificOutput"]
+        self.assertEqual((answer["permissionDecision"], answer["hookEventName"]), ("ask", "PreToolUse"))
+        self.assertIn("ask_trust off", answer["permissionDecisionReason"])
+        self.assertEqual(len(self.approvals()), 1)
+        self.guard(action="set", name="ask_trust", on=False)
+        self.assertEqual(len(self.approvals()), 1, "asking again replaces the earlier one")
+        self.assertFalse(server.take_approval("ask_trust", True))
+        self.who = [4243, 1234]
+        self.assertFalse(server.take_approval("ask_trust", False))
+        self.who = [4242, 1234]
+        self.assertTrue(server.take_approval("ask_trust", False))
+        self.assertFalse(server.take_approval("ask_trust", False))
+        self.guard(action="set", name="no_trust_write", on=True)
+        later = time.time() + server.ASK_SECONDS + 1
+        with mock.patch.object(server.time, "time", lambda: later):
+            self.assertFalse(server.take_approval("no_trust_write", True))
+
+    def test_other_modes_and_other_calls(self):
+        """In a mode that shows no prompt (bypassPermissions, dontAsk, plan) the hook refuses and
+        records nothing; a call that changes no protection is left to Claude Code's own rules."""
+        for mode in ("bypassPermissions", "dontAsk", "plan", None):
+            answer = self.guard(mode, action="set", name="ask_trust", on=False)["hookSpecificOutput"]
+            self.assertEqual(answer["permissionDecision"], "deny")
+        self.assertFalse(os.path.exists(os.path.join(self.data, server.APPROVALS_FILE)))
+        for args in ({"action": "show"}, {"action": "set", "name": "no_usage_log", "on": True},
+                     {"action": "set", "name": "ask_trust", "on": "off"}):
+            self.assertIsNone(self.guard(**args))
+        self.who = None
+        answer = self.guard(action="set", name="ask_trust", on=False)["hookSpecificOutput"]
+        self.assertEqual(answer["permissionDecision"], "deny")
+
+    def test_nouez_settings_takes_the_approval(self):
+        """Without a yes the tool refuses and says why; after one it changes the protection."""
+        with mock.patch.object(server, "update_settings") as update, \
+                mock.patch.object(server, "switch_setting", lambda name: (False, "settings file")), \
+                mock.patch.object(server, "in_dispatcher", lambda env=None: False):
+            with self.assertRaises(server.BridgeError) as e:
+                server.set_switch("ask_trust", False, from_tool=True)
+            self.assertIn("only after a yes in Claude Code's own prompt", str(e.exception))
+            update.assert_not_called()
+            self.guard(action="set", name="ask_trust", on=False)
+            server.set_switch("ask_trust", False, from_tool=True)
+            update.assert_called_once()
+        with mock.patch.object(server, "plugin_marker", lambda: None), self.assertRaises(server.BridgeError) as e:
+            server.set_switch("ask_trust", False, from_tool=True)
+        self.assertIn("changes only at the computer", str(e.exception))
+
+
+class PluginSetupTest(unittest.TestCase):
+    """0.30.0: `server.py setup` (/nouez:setup, /nouez:uninstall) adds and takes out the waiter's
+    allow rules and nouez's status line in Claude Code's user settings, nothing else."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.config = os.path.join(self.home, ".claude")
+        os.makedirs(self.config)
+        self.path = os.path.join(self.config, "settings.json")
+        here = os.path.abspath(server.__file__).replace("\\", "/")
+        self.rules = [f"Bash(py {here} wait *)"]
+        for patch in (mock.patch.object(server, "claude_config_dir", lambda env=None: self.config),
+                      mock.patch.object(server, "allow_rules", lambda: self.rules),
+                      mock.patch.object(server, "statusline_offer", _REAL_STATUSLINE_OFFER),
+                      mock.patch.object(server, "plugin_marker", lambda: None)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def write(self, data):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def read(self):
+        with open(self.path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_setup_and_remove(self):
+        """Robin sets nouez up, then takes it out again: their own rule, theme and status line stay."""
+        mine = {"permissions": {"allow": ["Bash(git status)"]}, "theme": "dark"}
+        self.write(mine)
+        out = []
+        self.assertEqual(server.run_setup(["--dry-run"], out.append), 0)
+        self.assertEqual(self.read(), mine)
+        self.assertEqual(server.run_setup(["--statusline"], out.append), 0)
+        data = self.read()
+        self.assertEqual(data["permissions"]["allow"], ["Bash(git status)"] + self.rules)
+        self.assertTrue(server.ours_statusline(data.get("statusLine")), out)
+        self.assertEqual(data["theme"], "dark")
+        self.assertTrue(any(line.startswith("Backed up") for line in out))
+        out = []
+        self.assertEqual(server.run_setup(["--remove", "--dry-run"], out.append), 0)
+        self.assertEqual(self.read(), data)
+        self.assertEqual(server.run_setup(["--remove"], out.append), 0)
+        self.assertEqual(self.read(), mine)
+        self.write({**mine, "statusLine": {"type": "command", "command": "my-line.sh"}})
+        self.assertEqual(server.run_setup(["--remove"], out.append), 0)
+        self.assertEqual(self.read()["statusLine"], {"type": "command", "command": "my-line.sh"})
+        for argv in (["--statusline", "--remove"], ["-x"], ["--dry-run", "--dry-run"]):
+            self.assertEqual(server.run_setup(argv, out.append), 2)
+
+    def test_a_status_line_that_passes_its_input_on_is_kept(self):
+        """Robin's own status line passes its input on to nouez's: /nouez:uninstall keeps it and says
+        which part to take out."""
+        here = os.path.abspath(server.__file__).replace("\\", "/")
+        line = {"type": "command", "command": f'my-line.sh | py -3 -I "{here}" statusline --quiet'}
+        self.write({"statusLine": line})
+        out = []
+        self.assertEqual(server.run_setup(["--remove"], out.append), 0)
+        self.assertEqual(self.read()["statusLine"], line)
+        self.assertTrue(any("passes its input on to it" in m for m in out), out)
+        # The one setup wrote is taken out even when another Python runs nouez now.
+        self.write({"statusLine": {"type": "command", "command": f'"C:/Old Python/python.exe" {here} statusline'}})
+        self.assertEqual(server.run_setup(["--remove"], out.append), 0)
+        self.assertNotIn("statusLine", self.read())
+
+    def test_the_clones_registration_and_where_the_plugin_is_on(self):
+        """The clone's registration sets a switch and a key: setup names both, the switch's value but
+        never the key's. The dispatcher folder's local settings turn the plugin off there, over the
+        user's settings turning it on."""
+        state = os.path.join(self.home, ".claude.json")
+        with open(state, "w", encoding="utf-8") as f:
+            json.dump({"mcpServers": {"consultants": {"command": "py", "env": {
+                "NOUEZ_ASK_TRUST": "1", "OPENAI_API_KEY": "sk-not-shown"}}}}, f)
+        with mock.patch.object(server, "claude_state_file", lambda *a, **k: state):
+            note = server.clone_env_note()
+            self.assertTrue(server.clone_registered())
+        self.assertIn("NOUEZ_ASK_TRUST (the switch ask_trust, on)", note)
+        self.assertIn("OPENAI_API_KEY", note)
+        self.assertNotIn("sk-not-shown", note)
+        # Until that registration goes, the protection it turns on holds for the plugin, which never got it.
+        with mock.patch.object(server, "claude_state_file", lambda *a, **k: state), \
+                mock.patch.dict(os.environ, {"NOUEZ_ASK_TRUST": "", "NOUEZ_NO_TRUST_WRITE": ""}), \
+                mock.patch.object(server, "plugin_marker", lambda: {"id": "nouez@nouez"}):
+            self.assertEqual(server.switch_setting("ask_trust"), (True, "clone's registration"))
+            self.assertNotEqual(server.switch_setting("no_trust_write")[1], "clone's registration")
+        folder = os.path.join(self.home, "dispatcher")
+        os.makedirs(os.path.join(folder, ".claude"))
+        self.write({"enabledPlugins": {"nouez@nouez": True}})
+        with mock.patch.object(server, "plugin_marker", lambda: {"id": "nouez@nouez"}):
+            self.assertIs(server.plugin_enabled(folder), True)
+            with open(os.path.join(folder, ".claude", "settings.local.json"), "w", encoding="utf-8") as f:
+                json.dump({"enabledPlugins": {"nouez@nouez": False}}, f)
+            self.assertIs(server.plugin_enabled(folder), False)
+
+
+class TrustedDevicesTest(unittest.TestCase):
+    """0.30.0: a session that lost Remote Control when the account began requiring trusted devices
+    is reported as such, from Claude Code's own notice in its transcript only."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.folder, True)
+        patch = mock.patch.object(server, "transcript_folder", lambda cwd: self.folder)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.sid = "2a1abb25-1b88-4a1b-8e1b-f479ac679c57"
+        self.session = {"session_id": self.sid, "cwd": self.folder, "registered": 1795573246744, "remote": False}
+
+    def transcript(self, *records):
+        with open(os.path.join(self.folder, self.sid + ".jsonl"), "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+    def notice(self, at, kind="system"):
+        text = ("Remote Control disconnected — Trusted devices now required — run /remote-control to "
+                "start a new session")
+        return {"type": kind, "subtype": "informational", "timestamp": at,
+                **({"content": text} if kind == "system" else {"message": {"content": text}})}
+
+    def test_only_claude_codes_notice_after_the_start(self):
+        """Kim's resumed session in fantasy_basket shows no Remote Control: the list says why, from
+        Claude Code's notice after the session started, never from a notice before it or from text
+        a user or model wrote."""
+        self.transcript(self.notice("2026-11-24T00:00:00.000Z"), self.notice("2026-11-27T04:40:51.055Z", "user"))
+        self.assertFalse(server.remote_dropped(self.session))
+        self.transcript(self.notice("2026-11-27T04:40:51.055Z"))
+        self.assertTrue(server.remote_dropped(self.session))
+        self.assertIn(server.TRUST_DROP_NOTE, server.describe_sessions(
+            [{**self.session, "pid": 1, "name": "fantasy", "status": "idle", "helper": None}], set()))
+        self.assertFalse(server.remote_dropped({**self.session, "remote": True}))
+
+    def test_a_dropped_session_is_reopened_as_a_fork_on_the_users_yes(self):
+        """Kim's MMM_NFP window lost the phone at the switch and won't reconnect: its row gives the
+        conversation id and says to ask Kim before closing it and opening it again as a fork, never
+        to type in the window."""
+        self.transcript(self.notice("2026-11-27T04:40:51.055Z"))
+        out = server.describe_sessions(
+            [{**self.session, "pid": 1, "name": "fantasy", "status": "idle", "helper": None}], set())
+        self.assertIn(f"conversation id {self.sid}", out)
+        self.assertIn("ask the user first", out)
+        self.assertIn("as a fork with a new Remote Control session", out)
+        self.assertNotIn("typed in its window", out)
+
+
+class LaunchRecordTest(unittest.TestCase):
+    """0.30.0: every resume opens as a fork (a new conversation id), so nouez keeps its own record
+    of each launch: the conversation it continues stays marked open, can't be opened twice, and the
+    list shows which fork continued which conversation."""
+
+    SOURCE = "2a1abb25-1b88-4a1b-8e1b-f479ac679c57"
+    FORK = "39dfbaee-0000-4000-8000-000000000001"
+
+    def setUp(self):
+        folder = server.launches_folder()
+        for name in os.listdir(folder):
+            os.remove(os.path.join(folder, name))
+        self.cwd = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.cwd, True)
+        self.transcripts = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.transcripts, True)
+        patch = mock.patch.object(server, "transcript_folder", lambda cwd: self.transcripts)
+        patch.start()
+        self.addCleanup(patch.stop)
+        for sid in (self.SOURCE, self.FORK):
+            with open(os.path.join(self.transcripts, sid + ".jsonl"), "w", encoding="utf-8") as f:
+                f.write(json.dumps({"cwd": self.cwd, "type": "user"}) + "\n")
+
+    def records_on_disk(self):
+        return sorted(n for n in os.listdir(server.launches_folder()) if n.endswith(".json"))
+
+    def record(self, **fields):
+        token = os.urandom(8).hex()
+        server.write_launch(token, {"v": 1, "cwd": self.cwd, "at": time.time(), "source": self.SOURCE, **fields})
+        return token
+
+    def test_a_starting_window_holds_its_conversation(self):
+        """Kim taps resume twice on the phone before the first window registers: the second is
+        refused, not a second window on the same conversation."""
+        token = server.new_launch(self.cwd, self.SOURCE)
+        self.assertTrue(server.read_launch(token))
+        with self.assertRaises(server.BridgeError) as e:
+            server.resume_target(self.SOURCE, self.cwd, [], server.launch_records())
+        self.assertIn("still starting", str(e.exception))
+        self.record()  # another request's record, written between the check and this one
+        with self.assertRaises(server.BridgeError):
+            server.new_launch(self.cwd, self.SOURCE)
+        self.assertEqual(len(self.records_on_disk()), 2)  # the refused one wrote none
+
+    def test_a_running_fork_holds_its_conversation(self):
+        running = [{"pid": 4242, "name": "mmm", "session_id": self.FORK, "cwd": self.cwd}]
+        self.record(pid=4242, start=7, fork=self.FORK)
+        with mock.patch.object(server, "launch_alive", return_value=True):
+            records = server.launch_records()
+            with self.assertRaises(server.BridgeError) as e:
+                server.resume_target(self.SOURCE, self.cwd, running, records)
+            self.assertIn("mmm (pid 4242), as a fork", str(e.exception))
+
+    def test_an_ended_window_frees_its_conversation(self):
+        """Monday's fork was closed: on Tuesday the original opens again, and the note says
+        Monday's work is in the fork, not in this one."""
+        self.record(pid=4242, start=7, fork=self.FORK, at=time.time() - 3600)
+        self.record(pid=4243, start=8, at=time.time() - 3600)  # a window that ended without a fork
+        with mock.patch.object(server, "launch_alive", return_value=False):
+            records = server.launch_records()
+            sid, note = server.resume_target(self.SOURCE.upper(), self.cwd, [], records)
+        self.assertEqual(sid, self.SOURCE)
+        self.assertEqual([r["fork"] for r in records], [self.FORK])
+        self.assertEqual(len(self.records_on_disk()), 1)
+        self.assertIn("as a fork", note)
+        self.assertIn(f"continued before in {self.FORK}", note)
+
+    def test_the_list_shows_forks(self):
+        self.record(pid=4242, start=7, fork=self.FORK)
+        with mock.patch.object(server, "launch_alive", return_value=True), \
+                mock.patch.object(server, "claude_sessions", return_value=[]), \
+                mock.patch.object(server, "own_claude_pids", return_value=set()), \
+                mock.patch.object(server, "saved_conversations", return_value=[
+                    (2000, self.FORK, os.path.join(self.transcripts, self.FORK + ".jsonl")),
+                    (1000, self.SOURCE, os.path.join(self.transcripts, self.SOURCE + ".jsonl"))]), \
+                mock.patch.object(server, "with_login_warning", side_effect=lambda text: text):
+            out = server.list_claude_sessions({"cwd": self.cwd})
+        self.assertIn(f"{self.SOURCE} | open, as a fork | continued in {self.FORK}", out)
+        self.assertIn(f"{self.FORK} | not open | fork of {self.SOURCE}", out)
+
+    def test_bad_records_are_ignored(self):
+        folder = server.launches_folder()
+        for name, data in (("0123456789abcdef.json", "{"), ("0123456789abcde0.json", '{"at": 1, "cwd": 5}'),
+                           ("0123456789abcde1.json", json.dumps({"at": 1, "cwd": "x", "source": "--flag"})),
+                           ("notarecord.json", json.dumps({"at": 1, "cwd": "x"}))):
+            with open(os.path.join(folder, name), "w", encoding="utf-8") as f:
+                f.write(data)
+        self.assertEqual(server.launch_records(), [])
+
+    def test_a_record_that_cant_be_written_blocks_only_a_resume(self):
+        with mock.patch.object(server, "write_launch", side_effect=OSError("full")):
+            self.assertIsNone(server.new_launch(self.cwd, None))
+            with self.assertRaises(server.BridgeError):
+                server.new_launch(self.cwd, self.SOURCE)
+
+    def test_the_helper_records_its_claude_and_the_fork(self):
+        token = self.record()
+        config = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, config, True)
+        os.mkdir(os.path.join(config, "sessions"))
+        child = mock.Mock(pid=4242)
+        child.poll.return_value = None
+        start = 1234.5
+        with open(os.path.join(config, "sessions", "4242.json"), "w", encoding="utf-8") as f:
+            json.dump({"pid": 4242, "sessionId": self.FORK.upper(), "procStart": str(start)}, f)
+        with mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": config}), \
+                mock.patch.object(server, "process_start", return_value=start), \
+                mock.patch.object(server.time, "time", return_value=start):
+            server.note_launch(token, child)
+        record = server.read_launch(token)
+        self.assertEqual((record["pid"], record["start"], record["fork"]), (4242, start, self.FORK))
+
+    @unittest.skipUnless(os.name == "nt", "Windows")
+    def test_a_claude_run_by_a_cmd_shim_is_found(self):
+        """Robin's claude is npm's claude.cmd: the helper starts cmd, and Claude Code registers the
+        node process under it. The record takes that one, so the check and the list find it."""
+        token = self.record()
+        config = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, config, True)
+        os.mkdir(os.path.join(config, "sessions"))
+        child = mock.Mock(pid=4242)
+        child.poll.return_value = None
+        for pid, parent, sid in ((5000, 1, "aaaaaaaa-0000-4000-8000-000000000000"), (4300, 4242, self.FORK)):
+            with open(os.path.join(config, "sessions", f"{pid}.json"), "w", encoding="utf-8") as f:
+                json.dump({"pid": pid, "sessionId": sid, "procStart": str(pid * 10)}, f)
+        table = {5000: (1, "node.exe"), 4300: (4242, "node.exe")}
+        with mock.patch.dict(server.os.environ, {"CLAUDE_CONFIG_DIR": config}),                 mock.patch.object(server, "process_table", return_value=table),                 mock.patch.object(server, "process_start", side_effect=lambda pid: pid * 10):
+            server.note_launch(token, child)
+        record = server.read_launch(token)
+        self.assertEqual((record["pid"], record["start"], record["fork"]), (4300, 43000, self.FORK))
+
+    def test_two_requests_for_one_conversation_open_one_window(self):
+        """Two phone chats resume the same conversation at once: the check and the record are one
+        step under a shared lock, so one opens it and the other is refused, never both."""
+        barrier, results = threading.Barrier(4), []
+
+        def request():
+            barrier.wait()
+            try:
+                results.append(server.new_launch(self.cwd, self.SOURCE))
+            except server.BridgeError:
+                results.append(None)
+        threads = [threading.Thread(target=request) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sum(1 for r in results if r), 1)
+        self.assertEqual(len(self.records_on_disk()), 1)
+
+    def test_a_resume_typed_in_the_fork_frees_the_original(self):
+        """Kim types /resume in the fork's window on the computer and picks another conversation:
+        the original is no longer held by that window."""
+        self.record(pid=4242, start=7, fork=self.FORK)
+        other = [{"pid": 4242, "name": "mmm", "session_id": "bbbbbbbb-0000-4000-8000-000000000000", "cwd": self.cwd}]
+        with mock.patch.object(server, "launch_alive", return_value=True):
+            records = server.launch_records()
+            self.assertTrue(server.launch_holds(records[0], []))
+            self.assertFalse(server.launch_holds(records[0], other))
+            self.assertEqual(server.resume_target(self.SOURCE, self.cwd, other, records)[0], self.SOURCE)
+            self.assertTrue(server.new_launch(self.cwd, self.SOURCE, other))
+
+    def test_live_records_outlast_the_cap(self):
+        live = self.record(pid=1, start=1, fork=self.FORK, at=time.time() - 9000)
+        for i in range(3):
+            self.record(pid=10 + i, start=1, fork=self.FORK)
+        with mock.patch.object(server, "LAUNCHES_KEPT", 2),                 mock.patch.object(server, "launch_alive", side_effect=lambda r, now=None: r["pid"] == 1):
+            tokens = [r["token"] for r in server.launch_records()]
+        self.assertIn(live, tokens)
+        self.assertEqual(len(tokens), 3)
+        self.assertEqual(len(self.records_on_disk()), 3)
+
+    def test_a_new_sessions_record_goes_after_the_check(self):
+        with mock.patch.object(server, "open_window", return_value="a window") as open_window,                 mock.patch.object(server, "folder_trusted", return_value=True),                 mock.patch.object(server, "trust_key", return_value=(self.cwd, False)),                 mock.patch.object(server, "exactly_trusted", return_value=True),                 mock.patch.object(server, "claude_sessions", return_value=[]),                 mock.patch.object(server, "CONNECT_SECONDS", 0):
+            server.open_claude_session({"cwd": self.cwd})
+        os.remove(open_window.call_args[0][1][-1])
+        self.assertEqual(self.records_on_disk(), [])
+
+    def test_a_close_names_the_conversation_the_user_agreed_to(self):
+        """Kim says yes to closing the dropped MMM_NFP window, but meanwhile someone at the computer
+        switched it to another conversation: nothing is closed."""
+        running = [{"pid": 41, "name": "mmm", "cwd": self.cwd, "session_id": "bbbbbbbb-0000-4000-8000-000000000000",
+                    "helper": None, "status": "idle", "remote": False}]
+        with mock.patch.object(server, "claude_sessions", return_value=running),                 mock.patch.object(server, "own_claude_pids", return_value=set()),                 mock.patch.object(server, "end_session") as end:
+            for bad in (self.SOURCE, "--x", 5):
+                with self.assertRaises(server.BridgeError):
+                    server.close_claude_session({"pid": 41, "session_id": bad})
+            end.assert_not_called()
+            server.close_claude_session({"pid": 41, "session_id": running[0]["session_id"].upper()})
+            end.assert_called_once()
+
+    def test_the_connection_check_is_this_windows(self):
+        """Two chats open windows in the same folder: the check reports this window's claude, not
+        the other one's."""
+        token = self.record()
+        other = {"pid": 5000, "cwd": self.cwd, "remote": True, "session_id": "x"}
+        mine = {"pid": 4242, "cwd": self.cwd, "remote": False, "session_id": self.FORK}
+        with mock.patch.object(server, "claude_sessions", return_value=[other]),                 mock.patch.object(server, "CONNECT_SECONDS", 0):  # this window's claude not recorded yet
+            self.assertIn("hadn't shown up", server.connection_note(set(), self.cwd, None, True, token))
+        server.write_launch(token, {**{k: v for k, v in server.read_launch(token).items() if k != "token"},
+                                    "pid": 4242, "start": 7})
+        with mock.patch.object(server, "claude_sessions", return_value=[other, mine]), \
+                mock.patch.object(server, "CONNECT_SECONDS", 0):
+            self.assertIn("hadn't connected", server.connection_note(set(), self.cwd, None, True, token))
+        with mock.patch.object(server, "claude_sessions", return_value=[other, {**mine, "remote": True}]):
+            out = server.connection_note(set(), self.cwd, None, True, token)
+        self.assertIn(f"Its conversation id is {self.FORK}", out)
 
 
 if __name__ == "__main__":

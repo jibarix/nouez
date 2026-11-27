@@ -6,6 +6,21 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-11-27
+
+nouez installs as a Claude Code plugin, on Windows: `claude plugin marketplace add jibarix/nouez`, `claude plugin install nouez@nouez`, then `/nouez:setup` in a new session. Installed that way, an update reaches open sessions by itself, and a protection can change from the phone after a yes in Claude Code's own prompt. A clone keeps working as before: reconnect `consultants` with `/mcp` in each open session to load 0.30.0.
+
+### Added
+
+- **nouez as a plugin.** Robin installs it with two commands and runs `/nouez:setup`, which shows what it would add (the waiter's allow rules and, if wanted, nouez's status line), asks, runs `doctor` and offers to set up the phone dispatcher. `/nouez:uninstall` takes out what setup added and the dispatcher's sign-in start ([plugin setup](docs/rules.md#rule-plugin-setup)). Someone who also registered a clone is told nouez runs twice, with the command that removes the clone's registration and the environment variables it sets, which the plugin doesn't get; the phone dispatcher's allow rules move to the plugin's tool names.
+- **Open sessions move to a new version by themselves.** Dana updates the plugin and runs `/reload-plugins` in one session while a review runs in another. That one keeps the running server until the review's reply is in; its next nouez call after that is answered by the new version, with no `/mcp` reconnect. The plugin's launcher asks the server whether anything is under way and moves only when nothing is; nothing is handed over ([the plugin](docs/rules.md#rule-plugin-launcher)).
+- **Protections from the phone, behind Claude Code's prompt.** Sam, with the plugin, asks the phone to turn `ask_trust` off: Claude Code's own prompt naming that change shows on the phone, and it changes only on his Allow, once. In a mode that shows no prompt (`bypassPermissions`, `dontAsk`, `plan`) it is refused. Without the plugin, protections still change only at the computer ([protections](docs/rules.md#rule-protections-behind-the-prompt)).
+- **Resumed sessions reach the phone again.** Kim resumes her fantasy_basket conversation from the phone and it connects. Resumed under its own id, a conversation reattaches to its old Remote Control session, which an account that now requires trusted devices refuses; so a resume now opens as a fork, a new conversation with the whole history and a new Remote Control session, and the original stays as it was. While the fork runs, the list marks the original "open, as a fork" and a second resume of it is refused; afterwards it shows "continued in <fork>" and "fork of <original>". Plan mode and permissions granted for that session only don't carry over. A session that lost the phone while running says so in the list, with its conversation id: Claude asks Kim before closing it and opening it again as a fork ([trusted devices](docs/rules.md#rule-trusted-devices)).
+
+### Documentation
+
+- The README and the setup guide say how to install, set up, update and remove the plugin; the architecture reference has a section on the launcher and the hook; the rulebook adds four rows; protections without the plugin still change only at the computer.
+
 ## [0.29.0] - 2026-11-27
 
 The phone sets itself up. Open a chat with the dispatcher and it offers to walk you through picking your projects folders, what nouez changes in Claude Code and the switches, with no flags at the computer. Projects you picked open from the phone without the trust question when their settings run and allow nothing. Reconnect `consultants` with `/mcp` in each open Claude Code session to load the new version. For the phone dispatcher, run `server.py dispatcher install` again the way you first did; the dispatcher then adds the allow rules for the new tools itself.
@@ -880,7 +895,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.30.0...HEAD
+[0.30.0]: https://github.com/jibarix/nouez/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/jibarix/nouez/compare/v0.28.6...v0.29.0
 [0.28.6]: https://github.com/jibarix/nouez/compare/v0.28.5...v0.28.6
 [0.28.5]: https://github.com/jibarix/nouez/compare/v0.28.4...v0.28.5

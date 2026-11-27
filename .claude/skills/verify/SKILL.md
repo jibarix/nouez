@@ -36,8 +36,9 @@ Never weaken a check, skip a test or add a retry to make a step pass.
    When the change touches OpenClaudeSession, ListClaudeSessions, CloseClaudeSession or the
    `claude` helper, add `--sessions`. That opens a Claude Code window named `nouez-verify` in this
    repo (haiku, low effort), checks it connects to Remote Control and answers, closes it, resumes it
-   by id, checks the id is kept, and closes it again. Tell the user before running it, since a window
-   opens on their screen.
+   by id, checks it opens as a fork (a new id holding the first conversation) and that resuming the
+   same conversation again while the fork runs opens nothing, and closes it again. Tell the user
+   before running it, since a window opens on their screen.
 
    When the change touches what a newcomer's setup meets (providers, how Codex or `agy` is found,
    `doctor`, setup steps, the MCP server instructions, ListConsultants or StartConsultant without a

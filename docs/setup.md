@@ -91,6 +91,8 @@ When a newer nouez is released on GitHub, `StartConsultant` adds a notice to its
 
 To find out, nouez asks GitHub for the latest release (`api.github.com/repos/jibarix/nouez/releases/latest`). It sends no sign-in and nothing from your projects or sessions: GitHub sees an HTTPS request from your IP address with `nouez/<version>` as the client name, through your proxy if you have one set. The check runs in the background at startup and can run again after a dispatcher tool is used. Nouez keeps the result in `nouez/latest-release.json` in your cache folder (`%LOCALAPPDATA%` on Windows, `$XDG_CACHE_HOME` or `~/.cache` elsewhere). If you're offline, there is simply no notice. See [when nouez reuses or retries a release lookup](rules.md#rule-release-poll). The notice is given once for each new release in a server process. To turn the check off, set the environment variable `NOUEZ_NO_UPDATE_CHECK=1`.
 
+With nouez installed as a plugin, Claude runs `claude plugin update nouez@nouez` instead, when you ask, and then asks you to run `/reload-plugins`. Your other open sessions move to the new version by themselves, the next time they call nouez while nothing of nouez's is running there; nothing needs reconnecting ([the plugin](rules.md#rule-plugin-launcher)). The phone dispatcher's notice says to update at the computer and run `/nouez:setup` there, which installs the dispatcher again.
+
 You can also watch the repository on GitHub (Watch → Custom → Releases) to get an email for each release.
 
 ## Codex updates

@@ -979,6 +979,15 @@ def answered(session_id):
     return False
 
 
+def has_text(session_id, text):
+    """Whether conversation `session_id`'s transcript holds `text`."""
+    try:
+        with open(transcript(session_id), encoding="utf-8") as f:
+            return any(text in line for line in f)
+    except OSError:
+        return False
+
+
 def wait_for(test, seconds):
     end = time.monotonic() + seconds
     while time.monotonic() < end:
@@ -1031,7 +1040,8 @@ def check_sessions(client):
         report(False, "session checks", f"a session named {SESSION_NAME} already runs here; close it first")
         return
     try:
-        entry = open_and_check(client, "opens a session", prompt="Reply with the single word ok.")
+        marker = "nouez-verify-" + os.urandom(6).hex()
+        entry = open_and_check(client, "opens a session", prompt=f"Reply with the single word ok. ({marker})")
         sid = entry and entry["session_id"]
         if not sid:
             return
@@ -1039,9 +1049,17 @@ def check_sessions(client):
             return
         if not close_verify_sessions(client):
             return
+        # 0.30.0: a resume is a fork, a new conversation id with the whole history and a new Remote
+        # Control session; the original can't be opened again while the fork runs.
         entry = open_and_check(client, "resumes it", resume=sid)
-        report(entry is not None and entry["session_id"] == sid, "the resumed session keeps its id",
-               f"{sid} -> {entry and entry['session_id']}")
+        fork = entry and entry["session_id"]
+        report(bool(fork) and fork != sid and has_text(fork, marker), "the resumed session is a fork with the history",
+               f"{sid} -> {fork}")
+        last_open[0] = time.monotonic()
+        text, err = client.call("OpenClaudeSession", timeout=90, cwd=ROOT, name=SESSION_NAME,
+                                model="haiku", effort="low", resume=sid)
+        report(err and "already open" in text and len(verify_sessions()) == 1,
+               "resuming it again while its fork runs opens nothing", short(text, 200))
     finally:
         close_verify_sessions(client)
 

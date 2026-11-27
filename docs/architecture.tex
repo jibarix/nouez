@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.29.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.30.0\\[0.3em]\large Architecture and message reference}
 \date{November 26, 2026}
 \author{}
 
@@ -290,7 +290,7 @@ the folder the call names, never in a workspace above it.
   "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
   "ttlMs": 0, "cacheScope": "private",
-  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.29.0"}}}}
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.30.0"}}}}
 \end{wire}
 
 Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
@@ -528,6 +528,68 @@ codex-nouez-77c2e0 is a Codex session the user opened, not a read-only consultan
 All of these are checked before anything is sent; the last one after the session is found.
 
 % =============================================================================
+\subsection{Running as a plugin}
+\label{sec:plugin}
+
+Installed as a Claude Code plugin, nouez starts as \code{py -3 -I launch.py DATA}, DATA being the
+plugin's data folder (\code{CLAUDE\_PLUGIN\_DATA}, \code{\textasciitilde/.claude/plugins/data/nouez-MARKET}).
+\code{launch.py}, standard library only, copies the plugin's \code{server.py} to
+\code{DATA/app/server.py} under a lock, only when its \code{SERVER\_VERSION} is higher (with
+\code{-{}-plugin-dir}, whose data folder ends in \code{-inline}, also when the same version has
+other bytes), and writes \code{app/plugin.json} with the plugin's id. It does so at its start,
+so a newer copy is put in place when a session starts nouez from the updated plugin (a new session,
+or \code{/reload-plugins}). A DATA or \code{app} folder that is a link is refused: the launcher
+ends without writing or running anything. By that file
+\code{server.py} knows it runs as the plugin: its tools are then
+\code{mcp\_\_plugin\_nouez\_consultants\_\_NAME}, its allow rules and doctor say so, and it warns
+when a clone is registered as well. The launcher runs that copy as its child and passes each line
+on unchanged, with these exceptions:
+\begin{itemize}
+  \item The answer to the first \code{initialize} gains \code{"tools": \{"listChanged": true\}}.
+  \item A request of the child's to Claude Code (\code{roots/list}, a prompt) goes out as
+    \code{launchG-ID}, G counting the children, and its answer goes back under the child's id;
+    an answer for a child that has ended goes nowhere.
+  \item Before passing on a request when the copy on disk is newer than the child's (its size and
+    time looked at), the launcher asks the child \code{nouez/idle} and holds Claude Code's
+    requests until the answer, for at most 15 s (none counts as not idle). The child is idle when
+    nothing a new process wouldn't know about is under way: no request or notification being
+    handled, no request to Claude Code open, no tool call running, no prompt waiting, no provider
+    the user named still waiting for its message, no usage-log write, and no Codex turn it started
+    or steered still running (asked of the daemon, which nouez doesn't start for this).
+\end{itemize}
+
+\begin{wire}[launch.py $\rightarrow$ nouez, and back]
+{"jsonrpc": "2.0", "id": "launch-idle-3", "method": "nouez/idle"}
+{"jsonrpc": "2.0", "id": "launch-idle-3", "result": {"idle": false, "why": "a tool call is running"}}
+\end{wire}
+
+When the child is idle, the launcher closes its input, gives it 10 s to end (then ends it), starts
+the newer copy, and gives it the session's \code{initialize} again (its answer isn't passed on)
+and \code{notifications/initialized}, then the requests it held, and sends Claude Code
+\code{notifications/tools/list\_changed}. If the new copy refuses that \code{initialize} or
+doesn't answer within 30 s, each held request gets error \code{-32603} saying to reconnect nouez
+with \code{/mcp}, and the launcher ends the copy and itself. Nothing is handed over: no consultation, prompt or
+request is under way to hand. A 2026-07-28 client has no \code{initialize} to give again: each
+request carries what it would, and \code{tools/list} answers with \code{ttlMs} 0. When the child
+isn't idle, the held requests go to it and it is asked again 10 s later; one from before 0.30
+answers \code{-32601} and is never asked again, so its session keeps it until it ends. A
+\code{notifications/cancelled} for a held request drops it, never sent.
+
+The plugin's \code{PreToolUse} hook on \code{NouezSettings} runs \code{server.py guard} with the
+hook's input. For a call that turns one of the four protections on or off, it answers
+\code{"permissionDecision": "ask"} in the \code{default}, \code{acceptEdits} and \code{auto} modes
+and records an approval slot in \code{DATA/approvals.json} (the change, the Claude Code process
+running the session as its id and start time, and when); in any other mode, or when it can't find
+that process, it answers \code{"deny"}. Claude Code shows its own prompt, on the phone too, and runs
+the tool only on a yes. \code{NouezSettings} then takes the matching slot, once; one older than 10
+minutes is gone. Any other call, a hook that fails among them, is left to Claude Code's own rules,
+and then \code{NouezSettings} refuses a protection, finding no slot.
+
+\begin{wire}[server.py guard $\rightarrow$ Claude Code]
+{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
+  "permissionDecisionReason": "nouez: turn the protection ask_trust off?"}}
+\end{wire}
+
 \section{nouez \texorpdfstring{$\leftrightarrow$}{<->} Codex daemon}
 \label{sec:codex}
 
@@ -1364,7 +1426,7 @@ codex-nouez-77c2e0 was not started by StartConsultant. Close it from its own ter
 \code{ConsultantBudget} gathers the facts for choosing a consultant's model and effort, and changes
 nothing, except that a \code{kind} with a \code{provider} keeps nouez's pick for the next send of
 that kind to that provider on its models (see the
-\href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-named-provider}{lifetime and scope of a named provider}). It makes two requests to the Codex daemon, reads one file the user's status line saves, and
+\href{https://github.com/jibarix/nouez/blob/v0.30.0/docs/rules.md#rule-named-provider}{lifetime and scope of a named provider}). It makes two requests to the Codex daemon, reads one file the user's status line saves, and
 asks Artificial Analysis for model scores about once a week. Each part fails on its own: an
 unreachable daemon or a missing file is reported in its place, and the rest still shows.
 
@@ -1450,7 +1512,7 @@ The suggestion comes from \code{suggest\_consultant}. \code{ConsultantBudget} ta
 \code{kind} (one of the usage log's kinds) and \code{provider}; without a kind it gives one line per
 kind, and with a provider it considers only that one. \code{CONSULT\_PICKS} lists, for each kind,
 the (provider, model, effort) options in order of preference. The rulebook gives the
-\href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-starting-picks}{starting order by kind};
+\href{https://github.com/jibarix/nouez/blob/v0.30.0/docs/rules.md#rule-starting-picks}{starting order by kind};
 \code{docs/consultants.md} dates the benchmark rationale.
 
 \begin{itemize}
@@ -1460,25 +1522,25 @@ the (provider, model, effort) options in order of preference. The rulebook gives
   using its default. A substitution within a model family, a switch to the provider default
   for a missing model, or a change to an unavailable effort adds a note. Skipping a missing
   model in favor of another listed pick can be silent. See the
-  \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-catalogue-fallback}{model and effort fallbacks}.
+  \href{https://github.com/jibarix/nouez/blob/v0.30.0/docs/rules.md#rule-catalogue-fallback}{model and effort fallbacks}.
   Apply the named-provider restriction and exclude Claude models for work that requires an
-  \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-independent-review}{independent reviewer},
+  \href{https://github.com/jibarix/nouez/blob/v0.30.0/docs/rules.md#rule-independent-review}{independent reviewer},
   including any send with \code{revision: true}.
 \item Read the windows for the quota each remaining option spends. For Antigravity the
   \code{/usage} group lists identify the quota. Classify each option from those windows and
   discard blocked options. An old reading gives a lower bound on use. An Antigravity turn that
   failed on its quota marks its group used up until the reset it named
-  (\href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-quota-hit}{quota failures}). The
-  \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-usage-forecast}{forecast rule}
+  (\href{https://github.com/jibarix/nouez/blob/v0.30.0/docs/rules.md#rule-quota-hit}{quota failures}). The
+  \href{https://github.com/jibarix/nouez/blob/v0.30.0/docs/rules.md#rule-usage-forecast}{forecast rule}
   specifies when a reading supports a pace.
 \item Start with the first remaining option and compare options on other quotas. An option whose
   usage is unknown yields to known room, after the spare-week and pace comparisons below. A tight week can move the choice or lower its effort.
   A busy week can yield to spare quota except for a fact check. For eligible research and quick
   checks, compare spare weeks by reset time, keeping the first choice on a tie, then consider
   how far a week is behind pace if the earlier rules left the pick in place. See the
-  \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-tight-week}{tight-week rule},
-  \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-spare-week}{spare-week rule}
-  and \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-behind-pace}{final pace comparison}.
+  \href{https://github.com/jibarix/nouez/blob/v0.30.0/docs/rules.md#rule-tight-week}{tight-week rule},
+  \href{https://github.com/jibarix/nouez/blob/v0.30.0/docs/rules.md#rule-spare-week}{spare-week rule}
+  and \href{https://github.com/jibarix/nouez/blob/v0.30.0/docs/rules.md#rule-behind-pace}{final pace comparison}.
 \end{itemize}
 
 The same judgment of each window serves the send, the prompt hook and the status screen. At send, a
@@ -1498,7 +1560,7 @@ for a fact check), the blind second opinion with the other provider's own sugges
 Gemini~4 Neon scores best on when Neon is listed, its group has room and the choice isn't already
 a Gemini model, and that a reused consultant keeps its last model and effort. The hand-out line can recommend sending code to write as kind \code{draft}; Claude checks and
 applies the returned text locally. Research advice can name a second provider for reading a
-page. See the \href{https://github.com/jibarix/nouez/blob/v0.29.0/docs/rules.md#rule-research-and-drafts}{research and draft advice}.
+page. See the \href{https://github.com/jibarix/nouez/blob/v0.30.0/docs/rules.md#rule-research-and-drafts}{research and draft advice}.
 \code{tests/consult\_eval.py} checks in fresh \code{claude -p} sessions that Claude calls it and
 follows it.
 
@@ -1894,8 +1956,22 @@ doesn't say where it ran (even in this folder's transcripts, which may be a twin
 when the running sessions can't be read, since it couldn't tell whether one has it open; a \code{prompt}
 starting with \code{/resume} or \code{/continue}, or a \code{resume} that isn't an id (such as
 \code{latest}), is refused with a pointer to \code{ListClaudeSessions}.
+The conversation opens as a fork (\code{-{}-fork-session}): a new conversation id with the whole
+history. Resumed under its own id, a conversation reattaches to its old Remote Control session,
+which an account that requires trusted devices refuses; a fork gets a new one. Plan mode and
+permissions granted for that session only don't carry over. Since the running session then has
+another id, nouez records each launch in its cache folder (\code{launches/<token>.json}): the server
+writes the conversation it picks up before the window opens, and the window's helper adds its
+\code{claude}'s process and, once Claude Code registers it, the fork's id. The original counts as
+open while that process runs and still shows the fork, or for up to 2 minutes before it is
+recorded, so it is never opened twice (the check and the record are one step under a lock every
+nouez server shares, \code{launches/launches.lock}); the connection check watches that process only; and \code{ListClaudeSessions} marks the
+original ``continued in'' the fork and the fork ``fork of'' the original (of the records whose window
+has ended, the newest 500 with a fork are kept). When \code{claude} is a \code{claude.cmd}, the process
+Claude Code registers is a child of the one the helper started, and the record takes that one. A running session that lost Remote Control shows its conversation id, and
+Claude asks the user before closing it and opening it again as a fork.
 \begin{plain}[Result text: resuming]
-... It resumes conversation 4b4f3c8c-0010-4e93-a427-9db7032f2be3, last active 2026-11-07 14:33. Checked: it is running and connected to Remote Control. ...
+... It resumes conversation 4b4f3c8c-0010-4e93-a427-9db7032f2be3, last active 2026-11-07 14:33, as a fork: a new conversation with its whole history and a new Remote Control session (an account that requires trusted devices refuses the old one), while the original stays as it was. Plan mode and permissions granted for that session only don't carry over. Checked: it is running and connected to Remote Control. Its conversation id is 9c1e57a2-3b0d-4f6e-8a41-2d7f0c9b6e15. ...
 \end{plain}
 \begin{wire}[Claude Code $\rightarrow$ nouez: a new folder]
 {"jsonrpc": "2.0", "id": 20, "method": "tools/call", "params": {"name": "OpenClaudeSession", "arguments": {"cwd": "C:\\Users\\me\\Projects\\economic-recession", "create": true}}}
@@ -1973,11 +2049,12 @@ Claude Code sessions running on this computer:
 \end{plain}
 
 \code{CloseClaudeSession} takes \code{name}, or \code{pid} to pick one of several sessions with the
-same name, and closes one session per call. It refuses the caller, and the tool description tells
+same name, and closes one session per call. Given \code{session\_id}, the conversation the user
+agreed to close, it closes the session only if that is still its conversation. It refuses the caller, and the tool description tells
 Claude to close only sessions the user picked from the list.
 
 \begin{plain}[Result text]
-Closed other (pid 20964) and its window. Its transcript is kept: `claude --resume 2e130d9e-3cce-4a4c-aed2-9693deab1875` in C:\Users\me\Projects\other picks it up again.
+Closed other (pid 20964) and its window. Its transcript is kept: OpenClaudeSession with cwd C:\Users\me\Projects\other and resume 2e130d9e-3cce-4a4c-aed2-9693deab1875 opens it again, as a fork with a new Remote Control session.
 \end{plain}
 \begin{plain}[Result text: refused (isError true)]
 That is the session you are running in; it can't close itself.
@@ -2157,7 +2234,7 @@ That helper reads and deletes the file, then starts Claude Code in \code{cwd}:
 
 \begin{plain}[What the helper runs]
 claude --remote-control <name> --name <name> --model <model> --effort <effort>
-  [--resume <session id>] [-- <prompt>]
+  [--resume <session id> --fork-session] [-- <prompt>]
 \end{plain}
 
 Claude Code sets \code{CLAUDECODE}, \code{CLAUDE\_CODE\_CHILD\_SESSION},
@@ -2687,6 +2764,11 @@ Default \code{wait} & 5 s / 0 s & SendConsultantMessage / GetConsultantReply \\
 \code{ARRANGE\_SETTLE\_MS} & 300 ms & quiet after events before a pass \\
 \code{ARRANGE\_IDLE\_MS} & 10 s & the arranger's wait for a window, with none left \\
 \code{ARRANGE\_TRIES} & 3 & moves to the same box before a window is left as it is \\
+\code{ASK\_EVERY} & 10 s & the plugin launcher's wait before asking a busy server again \\
+Idle answer wait & 15 s & for \code{nouez/idle}; none counts as not idle \\
+\code{STOP\_SECONDS} & 10 s & for the old server to end once its input is closed \\
+\code{REPLAY\_SECONDS} & 30 s & for the new server to answer the \code{initialize} given again \\
+Approval slot & 10 min & how long a prompt's yes can serve \code{NouezSettings} \\
 \bottomrule
 \end{tabular}
 \end{center}

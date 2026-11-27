@@ -25,6 +25,11 @@ Command line
   server.py hook                         Claude Code's UserPromptSubmit hook: when it is busy, a
                                          line on handing work to a consultant
   server.py top                          the status screen: usage and consultations
+  server.py setup [--dry-run] [--statusline | --remove]
+                                         the waiter's allow rules and the status line in Claude
+                                         Code's user settings (/nouez:setup, /nouez:uninstall)
+  server.py guard                        the plugin's PreToolUse hook: Claude Code's own prompt
+                                         before a protection changes
 
 Transport to Codex: `codex app-server proxy` relays stdio to the daemon's control
 socket, which speaks JSON-RPC over WebSocket. To Antigravity: one `agy -p` process per
@@ -69,7 +74,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.29.0"
+SERVER_VERSION = "0.30.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -116,6 +121,7 @@ _send_locks = {}  # thread id -> lock, so concurrent sends can't both start a tu
 _send_locks_guard = threading.Lock()
 _bridge_turns = set()  # turns this server started (read-only), which a later message may steer
 _delivered = {}  # turn id -> the texts this server delivered to it (started or steered), for repeats
+_live_turns = {}  # turn id -> thread id: each turn this server started or steered, until nouez/idle sees it end
 _update_noted = set()  # latest Codex versions StartConsultant has already told about
 _nouez_latest = None  # the latest nouez release found this process, e.g. "0.9.0"
 _nouez_noted = None  # the nouez release a notice has told about, so each newer one is told once
@@ -132,6 +138,10 @@ _on_reply = threading.local()  # .pending: what a tool call keeps only once its 
 _client_requests = {}  # id of a request we sent to Claude Code -> [Event, response]
 _client_guard = threading.Lock()
 _client_ids = iter(range(1, 1 << 62))
+_roots_lock = threading.Lock()  # one roots/list at a time: a tool call waits for the one under way
+_handlers = [0]  # requests and notifications being handled now (nouez/idle aside)
+_handlers_guard = threading.Lock()
+_log_threads = []  # usage-log writers still running after their call answered (nouez/idle waits for them)
 
 
 def log(*args):
@@ -327,9 +337,10 @@ def daemon_env(environ):
 class CodexClient:
     """One short-lived connection to the Codex app-server daemon."""
 
-    def __init__(self, timeout=15, on_spawn=None):
+    def __init__(self, timeout=15, on_spawn=None, start=True):
         """on_spawn(client), when given, is called as each proxy process starts, before the
-        handshake, so a caller can end it while this still waits; an exception from it ends it."""
+        handshake, so a caller can end it while this still waits; an exception from it ends it.
+        start=False: DaemonDown when no daemon runs, rather than start one."""
         exe = which("codex")
         if not exe:
             raise BridgeError("`codex` CLI not found on PATH.")
@@ -341,6 +352,8 @@ class CodexClient:
         try:
             self._connect(exe)
         except DaemonDown:
+            if not start:
+                raise
             # Nothing is listening: start the daemon ourselves and wait for its socket.
             start_daemon(exe)
             deadline = time.monotonic() + DAEMON_START_SECONDS
@@ -1531,6 +1544,20 @@ def nouez_update_notice(pending=None):
     page = RELEASE_PAGE.format(latest)
     shown = folder.replace("\\", "/") if os.name == "nt" else folder
     quoted = shell_literal(shown)
+    plugin = plugin_marker()
+    if plugin and in_dispatcher():
+        return (f"nouez {latest} is out; this dispatcher runs {SERVER_VERSION}. What changed: {page}. Tell the "
+                "user once, in a line, and go on with what they asked. Updating takes the computer, so don't "
+                f"run anything for it here: at the computer, `claude plugin update {plugin['id']}` in a terminal, "
+                "then /reload-plugins and /nouez:setup in a Claude Code session there, which installs the "
+                "dispatcher again and so ends the chats it has open: finish those first.")
+    if plugin:
+        return (f"nouez {latest} is out; this server is {SERVER_VERSION}. What changed: {page}. Tell the user "
+                "and go ahead with the consultation. Only if the user asks you to update, run "
+                f"`claude plugin update {plugin['id']}` in a shell; if it fails, tell the user what it said and "
+                "stop there. Once it succeeds, ask the user to run /reload-plugins, which starts the new version "
+                "here; their other open sessions move to it by themselves at their next nouez call made while "
+                "nothing of nouez's is running there.")
     if in_dispatcher():
         get = (f"`git -C {quoted} pull --ff-only`" if os.path.exists(os.path.join(folder, ".git")) and quoted
                else f"a git pull in {json.dumps(shown)}" if os.path.exists(os.path.join(folder, ".git"))
@@ -2218,7 +2245,10 @@ def run_claude(spec_path):
             print("This session id can't be passed to claude safely. Open a terminal and run claude --resume yourself.")
             input("Press Enter to close.")
             return 1
-        argv += ["--resume", spec["resume"]]
+        # A fork: a new conversation id with the whole history. Resumed under its own id, a
+        # conversation reattaches to its old Remote Control session, which an account that came to
+        # require trusted devices refuses ("Trusted devices now required"); a fork gets a new one.
+        argv += ["--resume", spec["resume"], "--fork-session"]
     prompt = spec.get("prompt")
     if prompt and exe.lower().endswith((".cmd", ".bat")):
         # A batch script gets its arguments through cmd, which reads quotes, % and & in them as its
@@ -2231,6 +2261,9 @@ def run_claude(spec_path):
     window = WindowEntry("claude") if spec.get("arrange") else None
     try:
         child = subprocess.Popen(argv, cwd=spec["cwd"], env=env)
+        launch = spec.get("launch")
+        if isinstance(launch, str) and LAUNCH_FILE.fullmatch(launch + ".json"):
+            threading.Thread(target=note_launch, args=(launch, child), daemon=True).start()
         code = child.wait()
     finally:
         if window:
@@ -3247,10 +3280,212 @@ def saved_conversations(cwd, cancel=None):
             yield item
 
 
-def resume_target(value, cwd, running):
+# Launch records: one small file per session OpenClaudeSession opens, in nouez's cache folder
+# (launches/<token>.json). The server writes it before the window opens, with the conversation a
+# resume picks up (`source`), which holds that conversation as open from then on; the window's
+# helper adds its claude's process (`pid`, `start`) and, for a resume, the fork's own conversation id
+# (`fork`) once Claude Code registers it. A resume opens as a fork (run_claude), so the running
+# session has a new id: these records are how nouez still knows the conversation it continues is
+# open, ties the connection check to its own window, and shows which fork continued which
+# conversation. A record without a fork goes once its window's claude has ended; one with a fork
+# is kept (the newest LAUNCHES_KEPT).
+LAUNCH_FILE = re.compile(r"[0-9a-f]{16}\.json")
+LAUNCH_PENDING_SECONDS = 120  # a window that hasn't recorded its claude yet holds its conversation this long
+LAUNCH_ID_SECONDS = 600  # how long a window's helper waits for its claude to register the fork's id
+LAUNCHES_KEPT = 500
+
+
+def launches_folder(create=False):
+    return cache_folder("launches", create=create)
+
+
+def write_launch(token, record):
+    """Save launch record `token`, written beside it and renamed over it."""
+    folder = launches_folder(create=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".launch-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        for attempt in range(40):  # on Windows a reader holding the file open refuses the replace for a moment
+            try:
+                os.replace(tmp, os.path.join(folder, token + ".json"))
+                break
+            except PermissionError:
+                if attempt == 39:
+                    raise
+                time.sleep(0.05)
+    except BaseException:
+        remove_file(tmp)
+        raise
+
+
+def clean_launch(record, token):
+    """Launch record `record` read from file `token`.json with its fields checked, or None."""
+    if not isinstance(record, dict):
+        return None
+    at, cwd = record.get("at"), record.get("cwd")
+    source, fork, pid, start = (record.get(k) for k in ("source", "fork", "pid", "start"))
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not isinstance(cwd, str):
+        return None
+    ids_ok = all(x is None or (isinstance(x, str) and CLAUDE_SESSION_ID.fullmatch(x)) for x in (source, fork))
+    pid_ok = pid is None or (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0)
+    start_ok = start is None or (isinstance(start, (int, float)) and not isinstance(start, bool))
+    if not (ids_ok and pid_ok and start_ok):
+        return None
+    source, fork = (x.lower() if x else None for x in (source, fork))
+    return {"token": token, "at": at, "cwd": cwd, "source": source, "fork": fork, "pid": pid, "start": start}
+
+
+def read_launch(token):
+    """Launch record `token`, or None (also for a link or a junction)."""
+    try:
+        path = os.path.join(launches_folder(), token + ".json")
+        if not regular_file(path):
+            return None
+        with open(path, encoding="utf-8") as f:
+            return clean_launch(json.load(f), token)
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def launch_alive(record, now=None):
+    """Whether launch `record`'s window still runs its claude, or is still starting it."""
+    if record["pid"] is None:
+        return (time.time() if now is None else now) - record["at"] < LAUNCH_PENDING_SECONDS
+    if os.name == "nt":
+        return record["start"] is not None and process_start(record["pid"]) == record["start"]
+    try:
+        os.kill(record["pid"], 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def launch_holds(record, running):
+    """Whether live launch `record` still holds the conversation it picked up: not once the running
+    session in its window shows another conversation than its fork (a /resume typed in it)."""
+    if not record["alive"]:
+        return False
+    s = next((s for s in running if record["pid"] is not None and s["pid"] == record["pid"]), None)
+    return not (s and record["fork"] and str(s.get("session_id") or "").lower() != record["fork"])
+
+
+def launch_records():
+    """nouez's launch records, newest first, each with "alive" (launch_alive). Removes those whose
+    window ended without a fork, and all but the newest LAUNCHES_KEPT. [] if none can be read."""
+    try:
+        folder = launches_folder()
+        with os.scandir(folder) as entries:
+            files = [e.path for e in entries if LAUNCH_FILE.fullmatch(e.name) and e.is_file(follow_symlinks=False)]
+    except OSError:
+        return []
+    now, records = time.time(), []
+    for path in files:
+        token = os.path.basename(path)[:-5]
+        record = read_launch(token)
+        if record is None:
+            continue
+        record["alive"] = launch_alive(record, now)
+        if not record["alive"] and not record["fork"]:
+            remove_file(path)
+            continue
+        records.append(record)
+    records.sort(key=lambda r: r["at"], reverse=True)
+    ended = [r for r in records if not r["alive"]]
+    for record in ended[LAUNCHES_KEPT:]:
+        remove_file(os.path.join(folder, record["token"] + ".json"))
+    dropped = {r["token"] for r in ended[LAUNCHES_KEPT:]}
+    return [r for r in records if r["token"] not in dropped]
+
+
+LAUNCH_LOCK_SECONDS = 10
+
+
+def new_launch(cwd, source, running=()):
+    """Record a launch in `cwd` before its window opens; returns its token. For a resume (`source`
+    set), the check that no live launch holds that conversation (launch_holds, with `running`) and
+    the record are one step under a lock every nouez server shares, so of two requests at once one
+    opens it. Without a resume, a record that can't be written only loses the tie between the
+    connection check and this window, and the token is None."""
+    token = os.urandom(8).hex()
+    try:
+        with FileLock(os.path.join(launches_folder(create=True), "launches.lock"), LAUNCH_LOCK_SECONDS,
+                      "Another request is opening a session right now; nothing was opened. Try again in a moment."):
+            records = launch_records()  # also removes ended ones
+            if source and any(r["source"] == source and launch_holds(r, running) for r in records):
+                raise BridgeError(f"Conversation {source} is being opened by another request right now, so nothing "
+                                  "was opened. Call ListClaudeSessions in a moment to see it.")
+            write_launch(token, {"v": 1, "cwd": cwd, "at": time.time(), "source": source})
+    except OSError as e:
+        log("launch record:", repr(e))
+        if source:
+            raise BridgeError(f"nouez couldn't record this resume in its cache folder ({e}), so it couldn't keep "
+                              "the conversation from opening twice. Nothing was opened.") from None
+        return None
+    return token
+
+
+def launched_entry(child_pid):
+    """The Claude Code registry entry (~/.claude/sessions/<pid>.json) of the claude the helper
+    started as `child_pid`: that process's own, or on Windows its child's (a claude.cmd runs
+    claude under cmd). (pid, entry), or None while there is none."""
+    folder = os.path.join(claude_config_dir(), "sessions")
+    own = os.path.join(folder, f"{child_pid}.json")
+    paths = [own] if os.path.isfile(own) or os.name != "nt" else glob.glob(os.path.join(glob.escape(folder), "*.json"))
+    table = process_table() if os.name == "nt" and paths != [own] else {}
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as f:
+                info = json.load(f)
+            pid = int(info["pid"])
+        except (OSError, ValueError, KeyError, TypeError, RecursionError):
+            continue
+        if not isinstance(info, dict) or not (pid == child_pid or table.get(pid, (None, ""))[0] == child_pid):
+            continue
+        if os.name == "nt" and str(info.get("procStart")) != str(process_start(pid)):
+            continue
+        return pid, info
+    return None
+
+
+def note_launch(token, child):
+    """In a window's helper: add its claude's process to launch record `token`, then the process
+    Claude Code registers for it and, for a resume, the fork's conversation id. Best effort: a
+    record left without them shows the conversation as open only while the window starts."""
+    try:
+        record = read_launch(token)
+        if record is None:
+            return
+        record["pid"] = child.pid
+        record["start"] = process_start(child.pid) if os.name == "nt" else time.time()
+        write_launch(token, {k: v for k, v in record.items() if k != "token"})
+        deadline = time.monotonic() + LAUNCH_ID_SECONDS
+        while child.poll() is None and time.monotonic() < deadline:
+            found = launched_entry(child.pid)
+            sid = str(found[1].get("sessionId") or "").lower() if found else ""
+            if found and (not record["source"] or (CLAUDE_SESSION_ID.fullmatch(sid) and sid != record["source"])):
+                if read_launch(token) is None:
+                    return  # the server is done with it
+                pid = found[0]
+                record["pid"] = pid
+                record["start"] = (process_start(pid) if os.name == "nt" else record["start"])
+                if record["source"]:
+                    record["fork"] = sid
+                write_launch(token, {k: v for k, v in record.items() if k != "token"})
+                return
+            time.sleep(1)
+    except Exception as e:  # only a record: never a reason to disturb the session
+        log("launch record:", repr(e))
+
+
+def resume_target(value, cwd, running, launches=()):
     """The conversation OpenClaudeSession's `resume` names: (session id, note). `value` is a session id
     the user picked from ListClaudeSessions' list of the folder's conversations; there is no "latest",
-    so the user always sees the list, each marked open or not, before one is resumed."""
+    so the user always sees the list, each marked open or not, before one is resumed. A conversation
+    is open when a running session has it, or a live launch (launch_records) holds it: that
+    session's fork carries it on under a new id."""
     if not isinstance(value, str):
         raise BridgeError("resume must be a session id.")
     in_use = {str(s.get("session_id") or "").lower(): s for s in running}
@@ -3264,6 +3499,14 @@ def resume_target(value, cwd, running):
         raise BridgeError(f"Conversation {sid} is already open in a running session, {s['name']} (pid {s['pid']}), "
                           "so nothing was opened. The user can carry on there; if it's stuck, close it with "
                           "CloseClaudeSession first, once the user says so.")
+    for r in launches:
+        if r["source"] == sid and launch_holds(r, running):
+            s = next((s for s in running if r["pid"] is not None and s["pid"] == r["pid"]), None)
+            where = (f"in a running session, {s['name']} (pid {s['pid']}), as a fork" if s else
+                     "in a window nouez opened that is still starting")
+            raise BridgeError(f"Conversation {sid} is already open {where}, so nothing was opened. The user can "
+                              "carry on there; if it's stuck, close it with CloseClaudeSession first, once the user "
+                              "says so.")
     path = os.path.join(transcript_folder(cwd), sid + ".jsonl")
     if not os.path.isfile(path):
         others = glob.glob(os.path.join(glob.escape(os.path.join(claude_config_dir(), "projects")), "*", sid + ".jsonl"))
@@ -3279,7 +3522,16 @@ def resume_target(value, cwd, running):
     if not ran_here(path, cwd):  # by its spelling and, when both exist, the folder on disk
         raise BridgeError(f"Conversation {sid} ran in {ran_in}, not {cwd}; Claude Code resumes it only "
                           f"there. Open the session with cwd {ran_in}. Nothing was opened.")
-    return sid, f"It resumes conversation {sid}, last active {mtime_text(os.path.getmtime(path))}."
+    note = (f"It resumes conversation {sid}, last active {mtime_text(os.path.getmtime(path))}, as a fork: a new "
+            "conversation with its whole history and a new Remote Control session (an account that requires "
+            "trusted devices refuses the old one), while the original stays as it was. Plan mode and permissions "
+            "granted for that session only don't carry over.")
+    later = [r["fork"] for r in launches if r["source"] == sid and r["fork"]
+             and os.path.isfile(os.path.join(os.path.dirname(path), r["fork"] + ".jsonl"))]
+    if later:
+        note += (" It was continued before in " + ", ".join(later) + " (newest first); what was done there "
+                 "isn't in this one.")
+    return sid, note
 
 
 CLAUDE_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,99}")  # an alias or full name, never an option
@@ -4247,11 +4499,12 @@ def same_folder(a, b):
         return False
 
 
-def connection_note(before, cwd, cancel=None, resumed=False):
+def connection_note(before, cwd, cancel=None, resumed=False, launch=None):
     """Whether a session new since `before` (pids) appeared in cwd with Remote Control, checked for
-    up to CONNECT_SECONDS. Only a report: the window is open either way. A resumed conversation can be
-    refused its old Remote Control session once the account requires trusted devices (Claude Code
-    2.1.332 says "Trusted devices now required"); `/remote-control` typed in it starts a new one."""
+    up to CONNECT_SECONDS: once the window's helper has recorded its claude in launch record
+    `launch`, only that one, so another window opening in the same folder isn't taken for it. Only
+    a report: the window is open either way. A resume is a fork (run_claude), which gets a new
+    Remote Control session, so the old one an account requiring trusted devices refuses isn't asked for."""
     deadline, seen = time.monotonic() + CONNECT_SECONDS, None
     while True:
         try:
@@ -4259,21 +4512,27 @@ def connection_note(before, cwd, cancel=None, resumed=False):
         except Exception as e:
             log("claude_sessions:", repr(e))
             new = []
+        if launch:  # until the helper records its claude, no session is known to be this window's
+            record = read_launch(launch)
+            new = [s for s in new if record and record["pid"] is not None and s["pid"] == record["pid"]]
         seen = new or seen
-        if any(s["remote"] for s in new):
-            return ("Checked: it is running and connected to Remote Control. If the user doesn't see it in "
-                    "the Claude app yet, the app's list can lag: ask them to refresh it, and don't open "
-                    "another session for this.")
+        connected = [s for s in new if s["remote"]]
+        if connected:
+            sid = str(connected[0].get("session_id") or "")
+            return ("Checked: it is running and connected to Remote Control."
+                    + (f" Its conversation id is {sid}." if resumed and CLAUDE_SESSION_ID.fullmatch(sid) else "")
+                    + " If the user doesn't see it in the Claude app yet, the app's list can lag: ask them to "
+                    "refresh it, and don't open another session for this.")
         if time.monotonic() >= deadline:
             break
         check_cancel(cancel)
         time.sleep(1)
+    if seen and any(remote_dropped(s) for s in seen):
+        return ("Checked: it is running, but Claude Code says Remote Control disconnected: Trusted devices now "
+                "required. Call ListClaudeSessions in a moment before opening another window for it.")
     if seen:
         return (f"Checked: it is running, but hadn't connected to Remote Control after {CONNECT_SECONDS}s. "
-                "It may still be connecting, or waiting for an answer on the computer."
-                + (" A resumed conversation can also be refused its old Remote Control session when the "
-                   "account now requires trusted devices (its window says \"Trusted devices now required\"): "
-                   "typing /remote-control in that window on the computer starts a new one." if resumed else ""))
+                "It may still be connecting, or waiting for an answer on the computer.")
     return (f"Checked: it hadn't shown up as a running session after {CONNECT_SECONDS}s. It may still be "
             "starting (resuming a long conversation takes longer), or waiting for an answer on the computer. "
             "Call ListClaudeSessions in a moment to see it, before telling the user it failed or opening "
@@ -4699,15 +4958,22 @@ def open_claude_session(args, cancel=None, progress=None):
     already = [s for s in before if same_folder(s["cwd"], cwd)]
     resume = None
     if args.get("resume"):
-        resume, resume_note = resume_target(args["resume"], cwd, before)
-    fd, spec = tempfile.mkstemp(prefix="nouez-claude-", suffix=".json")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump({"cwd": cwd, "name": name, "prompt": prompt, "model": model, "effort": effort,
-                   "arrange": True, **({"resume": resume} if resume else {})}, f)
+        resume, resume_note = resume_target(args["resume"], cwd, before, launch_records())
+    launch = new_launch(cwd, resume, before)
     try:
-        how = open_window(cwd, [sys.executable, "-I", os.path.abspath(__file__), "claude", spec], f"Claude: {name}")
-    except Exception:
-        os.remove(spec)
+        fd, spec = tempfile.mkstemp(prefix="nouez-claude-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"cwd": cwd, "name": name, "prompt": prompt, "model": model, "effort": effort,
+                       "arrange": True, **({"resume": resume} if resume else {}),
+                       **({"launch": launch} if launch else {})}, f)
+        try:
+            how = open_window(cwd, [sys.executable, "-I", os.path.abspath(__file__), "claude", spec], f"Claude: {name}")
+        except Exception:
+            os.remove(spec)
+            raise
+    except BaseException:
+        if launch:
+            remove_file(os.path.join(launches_folder(), launch + ".json"))
         raise
     out = " ".join(notes + [
         f"Opened {how} in {cwd} running Claude Code ({model}, {effort} effort) with Remote Control, named \"{name}\". It is a "
@@ -4720,7 +4986,9 @@ def open_claude_session(args, cancel=None, progress=None):
                 + ", ".join(f"{s['name']} (pid {s['pid']})" for s in already)
                 + ". Both can work there; they don't see each other's conversation.")
     if trusted is not False:
-        out += " " + connection_note({s["pid"] for s in before}, cwd, cancel, bool(resume))
+        out += " " + connection_note({s["pid"] for s in before}, cwd, cancel, bool(resume), launch)
+    if launch and not resume:
+        remove_file(os.path.join(launches_folder(), launch + ".json"))
     if trusted is False:
         out += (" Warning: Claude Code hasn't been trusted in this folder yet, so the new session is "
                 "waiting at the trust question on the computer and won't connect until someone answers it there.")
@@ -4934,6 +5202,47 @@ def own_claude_pids():
     return set(_ancestor_pids()) if os.name == "nt" else {os.getppid(), *(posix_ancestors() or [])}
 
 
+TRUST_DROP = "Trusted devices now required"  # in Claude Code 2.1.332's notice when it drops Remote Control
+TRUST_DROP_NOTE = ("Remote Control disconnected: Trusted devices now required, and it won't reconnect by itself. "
+                   "To reach it from the phone, ask the user first (it may still be working on the computer); "
+                   "on their yes, CloseClaudeSession with its pid and session_id, then OpenClaudeSession with its "
+                   "folder as cwd and resume set to that conversation id, which opens it again as a fork with a new "
+                   "Remote Control session")
+
+
+def remote_dropped(s, cancel=None):
+    """Whether running session `s` (claude_sessions) lost Remote Control because the account now
+    requires trusted devices: it has none now, and its transcript has Claude Code's own notice of
+    that (a system record, never user or model text) from after the session started, in the
+    transcript's bounded head and tail (transcript_lines): a notice followed by much more work at the
+    computer goes unseen, and the row then only lacks "Remote Control"."""
+    sid, cwd, started = str(s.get("session_id") or ""), s.get("cwd"), s.get("registered")
+    if s["remote"] or not CLAUDE_SESSION_ID.fullmatch(sid.lower()) or not cwd or cwd == "?" or \
+            not isinstance(started, (int, float)):
+        return False
+    path = os.path.join(transcript_folder(cwd), sid + ".jsonl")
+    if not regular_file(path):
+        return False
+    try:
+        with open(path, "rb") as f:
+            for line in transcript_lines(f, cancel, tail=True):
+                if TRUST_DROP.encode() not in line:
+                    continue
+                try:
+                    entry = json.loads(line.decode("utf-8"))
+                    at = datetime.datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00")).timestamp()
+                except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+                    continue
+                content = entry.get("content")
+                if entry.get("type") == "system" and isinstance(content, str) and \
+                        content.startswith("Remote Control disconnected") and TRUST_DROP in content and \
+                        at * 1000 >= started:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def describe_sessions(sessions, own):
     if not sessions:
         return "No Claude Code sessions are running on this computer."
@@ -4942,6 +5251,8 @@ def describe_sessions(sessions, own):
         notes = [s["status"]]
         if s["remote"]:
             notes.append("Remote Control")
+        elif remote_dropped(s):
+            notes.append(TRUST_DROP_NOTE + f" (conversation id {s['session_id']})")
         if s["helper"]:
             notes.append("opened by OpenClaudeSession")
         if s["pid"] in own:
@@ -4984,14 +5295,26 @@ def list_claude_sessions(args, cancel=None, progress=None):
     result = describe_sessions(sessions, own_claude_pids())
     if cwd:
         in_use = {str(s.get("session_id") or "").lower() for s in sessions}
+        launches = launch_records()
+        held = {r["source"] for r in launches if r["source"] and launch_holds(r, sessions)}
+        forked_from = {r["fork"]: r["source"] for r in launches if r["fork"] and r["source"]}
+        continued = collections.defaultdict(list)
+        for r in launches:  # newest first
+            if r["fork"] and r["source"]:
+                continued[r["source"]].append(r["fork"])
         rows = []
         for mtime, sid, path in saved_conversations(cwd, cancel):
             try:
                 title, branch = transcript_labels(path, cancel)
             except OSError:
                 continue
-            status = "open" if sid.lower() in in_use else "not open"
+            sid = sid.lower()
+            status = "open" if sid in in_use else "open, as a fork" if sid in held else "not open"
             fields = [mtime_text(mtime), sid, status]
+            if sid in forked_from:
+                fields.append("fork of " + forked_from[sid])
+            if continued.get(sid):
+                fields.append("continued in " + ", ".join(continued[sid]))
             if title:
                 fields.append("title: " + _short(_redacted(title)))
             if branch:
@@ -5173,11 +5496,14 @@ def open_status_screen(args, cancel=None, progress=None):
 
 
 def close_claude_session(args, cancel=None, progress=None):
-    name, pid = args.get("name"), args.get("pid")
+    name, pid, conversation = args.get("name"), args.get("pid"), args.get("session_id")
     if not name and pid is None:
         raise BridgeError("Pass the name or pid of the session to close. ListClaudeSessions lists them.")
     if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int)):
         raise BridgeError("pid must be an integer.")
+    if conversation is not None and not (isinstance(conversation, str)
+                                         and CLAUDE_SESSION_ID.fullmatch(conversation.strip())):
+        raise BridgeError("session_id must be a conversation id, as ListClaudeSessions shows it.")
     sessions, own = claude_sessions(), own_claude_pids()
     matches = [s for s in sessions if (pid is None or s["pid"] == pid) and (not name or s["name"] == name)]
     if not matches:
@@ -5188,6 +5514,9 @@ def close_claude_session(args, cancel=None, progress=None):
     target = matches[0]
     if target["pid"] in own:
         raise BridgeError("That is the session you are running in; it can't close itself.")
+    if conversation is not None and str(target["session_id"] or "").lower() != conversation.strip().lower():
+        raise BridgeError(f"{target['name']} (pid {target['pid']}) now has another conversation than "
+                          f"{conversation.strip()}, so it wasn't closed. Show the user ListClaudeSessions again.")
     end_session(target)
     if target["helper"]:
         where = "and its window"
@@ -5196,9 +5525,12 @@ def close_claude_session(args, cancel=None, progress=None):
     else:
         where = ("(its window closes if the terminal closes when its command ends, as most Linux terminals "
                  "do; otherwise it stays at a shell prompt)")
-    resume = f"claude --resume {target['session_id']}" if target["session_id"] else "claude --resume"
-    return (f"Closed {target['name']} (pid {target['pid']}) {where}. Its transcript is kept: "
-            f"`{resume}` in {target['cwd']} picks it up again.")
+    if target["session_id"]:
+        again = (f"OpenClaudeSession with cwd {target['cwd']} and resume {target['session_id']} opens it again, "
+                 "as a fork with a new Remote Control session.")
+    else:
+        again = f"`claude --resume` in {target['cwd']} picks it up again."
+    return f"Closed {target['name']} (pid {target['pid']}) {where}. Its transcript is kept: {again}"
 
 
 def git_root(path):
@@ -6287,6 +6619,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                     raise
                 turn_id, mode = current["id"], "steered into the running turn"
                 _delivered.setdefault(turn_id, set()).add(text)
+                _live_turns[turn_id] = tid
                 use_named(kind, "codex")
             else:
                 recent = list_turns(client, tid, 20) if kind in REVIEW_ROUND_KINDS else []
@@ -6300,6 +6633,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                 turn_id, mode = started["turn"]["id"], "started a new turn"
                 _bridge_turns.add(turn_id)
                 _delivered.setdefault(turn_id, set()).add(text)
+                _live_turns[turn_id] = tid
                 save_review_round(tid, chain, turn_id, message, args, cwd=thread.get("cwd"), digest=digest)
                 use_named(kind, "codex")
                 if overrides:
@@ -9764,7 +10098,9 @@ def send_agy_message(rec, args, message, sender, owner_words, timeout, kind, rea
 
         def log_send():  # agy's quota takes a few seconds to read: don't hold the reply for it
             record_usage({**event, **usage_snapshot(None, read_agy_usage())}, now=sent_at)
-        threading.Thread(target=log_send, daemon=True).start()
+        writer = threading.Thread(target=log_send, daemon=True)
+        _log_threads[:] = [t for t in _log_threads if t.is_alive()] + [writer]
+        writer.start()
     if not timeout:
         return f"Delivered to {name} ({mode}, turn {turn_id}).{switched} {read_later(cid, turn_id)}"
     done, turn = agy_wait(cid, turn_id, timeout, cancel, progress_reporter(progress, name))
@@ -11533,13 +11869,25 @@ def server_instructions():
     and the user hasn't turned it off; in the phone dispatcher, the phone setup offered until it is done."""
     auto = not auto_consult_off() and (codex_installed() or bool(agy_command()))
     offer = PHONE_SETUP_OFFER if in_dispatcher() and not setup_done() else ""
-    return INSTRUCTIONS_HEAD + (AUTO_CONSULT if auto else "") + INSTRUCTIONS + offer
+    return INSTRUCTIONS_HEAD + (AUTO_CONSULT if auto else "") + INSTRUCTIONS + offer + both_note()
+
+
+def both_note():
+    """When this is the plugin and a clone is registered as `consultants` too, the line that says so:
+    each session then has two sets of nouez's tools, one of them maybe an older nouez."""
+    if not plugin_marker() or not clone_registered():
+        return ""
+    env = clone_env_note()
+    return ("\nnouez runs here twice: as the plugin (tools named mcp__plugin_nouez_consultants__...) and as a clone "
+            "registered as `consultants`. Use the plugin's tools, and tell the user once that "
+            "`claude mcp remove --scope user consultants` removes the clone's." + (" " + env if env else ""))
 
 
 # --- The phone's own tools: settings, setup, restore and status --------------------
 # For a user who works from the phone: nouez's settings, the phone setup, what a Claude Code update
-# or reset took out of its settings, and a short status. The four protections change only at the
-# computer (set_switch), and an MCP server comes back only there (`server.py restore`).
+# or reset took out of its settings, and a short status. The four protections change only after a
+# yes in Claude Code's own prompt, or at the computer (set_switch), and an MCP server comes back only
+# at the computer (`server.py restore`).
 
 HOME_WARNING = ("The home folder ({home}) as a projects folder lets the phone trust any folder in it, Downloads "
                 "and Desktop too, where downloaded files land: such a folder opens after its report and a yes, "
@@ -11724,14 +12072,18 @@ def phone_setup(args, cancel=None, progress=None):
         f"question writes, with a copy of the file first in {trust_backup_dir()} (the newest {TRUST_BACKUPS_KEPT} "
         f"are kept); and an MCP server added back there only when the user runs `server.py restore ID` at the "
         f"computer. Nothing from the phone changes the user's settings ({os.path.join(claude_config_dir(), 'settings.json')}): "
-        "only `server.py dispatcher setup`, at the computer and on the user's yes, adds nouez's status line there "
-        "when it has none. After a Claude Code update or a reset, RestoreClaudeConfig lists the trust marks and "
+        "only nouez's setup at the computer (/nouez:setup with the plugin; `server.py setup` or `dispatcher setup` "
+        "from a clone), on the user's yes, adds nouez's status line there when it has none. After a Claude Code update or a reset, RestoreClaudeConfig lists the trust marks and "
         "MCP servers that are gone.",
         "4. The switches:",
         switches_text(),
-        "   NouezSettings (action set) changes those that aren't protections. The four protections change only "
-        "at the computer: turned on from the phone, the \"ask\" ones would wait for a question only the computer "
-        "shows.",
+        "   NouezSettings (action set) changes those that aren't protections. "
+        + ("A protection changes after a yes in Claude Code's own prompt, which the phone shows as \"NouezSettings "
+           "requests permission\": say first which protection and which way. Before turning ask_trust on, say that "
+           "this dispatcher then can't trust folders: each is trusted at the computer."
+           if plugin_marker() else
+           "The four protections change only at the computer: turned on from the phone, the \"ask\" ones would "
+           "wait for a question only the computer shows."),
         "",
         "When the user has been through these, call PhoneSetup with done=true.",
     ]
@@ -12316,7 +12668,7 @@ TOOLS = [
                 "effort": {"type": "string", "enum": list(CLAUDE_EFFORTS), "description": "Effort level. Default: medium. Set it only when the user asks for another."},
                 "name": {"type": "string", "description": "Session name, shown in the Claude app's session list: letters, digits, spaces, '.', '_' and '-', starting with a letter or digit, up to 64 characters. Default: the folder's name."},
                 "prompt": {"type": "string", "description": "Optional first message for the new session. Leave it out unless the user gave one."},
-                "resume": {"type": "string", "description": "Pick up an earlier conversation held in cwd instead of starting a new one: the session id the user picked from ListClaudeSessions' list for cwd (the transcript's file name without .jsonl). Use it when the user asks to resume or continue a session. A prompt, if given, is sent to it as the next message."},
+                "resume": {"type": "string", "description": "Pick up an earlier conversation held in cwd instead of starting a new one: the session id the user picked from ListClaudeSessions' list for cwd (the transcript's file name without .jsonl). Use it when the user asks to resume or continue a session. It opens as a fork: a new conversation id with the whole history and a new Remote Control session; the original stays as it was, and the list marks which fork continued it. A prompt, if given, is sent to it as the next message."},
             },
             "required": ["cwd"],
         },
@@ -12328,7 +12680,8 @@ TOOLS = [
             "List the Claude Code sessions running on the user's computer, whoever started them: each "
             "one's name, process id, folder and status, whether it has Remote Control, and which one "
             "is you. With cwd, also list saved conversations in that folder, newest first, so the user "
-            "can choose an id for OpenClaudeSession resume."
+            "can choose an id for OpenClaudeSession resume: each marked open or not, with the fork it was "
+            "continued in, or the conversation a fork continues."
         ),
         "inputSchema": {"type": "object", "properties": {
             "cwd": {"type": "string", "description": "Absolute project folder whose saved conversations to list."},
@@ -12409,6 +12762,7 @@ TOOLS = [
             "properties": {
                 "name": {"type": "string", "description": "The session's name, as ListClaudeSessions shows it."},
                 "pid": {"type": "integer", "description": "The session's process id from ListClaudeSessions, to pick one of several with the same name."},
+                "session_id": {"type": "string", "description": "The conversation id the user agreed to close, when ListClaudeSessions showed one: the session is closed only if it still has that conversation."},
             },
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
@@ -12444,7 +12798,9 @@ TOOLS = [
             "Show nouez's settings (each switch, on or off and where that comes from; the phone dispatcher's "
             "projects folders; whether the phone setup is done), or change one. set turns a switch on or off; "
             "the four protections (no_trust_write, ask_trust, no_user_sessions, ask_user_session) change only "
-            "at the computer, and nouez says the command. In the phone dispatcher, add_folder and remove_folder "
+            "after a yes in Claude Code's own permission prompt (with nouez as the Claude Code plugin; else only at "
+            "the computer, and nouez says the command). That prompt shows only the tool's name, so first say in "
+            "chat which protection you are about to turn on or off. In the phone dispatcher, add_folder and remove_folder "
             "change its projects folders, where the phone can trust projects: add only folders the user picked, "
             "and for the home folder show the user nouez's warning first."
         ),
@@ -12597,9 +12953,10 @@ def refresh_roots():
     """Ask Claude Code for its workspace folders. An unanswered request counts as no roots, so a
     client that never replies costs one timeout, not one per tool call."""
     global _client_roots
-    result = client_request("roots/list", {})
-    roots = [path_from_uri(r.get("uri", "")) for r in (result or {}).get("roots", [])]
-    _client_roots = [r for r in roots if r]
+    with _roots_lock:
+        result = client_request("roots/list", {})
+        roots = [path_from_uri(r.get("uri", "")) for r in (result or {}).get("roots", [])]
+        _client_roots = [r for r in roots if r]
 
 
 def client_roots():
@@ -12608,7 +12965,10 @@ def client_roots():
         # projects too: outside git, consultants are looked for in the folder the call names.
         return []
     if _client_roots is None and "roots" in _client_caps:
-        refresh_roots()
+        with _roots_lock:  # one already asked for (after initialized) is waited for, not asked again
+            asked = _client_roots is not None
+        if not asked:
+            refresh_roots()
     return _client_roots or []
 
 
@@ -12624,6 +12984,9 @@ def handle(msg, cancel):
         log("request error:", repr(e))
         if msg.get("id") is not None and not cancel.is_set():
             respond(msg["id"], error={"code": -32603, "message": f"Internal error: {e!r}"})
+    finally:
+        with _handlers_guard:
+            _handlers[0] -= 1
 
 
 def forget_cancel(msg_id, cancel):
@@ -12947,8 +13310,11 @@ researching here. Ask the user to do that in the project's own session.
   the user agrees, or says "set up this phone", call `PhoneSetup` and go through its steps one at a
   time. Add only the projects folders the user picks, and show the home folder's warning before
   adding it. Then call `PhoneSetup` with `done: true`.
-- **Settings:** `NouezSettings` shows nouez's settings and turns a switch on or off. The four
-  protections change only at the computer: give the user the command nouez names.
+- **Settings:** `NouezSettings` shows nouez's settings and turns a switch on or off. With nouez
+  installed as a plugin, the four protections change after a yes in Claude Code's own prompt, which
+  shows only the tool's name: first say which protection and which way. Before turning `ask_trust`
+  on, say that this dispatcher then can't trust folders. If nouez refuses (it always does from a
+  clone), give the user the command it names for the computer.
 - **What did I lose?** After a Claude Code update or a reset, `RestoreClaudeConfig` lists the trust
   marks and MCP servers that are gone. A trust mark comes back as in "Trust", calling it again with
   the same `restore` id. An MCP server comes back only at the computer, with the command it gives.
@@ -13070,8 +13436,9 @@ def dispatcher_where(name):
 # every nouez server and the command line read the same one). It holds the switches, the phone
 # dispatcher's projects folders and whether the phone setup is done. A switch's environment
 # variable, when set and not empty, wins, read as it always was. The phone can't answer an MCP
-# prompt (Claude Code 2.1.332 shows elicitation only in the computer's terminal), so the four
-# protections change only at the computer: no nouez tool changes them, either way.
+# prompt (Claude Code 2.1.332 shows elicitation only in the computer's terminal), so a nouez tool
+# changes one of the four protections, either way, only with the plugin, after a yes in Claude Code's
+# own permission prompt, which the phone does show (take_approval); otherwise only at the computer.
 
 SETTINGS_FILE = "settings.json"
 SETTINGS_BYTES = 256 * 1024
@@ -13197,12 +13564,19 @@ def update_settings(change):
 
 def switch_setting(name):
     """(on, source) for the switch `name`: source "environment" (its variable is set and not empty,
-    and wins), "settings file", "damaged settings file" (a protection then reads as on, any other
-    switch as off) or "default" (off)."""
+    and wins), "clone's registration" (the plugin, for a protection a clone's registration turns on
+    in its environment, which the plugin doesn't get: on until that registration is removed),
+    "settings file", "damaged settings file" (a protection then reads as on, any other switch as
+    off) or "default" (off)."""
     var, reads, protection, _, _ = SWITCHES[name]
     raw = os.environ.get(var, "").strip()
     if raw:
         return (raw == "1" if reads == "1" else raw.lower() not in ("0", "false", "no")), "environment"
+    if protection and plugin_marker():
+        env = (clone_registration() or {}).get("env")
+        raw = str(env.get(var) or "").strip() if isinstance(env, dict) else ""
+        if raw and (raw == "1" if reads == "1" else raw.lower() not in ("0", "false", "no")):
+            return True, "clone's registration"
     value, state = read_settings()
     if state == "damaged":
         return protection, "damaged settings file"
@@ -13219,34 +13593,175 @@ def switch_on(name):
 
 def set_switch(name, on, from_tool=False):
     """Turn the switch `name` on or off in the settings file; a note for the result. From a nouez
-    tool (`from_tool`), a protection is refused, so the phone can neither lock itself out of the
-    approvals only the computer shows nor take a protection off on Claude's word."""
+    tool (`from_tool`), a protection changes only with an approval the plugin's hook recorded for
+    exactly this change in this Claude Code session (take_approval), so neither Claude's word nor
+    text it read changes one: only a yes in Claude Code's own prompt, on the computer or the phone.
+    Without the plugin, or without that yes, it is refused."""
     if name not in SWITCHES:
         raise BridgeError(f"There is no switch {name!r}: " + ", ".join(SWITCHES) + ".")
     var, _, protection, applies, _ = SWITCHES[name]
-    if from_tool and protection:
-        raise BridgeError(f"{name} protects you, so it changes only at the computer: `server.py settings set {name} "
-                          f"{'on' if on else 'off'}` in a terminal there (or its environment variable, {var}). "
+    if from_tool and protection and not take_approval(name, on):
+        at_computer = (f"`server.py settings set {name} {'on' if on else 'off'}` in a terminal there (or its "
+                       f"environment variable, {var})")
+        if plugin_marker():
+            raise BridgeError(f"{name} protects you, so it changes from a session only after a yes in Claude Code's "
+                              "own prompt for this change, and this call had none: it was refused there, the yes "
+                              f"is over {ASK_SECONDS // 60} minutes old, or the plugin's hook didn't run (hooks turned "
+                              f"off, or another permission mode). Nothing was changed. At the computer: {at_computer}.")
+        raise BridgeError(f"{name} protects you, so it changes only at the computer: {at_computer}. "
                           "Nothing was changed.")
     update_settings(lambda s: s.setdefault("switches", {}).__setitem__(name, bool(on)))
     now, source = switch_setting(name)
     note = f"{name} is now {'on' if on else 'off'} in nouez's settings file; it applies from {applies}."
+    if from_tool and name == "ask_trust" and on and in_dispatcher():
+        note += " From now on this dispatcher can't record trust: each folder is trusted at the computer."
     if source == "environment" and now != bool(on):
         note += (f" But {var} is set in this server's environment, which wins: {name} stays "
                  f"{'on' if now else 'off'} until that variable is removed from nouez's MCP registration.")
+    elif source == "clone's registration" and not on:
+        note += (f" But the clone's registration (`consultants`) sets {var}, so {name} stays on until that "
+                 "registration is removed.")
     return note
 
 
 def switches_text():
     """Each switch: on or off, where that comes from, and where it changes."""
     lines = []
+    guarded = ("Changes after a yes in Claude Code's own prompt, or at the computer (`server.py settings set`)."
+               if plugin_marker() else "Changes only at the computer (`server.py settings set`).")
     for name, (var, _, protection, applies, does) in SWITCHES.items():
         on, source = switch_setting(name)
-        where = f"from the {source}" + (f" ({var})" if source == "environment" else "")
+        where = f"from the {source}" + (f" ({var})" if source in ("environment", "clone's registration") else "")
         lines.append(f"- {name}: {'on' if on else 'off'}, {where}. When on, {does}. "
-                     + ("Changes only at the computer (`server.py settings set`)." if protection else
-                        f"A change applies from {applies}."))
+                     + (guarded if protection else f"A change applies from {applies}."))
     return "\n".join(lines)
+
+
+# --- Protections from a session, behind Claude Code's own prompt (the plugin) ----------------------
+# The plugin's PreToolUse hook (`server.py guard`) runs before Claude Code decides on a NouezSettings
+# call. For one that changes a protection it answers "ask", so Claude Code asks the person, in the
+# terminal or on the phone (verified with Remote Control: Deny, and the tool doesn't run), and it
+# records an approval for exactly that change in that Claude Code process. NouezSettings takes one
+# to change a protection (take_approval), once and within ASK_SECONDS; a call the hook didn't see
+# (a clone, hooks turned off) finds none and is refused. The prompt, not the approval, is the gate:
+# every call of the tool goes through the hook, and so through the prompt, again.
+
+GUARD_MODES = ("default", "acceptEdits", "auto")  # permission modes that show the hook's "ask"; others: deny
+APPROVALS_FILE = "approvals.json"
+
+
+def session_claude():
+    """[pid, start] of the Claude Code process this one runs under (the nearest claude.exe or node.exe
+    above it), or None. The hook and the MCP server of one session find the same one."""
+    if os.name != "nt":
+        return None
+    table = process_table()
+    for pid in _ancestor_pids(table):
+        if table[pid][1].lower() in ("claude.exe", "node.exe"):
+            start = process_start(pid)
+            return [pid, start] if start else None
+    return None
+
+
+def protection_change(args):
+    """["set", name, on] when NouezSettings arguments `args` change a protection, else None."""
+    if not isinstance(args, dict) or args.get("action") != "set":
+        return None
+    name, on = args.get("name"), args.get("on")
+    if isinstance(name, str) and name in SWITCHES and SWITCHES[name][2] and isinstance(on, bool):
+        return ["set", name, on]
+    return None
+
+
+def edit_approvals(edit):
+    """edit(approvals) under the approvals lock, on the list with those older than ASK_SECONDS gone,
+    then saved as it leaves it; edit's result. OSError or BridgeError if it can't be done."""
+    marker = plugin_marker()
+    if not marker:
+        raise OSError("nouez isn't the plugin here")
+    folder = checked_folder(marker["data"])
+    path = os.path.join(folder, APPROVALS_FILE)
+    with FileLock(os.path.join(folder, "approvals.lock"), LOCK_SECONDS,
+                  "another nouez is recording an approval; try again"):
+        raw = read_regular_file(path, limit=64 * 1024)
+        try:
+            items = json.loads(raw.decode("utf-8")) if raw else []
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            items = []
+        now = time.time()
+        items = [a for a in items if isinstance(a, dict) and isinstance(a.get("at"), (int, float))
+                 and 0 <= now - a["at"] < ASK_SECONDS] if isinstance(items, list) else []
+        result = edit(items)
+        if not write_json_atomic(path, items):
+            raise OSError(f"couldn't write {path}")
+        return result
+
+
+def take_approval(name, on):
+    """Whether Claude Code's prompt approved turning `name` on (or off) in this session within
+    ASK_SECONDS: the hook's record of it, taken so it serves once."""
+    who = session_claude() if plugin_marker() else None
+    if not who:
+        return False
+    change = ["set", name, bool(on)]
+
+    def take(items):
+        for i, a in enumerate(items):
+            if a.get("change") == change and a.get("claude") == who:
+                del items[i]
+                return True
+        return False
+    try:
+        return edit_approvals(take)
+    except (OSError, BridgeError) as e:
+        log("approval not read:", e)
+        return False
+
+
+def guard_decision(data):
+    """What the PreToolUse hook answers for NouezSettings input `data` (Claude Code's hook input), as
+    the hook's JSON output, or None to leave the call to Claude Code's own rules."""
+    change = protection_change(data.get("tool_input") if isinstance(data, dict) else None)
+    if not change:
+        return None
+    _, name, on = change
+
+    def answer(decision, reason):
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                       "permissionDecisionReason": reason}}
+    mode = data.get("permission_mode")
+    if mode not in GUARD_MODES:
+        return answer("deny", f"nouez: {name} changes from a session only through Claude Code's prompt, which "
+                              f"permission mode {mode!r} doesn't show. Change it at the computer: "
+                              f"`server.py settings set {name} {'on' if on else 'off'}`.")
+    who = session_claude()
+    if not who:
+        return answer("deny", "nouez: couldn't tell which Claude Code session this is, so the change can't be "
+                              "approved here.")
+
+    def add(items):
+        items[:] = [a for a in items if not (a.get("change") == change and a.get("claude") == who)] + [
+            {"change": change, "claude": who, "at": time.time()}]
+    try:
+        edit_approvals(add)
+    except (OSError, BridgeError) as e:
+        return answer("deny", f"nouez: couldn't record the approval ({e}).")
+    return answer("ask", f"nouez: turn the protection {name} {'on' if on else 'off'}?")
+
+
+def run_guard():
+    """`server.py guard`: the plugin's PreToolUse hook for NouezSettings. Always exits 0: a hook that
+    fails leaves the call to Claude Code, and NouezSettings then refuses a protection, finding no
+    approval."""
+    try:
+        data = json.loads(sys.stdin.buffer.read(1 << 20).decode("utf-8"))
+        decision = guard_decision(data)
+    except Exception as e:
+        log("guard:", repr(e))
+        return 0
+    if decision:
+        print(json.dumps(decision))
+    return 0
 
 
 def settings_reset(out=print):
@@ -14413,14 +14928,123 @@ def dispatcher_trusted(folder, state_file=None):
 DISPATCHER_TRUST_NOTE = "trust in a folder above it doesn't count, since its own settings make Claude Code ask again"
 
 
+PLUGIN_MARKER = "plugin.json"  # launch.py writes it beside the server.py it runs: this nouez is the plugin
+PLUGIN_PREFIX = "mcp__plugin_nouez_consultants__"  # Claude Code's names for the plugin's tools
+CLONE_PREFIX = "mcp__consultants__"  # and for a clone registered as `consultants`
+_plugin = []  # [the marker read, or None], read once
+
+
+def plugin_marker():
+    """{"id": "nouez@<marketplace>", "data": the plugin's data folder} when this server.py is the copy
+    launch.py keeps for the Claude Code plugin (its marker is beside it), else None: a clone. Every
+    run of this file reads the same marker: the MCP server, the waiter, the status line, the hooks,
+    the dispatcher's sign-in start and `doctor` in a terminal."""
+    if not _plugin:
+        found = None
+        try:
+            raw = read_regular_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), PLUGIN_MARKER),
+                                    limit=4096)
+            data = json.loads(raw.decode("utf-8")) if raw else None
+            if isinstance(data, dict) and isinstance(data.get("id"), str) and re.fullmatch(
+                    r"nouez@[A-Za-z0-9._-]+", data["id"]):
+                found = {"id": data["id"], "data": os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}
+        except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+            pass
+        _plugin[:] = [found]
+    return _plugin[0]
+
+
+def tool_prefix():
+    """What Claude Code calls nouez's tools by, before each tool's name."""
+    return PLUGIN_PREFIX if plugin_marker() else CLONE_PREFIX
+
+
 def dispatcher_rules():
-    return [f"mcp__consultants__{tool}" for tool in DISPATCHER_TOOLS]
+    return [f"{tool_prefix()}{tool}" for tool in DISPATCHER_TOOLS]
+
+
+def clone_rules(allow):
+    """The allow rules that name a tool of a clone of nouez (mcp__consultants__...)."""
+    return [r for r in allow if isinstance(r, str) and r.startswith(CLONE_PREFIX)]
+
+
+def dispatcher_rules_note(folder):
+    """When the dispatcher's folder doesn't allow nouez's session tools under the names this nouez
+    has (after moving from a clone to the plugin, say), the note that says so; "" otherwise."""
+    state, data = read_config_file(os.path.join(folder, ".claude", "settings.json"))
+    allow = ((data or {}).get("permissions") or {}).get("allow") if isinstance(data, dict) else None
+    if state.startswith("unreadable") or not isinstance(allow, list):
+        return ""
+    if all(r in allow for r in dispatcher_rules()):
+        return ""
+    return (f"{folder} doesn't allow nouez's session tools under the names this nouez has, so the phone would "
+            "ask before each: run `server.py dispatcher setup"
+            + "".join(" " + shlex.quote(a) for a in dispatcher_flags(folder)) + "` first, which adds them.")
+
+
+def plugin_enabled(folder=None):
+    """Whether Claude Code has this plugin turned on, in its user settings or (with `folder`) that
+    folder's project settings, so its sessions there have nouez's tools; None if it can't be told."""
+    marker = plugin_marker()
+    places = [os.path.join(claude_config_dir(), "settings.json")]
+    if folder:
+        places += [os.path.join(folder, ".claude", n) for n in ("settings.json", "settings.local.json")]
+    for path in reversed(places):  # the folder's local settings, its project settings, the user's: the first that says wins
+        state, data = read_config_file(path)
+        if state.startswith("unreadable"):
+            return None
+        on = (data or {}).get("enabledPlugins")
+        if isinstance(on, dict) and isinstance(on.get(marker["id"]), bool):
+            return on[marker["id"]]
+    return False
+
+
+def clone_registration():
+    """The `consultants` entry Claude Code runs for every project (a clone of nouez), {} when there is
+    none, or None if its settings can't be read."""
+    try:
+        with open(claude_state_file(), encoding="utf-8") as f:
+            entry = (json.load(f).get("mcpServers") or {}).get("consultants", {})
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    return entry if isinstance(entry, dict) and entry else ({"command": None} if entry else {})
+
+
+def clone_registered():
+    """Whether Claude Code also runs a clone of nouez as `consultants` for every project (the plugin's
+    tools and the clone's would then both be there); None if its settings can't be read."""
+    entry = clone_registration()
+    return None if entry is None else bool(entry)
+
+
+def clone_env_note():
+    """When the clone's registration sets environment variables, which ones (values only for nouez's
+    switches, never others'), since the plugin doesn't get them; "" when it sets none."""
+    env = (clone_registration() or {}).get("env")
+    if not isinstance(env, dict) or not env:
+        return ""
+    by_var = {spec[0]: name for name, spec in SWITCHES.items()}
+    named = []
+    for var in sorted(env, key=str):
+        name, raw = by_var.get(var), str(env[var] or "").strip()
+        if name and raw:
+            on = raw == "1" if SWITCHES[name][1] == "1" else raw.lower() not in ("0", "false", "no")
+            named.append(f"{var} (the switch {name}, {'on' if on else 'off'})")
+        else:
+            named.append(str(var))
+    return ("The clone's registration sets environment variables the plugin doesn't get: " + ", ".join(named)
+            + ". Before removing it, set each switch with `server.py settings set NAME on` or `off`, and any "
+            "other variable in your environment.")
 
 
 def consultants_registered(folder):
-    """Whether Claude Code runs nouez as `consultants` in `folder` (registered for every project, for
-    that folder, or in its .mcp.json), so the dispatcher's allow rules name its tools; None if
-    Claude Code's settings can't be read."""
+    """Whether Claude Code runs nouez in `folder` under the names the dispatcher's allow rules give
+    its tools: the plugin turned on (for the plugin), or `consultants` registered for every project,
+    for that folder, or in its .mcp.json (for a clone); None if Claude Code's settings can't be read."""
+    if plugin_marker():
+        return plugin_enabled(folder)
     try:
         with open(claude_state_file(), encoding="utf-8") as f:
             data = json.load(f)
@@ -14705,8 +15329,8 @@ def add_missing_dispatcher_rules_locked(folder, out):
             out(f"couldn't check the dispatcher's allow rules: {e}")
             return []
         allow = (data.get("permissions") or {}).get("allow") or []
-        earlier = [f"mcp__consultants__{t}" for t in DISPATCHER_TOOLS if t not in DISPATCHER_TOOLS_ADDED]
-        new = [f"mcp__consultants__{t}" for t in DISPATCHER_TOOLS_ADDED if f"mcp__consultants__{t}" not in done]
+        earlier = [f"{tool_prefix()}{t}" for t in DISPATCHER_TOOLS if t not in DISPATCHER_TOOLS_ADDED]
+        new = [f"{tool_prefix()}{t}" for t in DISPATCHER_TOOLS_ADDED if f"{tool_prefix()}{t}" not in done]
         seen = [r for r in new if r in allow]  # granted already, by `setup` or the user: never again
         missing = [r for r in new if r not in allow]
         if raw is None or any(r not in allow for r in earlier):
@@ -14866,7 +15490,15 @@ def dispatcher_setup(folder, dry_run=False, out=print, projects=None, statusline
             out(f"couldn't read {path}: {e}")
             return 1
         allow = (data.get("permissions") or {}).get("allow") or []
-        missing = [r for r in dispatcher_rules() if r not in allow]
+        moving = plugin_marker() and clone_registered() is False
+        moved = clone_rules(allow) if moving else []
+        wanted = dispatcher_rules() + [PLUGIN_PREFIX + r[len(CLONE_PREFIX):] for r in moved]
+        missing = list(dict.fromkeys(r for r in wanted if r not in allow))
+        held = {}  # the user's deny and ask rules for the clone's names, moved too so none is lost
+        for kind in ("deny", "ask"):
+            rules = (data.get("permissions") or {}).get(kind)
+            if moving and isinstance(rules, list) and clone_rules(rules):
+                held[kind] = rules
         claude_md = os.path.join(folder, "CLAUDE.md")
         if dry_run:
             out("Dry run: nothing is changed.")
@@ -14894,12 +15526,22 @@ def dispatcher_setup(folder, dry_run=False, out=print, projects=None, statusline
             out(f"The projects folders weren't recorded: {e}")
             return 1
         out(roots_said(record, folder))
-        if not missing:
+        if moved:
+            out(f"{act} take out of permissions.allow in {path} the clone's names for nouez's tools, which no "
+                "registration uses now (the plugin's names are added): " + ", ".join(moved))
+        for kind, rules in held.items():
+            out(f"{act} give permissions.{kind} in {path} the plugin's names in place of the clone's: "
+                + ", ".join(clone_rules(rules)))
+        if not missing and not moved and not held:
             out(f"{path} already allows nouez's session tools.")
         else:
-            out(f"{act} add to permissions.allow in {path}: " + ", ".join(missing))
+            if missing:
+                out(f"{act} add to permissions.allow in {path}: " + ", ".join(missing))
             if not dry_run:
-                data.setdefault("permissions", {})["allow"] = allow + missing
+                data.setdefault("permissions", {})["allow"] = [r for r in allow if r not in moved] + missing
+                for kind, rules in held.items():
+                    data["permissions"][kind] = list(dict.fromkeys(
+                        PLUGIN_PREFIX + r[len(CLONE_PREFIX):] if r in clone_rules([r]) else r for r in rules))
                 try:
                     if not settings.exists:
                         settings.close()
@@ -14911,15 +15553,18 @@ def dispatcher_setup(folder, dry_run=False, out=print, projects=None, statusline
     finally:
         settings.close()
     if not dry_run:  # the folder has these now, so the supervisor never adds one the user takes out
-        added = [f"mcp__consultants__{t}" for t in DISPATCHER_TOOLS_ADDED]
+        added = [f"{tool_prefix()}{t}" for t in DISPATCHER_TOOLS_ADDED]
         if not note_dispatcher_rules(folder, [r for r in added if r in allow + missing], out):
             out(f"couldn't note this in {dispatcher_where('dispatcher-rules.json')}")
     registered = consultants_registered(folder)
-    if registered is False:
+    if registered is False and plugin_marker():
+        out(f"Claude Code doesn't have the plugin {plugin_marker()['id']} turned on there, so the dispatcher has "
+            f"none of its tools: `claude plugin enable {plugin_marker()['id']}`.")
+    elif registered is False:
         out("Claude Code doesn't run nouez as `consultants` there, so the dispatcher has none of its tools: "
             "register it for every project (README, Setup: `claude mcp add --scope user consultants ...`).")
     elif registered is None:
-        out("Couldn't read Claude Code's settings to check that nouez is registered as `consultants`.")
+        out("Couldn't read Claude Code's settings to check that nouez is registered there.")
     trusted = dispatcher_trusted(folder)
     command = shlex.join(["claude", *DISPATCHER_ARGS])
     if not trusted:
@@ -15639,6 +16284,8 @@ def dispatcher_install(folder, dry_run=False, force=False, out=print, projects=N
         return 1
     if clone_place_note():
         out("Note: " + clone_place_note())
+    if dispatcher_rules_note(folder):
+        out("Note: " + dispatcher_rules_note(folder))
     if getattr(sys, "base_prefix", sys.prefix) != sys.prefix:
         out(f"Note: this Python is a virtual environment's ({sys.prefix}); the sign-in start uses it, so "
             "it stops working if that environment goes.")
@@ -16023,6 +16670,16 @@ SCRIPT_IN_COMMAND = re.compile(r""""((?:[A-Za-z]:[\\/]|/)[^"]*?server\.py)"|'((?
                                r"""|((?:[A-Za-z]:[\\/]|/)[^\s"']*server\.py)(?=[\s)]|$)""")
 
 
+SETUP_STATUSLINE = re.compile(r"""\s*("[^"]*"|[^\s"'&;|<>()$`]+)\s+("[^"]*"|[^\s"'&;|<>()$`]+)\s+statusline\s*""")
+
+
+def setup_statusline(command, here):
+    """Whether a status line command has the shape setup writes (usage_command): a Python, the
+    server.py in `here`'s folder and `statusline`, nothing else, whichever Python it names."""
+    m = SETUP_STATUSLINE.fullmatch(command) if isinstance(command, str) else None
+    return bool(m) and same_folder(m.group(2).strip('"'), here)
+
+
 def scripts_in(command):
     """The server.py paths a command names (SCRIPT_IN_COMMAND)."""
     return [m.group(1) or m.group(2) or m.group(3)
@@ -16040,6 +16697,10 @@ def script_paths_report(settings):
     try:
         with open(claude_state_file(), encoding="utf-8") as f:
             server = (json.load(f).get("mcpServers") or {}).get("consultants")
+        if isinstance(server, dict) and plugin_marker():
+            return None, ("Claude Code runs nouez twice: as the plugin and as a clone registered as `consultants`, "
+                          "so each session has both sets of tools. Remove the clone's: "
+                          "`claude mcp remove --scope user consultants`.")
         if isinstance(server, dict):
             places += [("the `consultants` registration", a) for a in server.get("args") or []
                        if isinstance(a, str) and os.path.basename(a.replace("\\", "/")) == "server.py"]
@@ -16104,6 +16765,100 @@ def run_dispatcher(argv):
     return dispatcher_status_text()
 
 
+SETUP_USAGE = "usage: server.py setup [--dry-run] [--statusline | --remove]"
+
+
+def run_setup(argv, out=print):
+    """`server.py setup` (the plugin's /nouez:setup and /nouez:uninstall run it), on Claude Code's
+    user settings, the file backed up before it changes: the waiter's allow rules that are missing
+    (only those), then nouez's status line into an empty slot (statusline_offer; --statusline adds
+    it), and a line when a clone is registered too. --remove takes out those allow rules and a status
+    line that runs this server.py, nothing else. --dry-run says what would change and changes
+    nothing. Exit code."""
+    flags = set(argv)
+    if not flags <= {"--dry-run", "--statusline", "--remove"} or len(flags) != len(argv) or \
+            {"--statusline", "--remove"} <= flags:
+        out(SETUP_USAGE)
+        return 2
+    dry_run, remove = "--dry-run" in flags, "--remove" in flags
+    config = os.path.abspath(claude_config_dir())
+    path = os.path.join(config, "settings.json")
+    if dry_run:
+        out("Dry run: nothing is changed.")
+    rules = allow_rules()
+    if not rules and not remove:
+        out(NO_ALLOW_RULE)
+    elif not os.path.isdir(config):
+        out(f"Claude Code's settings folder {config} isn't there; there is nothing to {'remove' if remove else 'add to'}.")
+        return 0 if remove else 1
+    else:
+        try:
+            settings = SettingsFolder(os.path.dirname(config), name=os.path.basename(config))
+        except OSError as e:
+            out(f"Couldn't read {path}: {e}")
+            return 1
+        try:
+            try:
+                data, raw = read_settings_for_edit(settings)
+            except (OSError, ValueError) as e:
+                out(f"Couldn't read {path}: {e}")
+                return 1
+            permissions = data.get("permissions")
+            allow = permissions.get("allow") if isinstance(permissions, dict) else None
+            if permissions is not None and not isinstance(permissions, dict) or \
+                    allow is not None and not isinstance(allow, list):
+                out(f"permissions.allow in {path} isn't a list; it is left as it is."
+                    + ("" if remove else " Add these yourself: " + ", ".join(rules)))
+                return 1
+            allow = allow or []
+            would = "Would" if dry_run else "Will"
+            if remove:
+                gone = [r for r in allow if r in rules]
+                line = data.get("statusLine")
+                here = os.path.abspath(__file__)
+                runs = ours_statusline(line) and any(same_folder(m, here) for m in scripts_in(line.get("command")))
+                ours = runs and setup_statusline(line.get("command"), here)
+                if gone:
+                    out(f"{would} take out of permissions.allow in {path}: " + ", ".join(gone))
+                    data["permissions"]["allow"] = [r for r in allow if r not in rules]
+                if ours:
+                    out(f"{would} take out the status line, which runs this nouez: {line.get('command')}")
+                    del data["statusLine"]
+                elif runs:
+                    out(f"The status line in {path} runs this nouez but isn't the one setup adds (your own, which "
+                        "passes its input on to it, say); it is kept. Take the part that runs `server.py "
+                        "statusline` out of it yourself.")
+                changed = bool(gone or ours)
+                if not changed and not runs:
+                    out(f"{path} has none of this nouez's allow rules and no status line that runs it.")
+            else:
+                missing = [r for r in rules if r not in allow]
+                if missing:
+                    out(f"{would} add to permissions.allow in {path}, so the waiter that brings a consultant's "
+                        "reply runs without asking: " + ", ".join(missing))
+                    data.setdefault("permissions", {})["allow"] = allow + missing
+                else:
+                    out(f"{path} already lets the waiter run without asking.")
+                changed = bool(missing)
+            if changed and not dry_run:
+                try:  # the folder is there (checked above), so settings.json is written in it
+                    write_settings(settings, data, raw, out)
+                except OSError as e:
+                    out(f"Couldn't change {path}: {e}")
+                    return 1
+        finally:
+            settings.close()
+    if remove:
+        return 0
+    statusline_offer(dry_run, "--statusline" in flags, out)
+    if plugin_marker() and clone_registered():
+        env = clone_env_note()
+        out("\nA clone of nouez is registered as `consultants` too, so each session has both sets of tools. "
+            "`claude mcp remove --scope user consultants` removes the clone's (its folder stays)."
+            + (" " + env if env else ""))
+    return 0
+
+
 USAGE_SETUP_DAYS = 7  # doctor: a status line that saved nothing for this long isn't passing the usage on
 
 
@@ -16133,16 +16888,20 @@ def usage_setup_report(settings):
     lines = [(True, f"a status line passes Claude Code's usage to nouez (saved {span_text(time.time() - saved)} "
                     "ago)") if fresh else
              (None, f"no status line has passed Claude Code's usage to nouez in {USAGE_SETUP_DAYS} days, so its "
-                    "pace isn't known. Add to the settings (or pass the input on from your own script, "
-                    "docs/consultants.md), or, with the phone dispatcher, run `server.py dispatcher setup` again "
-                    "with the options you set it up with and --statusline:\n    "
+                    "pace isn't known. "
+                    + ("Run /nouez:setup in a Claude Code session, which adds it when there is no status line, or "
+                       "add it yourself (or pass the input on from your own script, docs/consultants.md):\n    "
+                       if plugin_marker() else
+                       "Add to the settings (or pass the input on from your own script, "
+                       "docs/consultants.md), or, with the phone dispatcher, run `server.py dispatcher setup` again "
+                       "with the options you set it up with and --statusline:\n    ")
                     + json.dumps({"statusLine": {"type": "command", "command": usage_command("statusline")}}))]
     hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
     groups = hooks.get("UserPromptSubmit") if isinstance(hooks.get("UserPromptSubmit"), list) else []
     commands = [h.get("command") for group in groups if isinstance(group, dict)
                 for h in group.get("hooks") or [] if isinstance(h, dict)]
-    hooked = any(isinstance(c, str) and "server.py" in c and c.rstrip().rstrip('"').endswith("hook")
-                 for c in commands)
+    hooked = plugin_marker() is not None or any(  # the plugin brings its own (hooks/hooks.json)
+        isinstance(c, str) and "server.py" in c and c.rstrip().rstrip('"').endswith("hook") for c in commands)
     lines.append((True, "the prompt hook says when to hand work out while Claude Code is busy") if hooked else
                  (None, "no prompt hook says when to hand work out while Claude Code is busy. Add to the "
                         "settings' hooks (beside any others):\n    " + json.dumps(
@@ -16320,6 +17079,56 @@ def main():
             log("bad message:", repr(e))
 
 
+IDLE_METHOD = "nouez/idle"  # launch.py, the plugin's launcher, asks it before it moves to a newer nouez
+
+
+def idle_reason():
+    """Why moving this session to a newer nouez now could lose something, or None when nothing is
+    under way that a new server process wouldn't know about (launch.py then starts one in this one's
+    place): a request or notification being handled, a request to Claude Code open, a cancellation
+    pending, a prompt not yet answered, a provider the user named still waiting for its message, a
+    usage-log write, or a Codex turn this server started or steered that may still run (asked of the
+    daemon, never started for it: one that can't be reached counts as running)."""
+    with _handlers_guard:
+        if _handlers[0]:
+            return "a request is being answered"
+    with _client_guard:
+        if _client_requests:
+            return "a request to Claude Code is open"
+    with _cancel_guard:
+        if _cancel_events:
+            return "a tool call is running"
+    now = time.monotonic()
+    with _asked_guard:
+        if any(deadline > now for _, _, deadline in _asked.values()):
+            return "a prompt waits for its answer"
+    with _named_guard:
+        if any(deadline > now for _, deadline in _named.values()):
+            return "a provider the user named waits for its message"
+    if any(t.is_alive() for t in _log_threads):
+        return "the usage log is being written"
+    if not _live_turns:
+        return None
+    try:
+        with contextlib.closing(CodexClient(timeout=5, start=False)) as client:
+            for turn_id, thread_id in list(_live_turns.items()):
+                turn = find_turn(client, thread_id, turn_id)
+                if turn and turn.get("status") == "inProgress":
+                    return "a Codex turn it started or steered is running"
+                _live_turns.pop(turn_id, None)  # ended, or gone from the newest turns: a newer one followed
+    except (BridgeError, OSError) as e:
+        return f"Codex couldn't be asked whether a turn it started has ended ({e})"
+    return None
+
+
+def answer_idle(msg_id):
+    try:
+        why = idle_reason()
+    except Exception as e:  # never idle on a check that failed
+        why = f"the check failed ({e!r})"
+    respond(msg_id, {"idle": why is None, **({"why": why} if why else {})})
+
+
 def valid_id(value):
     return value is None or (isinstance(value, (str, int, float)) and not isinstance(value, bool))
 
@@ -16352,8 +17161,18 @@ def route(msg):
     if msg["method"] == "tools/call" and msg.get("id") is not None:
         with _cancel_guard:
             _cancel_events[msg["id"]] = cancel
+    if msg["method"] == IDLE_METHOD and msg.get("id") is not None:  # launch.py's, not Claude Code's: not counted
+        threading.Thread(target=answer_idle, args=(msg["id"],), daemon=True).start()
+        return
+    with _handlers_guard:  # counted before the thread starts, so nouez/idle can't slip in between
+        _handlers[0] += 1
     # Tool calls can block for minutes; run each request on its own thread.
-    threading.Thread(target=handle, args=(msg, cancel), daemon=True).start()
+    try:
+        threading.Thread(target=handle, args=(msg, cancel), daemon=True).start()
+    except Exception:
+        with _handlers_guard:
+            _handlers[0] -= 1
+        raise
 
 
 if __name__ == "__main__":
@@ -16397,6 +17216,12 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["hook"]:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.exit(run_hook(sys.argv[2:]))
+    if sys.argv[1:] == ["guard"]:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.exit(run_guard())
+    if sys.argv[1:2] == ["setup"]:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.exit(run_setup(sys.argv[2:]))
     if sys.argv[1:] == ["allow-rule"]:
         if not allow_rules():
             print(NO_ALLOW_RULE)

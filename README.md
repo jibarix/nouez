@@ -65,7 +65,7 @@ The protocol between the bridge and Codex is experimental, so this is the last c
 
 | Component | Version |
 |---|---|
-| nouez | 0.29.0 |
+| nouez | 0.30.0 |
 | Claude Code | 2.1.332 |
 | Codex CLI | 0.172.0 |
 | Codex app-server daemon | 0.172.0 |
@@ -78,6 +78,19 @@ Run `claude --version`, `codex --version` and `agy --version` to see your versio
 ## Setup
 
 Run each command in a terminal. Where a path appears, use the absolute path to your copy of nouez, in quotes if it contains a space. On macOS and Linux, use `python3` wherever this says `python` if `python` isn't on your `PATH`. First check that `python --version` prints 3.9 or later. On Windows, if it opens the Microsoft Store or prints nothing, install Python from python.org (or use `py -3` wherever this says `python`). Run the commands outside any virtual environment, unless you mean nouez to run on that environment's Python. [The setup guide](docs/setup.md) has each step in full: what it checks and changes, and the choices it offers.
+
+### As a Claude Code plugin (Windows)
+
+The plugin runs nouez with the Python launcher (`py -3`, part of python.org's Python for Windows). In a terminal:
+
+```sh
+claude plugin marketplace add jibarix/nouez
+claude plugin install nouez@nouez
+```
+
+Then, in a new Claude Code session, run `/nouez:setup`. It shows what it would add to Claude Code's settings (the waiter's allow rules and, if you want it, nouez's status line), asks, then runs `doctor` and offers to set up the phone dispatcher. Do step 4 below for a consultant CLI. After an update, run `/reload-plugins` in one session (or start a new one): that puts the new version in place, and the other open sessions move to it by themselves, the next time nouez has nothing running there ([the plugin](docs/rules.md#rule-plugin-launcher)). With the plugin, a protection can change from a session after a yes in Claude Code's own prompt ([protections](docs/rules.md#rule-protections-behind-the-prompt)). `/nouez:uninstall` takes out what setup added and the dispatcher's sign-in start; `claude plugin uninstall nouez@nouez` removes the plugin. Already registered nouez from a clone? `/nouez:setup` offers to remove that registration, so nouez doesn't run twice.
+
+### From a clone
 
 **1. Get the code.**
 
@@ -138,14 +151,14 @@ It checks Claude Code's side, the phone dispatcher and each consultant CLI, and 
 
 ### What nouez changes in your Claude Code setup
 
-- **The MCP entry** for `consultants`, made by Claude Code's own `claude mcp add` in step 2.
+- **The MCP entry** for `consultants`, made by Claude Code's own `claude mcp add` in step 2, or the plugin, which Claude Code installs.
 - **One trust mark in `~/.claude.json`** for each folder you trust a session in, only after nouez reports what the folder's settings would run and you say yes (Claude passes your yes on; `NOUEZ_ASK_TRUST=1` makes nouez ask you in its own prompt). A folder nouez creates outside git, in the same call that marks it, has no settings, so it needs no report. Before changing the file, nouez makes a dated backup. `doctor` reports the backup folder, counts this profile's copies, names the newest and says how to restore one. See [which trust backups nouez keeps](docs/rules.md#rule-trust-backups). `NOUEZ_NO_TRUST_WRITE=1` turns this off.
 - **An MCP server added back to `~/.claude.json`**, only when you run `server.py restore ID` at the computer for one that `RestoreClaudeConfig` found in nouez's copies and missing now; nothing else in the file changes, and it is copied first.
 - **The dispatcher folder's own files:** its `CLAUDE.md`, and allow rules for nouez's session tools in its `.claude/settings.json`, copied first.
 - **The sign-in start** that `dispatcher install` adds, which `dispatcher uninstall` removes.
 - **nouez's status line** in Claude Code's own `settings.json`, only on your yes and only when it has none, copied first.
 
-nouez changes nothing else in your Claude Code settings. The waiter's allow rules (step 5) are yours to add.
+nouez changes nothing else in your Claude Code settings. The waiter's allow rules (step 5) are yours to add; with the plugin, `/nouez:setup` adds them on your yes, copied first.
 
 ## From your phone
 
