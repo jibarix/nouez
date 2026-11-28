@@ -46,9 +46,11 @@ A consultant keeps its whole conversation until you stop it, so you can keep goi
 
 > Show me what the consultant is doing.
 
-This works from a new Claude Code session too: consultants that went idle still appear in the list, and the next message reloads them. Reuse is the default. `StartConsultant` searches first: if a consultant it started earlier already works in the same project, it returns that one and starts nothing; if none is found, it starts one. It never picks a Codex session you opened yourself, even in the same project, because that session keeps your permissions; it lists such sessions in its result instead. `model`, `title` and `instructions` only apply when a new consultant is started. The project is the git repo. Outside git it is the folder `cwd` names: a Claude Code that connects without the handshake (any from 2026-07-28 on) shares no workspace folders, so a subfolder gets a consultant of its own; with a client that shares them, it is the workspace folder holding `cwd`, and a subfolder finds the consultant started at the top. When you want a clean slate, ask for a new one, and Claude passes `new: true`:
+This works from a new Claude Code session too: consultants that went idle still appear in the list, and the next message reloads them. Reuse is the default. `StartConsultant` searches first: if a consultant it started earlier already works in the same project, it returns that one (the one used most recently) and starts nothing; if none is found, it starts one. It never picks a Codex session you opened yourself, even in the same project, because that session keeps your permissions; it lists such sessions in its result instead. `model`, `title` and `instructions` only apply when a new consultant is started. The project is the git repo. Outside git it is the exact folder `cwd` names, so a neighbouring folder's consultant, with that folder's files and history, is never reused, and a subfolder gets a consultant of its own. When you want a clean slate, ask for a new one, and Claude passes `new: true`:
 
 > Start a new Codex consultant for this.
+
+A consultant started with `new: true` is an extra: `StartConsultant` never reuses it. To keep the list short, nouez closes its own consultants that have been idle for an hour, except each project's main one (the one `StartConsultant` reuses there). It closes them the way `StopConsultant` does, and never one with a turn running or a reply not read yet (with the usage log off, that isn't known, so the hour is enough). Closing a Claude Code session never closes its consultants. `NouezStatus` and `doctor` count the ones closed in the last week; `codex unarchive ID` brings back a Codex one. To keep them all open, turn on `no_auto_close` (`server.py settings set no_auto_close on`, or `NOUEZ_NO_AUTO_CLOSE=1`).
 
 > Start a second consultant in ~/projects/other-repo and ask it to …
 
@@ -132,11 +134,13 @@ In 0.25.0, the suggestions in each of those setups and scenarios are the same as
 
 0.30.3, whose review advice no longer sets a bar for which findings count, was checked on 2026-11-27 against 0.30.2, three runs of each of the 14 cases, both providers installed and plenty of room. Both gave the same results: commits got a review 12 of 12 times and research 6 of 6, neither consulted where it shouldn't (0 of 18), every consultation called `ConsultantBudget` first and took its suggestion, both committed after the OK verdict 3 of 3 and didn't act on the false finding (0 of 3). The plan and the bug case were missed in every run of both.
 
+0.31.0's critique point (a critique when the request leaves Claude the choice, whether or not it sets constraints) was checked on 2026-11-27 against 0.30.3, three runs of each of the 16 cases, both providers installed and plenty of room. A new case, `plan-open`, asks for a change and leaves the approach open. Both versions gave the same results: commits got a review 12 of 12 times and research 6 of 6, `plan-open` got a critique 2 of 3 times, the `plan` case (whose request sets constraints but leaves the rest to Claude) and the bug case were missed every time, and one of the three runs of the one-line change that leaves behavior alone got a review (1 of 21 where it shouldn't). Every consultation called `ConsultantBudget` first; both committed after the OK verdict 3 of 3 and didn't act on the false finding. An earlier run of the plan cases alone on 0.31.0 gave `plan-open` 3 of 3, so the new wording shows no measurable gain over 0.30.3.
+
 ## Choosing a consultant
 
 `ConsultantBudget` gathers what a choice of model and effort depends on, in one call that changes nothing, except that a `kind` with a `provider` keeps nouez's pick for the next send of that kind to that provider on that provider's models, for up to half an hour (see above):
 
-- **Codex usage.** Each usage window on your Codex subscription (5-hour, weekly) with the percentage used, when it resets, and where the current pace lands at the reset, or when it runs out first. Also any free full resets your plan has; only you decide to use one. And the models your account offers, with their effort levels.
+- **Codex usage.** Each usage window on your Codex subscription (5-hour, weekly) with the percentage used, when it resets, and where the current pace lands at the reset, or when it runs out first. Also any free full resets your plan has, with the times of those that expire before your week resets; while one does, Codex counts as having usage to spare. Only you decide to use one. And the models your account offers, with their effort levels.
 - **Antigravity's quota,** when `agy` is installed: each quota group's windows the same way, and the models agy lists with their levels.
 - **Claude Code's own usage.** Claude Code tells only its status line how much of its 5-hour and weekly windows is used, so nouez reads a file the status line saves (below). Without it this part says "not known".
 - **Model scores.** The [Artificial Analysis](https://artificialanalysis.ai) Intelligence Index for the top OpenAI, Google and Anthropic models, with API price and speed. Higher is smarter. Data from Artificial Analysis; credit it when you share it.
@@ -222,6 +226,17 @@ You are read-only: describe changes, don't make them.
 ```
 
 A verdict line first makes the reply easy to act on, and "what you didn't check" makes the gaps visible instead of leaving silence to read as approval.
+
+## Your own wording for nouez's prompts
+
+nouez's text that guides Claude can be replaced with your own: when to consult unasked (`auto-consult`), how to consult (`instructions`), the blind second opinion (`second-opinion`) and the note `ConsultantBudget` gives with each kind (`note-review`, `note-bug-hunt` and so on). `server.py prompts` prints each one as it is now and where your file goes: `prompts.md` in nouez's settings folder (`%LOCALAPPDATA%\nouez`). Copy in the sections you want to change, each starting with a line `## key`:
+
+```markdown
+## note-review
+Ask for every finding in the first round, each with a user scenario.
+```
+
+A key you leave out keeps nouez's text, and gets nouez's newer wording when it updates; a key you replace doesn't, so copy only what you change. An empty section drops that text. `auto-consult` and `instructions` reach conversations started after the change; the rest, the next `ConsultantBudget`. `doctor` and `NouezStatus` name the keys your file replaces and anything it ignored (an unknown key, a key given twice). The line asking for the verdict nouez reads, the tools' descriptions and every protection stay in nouez's code, so the file can't turn them off. To counter nouez's text without replacing it, a line in your `CLAUDE.md` still works.
 
 ## Tips
 

@@ -141,6 +141,7 @@ def fake_cli(mod, setup, scenario, cache):
         "start_pane_cleanup": lambda *a, **k: None,
         "login_state": lambda *a, **k: None,
         "tidy": lambda *a, **k: None,
+        "read_prompts": lambda *a, **k: ({}, None),  # the shipped wording, never a personal prompts.md
     }
     for name, fake in fakes.items():
         if hasattr(mod, name):
@@ -260,6 +261,10 @@ SPECIFIED_PROMPT = ("Make the discount a percentage: in pricing.py, `(1 - discou
                     "test_pricing.py, `total([10], 0.1)` becomes `total([10], 10)`; in README.md, "
                     "\"fractional discount (0.1 = 10%)\" becomes \"percentage discount (10 = 10%)\". Make "
                     "the change.")
+# 0.31: a change to three files with one obvious way to make it (a check, a test, a line of
+# docs): not every edit is named, but nothing is left to choose, so no plan to critique.
+ROUTINE_PROMPT = ("total() should reject a negative price with a ValueError, as it would a bad argument. "
+                  "Add a test for it in test_pricing.py and say so in README.md. Make the change.")
 
 RATES = {
     "rates.py": '''import json
@@ -328,6 +333,9 @@ SHOP = {**CALC, **RATES, **CHECKOUT, "README.md": README + "`order_total(lines)`
 PLAN_PROMPT = ("Orders should be totalled in the customer's currency, not always USD: order_total gets a "
                "`currency` argument (USD, EUR or GBP), conversions go through rates.json, and the discount "
                "and rounding still apply once, at the end. Make the change.")
+# 0.31: the same feature with the design left open (where rates come from, when to convert, how
+# discount and rounding meet the conversion): the plan case Claude may judge spelled out.
+OPEN_PLAN_PROMPT = "Orders should be totalled in the customer's currency (USD, EUR or GBP), not always USD. Make the change."
 
 # Canned replies for the outcome cases: a clean verdict, and a finding that is false (sum([]) is 0, so
 # total([]) can't divide by zero) and must not be "fixed".
@@ -348,7 +356,9 @@ CASES = {
     "commit-oneline-behavior": ("pos", {"review"}, "commit", CALC, ONE_LINE_BEHAVIOR, "Commit this.", "commit", ""),
     "bug": ("maybe", {"bug-hunt"}, "bug", RATES, {}, BUG_PROMPT, "edit", ""),
     "plan": ("pos", {"plan-critique"}, "plan", SHOP, {}, PLAN_PROMPT, "edit", ""),
+    "plan-open": ("pos", {"plan-critique"}, "plan", SHOP, {}, OPEN_PLAN_PROMPT, "edit", ""),
     "plan-specified": ("neg", set(), "plan", CALC, {}, SPECIFIED_PROMPT, "edit", ""),
+    "plan-routine": ("neg", set(), "plan", CALC, {}, ROUTINE_PROMPT, "edit", ""),
     "research-config": ("pos", {"research"}, "research", CALC, {},
                         "Should this project read its settings from TOML or JSON? Compare them for a "
                         "Python 3.9+ tool across current sources (parsers, writing files back, comments) "

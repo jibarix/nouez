@@ -29,7 +29,7 @@ claude plugin marketplace add jibarix/nouez
 claude plugin install nouez@nouez
 ```
 
-Sign in to Codex or Antigravity if you use them, then run `/nouez:setup` in a new Claude Code session. It sets up what a plugin can't by itself (the waiter's allow rules, nouez's status line, the phone dispatcher), asking before each change. [The setup guide](docs/setup.md) has each step and what it's for, updating and uninstalling, and running nouez from a clone.
+Sign in to Codex or Antigravity if you use them, then run `/nouez:setup` in a new Claude Code session. It sets up what a plugin can't by itself (the waiter's allow rules, nouez's status line, auto-update, the phone dispatcher), asking before each change. [The setup guide](docs/setup.md) has each step and what it's for, updating and uninstalling, and running nouez from a clone.
 
 ## From your phone
 
@@ -106,7 +106,7 @@ The protocol between nouez and Codex is experimental, so this is the last combin
 
 | Component | Version |
 |---|---|
-| nouez | 0.30.3 |
+| nouez | 0.31.0 |
 | Claude Code | 2.1.332 |
 | Codex CLI | 0.172.0 |
 | Codex app-server daemon | 0.172.0 |

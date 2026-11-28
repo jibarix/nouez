@@ -6,6 +6,23 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-11-27
+
+Idle consultants close by themselves, a sessions page shows what each Claude Code session runs and its memory, setup offers auto-update, and nouez's prompts can take your own wording. With the plugin, update with `claude plugin update nouez@nouez`, then start a Claude Code session or run `/reload-plugins` in one, and run `/nouez:setup` once to be asked about auto-update; the other open sessions then move to the new version by themselves once idle. With a clone, pull, then reconnect `consultants` with `/mcp` in each open Claude Code session, and run `server.py dispatcher install` again the way you first did, to restart the dispatcher.
+
+### Added
+
+- **Idle consultants close by themselves.** Lee asked for a blind second opinion yesterday and it still sat in his list. Now, every 10 minutes at most, nouez closes its own consultants that have been idle for an hour, the way `StopConsultant` does, except each project's main one (the one `StartConsultant` reuses), one with a turn running and one with a reply not read yet. `NouezStatus` and `doctor` list those closed in the last week with how to bring one back (`codex unarchive ID`). Turn it off with `no_auto_close` ([idle close](docs/rules.md#rule-idle-close)).
+- **The sessions page.** Ana's computer feels slow with five Claude Code sessions open. `s` in `server.py top` (or `OpenStatusScreen` with `page: "sessions"`; Windows only) lists each session with its state, model, effort and the memory of everything running under it, then the dispatcher, the Codex daemon, Antigravity turns and nouez processes outside every session. A command line is read only to name a process, and only for Python, Claude Code and Codex, without the arguments that follow the script or module ([sessions page](docs/rules.md#rule-sessions-page)).
+- **Setup offers auto-update.** Robin installed nouez from its marketplace, where Claude Code's auto-update is off by default. `/nouez:setup` now says whether it is on and what decides it, and asked, turns it on for that marketplace (which then updates every plugin from it without a review step); `doctor` gives the same line, and `/nouez:uninstall` puts it back ([plugin setup](docs/rules.md#rule-plugin-setup)).
+- **Your own wording for nouez's prompts.** Mia wants her own review note. A `prompts.md` in nouez's settings folder replaces nouez's text per key (the automatic-consultation advice, the server instructions, the second-opinion text, the note for each kind); a key left out keeps nouez's text, and the verdict line nouez reads stays. `server.py prompts` prints the text in use, and `doctor` says which keys your file replaces ([prompts file](docs/rules.md#rule-prompts-file)).
+- **Free Codex resets in the budget.** Pat has two free full resets, one expiring Monday while his week resets Wednesday. `ConsultantBudget` shows them, and while one would expire unused, routing treats Codex as having room; spending one stays the user's decision ([banked resets](docs/rules.md#rule-banked-resets)).
+
+### Changed
+
+- **A plan critique when the choice is Claude's.** Dana says "make the change" and leaves the approach open: Claude is now told to get its plan critiqued before the first edit, even when the request sets constraints. Given the exact edits, it just makes them ([automatic consultation](docs/rules.md#rule-automatic-consultation)).
+- **Outside git, a consultant is reused only from the same folder.** Ana opens Claude Code on `C:\Work`, which isn't in git and holds `ProjectA` and `ProjectB`. A review in `ProjectB` used to get the consultant started in `ProjectA`, which then reviewed with ProjectA's files and history. Now it gets one of its own; a subfolder does too. Inside git, the work tree is the project as before.
+
 ## [0.30.3] - 2026-11-27
 
 nouez's review advice no longer sets a bar for which findings count; your own instructions and skills do. With the plugin, update with `claude plugin update nouez@nouez`, then start a Claude Code session or run `/reload-plugins` in one; the other open sessions then move to the new version by themselves once idle. With a clone, pull, then reconnect `consultants` with `/mcp` in each open Claude Code session, and run `server.py dispatcher install` again the way you first did, to restart the dispatcher.
@@ -927,7 +944,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.30.3...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/jibarix/nouez/compare/v0.30.3...v0.31.0
 [0.30.3]: https://github.com/jibarix/nouez/compare/v0.30.2...v0.30.3
 [0.30.2]: https://github.com/jibarix/nouez/compare/v0.30.1...v0.30.2
 [0.30.1]: https://github.com/jibarix/nouez/compare/v0.30.0...v0.30.1

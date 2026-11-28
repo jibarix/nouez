@@ -1907,6 +1907,55 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual((running["status"], daemon.archived), ("interrupted", c["id"]))
         self.assertLess(daemon.calls.index("turn/interrupt"), daemon.calls.index("thread/archive"))
 
+    def test_idle_codex_consultants_close_and_the_repos_main_stays(self):
+        """0.31: in Dana's repo, two hours after their last turns, the sweep archives the older
+        consultant (one in a subfolder counts for the repo too) and her blind second opinion
+        (new=true, never reused), and keeps the one StartConsultant reuses and her own Codex session.
+        With the usage log off, an hour idle is enough. One that took a turn since stays."""
+        cache = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cache, True)
+        now = time.time()
+        main = self.consultant("main01", updatedAt=now - 8000)
+        old = self.consultant("old001", updatedAt=now - 9000, cwd=os.path.join(ROOT, "docs"))
+        mine = {"id": "0199aaaa-0000-0000-0000-000000user09", "cwd": ROOT, "updatedAt": now - 9900}
+        done = {"id": "turn-old", "status": "completed", "completedAt": now - 9000, "items": [user("q")]}
+        daemon = self.use(FakeDaemon([main, old, mine], {old["id"]: [done]}))
+        archived = []
+        real = daemon.request
+
+        def request(method, params):
+            if method == "thread/archive":
+                archived.append(params["threadId"])
+            return real(method, params)
+        daemon.request = request
+        for name, value in (("nouez_cache_dir", lambda: cache), ("codex_installed", lambda: True),
+                            ("CodexClient", lambda *a, **kw: daemon), ("agy_consultants", lambda include_stopped=False: [])):
+            patcher = mock.patch.object(server, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {"NOUEZ_NO_USAGE_LOG": "1", "NOUEZ_NO_AUTO_CLOSE": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+        out = server.start_consultant({"cwd": ROOT, "new": True})
+        self.assertIn("extra: started with new=true", out)
+        extra = daemon.threads["0199ffff-0000-0000-0000-000000new001"]
+        extra.update(updatedAt=now - 4000, createdAt=now - 4000)
+        self.assertTrue(server.is_extra("codex", extra))
+        self.assertIn(f"Using {server.short_name(main)}", server.start_consultant({"cwd": ROOT}))
+        closed = server.run_sweep(now)
+        self.assertEqual(sorted(archived), sorted([old["id"], extra["id"]]))
+        self.assertEqual(sorted(c["id"] for c in closed), sorted(archived))
+        self.assertTrue(server.is_extra("codex", extra))  # its mark stays: codex unarchive brings back an extra
+        report = server.auto_close_report(now)
+        self.assertIn("To bring back a Codex one: codex unarchive ID", report)
+        # Used again after the sweep looked: the close is called off under the lock.
+        again = self.consultant("used01", updatedAt=now - 7300)
+        daemon.threads[again["id"]] = again
+        seen = dict(again)
+        again["updatedAt"] = now - 10
+        self.assertIsNone(server.close_idle_codex(daemon, seen, None, now))
+        self.assertNotIn(again["id"], archived)
+
     def test_stop_never_touches_a_user_session(self):
         """0.26.1: StopConsultant refuses a Codex session the user opened, running turn or not, and
         neither interrupts nor archives it."""
@@ -4461,7 +4510,18 @@ class BudgetTest(unittest.TestCase):
         self.assertIn("5-hour window: 40% used", text)
         self.assertNotIn("weekly", text)
         self.assertIn("2 free full reset(s)", text)
+        self.assertNotIn("expire before the week resets", text)  # no weekly window read
         self.assertIn("m-1 (default): effort low, high (default low)", text)
+        # 0.31: with a weekly window, the resets that expire before it resets are named with their times.
+        answers["account/rateLimits/read"]["rateLimits"]["secondary"] = {
+            "usedPercent": 30, "windowDurationMins": 10080, "resetsAt": self.NOW + 3 * 86400}
+        answers["account/rateLimits/read"]["rateLimitResetCredits"]["credits"] = [
+            {"status": "available", "expiresAt": self.NOW + 86400}, {"status": "available", "expiresAt": self.NOW + 9 * 86400}]
+        state = {}
+        text = "\n".join(server.codex_budget(client, self.NOW, state))
+        self.assertIn("1 of them expires before the week resets, unused unless spent: "
+                      + time.strftime("%a %b %d %H:%M", time.localtime(self.NOW + 86400)), text)
+        self.assertEqual(state["reset_expiries"], [self.NOW + 86400, self.NOW + 9 * 86400])
         self.assertNotIn("m-hidden", text)
 
     def test_codex_budget_without_models(self):
@@ -5509,6 +5569,37 @@ class SuggestTest(unittest.TestCase):
         self.assertIn("its 5-hour window on pace for about 95%", server.claude_pace({"windows": hot}, self.NOW)[1])
         self.assertEqual(server.window_state(76, self.NOW + 3600, five, self.NOW)["colour"], "33")
 
+    def test_free_resets_expiring_before_the_week_count_as_spare(self):
+        """0.31: a free full reset that expires before the week resets is usage that goes unused unless
+        spent, so that subscription counts as spare: no step down for a tight week, and the reason says
+        why. One expiring after the week resets changes nothing; a used-up week stays blocked (only the
+        user spends a reset) and says how many there are."""
+        tight = self.codex(used=80, days_left=1)  # 80% after six days: tight at the reset
+        plain = server.suggest_consultant("review", {"codex": tight}, self.NOW)
+        self.assertIn(server.EASED, plain["why"])
+        banked = {**tight, "reset_expiries": [self.NOW + self.DAY / 2, self.NOW + 3 * self.DAY]}
+        got = server.suggest_consultant("review", {"codex": banked}, self.NOW)
+        self.assertNotIn(server.EASED, got["why"])
+        self.assertEqual((got["provider"], got["effort"]), ("codex", "high"))
+        self.assertTrue(any("has 1 free full reset expiring before its week resets" in w for w in got["why"]), got)
+        later = {**tight, "reset_expiries": [self.NOW + 3 * self.DAY]}
+        self.assertIn(server.EASED, server.suggest_consultant("review", {"codex": later}, self.NOW)["why"])
+        spent = {**self.codex(used=100, days_left=1), "reset_expiries": [self.NOW + self.DAY / 2]}
+        none = server.suggest_consultant("review", {"codex": spent}, self.NOW)["none"]
+        self.assertIn("1 free full reset(s) available; only the user decides to use one", none)
+        # Codex gave only a count, no dates: the blocked line still says how many there are.
+        counted = {**self.codex(used=100, days_left=1), "reset_expiries": [], "reset_count": 2}
+        none = server.suggest_consultant("review", {"codex": counted}, self.NOW)["none"]
+        self.assertIn("2 free full reset(s) available; only the user decides to use one", none)
+        # Codex's list: available ones with a future expiry, soonest first.
+        listed = {"credits": [{"status": "available", "expiresAt": self.NOW + 9},
+                              {"status": "used", "expiresAt": self.NOW + 5},
+                              {"status": "available", "expiresAt": self.NOW - 1},
+                              {"status": "available", "expiresAt": self.NOW + 2}, "junk"]}
+        self.assertEqual(server.reset_expiries(listed, self.NOW), [self.NOW + 2, self.NOW + 9])
+        self.assertEqual(server.reset_expiries({"availableCount": 2}, self.NOW), [])
+        self.assertEqual(server.reset_expiries(None, self.NOW), [])
+
     def test_revision_picks_keep_off_claude_models(self):
         """0.28.1: with revision=true any kind keeps off Claude models, in ConsultantBudget as at the
         send; without it, a draft whose pick is Claude says how to get the other."""
@@ -5909,7 +6000,7 @@ class SuggestTest(unittest.TestCase):
                            ("bug-hunt", "draft the fix as a unified diff"),
                            ("review", "each with the scenario where a user meets it"),
                            ("review", '"Verdict: OK" or "Verdict: CHANGES" on its first line'),
-                           ("re-check", "Ask for the verdict on its first line"),
+                           ("re-check", '"Verdict: OK" or "Verdict: CHANGES" on its first line'),
                            ("re-check", "any new finding with its scenario, as in a review"),
                            ("bug-hunt", "ask for the cause with the scenario where a user meets it"),
                            ("plan-critique", "each objection with the scenario where a user would be affected"),
@@ -6327,6 +6418,100 @@ class AgyTest(unittest.TestCase):
                 server.start_consultant({"cwd": tempfile.gettempdir(), "provider": "antigravity", "new": True})
             with self.assertRaisesRegex(server.BridgeError, "Antigravity CLI .* can't be found"):
                 server.start_consultant({"cwd": self.work, "provider": "antigravity"})  # not "Using ..."
+
+    def agy_rec(self, cwd, created, **extra):
+        cid = str(server.uuid.uuid4())
+        os.makedirs(server.agy_folder(cid))
+        rec = {"id": cid, "name": f"agy-{cid[:4]}", "cwd": cwd, "model": "gemini-4-neon-high", "created": created, **extra}
+        server.agy_save(rec)
+        return rec
+
+    def test_reuse_picks_the_last_used_and_never_an_extra(self):
+        """0.31: Dana's repo has the consultant she has used all week, one from before 0.31 started
+        later but not used since, and a blind second opinion (new=true). StartConsultant reuses the
+        one she used last, never the extra, which says it is one."""
+        no_codex = mock.patch.object(server, "codex_installed", lambda: False)
+        no_codex.start()
+        self.addCleanup(no_codex.stop)
+        now = time.time()
+        used = self.agy_rec(self.work, now - 5000)
+        self.agy_rec(self.work, now - 4000)  # from before 0.31: not known as an extra, so a possible main
+        tid = str(server.uuid.uuid4())
+        os.makedirs(os.path.join(server.agy_folder(used["id"]), "turns"))
+        server.write_json_atomic(os.path.join(server.agy_folder(used["id"]), "turns", tid + ".json"),
+                                 {"id": tid, "started": now - 100, "pid": 1, "stopped": True})
+        out, extra = self.start(new=True)
+        self.assertIn("extra: started with new=true, so StartConsultant never reuses it", out)
+        self.assertTrue(server.agy_resolve(extra)["extra"])
+        again = server.start_consultant({"cwd": self.work, "provider": "antigravity"})
+        self.assertIn(f"Using {used['name']}", again)
+        self.assertNotIn(extra, again)  # an extra isn't offered among the others either
+
+    def test_idle_consultants_close_and_each_project_keeps_its_main(self):
+        """0.31: two hours after Lee's last turns, the sweep closes the blind second opinion and the
+        older consultant of his project, keeps the one StartConsultant reuses there and the main one of
+        another folder, and says so in NouezStatus's line; a second sweep within ten minutes does
+        nothing, and with no_auto_close on, none runs."""
+        no_codex = mock.patch.object(server, "codex_installed", lambda: False)
+        no_codex.start()
+        self.addCleanup(no_codex.stop)
+        quiet = mock.patch.dict(os.environ, {"NOUEZ_NO_AUTO_CLOSE": "0"})
+        quiet.start()
+        self.addCleanup(quiet.stop)
+        other = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, other, True)
+        now = time.time() + 2 * 3600
+        old = self.agy_rec(self.work, now - 9000)
+        main = self.agy_rec(self.work, now - 8000)
+        extra = self.agy_rec(self.work, now - 7300, extra=True)
+        fresh_extra = self.agy_rec(self.work, now - 600, extra=True)  # idle ten minutes: stays
+        elsewhere = self.agy_rec(other, now - 9500)
+        self.assertEqual(server.project_mains("antigravity", server.agy_consultants()), {main["id"], elsewhere["id"]})
+        closed = server.run_sweep(now)
+        self.assertEqual({c["id"] for c in closed}, {old["id"], extra["id"]})
+        left = {r["id"] for r in server.agy_consultants()}
+        self.assertEqual(left, {main["id"], fresh_extra["id"], elsewhere["id"]})
+        stopped = server.read_json_file(os.path.join(server.agy_folder(extra["id"]), "consultant.json"))
+        self.assertTrue(stopped["stopped"] and stopped["closed_idle"])
+        self.assertEqual(sorted(e["thread"] for e in self.events() if e["event"] == "auto-close"),
+                         sorted([old["id"], extra["id"]]))
+        report = server.auto_close_report(now)
+        self.assertIn("2 idle consultant(s) closed in the last 7 days", report)
+        self.assertIn("each project keeps its main one", report)
+        self.assertIsNone(server.run_sweep(now + 60))  # swept a minute ago
+        with mock.patch.dict(os.environ, {"NOUEZ_NO_AUTO_CLOSE": "1"}):
+            self.assertIsNone(server.run_sweep(now + 3 * 3600))
+            self.assertIn("no_auto_close is on", server.auto_close_report(now))
+        later = server.run_sweep(now + 3 * 3600)  # the second extra's hour is up too; the mains stay
+        self.assertEqual([c["id"] for c in later], [fresh_extra["id"]])
+        # The list keeps a week of closes, however many, so any of them can be brought back.
+        week = now + 3 * 3600 + 7 * 86400 - 60
+        server.run_sweep(week)
+        kept = server.read_json_file(server.auto_close_file())["closed"]
+        self.assertEqual([c["id"] for c in kept], [fresh_extra["id"]])
+        busy = [{"provider": "codex", "id": f"0199aaaa-0000-0000-0000-{i:012d}", "name": f"c{i}", "at": week - i}
+                for i in range(60)] + [{"provider": "codex", "id": "old", "name": "old", "at": week - 8 * 86400}]
+        server.write_json_atomic(server.auto_close_file(), {"at": week, "closed": busy})
+        server.run_sweep(week + 3600)
+        kept = server.read_json_file(server.auto_close_file())["closed"]
+        self.assertEqual(len(kept), 60)  # no cap on a busy week; the closes over a week old go
+        self.assertIn("60 idle consultant(s) closed in the last 7 days", server.auto_close_report(week + 3600))
+
+    def test_a_consultant_working_or_with_a_reply_not_read_stays_open(self):
+        """0.31: the sweep never closes a consultant with a turn running or a reply nobody read yet
+        (with the usage log off that isn't known, and an hour idle is enough); an hour counts from
+        the later of the turn's end and the reply's reading."""
+        now = 100000.0
+        turn = {"id": "t", "status": "completed", "startedAt": int(now - 7200), "durationMs": 60000}
+        row = {"busy": False, "pending": False, "state": "idle", "verdict_at": 0}
+        self.assertTrue(server.idle_enough(row, turn, None, now))
+        self.assertFalse(server.idle_enough({**row, "busy": True, "state": "working"}, turn, None, now))
+        self.assertFalse(server.idle_enough({**row, "pending": True, "state": "done"}, turn, None, now))
+        self.assertFalse(server.idle_enough({**row, "state": "unknown"}, turn, None, now))
+        self.assertFalse(server.idle_enough({**row, "verdict_at": now - 600}, turn, None, now))
+        self.assertTrue(server.idle_enough(row, None, now - 3600, now))  # never sent work: from its start
+        self.assertFalse(server.idle_enough(row, None, now - 3000, now))
+        self.assertFalse(server.idle_enough(row, None, None, now))
 
     def test_without_codex(self):
         """0.18.0: with only agy installed, the tools work without naming a provider."""
@@ -7432,6 +7617,236 @@ class PaneTest(unittest.TestCase):
         self.assertIsNone(server.handle_exited(bare))
 
 
+class SessionsPageTest(unittest.TestCase):
+    """0.31: the status screen's sessions page, NouezStatus and `top --once` show what runs for
+    Claude Code and nouez, from Windows' processes."""
+
+    NOW = 1_800_000_000.0
+
+    def ft(self, ago):
+        return int((self.NOW - ago + server.FILETIME_UNIX) * 1e7)
+
+    def proc(self, ppid, exe, ago, line="", memory=10 << 20, committed=None):
+        return {"ppid": ppid, "exe": exe, "start": self.ft(ago), "line": line or exe,
+                "memory": memory, "committed": committed if committed is not None else (memory or 0) * 2}
+
+    def table(self):
+        p = self.proc
+        return {
+            10: p(1, "WindowsTerminal.exe", 9000),
+            20: p(10, "python.exe", 8000, r"python.exe -I C:\u\.claude\plugins\data\nouez-nouez\app\server.py claude C:\t\spec.json"),
+            30: p(20, "cmd.exe", 7990, "cmd.exe /k"),
+            40: p(30, "claude.exe", 7980, 'claude.exe --model opus --effort high --name dana -- "--model evil"', 300 << 20),
+            50: p(40, "python.exe", 7900, "python.exe -I C:/u/.claude/plugins/cache/nouez/nouez/0.31.0/launch.py C:/d"),
+            60: p(50, "python.exe", 7890, r"python.exe -I C:\u\.claude\plugins\data\nouez-nouez\app\server.py", None),
+            70: p(40, "python.exe", 9500, "python.exe -m stale_tool"),  # older than its "parent": another pid's child
+            80: p(40, "node\x1b[2J.exe", 7000, "node.exe --token=SECRET123 serve"),
+            110: p(60, "codex.exe", 7000, "codex.exe app-server proxy"),
+            90: p(1, "pythonw.exe", 6000, r"pythonw.exe -I C:\Projects\nouez\server.py dispatcher run"),
+            91: p(90, "claude.exe", 5900, "claude.exe remote-control --name dispatcher"),
+            100: p(1, "codex.exe", 50000, "codex.exe app-server --listen unix://"),
+            101: p(100, "codex-code-mode-host.exe", 49000),
+            120: p(1, "agy.exe", 30, "agy.exe -p secret prompt"),
+            130: p(999, "python.exe", 7200, r"python.exe C:\Projects\nouez\server.py wait t u"),
+            140: p(1, "python.exe", 100, r"python.exe C:\elsewhere\server.py"),  # not nouez's
+            150: {"ppid": 1, "exe": "claude.exe", "start": None, "line": None, "memory": None, "committed": None},
+        }
+
+    def test_each_session_its_processes_and_each_pid_once(self):
+        """Dana's session was opened by OpenClaudeSession (the wrapper, then cmd.exe, then claude):
+        its row counts the wrapper, cmd, claude, nouez's launcher and MCP server and the Codex proxy
+        under it, with claude's model and effort from before "--", never a process that took a dead
+        parent's pid or anyone's arguments. The dispatcher, the Codex daemon, the Antigravity turn and
+        a waiter left from an ended session each get their own row; another program's server.py and
+        a session whose pid is now another process's get none."""
+        procs = self.table()
+        sessions = [{"pid": 40, "name": "dana", "cwd": r"C:\work", "status": "busy", "start": procs[40]["start"]},
+                    {"pid": 91, "name": "old", "cwd": "C:\\", "status": "idle", "start": 123}]
+        report = server.session_report(procs, sessions, (90, self.NOW - 5990), [("agy-1a2b", 120)], self.NOW)
+        rows = {r["title"]: r for r in report["rows"]}
+        dana = rows["dana"]
+        self.assertEqual(dana["processes"], 7)
+        self.assertEqual(dana["settings"], "opus high")
+        self.assertEqual(dana["unknown"], 1)  # the MCP server's memory couldn't be read
+        self.assertEqual(dana["memory"], (300 << 20) + 5 * (10 << 20))
+        labels = dict(dana["parts"])
+        for label in ("nouez wrapper", "cmd", "claude", "nouez launcher", "nouez mcp", "codex", "node[2J"):
+            self.assertIn(label, labels)
+        self.assertEqual(rows["Phone dispatcher"]["processes"], 2)  # the old session's pid is the dispatcher's claude
+        self.assertEqual(rows["Codex daemon"]["processes"], 2)
+        self.assertEqual(rows["Antigravity turn of agy-1a2b"]["processes"], 1)
+        self.assertEqual(rows["nouez waiter"]["kind"], "other")
+        self.assertNotIn("old", rows)
+        counted = sum(r["processes"] for r in report["rows"])
+        self.assertEqual(counted, 7 + 2 + 2 + 1 + 1)
+        text = "\n".join(server.sessions_rows(report))
+        for word in ("SECRET123", "evil", "secret prompt", "stale_tool", "elsewhere", "\x1b"):
+            self.assertNotIn(word, text)
+        self.assertIn("dana (busy) · started: opus high · 350 MB (+1 not read), committed 700 MB in 7 processes", text)
+        self.assertIn("nouez waiter, outside every session, running 2h 0m", text)
+        # A dispatcher pid that started after the dispatcher's own record is another process.
+        late = server.session_report(procs, [], (90, self.NOW - 7000), [], self.NOW)
+        self.assertNotIn("Phone dispatcher", {r["title"] for r in late["rows"]})
+        self.assertIn("nouez dispatcher", {r["title"] for r in late["rows"]})  # still shown, as outside
+
+    def test_labels_and_settings_are_safe_words(self):
+        label = server.process_label
+        self.assertEqual(label({"exe": r"C:\Py\python.exe", "line": "python.exe -X utf8 -m edgar_mcp --key=abc"}),
+                         "python -m edgar_mcp")
+        self.assertEqual(label({"exe": "python.exe", "line": 'python.exe -c "import os; secret"'}), "python -c")
+        self.assertEqual(label({"exe": "python.exe", "line": r"python.exe C:\a\tool.py --password hunter2"}), "tool.py")
+        self.assertEqual(label({"exe": "python.exe", "line": r"python.exe C:\nouez\server.py top --days 7"}),
+                         "nouez status screen")
+        self.assertEqual(label({"exe": "python.exe", "line": r"python.exe C:\nouez\server.py frobnicate"}), "nouez")
+        self.assertEqual(label({"exe": "x" * 80 + ".exe", "line": ""}), "x" * 40)
+        # Python's options joined or unknown never let an argument through as a "script".
+        for line, want in (("python -cpass SECRET", "python -c"), ('python -Ic "x=SECRET"', "python -c"),
+                           ("python -Wignore -m pip install SECRET", "python -m pip"),
+                           ("python -mjson.tool SECRET", "python -m json.tool"),
+                           ("python --check-hash-based-pycs always SECRET", "python"),
+                           ("python - SECRET", "python"), ("python -m SECRET;x", "python")):
+            self.assertEqual(label({"exe": "python.exe", "line": line}), want, line)
+        self.assertFalse(server.needs_line(r"C:\bin\node.exe"))
+        self.assertTrue(server.needs_line(r"C:\Py\pythonw.exe"))
+        settings = server.claude_start_settings
+        self.assertEqual(settings("claude --model=sonnet --effort low"), "sonnet low")
+        self.assertEqual(settings('claude --model "opus; rm -rf" --effort max'), "max")
+        self.assertEqual(settings("claude -- --model opus"), "")
+        self.assertEqual(settings(None), "")
+
+    def test_a_session_opened_from_another_keeps_its_row(self):
+        """Dana's session opened Eli's (its claude is under hers) and her nouez runs an Antigravity
+        turn: Eli's row and the turn's are their own, not counted in Dana's."""
+        procs = self.table()
+        procs[200] = self.proc(40, "claude.exe", 600, "claude.exe --model sonnet")
+        procs[201] = self.proc(200, "node.exe", 590)
+        procs[210] = self.proc(60, "agy.exe", 20, "agy.exe -p x")
+        sessions = [{"pid": 40, "name": "dana", "status": "busy", "start": procs[40]["start"]},
+                    {"pid": 200, "name": "eli", "status": "idle", "start": procs[200]["start"]}]
+        report = server.session_report(procs, sessions, None, [("agy-9", 210)], self.NOW)
+        rows = {r["title"]: r for r in report["rows"]}
+        self.assertEqual(rows["dana"]["processes"], 7)
+        self.assertEqual((rows["eli"]["processes"], rows["eli"]["settings"]), (2, "sonnet"))
+        self.assertEqual(rows["Antigravity turn of agy-9"]["processes"], 1)
+        # A codex exec whose prompt names app-server is Dana's own, not the daemon.
+        procs[220] = self.proc(40, "codex.exe", 500, 'codex.exe exec "restart app-server"')
+        report = server.session_report(procs, sessions, None, [], self.NOW)
+        self.assertEqual({r["title"]: r for r in report["rows"]}["dana"]["processes"], 9)
+        self.assertEqual({r["title"]: r for r in report["rows"]}["Codex daemon"]["processes"], 2)
+
+    def test_a_page_taller_than_the_window_says_so(self):
+        """Forty sessions on a 30-line window: the page says how many lines it leaves out, and keeps
+        its key bar."""
+        scr = server.Screen(False)
+        rows = [{"kind": "session", "title": f"s{i}", "processes": 1, "memory": 1 << 20, "unknown": 0,
+                 "committed": 2 << 20, "parts": [("claude", [1, 1 << 20])], "settings": "", "cwd": "C:\\",
+                 "status": "idle"} for i in range(40)]
+        lines = server.sessions_frame(scr, {"rows": rows, "at": 0}, None, 100, 30, "top", "bottom")
+        self.assertEqual(len(lines), 30)
+        self.assertEqual(lines[-1], server.fit("bottom", 100))
+        self.assertIn("more line(s): make the window taller", lines[-2])
+
+    def test_the_keys_fit_a_100_column_screen(self):
+        """0.31: [s] made the usage page's bar too long for 100 columns, cutting off [q] quit. A
+        narrow bar closes up, then leaves [r] and [s] to the help page, so [?] and [q] stay."""
+        scr = server.Screen(False)
+        for view in ("screen", "consultations", "sessions", "help"):
+            for width in (100, 149):
+                bar = server.bottom_bar(scr, width, True, view, 12)
+                self.assertIn("[q] quit", bar, (view, width))
+                self.assertEqual(server.visible(bar), width)
+        self.assertIn("[s] sessions", server.bottom_bar(scr, 149, True, "screen", 12))
+        self.assertIn("[s] sessions", server.bottom_bar(scr, 100, False, "screen", 0))
+
+    def test_memory_not_known_and_off_windows(self):
+        procs = {40: self.proc(1, "claude.exe", 100, "claude.exe", None, 0)}
+        report = server.session_report(procs, [{"pid": 40, "name": "jo", "status": "idle"}], None, [], self.NOW)
+        self.assertIn("jo (idle) · not known in 1 process", "\n".join(server.sessions_rows(report)))
+        self.assertIn("shows nothing on this system", server.sessions_rows(None)[0])
+        self.assertEqual(server.sessions_rows({"rows": [], "at": 0}), ["No Claude Code session or nouez process is running."])
+
+    @unittest.skipUnless(os.name == "nt", "reads Windows' processes")
+    def test_this_process_is_read(self):
+        procs = server.read_processes()
+        me = procs[os.getpid()]
+        self.assertIsNotNone(me["start"])
+        self.assertGreater(me["committed"], 0)
+        self.assertTrue(me["memory"] is None or me["memory"] > 0)
+        self.assertTrue(server.process_label(me).startswith("python"))
+
+
+class PromptsTest(unittest.TestCase):
+    """0.31: the user's own wording for nouez's prompts, from prompts.md in nouez's settings folder."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        patch = mock.patch.object(server, "_dispatcher_root", [self.root])
+        patch.start()
+        self.addCleanup(patch.stop)
+        server._prompts_seen.clear()
+        self.addCleanup(server._prompts_seen.clear)
+
+    def write(self, text, raw=None):
+        with open(os.path.join(self.root, "prompts.md"), "wb") as f:
+            f.write(raw if raw is not None else text.encode("utf-8"))
+        server._prompts_seen.clear()  # a write within the same tick keeps lstat's stamp
+
+    def test_no_file_is_nouez_own_text(self):
+        self.assertEqual(server.read_prompts(), ({}, None))
+        self.assertIsNone(server.prompts_summary())
+        self.assertEqual(server.prompt_text("instructions"), server.INSTRUCTIONS)
+        out = []
+        self.assertEqual(server.run_prompts([], out.append), 0)
+        text = "\n".join(out)
+        for key in server.prompt_defaults():
+            self.assertIn(f"\n## {key}\n", text)
+        self.assertEqual(server.run_prompts(["x"], out.append), 2)
+
+    def test_a_section_replaces_one_prompt_and_the_rest_stay(self):
+        """Mia writes her own review note and empties auto-consult. ConsultantBudget gives her note,
+        still followed by the verdict line nouez reads; her new conversations no longer consult
+        unasked; instructions and every other note keep nouez's text. doctor and NouezStatus say
+        which keys her file replaces and what it ignored."""
+        self.write("My notes, ignored.\n\n## note-review\nFind everything, with scenarios.\n\n"
+                   "## auto-consult\n\n## Frobnicate\nx\n## note-review\nAsk for every finding, with scenarios.\n")
+        found, problem = server.read_prompts()
+        self.assertEqual(found, {"note-review": "Ask for every finding, with scenarios.", "auto-consult": ""})
+        self.assertIn("unknown key frobnicate", problem)
+        self.assertIn("note-review given twice", problem)
+        with mock.patch.object(server, "codex_installed", return_value=True), \
+             mock.patch.object(server, "auto_consult_off", return_value=False), \
+             mock.patch.object(server, "in_dispatcher", return_value=False):
+            text = server.server_instructions()
+        self.assertNotIn(server.AUTO_CONSULT.strip(), text)
+        self.assertIn(server.INSTRUCTIONS, text)
+        summary = server.prompts_summary()
+        self.assertIn("replaces nouez's text for auto-consult, note-review", summary)
+        self.assertIn("unknown key frobnicate", summary)
+        self.assertEqual(server.prompt_text("note-bug-hunt"), server.CONSULT_NOTES["bug-hunt"])
+
+    def test_the_verdict_line_stays_whatever_the_note(self):
+        """Sam empties his review note to shorten ConsultantBudget's answer: the line asking for the
+        verdict nouez reads still comes, so the status screen and round counts keep the verdicts."""
+        self.write("## note-review\n\n## note-re-check\nShort.\n## second-opinion\n\n")
+        suggest = SuggestTest()
+        state = {"codex": suggest.codex(), "antigravity": suggest.agy(), "claude": {}}
+        review = "\n".join(server.suggestion_lines("review", state, suggest.NOW))
+        self.assertIn(server.VERDICT_NOTE, review)
+        self.assertNotIn("Ask for every finding in the first round", review)
+        self.assertIn("  The other provider now: ", review)  # the second-opinion text dropped, the pick kept
+        recheck = "\n".join(server.suggestion_lines("re-check", state, suggest.NOW))
+        self.assertIn("  Short.\n  " + server.VERDICT_NOTE, recheck)
+
+    def test_a_file_that_cant_be_read_keeps_nouez_text(self):
+        self.write("", raw=b"## instructions\n\xff\xfe bad")
+        found, problem = server.read_prompts()
+        self.assertEqual(found, {})
+        self.assertIn("couldn't be read", problem)
+        self.assertEqual(server.prompt_text("instructions"), server.INSTRUCTIONS)
+        self.assertIn("replaces none of nouez's text; couldn't be read", server.prompts_summary())
+
+
 class TopReloadTest(unittest.TestCase):
     """0.16.0: the status screen starts again on an updated server.py."""
 
@@ -7537,7 +7952,7 @@ class TopReloadTest(unittest.TestCase):
         codes = [server.TOP_RELOAD, failed, server.TOP_QUIT]  # reloaded, the new file fails, the next one runs
 
         class Child:
-            def __init__(self, argv):
+            def __init__(self, argv, **kw):
                 pass
 
             def wait(self):
@@ -7555,7 +7970,7 @@ class TopReloadTest(unittest.TestCase):
         # Ctrl+C reaching the supervisor means quit, whatever code the screen then ends with
         # (it may not have reached its own quit handler yet).
         class Child:
-            def __init__(self, argv):
+            def __init__(self, argv, **kw):
                 self.calls = 0
 
             def wait(self, timeout=None):
@@ -7592,7 +8007,7 @@ class TopReloadTest(unittest.TestCase):
         handlers, ended = {}, []
 
         class Child:
-            def __init__(self, argv):
+            def __init__(self, argv, **kw):
                 pass
 
             def poll(self):
@@ -7615,7 +8030,7 @@ class TopReloadTest(unittest.TestCase):
         self.assertEqual(set(handlers), {server.signal.SIGTERM, 1})
 
         class Starting(Child):  # the signal comes while the screen is being started
-            def __init__(self, argv):
+            def __init__(self, argv, **kw):
                 handlers[1](1, None)
 
             def wait(self, timeout=None):
@@ -7635,7 +8050,7 @@ class TopReloadTest(unittest.TestCase):
         codes, argvs, calls = [server.TOP_RELOAD, 1, server.TOP_QUIT], [], []
 
         class Child:
-            def __init__(self, argv):
+            def __init__(self, argv, **kw):
                 argvs.append(argv)
 
             def wait(self):
@@ -7657,7 +8072,7 @@ class TopReloadTest(unittest.TestCase):
         argvs = []
 
         class Child:
-            def __init__(self, argv):
+            def __init__(self, argv, **kw):
                 argvs.append(argv)
 
             def wait(self):
@@ -9091,6 +9506,36 @@ class ConsultationsPageTest(unittest.TestCase):
             self.assertIsNone(server.read_key(5, wake))
         self.assertLess(time.monotonic() - start, 2)
 
+    def test_the_sessions_feed_reads_in_its_own_thread(self):
+        """0.31: the sessions page's processes are read in the feed's thread while the page is
+        shown, never while the screen draws; a read that fails keeps the last report and says why."""
+        calls, changed = [], threading.Event()
+        results = iter([{"rows": [], "at": 1}, OSError("denied")])
+
+        def read():
+            calls.append(threading.current_thread())
+            value = next(results)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        feed = server.SessionsFeed(changed.set, read)
+        self.assertEqual(feed.state(), (None, None))
+        thread = threading.Thread(target=feed.run, daemon=True)
+        thread.start()
+        self.addCleanup(feed.close, thread)
+        time.sleep(0.2)
+        self.assertEqual(calls, [])  # not shown: nothing read
+        feed.show(True)
+        self.assertTrue(changed.wait(5))
+        self.assertEqual(feed.state(), ({"rows": [], "at": 1}, None))
+        self.assertIs(calls[0], thread)
+        changed.clear()
+        feed.refresh()
+        self.assertTrue(changed.wait(5))
+        report, error = feed.state()
+        self.assertEqual(report, {"rows": [], "at": 1})
+        self.assertIn("denied", error)
+
     def test_reload_keeps_page_and_period(self):
         periods = list(server.TOP_PERIODS.values())
         cases = [(30, "usage", 7, ["--days", "30"]), (None, "consultations", 7, ["--days", "0", "--page", "consultations"]),
@@ -9104,6 +9549,57 @@ class ConsultationsPageTest(unittest.TestCase):
         self.assertEqual(server.reload_args(["--days", "7"], server.TOP_RELOAD), ["--days", "7"])
         self.assertEqual(server.reload_code(None, "consultations", None),
                          server.TOP_RELOAD + 1 + 2 * (len(periods) + 1) - 1)
+
+    def screen_run(self, keys, due, argv, env=None):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        keys, due = iter(keys), iter(due)
+        with mock.patch.object(server, "read_scan_state", return_value={}), \
+             mock.patch.object(server, "nouez_cache_dir", lambda: root), \
+             mock.patch.object(server.ConsultationFeed, "run"), mock.patch.object(server.SessionsFeed, "run"), \
+             mock.patch.object(server, "scan_usage"), mock.patch.object(server, "write_json_atomic"), \
+             mock.patch.object(server, "read_codex_usage"), mock.patch.object(server, "read_agy_usage"), \
+             mock.patch.object(server, "read_usage_log", return_value=[]), \
+             mock.patch.object(server, "top_frame", return_value=[]), \
+             mock.patch.object(server, "sessions_frame", return_value=[]), \
+             mock.patch.object(server, "enable_ansi", return_value=False), \
+             mock.patch.object(server, "read_key", side_effect=lambda t, wake=None: next(keys)), \
+             mock.patch.object(server, "top_reload_due", side_effect=lambda *a: (next(due), (1, 1))), \
+             mock.patch.object(server.sys.stdin, "isatty", return_value=False), \
+             mock.patch.dict(os.environ, env or {}), \
+             mock.patch.object(server.sys, "stdout", io.StringIO()):
+            if env is None:
+                os.environ.pop("NOUEZ_TOP_PAGES", None)
+            return server.run_top(list(argv))
+
+    def test_the_sessions_page_reloads_under_any_supervisor(self):
+        """0.31: Dana's status screen window was opened by 0.30's supervisor, which knows only the
+        usage and consultations pages' exit codes and takes any other for a crash. She presses [s],
+        and nouez updates: the screen comes back on the usage page rather than leaving the window
+        waiting. Under 0.31's supervisor, which names its pages to the screen, it comes back on the
+        sessions page."""
+        periods = list(server.TOP_PERIODS.values())
+        old_top = server.TOP_RELOAD + 1 + 1 * (len(periods) + 1) + len(periods)  # 0.30's highest code
+        supervised = ("--screen", "--supervised", "--days", "7")
+        self.assertEqual(self.screen_run(["s"], [False, True], supervised), server.TOP_RELOAD)
+        code = self.screen_run(["s"], [False, True], supervised + ("--page", "consultations"))
+        self.assertEqual(code, server.reload_code(7, "usage", 7))
+        self.assertLessEqual(code, old_top)
+        self.assertEqual(server.reload_args(["--days", "7", "--page", "consultations"], code), ["--days", "7"])
+        pages = {"NOUEZ_TOP_PAGES": ",".join(server.TOP_PAGES)}
+        code = self.screen_run(["s"], [False, True], supervised, pages)
+        self.assertEqual(server.reload_args(["--days", "7"], code), ["--days", "7", "--page", "sessions"])
+        self.assertEqual(self.screen_run(["s", "s"], [False, False, True], supervised, pages), server.TOP_RELOAD)
+        # The supervisor names its pages to the screen it starts.
+        started = []
+
+        class Child:
+            def wait(self, timeout=None):
+                return server.TOP_QUIT
+        with mock.patch.object(server.subprocess, "Popen",
+                               side_effect=lambda cmd, env=None: started.append(env) or Child()):
+            self.assertEqual(server.supervise_top(["--days", "7"]), 0)
+        self.assertEqual(started[0]["NOUEZ_TOP_PAGES"], "usage,consultations,sessions")
 
     def test_single_status_screen(self):
         root = tempfile.mkdtemp()
@@ -12111,7 +12607,7 @@ class ClonePlaceTest(unittest.TestCase):
         self.assertNotIn("registration", text)
         text = report({}, [other])[1]
         self.assertIn("the `consultants` registration runs", text)
-        self.assertIn("register nouez again from here (README, Setup).", text)
+        self.assertIn(f"register nouez again from here ({server.doc_link('setup.md', 'from-a-clone')}).", text)
         self.assertNotIn("settings.json", text)
         # With the plugin and no clone registered, setup takes out a clone's waiter rule, but not one
         # naming a server.py that is gone.
@@ -12177,7 +12673,7 @@ class CwdDefaultTest(unittest.TestCase):
         self.assertFalse(server.in_repo({"cwd": self.top}, root))
         self.assertTrue(server.in_repo({"cwd": self.sub}, root))
 
-    def test_outside_git_a_subfolder_finds_the_consultant_at_its_shared_workspace_folder(self):
+    def test_outside_git_the_listing_covers_the_shared_workspace_folder(self):
         inner = os.path.join(self.sub, "inner")
         os.mkdir(inner)
         self.roots([self.top, self.sub])
@@ -12201,10 +12697,27 @@ class CwdDefaultTest(unittest.TestCase):
         self.assertEqual(daemon.calls.count("thread/start"), 1)
         self.assertEqual(daemon.thread_started["cwd"], os.path.abspath(self.top))
 
-    def test_start_outside_git_reuses_a_child_from_its_parent_only(self):
-        self.roots([])
-        for existing, requested, reuse in ((self.top, self.sub, False),
-                                           (self.sub, self.top, True)):
+    def test_outside_git_the_disk_look_runs_when_the_index_holds_only_a_neighbours(self):
+        # Ana restored her sessions: Codex's index holds ProjectA's consultant, ProjectB's is only on
+        # disk. A review in ProjectB looks on disk and finds its own rather than starting a fresh one.
+        self.roots([self.top])
+        neighbour = os.path.join(self.top, "other")
+        os.mkdir(neighbour)
+        a = {"id": "0199aaaa-0000-0000-0000-00000000000a", "cwd": neighbour, "threadSource": "nouez"}
+        b = {"id": "0199aaaa-0000-0000-0000-00000000000b", "cwd": self.sub, "threadSource": "nouez"}
+        looks = lambda client, *args, fast=True, **kw: [a] if fast else [a, b]
+        with mock.patch.object(server, "load_consultants", looks):
+            root, found = server.repo_consultants(None, self.sub)
+        self.assertEqual([t["id"] for t in found if server.same_project(t, self.sub)], [b["id"]])
+
+    def test_start_outside_git_reuses_only_from_the_same_folder(self):
+        # Ana's C:\Work holds ProjectA and ProjectB, neither in git: a review in B never gets A's
+        # consultant (A's files and history), and neither does C:\Work or a subfolder.
+        self.roots([self.top])
+        neighbour = os.path.join(self.top, "other")
+        os.mkdir(neighbour)
+        for existing, requested, reuse in ((self.top, self.sub, False), (self.sub, self.top, False),
+                                           (neighbour, self.sub, False), (self.sub, self.sub, True)):
             with self.subTest(existing=existing, requested=requested):
                 thread = {"id": "0199aaaa-0000-0000-0000-000000000001",
                           "cwd": existing, "threadSource": "nouez"}
@@ -12773,6 +13286,7 @@ class PhoneSetupAndStatusTest(unittest.TestCase):
         patches = {"codex_installed": lambda: False, "claude_budget": lambda now: ["Claude Code: 10% of the week used."],
                    "agy_command": lambda: None, "claude_sessions": lambda: [{"name": "nouez"}],
                    "dispatcher_status": lambda: (False, None), "read_release_cache": lambda path, now: (None, None),
+                   "read_session_report": lambda now: {"rows": [], "at": now},
                    "_nouez_latest": None, **kw}
         with contextlib.ExitStack() as stack:
             for name, value in patches.items():
@@ -13491,6 +14005,145 @@ class PluginSetupTest(unittest.TestCase):
         self.assertEqual(self.read()["statusLine"], {"type": "command", "command": "my-line.sh"})
         for argv in (["--statusline", "--remove"], ["-x"], ["--dry-run", "--dry-run"]):
             self.assertEqual(server.run_setup(argv, out.append), 2)
+
+    def auto_update_world(self, managed=({}, None), known=None, env=None):
+        """The plugin from the nouez marketplace, nouez's settings file in memory, the managed
+        settings and known_marketplaces.json as given, and none of the updates variables set."""
+        store = {}
+
+        def update(change):
+            change(store)
+            return store
+        quiet = {v: "" for v in server.UPDATE_OFF_VARS + ("FORCE_AUTOUPDATE_PLUGINS",)}
+        quiet.update(env or {})
+        for patch in (mock.patch.object(server, "plugin_marker", lambda: {"id": "nouez@nouez"}),
+                      mock.patch.object(server, "clone_registered", lambda: False),
+                      mock.patch.object(server, "managed_settings", lambda: managed),
+                      mock.patch.object(server, "known_marketplaces", lambda config: known),
+                      mock.patch.object(server, "read_settings", lambda: (store, "ok")),
+                      mock.patch.object(server, "update_settings", update),
+                      mock.patch.dict(os.environ, quiet)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return store
+
+    def test_setup_turns_on_the_marketplaces_auto_update_and_remove_puts_it_back(self):
+        """0.31: Robin runs /nouez:setup with --auto-update. The nouez marketplace's entry gains
+        autoUpdate true (after a copy), the rest of it and their settings stay, and nouez records what
+        was there; /nouez:uninstall puts that back. Without --auto-update setup only says it is off."""
+        store = self.auto_update_world()
+        entry = {"source": {"source": "github", "repo": "jibarix/nouez"}}
+        mine = {"theme": "dark", "extraKnownMarketplaces": {"nouez": dict(entry), "other": {"source": "x"}}}
+        self.write(mine)
+        out = []
+        self.assertEqual(server.run_setup([], out.append), 0)
+        self.assertNotIn("autoUpdate", self.read()["extraKnownMarketplaces"]["nouez"])
+        self.assertTrue(any("is off (the default" in m and "setup --auto-update" in m for m in out), out)
+        self.assertEqual(server.run_setup(["--dry-run", "--auto-update"], out.append), 0)
+        self.assertNotIn("autoUpdate", self.read()["extraKnownMarketplaces"]["nouez"])
+        self.assertEqual(store, {})
+        out = []
+        self.assertEqual(server.run_setup(["--auto-update"], out.append), 0)
+        data = self.read()
+        self.assertEqual(data["extraKnownMarketplaces"]["nouez"], {**entry, "autoUpdate": True})
+        self.assertEqual(data["extraKnownMarketplaces"]["other"], {"source": "x"})
+        self.assertEqual(data["theme"], "dark")
+        self.assertTrue(any(m.startswith("Backed up") for m in out), out)
+        self.assertTrue(any("every plugin from nouez" in m and "/reload-plugins" in m for m in out), out)
+        self.assertEqual(store[server.AUTO_UPDATE_KEY], {"config": self.config, "market": "nouez", "prior": "absent"})
+        out = []
+        self.assertEqual(server.run_setup(["--auto-update"], out.append), 0)  # on now: said, nothing changed
+        self.assertTrue(any("is on (settings.json" in m for m in out), out)
+        self.assertEqual(server.run_setup(["--remove"], out.append), 0)
+        self.assertEqual(self.read()["extraKnownMarketplaces"]["nouez"], entry)
+        self.assertNotIn(server.AUTO_UPDATE_KEY, store)
+        # A value of theirs that setup replaced comes back; one they changed since is theirs.
+        self.write({"extraKnownMarketplaces": {"nouez": {**entry, "autoUpdate": False}}})
+        self.assertEqual(server.run_setup(["--auto-update"], out.append), 0)
+        self.assertIs(self.read()["extraKnownMarketplaces"]["nouez"]["autoUpdate"], True)
+        self.assertEqual(server.run_setup(["--remove"], out.append), 0)
+        self.assertIs(self.read()["extraKnownMarketplaces"]["nouez"]["autoUpdate"], False)
+        self.write({"extraKnownMarketplaces": {"nouez": dict(entry)}})
+        self.assertEqual(server.run_setup(["--auto-update"], out.append), 0)
+        self.write({"extraKnownMarketplaces": {"nouez": {**entry, "autoUpdate": False}}})
+        self.assertEqual(server.run_setup(["--remove"], out.append), 0)
+        self.assertIs(self.read()["extraKnownMarketplaces"]["nouez"]["autoUpdate"], False)
+        self.assertNotIn(server.AUTO_UPDATE_KEY, store)
+        for argv in (["--auto-update", "--remove"], ["--auto-update", "--auto-update"]):
+            self.assertEqual(server.run_setup(argv, out.append), 2)
+
+    def test_setup_leaves_auto_update_to_what_decides_it(self):
+        """0.31: setup never turns on auto-update over what decides it: no settings entry for the
+        marketplace (it doesn't make one), managed settings, a variable that turns updates off (unless
+        FORCE_AUTOUPDATE_PLUGINS=1), or a managed settings file it can't read. Each says why."""
+        entry = {"source": {"source": "github", "repo": "jibarix/nouez"}}
+        cases = [
+            ({}, {}, "no extraKnownMarketplaces entry for nouez"),
+            ({"managed": ({"extraKnownMarketplaces": {"nouez": {"autoUpdate": False}}}, None)}, None,
+             "set by managed settings"),
+            ({"managed": (None, "denied")}, None, "isn't known"),
+            ({"env": {"DISABLE_AUTOUPDATER": "1"}}, None, "DISABLE_AUTOUPDATER is set in the environment"),
+            ({"managed": ({"env": {"DISABLE_UPDATES": "1"}}, None)}, None,
+             "DISABLE_UPDATES is set in managed settings's env"),
+            ({"settings_env": {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}}, None,
+             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set in settings.json's env"),
+        ]
+        for world, markets, said in cases:
+            with self.subTest(said=said):
+                store = self.auto_update_world(managed=world.get("managed", ({}, None)), env=world.get("env"))
+                data = {"extraKnownMarketplaces": {"nouez": dict(entry)} if markets is None else markets}
+                if world.get("settings_env"):
+                    data["env"] = world["settings_env"]
+                self.write(data)
+                out = []
+                self.assertEqual(server.run_setup(["--auto-update"], out.append), 0)
+                self.assertEqual(self.read()["extraKnownMarketplaces"], data["extraKnownMarketplaces"])
+                self.assertEqual(store, {})
+                self.assertTrue(any(said in m for m in out), out)
+        # FORCE_AUTOUPDATE_PLUGINS=1 lets it through a variable that would turn it off.
+        on = {"extraKnownMarketplaces": {"nouez": {"autoUpdate": True}}}
+        self.assertEqual(server.auto_update_state(on, "nouez", None, ({}, None),
+                                                  {"DISABLE_UPDATES": "1", "FORCE_AUTOUPDATE_PLUGINS": "1"})[0], "on")
+        # Such a variable turns off the whole update pass, even one managed settings turn on.
+        self.assertEqual(server.auto_update_state({}, "nouez", None, (on, None), {"DISABLE_AUTOUPDATER": "1"})[0],
+                         "blocked")
+        # Set to 0 or false, such a variable is off.
+        self.assertEqual(server.auto_update_state(on, "nouez", None, ({}, None),
+                                                  {"DISABLE_AUTOUPDATER": "0", "DISABLE_UPDATES": "false"})[0], "on")
+        # With no marketplace entry in settings.json, setup can't turn it on, so it isn't offered.
+        note = server.auto_update_note("off", "the default", "nouez", False)
+        self.assertNotIn("setup --auto-update", note)
+        self.assertIn("/plugin, then Marketplaces", note)
+        # The /plugin toggle's value counts when the settings entry has none, and the entry wins over it.
+        self.assertEqual(server.auto_update_state({}, "nouez", {"nouez": {"autoUpdate": True}}, ({}, None), {}),
+                         ("on", "the /plugin toggle"))
+        off = {"extraKnownMarketplaces": {"nouez": {"autoUpdate": False}}}
+        self.assertEqual(server.auto_update_state(off, "nouez", {"nouez": {"autoUpdate": True}}, ({}, None), {})[0],
+                         "off")
+
+    def test_setups_links_lead_to_a_section_of_the_docs(self):
+        """0.31: setup's messages send Robin to the docs for the details; each link names a page in
+        docs/ and a heading on it, as GitHub makes its anchor, at the version that runs."""
+        here = os.path.dirname(os.path.abspath(server.__file__))
+        with open(os.path.join(here, "server.py"), encoding="utf-8") as f:
+            links = re.findall(r'doc_link\(\s*["\']([\w.-]+\.md)["\'],\s*["\']([\w-]+)["\']', f.read())
+        links += [("setup.md", "as-a-plugin"), ("setup.md", "from-a-clone")]
+        self.assertGreaterEqual(len(links), 4)
+        for page, slug in links:
+            with open(os.path.join(here, "docs", page), encoding="utf-8") as f:
+                heads = [re.sub(r"[^\w\- ]", "", h.strip().lower()).replace(" ", "-")
+                         for h in re.findall(r"^#+ (.+)$", f.read(), re.M)]
+            self.assertIn(slug, heads, page)
+        self.assertEqual(server.doc_link("setup.md", "as-a-plugin"),
+                         f"https://github.com/jibarix/nouez/blob/v{server.SERVER_VERSION}/docs/setup.md#as-a-plugin")
+        self.write({})
+        out = []
+        self.assertEqual(server.run_setup(["--dry-run"], out.append), 0)
+        self.assertIn(server.doc_link("setup.md", "from-a-clone"), out[-1])
+        with mock.patch.object(server, "plugin_marker", lambda: {"id": "nouez@nouez"}), \
+                mock.patch.object(server, "clone_registered", lambda: False):
+            self.assertEqual(server.run_setup(["--remove", "--dry-run"], out.append), 0)
+        self.assertIn(server.doc_link("setup.md", "as-a-plugin"), out[-1])
 
     def test_a_status_line_that_passes_its_input_on_is_kept(self):
         """Robin's own status line passes its input on to nouez's: /nouez:uninstall keeps it and says

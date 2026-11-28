@@ -46,6 +46,7 @@ import hashlib
 import hmac
 import json
 import math
+import ntpath
 import os
 import queue
 import reprlib
@@ -74,7 +75,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.30.3"
+SERVER_VERSION = "0.31.0"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -109,6 +110,7 @@ CLIENT_NAME = "nouez"  # the clientInfo name nouez gives Codex, which Codex reco
 SANDBOX = "read-only"
 RELEASES_URL = "https://api.github.com/repos/jibarix/nouez/releases/latest"
 RELEASE_PAGE = "https://github.com/jibarix/nouez/releases/tag/v{}"
+DOC_PAGE = "https://github.com/jibarix/nouez/blob/v{}/docs/{}#{}"  # the docs as this version ships them
 RELEASE_CHECK_SECONDS = 24 * 60 * 60  # how long a looked-up latest release is trusted
 RELEASE_RETRY_SECONDS = 60 * 60  # how long after a failed lookup the next one waits
 RELEASE_TIMEOUT = 3  # seconds each network step of the lookup may block; it runs in the background
@@ -5555,7 +5557,7 @@ def open_status_screen(args, cancel=None, progress=None):
     if page not in TOP_PAGES:
         raise BridgeError("page must be " + " or ".join(TOP_PAGES) + ".")
     away = (" It shows only on the computer's screen: to tell a user who is away from it how their usage "
-            "stands, use ConsultantBudget instead. [c] switches pages; they close it with q.")
+            "stands, use ConsultantBudget instead. [c] and [s] switch pages; they close it with q.")
     with FileLock(os.path.join(nouez_cache_dir(), "status-open.lock"), 10,
                   "Another Claude Code session is opening the status screen; nothing was done. Try again in a moment."):
         written = write_status_command({"page": page, **({"days": days} if days is not None else {})})
@@ -5661,11 +5663,11 @@ def in_repo(thread, root):
     return bool(cwd) and is_under(cwd, root)
 
 
-def with_disk_look(client, threads, root=None):
+def with_disk_look(client, threads, root=None, eligible=None):
     """threads, plus the consultants Codex finds on disk when threads holds none of nouez's: Lee
     restored his sessions without Codex's index, and StartConsultant must reuse his consultant rather
     than start a second one. It costs a second or two, only for a project with no consultant yet."""
-    if any(is_bridge(t) for t in threads):
+    if any(is_bridge(t) and (eligible is None or eligible(t)) for t in threads):
         return threads
     known = {t["id"] for t in threads}
     return threads + [t for t in load_consultants(client, root=root, fast=False) if t["id"] not in known]
@@ -5673,7 +5675,9 @@ def with_disk_look(client, threads, root=None):
 
 def repo_consultants(client, cwd):
     root = repo_root(cwd)
-    return root, [t for t in with_disk_look(client, load_consultants(client, root=root), root) if in_repo(t, root)]
+    # The disk look also runs when the index holds only a neighbouring folder's consultant (outside git).
+    threads = with_disk_look(client, load_consultants(client, root=root), root, lambda t: same_project(t, cwd))
+    return root, [t for t in threads if in_repo(t, root)]
 
 
 def default_cwd():
@@ -5760,6 +5764,11 @@ def list_consultants(args, cancel=None, progress=None):
 PROVIDERS = ("codex", "antigravity")
 
 
+def extra_note():
+    return ("    extra: started with new=true, so StartConsultant never reuses it; nouez closes it after "
+            f"{span_text(AUTO_CLOSE_IDLE)} idle\n")
+
+
 def start_consultant(args, cancel=None, progress=None):
     cwd = os.path.abspath(args.get("cwd") or default_cwd())
     if not os.path.isdir(cwd):
@@ -5812,19 +5821,23 @@ def start_consultant(args, cancel=None, progress=None):
             # duplicate splits the conversation across sessions. Only our own sessions are reused:
             # they were created read-only, while a user's session keeps the user's permissions.
             root, found = repo_consultants(client, cwd)
-            existing = sorted((t for t in found if is_bridge(t)),
-                              key=lambda t: t.get("updatedAt") or 0, reverse=True)
+            existing = reuse_order("codex", [t for t in found if is_bridge(t) and same_project(t, cwd)])
             users = [t for t in found if not is_bridge(t)]
         if existing:
             thread = existing[0]
             recent = list_turns(client, thread["id"], REPLY_LOOKBACK)
         else:
             thread = client.request("thread/start", params)["thread"]
+            unmarked = mark_extra(thread["id"]) if new else None
+            if unmarked:
+                title_note = (f"It couldn't be marked as a separate consultant ({unmarked}), so StartConsultant "
+                              "may reuse it, and it can become this project's main one.")
             if args.get("title"):
                 try:
                     client.request("thread/name/set", {"threadId": thread["id"], "name": args["title"]})
                 except Exception as e:  # the thread exists either way: an error here mustn't lose it
-                    title_note = f"Its title couldn't be set ({e}); it works without one."
+                    title_note = " ".join(n for n in (title_note, f"Its title couldn't be set ({e}); it works "
+                                                                  "without one.") if n)
         notice = "\n".join(n for n in (title_note, safe_nouez_update_notice(), update_notice(client.info)) if n)
 
     name = short_name(thread)
@@ -5842,6 +5855,7 @@ def start_consultant(args, cancel=None, progress=None):
             f"    cwd: {thread.get('cwd')}\n"
             f"    model: {thread.get('model')} ({thread.get('modelProvider')})\n"
             f"    sandbox: {SANDBOX}\n"
+            + (extra_note() if new else "")
             + "Send it work with SendConsultantMessage."
             + user_note
             + (f"\n{notice}" if notice else "")
@@ -7329,6 +7343,21 @@ def agy_hit_windows(live, now):
             for q in [quota_window("reached", "quota reached", None, 100, end, now, now, group=g)] if q]
 
 
+def reset_expiries(resets, now):
+    """When each free full reset Codex lists as available expires, soonest first: from the
+    `rateLimitResetCredits` of account/rateLimits/read. Ones without a future expiry are left out."""
+    credits = resets.get("credits") if isinstance(resets, dict) else None
+    return sorted(t for c in credits if isinstance(c, dict) and c.get("status") == "available"
+                  for t in [number(c.get("expiresAt"))] if t and t > now) if isinstance(credits, list) else []
+
+
+def expiring_resets(st, windows, now):
+    """The free full resets (their expiry times) that expire before the weekly window among
+    `windows` resets: usage they would restore goes unused unless spent first. [] when none."""
+    week = week_resets(windows)
+    return [t for t in (st or {}).get("reset_expiries") or () if week and now < t < week]
+
+
 def codex_budget(client, now, state=None):
     """Lines on the Codex account's usage windows and the models it offers. A `state` dict gets
     the same as data, for suggest_consultant: {"windows": [(length, used, resets_at)], "models":
@@ -7359,8 +7388,14 @@ def codex_budget(client, now, state=None):
         lines.append("  - no usage windows reported")
     resets = limits.get("rateLimitResetCredits")
     count = number(resets.get("availableCount")) if isinstance(resets, dict) else None
+    state["reset_expiries"] = reset_expiries(resets, now)
+    state["reset_count"] = count or 0
     if count:
         lines.append(f"  - {count:g} free full reset(s) available (only the user decides to use one)")
+        before = expiring_resets(state, state["windows"], now)
+        if before:
+            lines.append(f"  - {len(before)} of them expire{'s' if len(before) == 1 else ''} before the week resets, unused unless spent: "
+                         + ", ".join(time.strftime("%a %b %d %H:%M", time.localtime(t)) for t in before))
     try:
         models = client.request("model/list", {})
         models = models.get("data") if isinstance(models, dict) else None
@@ -7489,7 +7524,7 @@ def claude_budget(now, path=None, state=None):
     quota = claude_quota(now, path)
     if quota["status"] == "missing":
         return ["Claude Code: not known. Its usage reaches nouez only through the status line; "
-                "see Choosing a consultant in nouez's docs/consultants.md."]
+                f"how to pass it on: {doc_link('consultants.md', 'choosing-a-consultant')}"]
     if quota["status"] == "unreadable":
         return ["Claude Code: the saved usage file can't be read."]
     at, lines = quota["saved"], []
@@ -7582,7 +7617,7 @@ def aa_scores(now, refresh=False, env=None, path=None, fetch=None):
         key = (env.get(AA_KEY_VARIABLE) or "").strip()
     if not key:
         return cache, (f"no Artificial Analysis key: set {AA_KEY_VARIABLE} for the MCP server to get "
-                       "model scores (a free key; see Choosing a consultant in nouez's docs/consultants.md)")
+                       f"model scores (a free key; see {doc_link('consultants.md', 'choosing-a-consultant')})")
     fetched = number(cache.get("fetched")) or 0
     failed = number(cache.get("failed")) or 0
     due = now - fetched >= AA_REFRESH_SECONDS or (refresh and now - fetched >= 3600)
@@ -7675,13 +7710,10 @@ CONSULT_PICKS = {
 CONSULT_NOTES = {
     "review": "Ask for every finding in the first round, each with the scenario where a user meets it (their setup "
               "and what they do, what goes wrong, and where they would notice it: a command, a tool result, a "
-              "screen, a file), and \"Verdict: OK\" or \"Verdict: CHANGES\" on its first line, where nouez reads it. "
-              "Later rounds that only check named fixes are "
-              "re-checks. "
+              "screen, a file). Later rounds that only check named fixes are re-checks. "
               "nouez counts the rounds and says when to show the user the open points.",
-    "re-check": "Ask for the verdict on its first line and any new finding with its scenario, as in a review. "
-                "When new work comes up for review, send the "
-                "review's model and effort again.",
+    "re-check": "Ask for any new finding with its scenario, as in a review. When new work comes up for review, "
+                "send the review's model and effort again.",
     "bug-hunt": "Give it the failing command, its output and what you have ruled out, and ask for the cause with the "
                 "scenario where a user meets it. For a hard problem whose fix "
                 "is small, ask it to draft the fix as a unified diff in its reply; check it, then apply it with "
@@ -7693,6 +7725,9 @@ CONSULT_NOTES = {
              "Check it, apply it with git apply, run the tests, and have the change reviewed as usual.",
     "fact-check": "Ask for its sources, and check the ones you will rely on.",
 }
+# Added in code to these kinds' notes, so a prompts file can't drop the line nouez reads the verdict from.
+VERDICT_NOTE = "Ask for \"Verdict: OK\" or \"Verdict: CHANGES\" on its first line, where nouez reads it."
+VERDICT_KINDS = ("review", "re-check")
 # The subjects where Artificial Analysis's scores put Gemini 4 Neon ahead of every Codex model.
 NEON_SUBJECTS = "finance, legal, medicine, economics or strategy"
 SECOND_OPINION = ("When you and the consultant disagree on a finding, ask the other provider blind: "
@@ -8018,16 +8053,24 @@ def suggest_consultant(kind, state, now, only=None, revision=False):
         *outlook, basis = usage_outlook_detail(windows, now)
         outlook = tuple(outlook)
         if outlook[0] == "blocked":
-            blocked.append(f"{PROVIDER_TITLES[provider]} {got[0] or 'default model'}: {outlook[1]}")
+            banked = max(number((st or {}).get("reset_count")) or 0, len((st or {}).get("reset_expiries") or ()))
+            blocked.append(f"{PROVIDER_TITLES[provider]} {got[0] or 'default model'}: {outlook[1]}"
+                           + (f" ({banked} free full reset(s) available; only the user decides to use one)"
+                              if banked else ""))
             continue
+        # A free reset that expires before the week resets is usage that goes unused unless spent
+        # first: the subscription counts as spare however its week stands (0.31).
+        expiring = expiring_resets(st, windows, now) if outlook[0] != "unknown" else []
+        if expiring:
+            outlook = ("spare", outlook[1])
         notes = [got[2]] if got[2] else []
         if provider == "antigravity" and (got[0] or "").startswith(("claude-", "gpt-")):
             notes.append("A reused Antigravity consultant switches to this model for the message and keeps "
                          "its conversation.")
         options.append({"provider": provider, "model": got[0], "effort": got[1], "why": [why], "notes": notes,
                         "outlook": outlook, "basis": basis, "title": quota_title(provider, got[0], st),
-                        "resets": week_resets(windows),
-                        "behind": behind_schedule(windows, now)})
+                        "resets": min([t for t in [week_resets(windows)] if t] + expiring[:1], default=None),
+                        "expiring": expiring, "behind": behind_schedule(windows, now)})
     if not options:
         return {"none": "; ".join(blocked) if blocked else "no consultant CLI is installed"}
     best = options[0]
@@ -8063,6 +8106,11 @@ def suggest_consultant(kind, state, now, only=None, revision=False):
     outlook, title = best["outlook"], best["title"]
     if outlook[0] == "unknown":
         best["why"].append(f"{title}: usage not known")
+    elif best.get("expiring"):
+        n = len(best["expiring"])
+        best["why"].append(f"{title} has {n} free full reset{'s' if n > 1 else ''} expiring before its week "
+                           f"resets (the first {time.strftime('%a %b %d %H:%M', time.localtime(best['expiring'][0]))}), "
+                           "so its usage would go unused")
     elif outlook[0] == "spare":
         best["why"].append(f"{title} resets within {SPARE_DAYS} days at about {outlook[1]:.0f}% of its week, "
                            "so the rest would go unused")
@@ -8072,7 +8120,8 @@ def suggest_consultant(kind, state, now, only=None, revision=False):
     if eased != best["effort"]:
         best["effort"] = eased
         best["why"].append(EASED)
-    best["notes"] = best["notes"] + ([CONSULT_NOTES[kind]] if kind in CONSULT_NOTES else [])
+    note = prompt_text(f"note-{kind}") if kind in CONSULT_NOTES else ""
+    best["notes"] = best["notes"] + [n for n in (note, VERDICT_NOTE if kind in VERDICT_KINDS else "") if n]
     return best
 
 
@@ -8206,7 +8255,8 @@ def suggestion_lines(kind, state, now, only=None, revision=False):
             # The other provider, chosen the same way: from its models, levels and usage.
             other = suggest_consultant(k, {**state, best["provider"]: None}, now, None, revision)
             if "none" not in other:
-                lines.append(f"  {SECOND_OPINION} The other provider now: {call_text(other)}.")
+                lines.append("  " + " ".join(t for t in (prompt_text("second-opinion"),
+                                                f"The other provider now: {call_text(other)}.") if t))
         if k == "research" and best["provider"] == "antigravity" and state.get("codex") is not None:
             page = suggest_consultant(k, {**state, "antigravity": None}, now, None, revision)
             if "none" not in page:
@@ -9273,7 +9323,7 @@ def subscription_groups(now, codex_live, codex_saved, claude_path=None, agy_live
         note = f"{note} · {advice}" if note else advice
         short = f"{short} · {advice.split(':')[0]}" if short else advice.split(":")[0]
     groups.append({"title": "Claude Code", "entries": entries, "note": note, "short": short,
-                   "empty": "usage not known: it reaches nouez through the status line (docs/consultants.md, Choosing a consultant)"
+                   "empty": f"usage not known: it reaches nouez through the status line ({doc_link('consultants.md', 'choosing-a-consultant')})"
                    if quota["status"] != "ok" else "no current window saved yet"})
     if agy_live is not None:
         groups.append(agy_group(now, agy_live))
@@ -10045,6 +10095,7 @@ def start_agy_consultant(args, cwd):
     notice = safe_nouez_update_notice()
     notice = f"\n{notice}" if notice else ""
     root, existing = agy_repo_consultants(cwd)
+    existing = reuse_order("antigravity", [r for r in existing if same_project(r, cwd)])
     if existing and not new:
         rec = existing[0]
         recent = agy_turns(rec["id"], REPLY_LOOKBACK)
@@ -10070,7 +10121,8 @@ def start_agy_consultant(args, cwd):
     with agy_lock(None):  # two sessions starting consultants at once can't pick the same name
         taken = {r.get("name") for r in agy_consultants(include_stopped=True)}
         rec = {"id": cid, "name": agy_name(cwd, cid, taken), "cwd": cwd, "model": model,
-               "created": round(time.time(), 3), "instructions": instructions or None, "title": title}
+               "created": round(time.time(), 3), "instructions": instructions or None, "title": title,
+               **({"extra": True} if new else {})}
         try:
             checked_folder(agy_root(), cid, create=True)
         except OSError as e:
@@ -10083,7 +10135,8 @@ def start_agy_consultant(args, cwd):
             f"    cwd: {cwd}\n"
             f"    model: {model} (Antigravity)\n"
             f"    permissions: read-only (agy denies file writes and edits, commands and MCP tools)\n"
-            f"Send it work with SendConsultantMessage. Each message runs one agy turn; the "
+            + (extra_note() if new else "")
+            + f"Send it work with SendConsultantMessage. Each message runs one agy turn; the "
             "consultant keeps its conversation between messages." + notice)
 
 
@@ -10336,6 +10389,262 @@ def stop_agy_consultant(rec, turn_only=False):
     return (f"Stopped {rec['name']}." + (" Ended its running turn." if ended else "")
             + (f" Its conversation stays in Antigravity: to pick it up yourself, run "
                f"{agy_shown()} --conversation {conv} in {rec.get('cwd')}." if conv else ""))
+
+
+# --- Idle consultants close by themselves (0.31) ------------------------------
+
+AUTO_CLOSE_IDLE = 60 * 60  # a consultant other than its project's main closes after this long idle
+AUTO_CLOSE_EVERY = 10 * 60  # at most one sweep per computer this often
+AUTO_CLOSE_FILE = "auto-close.json"  # in nouez's cache folder: the last sweep's time and recent closes
+AUTO_CLOSE_SHOWN_DAYS = 7  # closes remembered for NouezStatus and doctor, to bring one back
+EXTRAS_DIR = "extras"  # in nouez's cache folder: one empty file per Codex consultant started with new=true
+_sweep = {"running": False}
+_sweep_guard = threading.Lock()
+_sweep_stop = threading.Event()  # set when the server's input ends: the sweep stops between closes
+
+
+def extra_marker(tid):
+    return os.path.join(nouez_cache_dir(), EXTRAS_DIR, re.sub(r"[^0-9A-Za-z-]", "_", tid))
+
+
+def mark_extra(tid):
+    """Record that the Codex consultant tid was started with new=true: an extra, never reused. The
+    mark stays when it is closed, so one brought back with codex unarchive is an extra still. What
+    went wrong, or None."""
+    try:
+        cache_folder(EXTRAS_DIR, create=True)
+        with open(extra_marker(tid), "w"):
+            pass
+    except OSError as e:  # the consultant works either way; unmarked, it counts as a possible main
+        log("extra mark:", e)
+        return str(e)
+    return None
+
+
+def is_extra(provider, item):
+    """Whether a consultant was started with new=true. One from before 0.31 isn't known as one."""
+    if provider == "antigravity":
+        return item.get("extra") is True
+    try:
+        return isinstance(item.get("id"), str) and os.path.isfile(extra_marker(item["id"]))
+    except OSError:
+        return False
+
+
+def last_use(provider, item):
+    """When a consultant last took a message (or started), as reuse and the sweep both order them."""
+    if provider == "antigravity":
+        ids = agy_turn_ids(item["id"])
+        meta = read_json_file(os.path.join(agy_folder(item["id"]), "turns", ids[0] + ".json")) if ids else None
+        return number((meta or {}).get("started")) or number(item.get("created")) or 0
+    return number(item.get("updatedAt")) or 0
+
+
+def reuse_order(provider, items):
+    """The consultants StartConsultant may reuse, the one it picks first: never an extra (new=true),
+    the most recently used first."""
+    return sorted((i for i in items if not is_extra(provider, i)), key=lambda i: last_use(provider, i),
+                  reverse=True)
+
+
+def consultant_group(cwd):
+    """A project, for the main consultant each keeps: its git work tree, or outside git the exact folder."""
+    return os.path.normcase(os.path.normpath(git_root(cwd) or os.path.abspath(cwd)))
+
+
+def same_project(item, cwd):
+    """Whether StartConsultant may reuse item from cwd: same git work tree, or outside git the same
+    exact folder, so a neighbour folder's consultant (its files, its history) is never handed over."""
+    return isinstance(item.get("cwd"), str) and bool(item["cwd"]) and consultant_group(item["cwd"]) == consultant_group(cwd)
+
+
+def project_mains(provider, items):
+    """The ids of each project's main consultant: the one StartConsultant reuses there. Outside git,
+    projects are exact folders, so a reuse from a folder above still picks one of them."""
+    groups = {}
+    for item in items:
+        if isinstance(item.get("cwd"), str) and item["cwd"]:
+            groups.setdefault(consultant_group(item["cwd"]), []).append(item)
+    return {order[0]["id"] for group in groups.values() for order in [reuse_order(provider, group)] if order}
+
+
+def turn_end(turn):
+    """When a finished turn ended, as far as its timestamps tell (its start, failing that), or None."""
+    end = number(turn.get("completedAt"))
+    if end is None:
+        start, ms = number(turn.get("startedAt")), number(turn.get("durationMs"))
+        end = start + ms / 1000 if start is not None and ms is not None else start
+    return end
+
+
+def idle_enough(row, turn, created, now):
+    """Whether a consultant may close: no turn running, its last reply read (with the usage log off,
+    not known, so not asked), and AUTO_CLOSE_IDLE since its last turn ended or that reply was read,
+    or, with no turn, since it started."""
+    if row["busy"] or row["pending"] or row["state"] != "idle":
+        return False
+    since = turn_end(turn) if turn else number(created)
+    return since is not None and now - max(since, row.get("verdict_at") or 0) >= AUTO_CLOSE_IDLE
+
+
+def closed_entry(provider, tid, name, idle_since, now):
+    entry = {"provider": provider, "id": tid, "name": _printable(str(name))[:80], "at": round(now, 3),
+             "idle_minutes": int((now - idle_since) // 60) if idle_since else None}
+    log(f"auto-close: closed {entry['name']} ({provider} {tid}), idle {entry['idle_minutes']} min")
+    record_usage({"event": "auto-close", "consultant": entry["name"], "thread": tid, "provider": provider,
+                  "idle_minutes": entry["idle_minutes"]})
+    return entry
+
+
+def close_idle_codex(client, thread, seen, now):
+    """Archive the Codex consultant `thread` when it is still as idle as the sweep saw it (`seen`, its
+    latest turn then), under StopConsultant's locks; never waits for a send. The closed entry, or None."""
+    tid, lock = thread["id"], send_lock(thread["id"])
+    if not lock.acquire(blocking=False):
+        return None
+    try:
+        with codex_lock(tid):
+            fresh = read_thread(client, tid)
+            if not fresh or archived(fresh) or (fresh.get("status") or {}).get("type") == "active":
+                return None
+            if (number(fresh.get("updatedAt")) or 0) > (number(thread.get("updatedAt")) or 0):
+                return None  # used since the sweep looked
+            turn = latest_turn(client, tid)
+            if (turn or {}).get("id") != (seen or {}).get("id") or (turn and turn.get("status") == "inProgress"):
+                return None
+            client.request("thread/archive", {"threadId": tid})
+    finally:
+        lock.release()
+    return closed_entry("codex", tid, short_name(thread), turn_end(turn) if turn else number(thread.get("createdAt")), now)
+
+
+def close_idle_agy(rec, seen, now):
+    """Mark the Antigravity consultant `rec` stopped when it is still as idle as the sweep saw it, under
+    StopConsultant's lock. The closed entry, or None."""
+    cid = rec["id"]
+    with agy_lock(cid):
+        fresh = read_json_file(os.path.join(agy_folder(cid), "consultant.json"))
+        if not fresh or fresh.get("id") != cid or fresh.get("stopped"):
+            return None
+        ids = agy_turn_ids(cid)
+        if (ids[0] if ids else None) != (seen or {}).get("id"):
+            return None  # a turn started since the sweep looked
+        turn = agy_turn(cid, ids[0]) if ids else None
+        if turn and turn.get("status") == "inProgress":
+            return None
+        agy_save({**fresh, "stopped": round(time.time(), 3), "conversation": agy_conversation(cid),
+                  "closed_idle": True})
+    return closed_entry("antigravity", cid, rec.get("name") or cid,
+                        turn_end(turn) if turn else number(rec.get("created")), now)
+
+
+def sweep_idle_consultants(now):
+    """Close nouez's own consultants that aren't their project's main, after AUTO_CLOSE_IDLE idle:
+    Codex ones are archived, Antigravity ones marked stopped, as StopConsultant does. The Codex daemon
+    isn't started for it. The closed entries."""
+    events = read_usage_log() if not usage_log_off() else []
+    closed = []
+
+    def close(step, *args):
+        if _sweep_stop.is_set():
+            return
+        try:
+            done = step(*args)
+        except (BridgeError, OSError) as e:  # busy elsewhere, or gone: the next sweep looks again
+            log("auto-close:", e)
+            return
+        if done:
+            closed.append(done)
+
+    if codex_installed():
+        try:
+            with contextlib.closing(CodexClient(timeout=30, start=False)) as client:
+                threads = [t for t in load_consultants(client) if is_bridge(t) and not archived(t)]
+                mains = project_mains("codex", threads)
+                rest = [t for t in threads if t["id"] not in mains]
+                latest = codex_overview_turns(client, rest)
+                rows = {r["id"]: r for r in consultant_overview(rest, [], events, latest)}
+                for t in rest:
+                    if t["id"] in rows and idle_enough(rows[t["id"]], latest.get(t["id"]), t.get("createdAt"), now):
+                        close(close_idle_codex, client, t, latest.get(t["id"]), now)
+        except DaemonDown:
+            pass  # no daemon running: nothing of Codex's is working, and nothing is started to close it
+        except (BridgeError, OSError) as e:
+            log("auto-close codex:", e)
+    recs = agy_consultants()
+    mains = project_mains("antigravity", recs)
+    rest = [r for r in recs if r["id"] not in mains]
+    latest = {}
+    rows = {r["id"]: r for r in overview_rows([], rest, events, latest)}
+    for rec in rest:
+        if rec["id"] in rows and idle_enough(rows[rec["id"]], latest.get(rec["id"]), rec.get("created"), now):
+            close(close_idle_agy, rec, latest.get(rec["id"]), now)
+    return closed
+
+
+def auto_close_file():
+    return os.path.join(nouez_cache_dir(), AUTO_CLOSE_FILE)
+
+
+def run_sweep(now=None):
+    """One sweep, unless no_auto_close is on, another nouez server on this computer is sweeping, or one
+    swept less than AUTO_CLOSE_EVERY ago. The consultants it closed, or None when it didn't run."""
+    if switch_on("no_auto_close"):
+        return None
+    path = auto_close_file()
+    try:
+        with FileLock(path + ".lock", 0, "another nouez server is closing idle consultants"):
+            state = read_json_file(path, limit=None) or {}
+            now = time.time() if now is None else now
+            if -60 <= now - (number(state.get("at")) or 0) < AUTO_CLOSE_EVERY:  # a clock set back: sweep again
+                return None
+            with _sweep_guard:
+                _sweep["running"] = True
+            try:
+                closed = sweep_idle_consultants(now)
+            finally:
+                with _sweep_guard:
+                    _sweep["running"] = False
+            kept = [c for c in state.get("closed") or [] if isinstance(c, dict)
+                    and now - (number(c.get("at")) or 0) < AUTO_CLOSE_SHOWN_DAYS * 86400] if isinstance(
+                state.get("closed"), list) else []
+            write_json_atomic(path, {"at": round(now, 3), "closed": closed[::-1] + kept})
+            return closed
+    except BridgeError:
+        return None
+
+
+def auto_close_loop():
+    """Each MCP server's timer for run_sweep."""
+    while not _sweep_stop.wait(AUTO_CLOSE_EVERY):
+        try:
+            run_sweep()
+        except Exception as e:  # the sweep must never take the server down
+            log("auto-close:", repr(e))
+
+
+def auto_close_report(now=None):
+    """A line on the consultants nouez closed for being idle in the last AUTO_CLOSE_SHOWN_DAYS days and
+    how to bring one back, or None when none were."""
+    if switch_on("no_auto_close"):
+        return "Idle consultants aren't closed (no_auto_close is on)."
+    now = time.time() if now is None else now
+    try:
+        state = read_json_file(auto_close_file(), limit=None) or {}
+    except OSError:
+        return None
+    closed = state.get("closed") if isinstance(state.get("closed"), list) else []
+    recent = [c for c in closed if isinstance(c, dict) and -60 <= now - (number(c.get("at")) or 0)
+              < AUTO_CLOSE_SHOWN_DAYS * 86400 and isinstance(c.get("id"), str)]
+    if not recent:
+        return None
+    codex = [c for c in recent if c.get("provider") == "codex"]
+    agy = [c for c in recent if c.get("provider") == "antigravity"]
+    return (f"{len(recent)} idle consultant(s) closed in the last {AUTO_CLOSE_SHOWN_DAYS} days (after "
+            f"{span_text(AUTO_CLOSE_IDLE)} idle; each project keeps its main one, and no_auto_close turns this off)."
+            + (f" To bring back a Codex one: codex unarchive ID (the latest: {_printable(str(codex[0].get('name')))},"
+               f" {_printable(codex[0]['id'])[:64]})." if codex else "")
+            + (" An Antigravity one's conversation stays in Antigravity (agy --conversation)." if agy else ""))
 
 
 def prune_agy_turns(now=None):
@@ -10683,17 +10992,26 @@ def top_bar(scr, groups, days, now, width):
 
 
 def bottom_bar(scr, width, scanning, view, busy=0):
-    """The keys, on the bottom line. view: "screen" (the usage page), "consultations" or "help";
+    """The keys, on the bottom line. view: "screen" (the usage page), "consultations", "sessions" or "help";
     busy: how many consultants are working, shown beside the key to their page."""
     if view == "help":
-        keys = " [?] or [Esc] back   [q] quit"
+        groups = ["[?] or [Esc] back", "[q] quit"]
     elif view == "consultations":
-        keys = " [↑↓] select   [PgUp PgDn Home End] scroll   [c] usage   [r] refresh   [?] help   [q] quit"
+        groups = ["[↑↓] select", "[PgUp PgDn Home End] scroll", "[c] usage", "[s] sessions", "[r] refresh",
+                  "[?] help", "[q] quit"]
+    elif view == "sessions":
+        groups = ["[s] usage", "[c] consultants", "[r] refresh", "[?] help", "[q] quit"]
     else:
         periods = "  ".join(f"[{k}] {'all' if v is None else f'{v}d'}" for k, v in TOP_PERIODS.items())
         working = f" ({busy} working)" if busy else ""
-        keys = f" {periods}   [c] consultants{working}   [r] refresh   [?] help   [q] quit"
+        groups = [periods, f"[c] consultants{working}", "[s] sessions", "[r] refresh", "[?] help", "[q] quit"]
     status = "reading transcripts… " if scanning else ""
+    # 0.31: on a narrow screen the keys close up, then [r] and [s] go (the help page still lists them),
+    # so [?] and [q] always show.
+    for sep, drop in (("   ", ()), ("  ", ()), ("  ", ("[r] refresh",)), ("  ", ("[r] refresh", "[s] sessions"))):
+        keys = " " + sep.join(g for g in groups if g not in drop)
+        if visible(keys) + visible(status) < width:
+            break
     gap = max(1, width - visible(keys) - visible(status))
     return scr.reverse(pad(keys + " " * gap + status, width))
 
@@ -10718,6 +11036,9 @@ def help_rows(scr):
                    "         first; the selected one's latest turn as it runs; and the command that opens it",
                    "         in its own CLI for you to type to. [c] again comes back here.",
                    "  [↑↓]   on that page, select a consultant; [PgUp] [PgDn] [Home] [End] scroll its turn",
+                   "  [s]    the sessions page: each Claude Code session's processes and their memory, the",
+                   "         phone dispatcher's, the Codex daemon's, Antigravity's turns, and nouez's processes",
+                   "         outside them. [s] again comes back here.",
                    "  [r]    read Codex's and Antigravity's usage and the consultants again now",
                    "  [?]    this help; [?] or [Esc] goes back",
                    "  [q]    quit (Esc and Ctrl+C too)", ""] + notes_rows(scr)
@@ -10799,7 +11120,7 @@ def _top_frame(scr, now, days, data, scanning, width, level, last, view):
 
 TOP_LIST_SECONDS = 12    # between reads of the consultants list
 TOP_TURN_SECONDS = 1.5   # between reads of the selected consultant's turn while it runs
-TOP_PAGES = ("usage", "consultations")
+TOP_PAGES = ("usage", "consultations", "sessions")
 VERDICT_COLOURS = {"yes": "32", "changes": "33", "no": "31", "incomplete": "31"}
 
 
@@ -11630,7 +11951,7 @@ def _supervise_top(args, flags, source, state):
         state["raise"] = False  # a signal while the screen starts is acted on once it has
         try:
             child = subprocess.Popen([sys.executable, *flags, source, "top", "--screen", "--supervised",
-                                      *since, *args])
+                                      *since, *args], env={**os.environ, "NOUEZ_TOP_PAGES": ",".join(TOP_PAGES)})
         except OSError as e:
             state["raise"] = True
             print(f"Could not start the status screen: {e}")
@@ -11680,7 +12001,7 @@ def _supervise_top(args, flags, source, state):
 
 
 def run_top(argv):
-    """`server.py top [--once] [--days N] [--page usage|consultations]`: the status screen.
+    """`server.py top [--once] [--days N] [--page usage|consultations|sessions]`: the status screen.
     --arranged (OpenStatusScreen's windows) records its window, so OpenStatusScreen can bring it
     forward; the status screen is never arranged."""
     arranged = "--arranged" in argv
@@ -11717,8 +12038,8 @@ def run_top(argv):
     except (IndexError, ValueError):
         page = None
     if page is None or (once and page != "usage"):
-        print("usage: server.py top [--once] [--days N] [--page usage|consultations]  "
-              "(N from 0, everything kept, to 65535; --once prints the usage page only)")
+        print("usage: server.py top [--once] [--days N] [--page usage|consultations|sessions]  "
+              "(N from 0, everything kept, to 65535; --once prints the usage and sessions pages)")
         return 2
     state_path = os.path.join(nouez_cache_dir(), SCAN_STATE_FILE)
     state = read_scan_state(state_path)
@@ -11741,6 +12062,14 @@ def run_top(argv):
         width = shutil.get_terminal_size().columns - 1 if tty_out else TOP_PANEL  # a file or pipe: one column
         print("\n".join(top_frame(scr, time.time(), days, shared["codex"], shared["scan"],
                                   read_usage_log(), False, width, shared["agy"], None, "once")))
+        try:
+            report, error = read_session_report(), None
+        except Exception as e:
+            log("sessions:", repr(e))
+            report, error = None, f"The processes couldn't be read: {e}"
+        print("\n".join(fit(line, width) for line in panel(
+            scr, heading(scr, "SESSIONS", "memory: each process tree's private working set"),
+            [error] if error else sessions_rows(report), min(width, TOP_PANEL))))
         return 0
 
     stop, refresh = threading.Event(), {"codex": threading.Event(), "agy": threading.Event()}
@@ -11782,6 +12111,7 @@ def run_top(argv):
             return TOP_QUIT  # supervisor quits on 70)
     redraw = threading.Event()  # set by the threads below for the screen to be drawn again now
     feed = ConsultationFeed(redraw.set)
+    sessions_feed = SessionsFeed(redraw.set)
     command_path, screen_path = status_command_file(), status_screen_file()
     # This screen's id: from its supervisor, or the lock it took itself. Never read from the file
     # alone, which can be an earlier screen's when this one's couldn't be written.
@@ -11817,6 +12147,7 @@ def run_top(argv):
     threading.Thread(target=background, daemon=True).start()
     feed_thread = threading.Thread(target=feed.run, daemon=True)
     feed_thread.start()
+    threading.Thread(target=sessions_feed.run, daemon=True).start()
     if not legacy or holder is not None:  # a second screen leaves commands to the first
         threading.Thread(target=commands, daemon=True).start()
     if shared["agy"] is not None:
@@ -11859,6 +12190,7 @@ def run_top(argv):
                 selected, scroll = (rows[0]["provider"], rows[0]["id"]), 0
             on_page = page == "consultations" and view != "help"
             feed.show(selected, on_page)
+            sessions_feed.show(page == "sessions" and view != "help")
             busy = sum(1 for r in rows or [] if r["busy"])
             now = time.time()
             # One column short of the edge, so no line wraps on a console that wraps at the last one.
@@ -11868,6 +12200,11 @@ def run_top(argv):
                     scr, now, rows, turn, error, selected, scroll, size.columns - 1, size.lines,
                     fit(top_bar(scr, groups, days, now, size.columns - 1), size.columns - 1),
                     bottom_bar(scr, size.columns - 1, scanning, "consultations"))
+            elif page == "sessions" and view != "help":
+                groups = subscription_groups(now, codex, scan.get("codex_limits"), agy_live=agy)
+                lines = sessions_frame(scr, *sessions_feed.state(), size.columns - 1, size.lines,
+                                       fit(top_bar(scr, groups, days, now, size.columns - 1), size.columns - 1),
+                                       bottom_bar(scr, size.columns - 1, scanning, "sessions"))
             else:
                 lines = top_frame(scr, now, days, codex, scan, read_usage_log(), scanning, size.columns - 1,
                                   agy, size.lines, view, busy)[:size.lines]
@@ -11883,11 +12220,14 @@ def run_top(argv):
             elif key in TOP_PERIODS:
                 days, view, page = TOP_PERIODS[key], "screen", "usage"
             elif key in ("c", "C"):
-                page, view, scroll = "consultations" if page == "usage" else "usage", "screen", 0
+                page, view, scroll = "consultations" if page != "consultations" else "usage", "screen", 0
+            elif key in ("s", "S"):
+                page, view = "sessions" if page != "sessions" else "usage", "screen"
             elif key in ("r", "R"):  # read again in the background; the screen keeps answering keys
                 refresh["codex"].set()
                 refresh["agy"].set()
                 feed.refresh()
+                sessions_feed.refresh()
             elif on_page and rows and key in ("up", "down", "k", "j"):
                 index = next((i for i, r in enumerate(rows) if (r["provider"], r["id"]) == selected), 0)
                 index = max(0, min(len(rows) - 1, index + (1 if key in ("down", "j") else -1)))
@@ -11906,9 +12246,411 @@ def run_top(argv):
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, posix_tty)
         release_status_screen(holder)
         feed.close(feed_thread)  # after the terminal is back: a slow close doesn't hold the window
-    if days == given and (page == given_page or legacy):
+        sessions_feed.close()
+    return top_exit_code(days, given, page, given_page, legacy)
+
+
+# --- The sessions page -----------------------------------------------------------
+# What runs on this computer for Claude Code and nouez: each session's processes and their memory,
+# the phone dispatcher's, the Codex daemon's, Antigravity's running turns and nouez's processes
+# outside all of them. Windows only. Read in a thread of its own (SessionsFeed), never while drawing.
+
+TOP_SESSIONS_SECONDS = 5  # between reads of the processes while the page is shown
+NOUEZ_COMMANDS = {"": "nouez mcp", "claude": "nouez wrapper", "wait": "nouez waiter", "top": "nouez status screen",
+                  "dispatcher": "nouez dispatcher", "arrange": "nouez arranger", "doctor": "nouez doctor",
+                  "settings": "nouez settings", "restore": "nouez restore", "statusline": "nouez status line",
+                  "hook": "nouez hook"}
+SAFE_WORD = re.compile(r"[A-Za-z0-9._:/-]{1,40}")
+FILETIME_UNIX = 11644473600  # seconds from 1601, where process times count from, to 1970
+
+
+def process_memory(handle):
+    """Windows: (private working set, committed private bytes) of a process, each None when it
+    can't be read. A Windows without PROCESS_MEMORY_COUNTERS_EX2 gives the committed bytes only."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in (
+                "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage",
+                "PrivateUsage", "PrivateWorkingSetSize", "SharedCommitUsage")]
+    k32 = ctypes.windll.kernel32
+    k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+    k32.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+    counters = Counters()
+    counters.cb = ctypes.sizeof(Counters)
+    if k32.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+        return counters.PrivateWorkingSetSize, counters.PrivateUsage
+    counters.cb = Counters.PrivateWorkingSetSize.offset  # PROCESS_MEMORY_COUNTERS_EX
+    if k32.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+        return None, counters.PrivateUsage
+    return None, None
+
+
+def needs_line(exe):
+    """Whether the sessions page reads a program's command line: Python's (for nouez's roles and
+    script names), Claude Code's (its start settings) and Codex's (the daemon)."""
+    name = ntpath.basename(exe or "").lower()
+    return name.startswith("python") or name in ("claude.exe", "codex.exe")
+
+
+def read_processes():
+    """Windows: {pid: {"ppid", "exe", "start", "line", "memory", "committed"}} for every running
+    process. What can't be read of one (another user's, or one that just ended) is None; its
+    command line and memory are read only through the handle its start time came from."""
+    procs = {}
+    for pid, (ppid, exe) in process_table().items():
+        info = {"ppid": ppid, "exe": exe, "start": None, "line": None, "memory": None, "committed": None}
+        handle = open_process(pid, QUERY | 0x10) or open_process(pid) if pid else None  # PROCESS_VM_READ
+        if handle:
+            try:
+                info["start"] = handle_start(handle)
+                if info["start"] is not None:
+                    if needs_line(exe):
+                        info["line"] = process_command_line(handle=handle)
+                    info["memory"], info["committed"] = process_memory(handle)
+            finally:
+                close_handle(handle)
+        procs[pid] = info
+    return procs
+
+
+# One of Python's options: flags (joined or not), then -X or -W with their value joined or next, or
+# -c or -m with what follows. Anything else that starts with "-" isn't read, so the label stays "python".
+PYTHON_OPTION = re.compile(r"-[bBdEhiIOPqRsSuvVx]*(?:([XW])(.*)|([cm])(.*)|)", re.S)
+
+
+def nouez_script_path(path):
+    """Whether a script path is nouez's server.py or launch.py: in a clone or the plugin's folders,
+    one of whose names starts with "nouez"."""
+    parts = re.split(r"[\\/]+", path.lower())
+    return parts[-1] in ("server.py", "launch.py") and any(p.startswith("nouez") for p in parts[:-1])
+
+
+def process_label(info):
+    """A short, safe name for a process, never its arguments: nouez's own by role (nouez mcp,
+    nouez wrapper, nouez launcher...), Python's by its -m module or script's file name, any other
+    by its program's name."""
+    exe = ntpath.basename(info.get("exe") or "") or "?"
+    stem = exe[:-4] if exe.lower().endswith(".exe") else exe
+    label = stem
+    if stem.lower().startswith("python"):
+        args = split_windows_args(info.get("line") or "")[1:]
+        label, i = stem, 0
+        while i < len(args):  # Python's own options; flags may be joined, as in -Ic or -Wignore
+            option = PYTHON_OPTION.fullmatch(args[i]) if args[i] != "-" else None  # "-": a script from stdin
+            if not option:
+                break
+            what, value = option.group(1) or option.group(3), option.group(2) or option.group(4) or ""
+            if what in ("X", "W"):
+                i += 1 if value else 2
+                continue
+            if what == "c":
+                label = "python -c"
+            elif what == "m":
+                module = value or (args[i + 1] if i + 1 < len(args) else "")
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,30}", module):
+                    label = f"python -m {module}"
+            i = len(args) if what in ("c", "m") else i + 1
+        else:
+            i = None  # options only, or one -c/-m: nothing more is read
+        rest = args[i:] if i is not None else []
+        if rest and not rest[0].startswith("-"):  # a script: only its file name is shown
+            if nouez_script_path(rest[0]):
+                label = ("nouez launcher" if ntpath.basename(rest[0]).lower() == "launch.py"
+                         else NOUEZ_COMMANDS.get(rest[1] if len(rest) > 1 else "", "nouez"))
+            else:
+                label = ntpath.basename(rest[0]) or stem
+    return _printable(label)[:40] or "?"
+
+
+def claude_start_settings(line):
+    """"model effort" from a claude command line, from its options before "--" (what follows is
+    the prompt's), each only when it is a plain word; "" when it sets neither."""
+    args = split_windows_args(line or "")[1:]
+    if "--" in args:
+        args = args[:args.index("--")]
+    found = []
+    for flag in ("--model", "--effort"):
+        value = None
+        for i, a in enumerate(args):
+            if a == flag and i + 1 < len(args):
+                value = args[i + 1]
+            elif a.startswith(flag + "="):
+                value = a[len(flag) + 1:]
+        if value and SAFE_WORD.fullmatch(value):
+            found.append(value)
+    return " ".join(found)
+
+
+def started_after(procs, parent, child):
+    """Whether `child` started no earlier than `parent`: a parent younger than its child is another
+    process that took a dead parent's pid."""
+    p, c = (procs.get(parent) or {}).get("start"), (procs.get(child) or {}).get("start")
+    return p is not None and c is not None and c >= p
+
+
+def session_root(procs, pid):
+    """Where a Claude Code session's processes start: the nouez wrapper OpenClaudeSession ran it
+    from, above it or above the cmd.exe in between, else the claude process itself."""
+    child, up = pid, 0
+    while up < 4:
+        parent = (procs.get(child) or {}).get("ppid")
+        info = procs.get(parent)
+        if not info or not started_after(procs, parent, child):
+            return pid
+        if process_label(info) == "nouez wrapper":
+            return parent
+        if (info.get("exe") or "").lower() != "cmd.exe":
+            return pid
+        child, up = parent, up + 1
+    return pid
+
+
+def codex_daemon_process(info):
+    """Whether a process is the Codex app-server daemon: codex's first argument is app-server, and
+    the next isn't proxy (a session's own connection to it)."""
+    if ntpath.basename(info.get("exe") or "").lower() not in ("codex.exe", "codex"):
+        return False
+    args = split_windows_args(info.get("line") or "")
+    return args[1:2] == ["app-server"] and args[2:3] != ["proxy"]
+
+
+def session_report(procs, sessions, dispatcher, agy_turns, now):
+    """What the sessions page shows, from read_processes(), claude_sessions(), the dispatcher's
+    (pid, since) or None, and Antigravity's running turns as (consultant name, pid). Each process
+    counts in one row only: sessions first, then the dispatcher, the Codex daemon, Antigravity's
+    turns, and nouez's processes outside all of them."""
+    children = {}
+    for pid in sorted(procs, key=lambda p: procs[p].get("start") or 0):
+        children.setdefault(procs[pid].get("ppid"), []).append(pid)
+    claimed = set()
+    live = []
+    for s in sessions:
+        pid = s.get("pid")
+        info = procs.get(pid)
+        if not info or info.get("start") is None or (s.get("start") is not None and info["start"] != s["start"]):
+            continue  # ended, or its pid is another process's now
+        live.append((s, pid, session_root(procs, pid)))
+    daemon = [p for p in sorted(procs, key=lambda p: procs[p].get("start") or 0) if codex_daemon_process(procs[p])]
+    # Each row's own processes start its tree only: a session opened from another session, or an
+    # Antigravity turn under a session's nouez, keeps its own row.
+    reserved = {root for _, _, root in live} | set(daemon) | {pid for _, pid in agy_turns}
+    if dispatcher:
+        reserved.add(dispatcher[0])
+
+    def tree(root):
+        out, todo = [], [root]
+        while todo:
+            pid = todo.pop()
+            if pid in claimed or pid not in procs or procs[pid].get("start") is None:
+                continue
+            claimed.add(pid)
+            out.append(pid)
+            todo += [c for c in children.get(pid, ()) if started_after(procs, pid, c) and c not in reserved]
+        return out
+
+    def group(kind, title, roots, **extra):
+        pids = [p for r in roots for p in tree(r)]
+        if not pids:
+            return None
+        memory = [procs[p].get("memory") for p in pids]
+        known = [m for m in memory if m is not None]
+        parts = {}
+        for p in pids:
+            part = parts.setdefault(process_label(procs[p]), [0, 0])
+            part[0] += 1
+            part[1] += procs[p].get("memory") or 0
+        return {"kind": kind, "title": _printable(str(title))[:60], "processes": len(pids),
+                "memory": sum(known) if known else None, "unknown": len(memory) - len(known),
+                "committed": sum(procs[p].get("committed") or 0 for p in pids) or None,
+                "parts": sorted(parts.items(), key=lambda kv: (-kv[1][1], kv[0])), **extra}
+
+    rows = []
+    for s, pid, root in live:
+        info = procs[pid]
+        row = group("session", s.get("name") or "?", [root],
+                    settings=claude_start_settings(info.get("line")), cwd=_printable(str(s.get("cwd") or "?")),
+                    status=_printable(str(s.get("status") or "?"))[:20])
+        if row:
+            rows.append(row)
+    if dispatcher:
+        pid, since = dispatcher
+        info = procs.get(pid) or {}
+        start = info.get("start")
+        if (isinstance(pid, int) and start is not None and number(since) is not None
+                and start / 1e7 - FILETIME_UNIX <= since + 60 and process_label(info) == "nouez dispatcher"):
+            row = group("dispatcher", "Phone dispatcher", [pid])
+            if row:
+                rows.append(row)
+    row = group("daemon", "Codex daemon", daemon)
+    if row:
+        rows.append(row)
+    for name, pid in agy_turns:
+        row = group("agy", f"Antigravity turn of {name}", [pid])
+        if row:
+            rows.append(row)
+    for pid in sorted(procs, key=lambda p: procs[p].get("start") or 0):
+        info = procs[pid]
+        if pid in claimed or info.get("start") is None or not process_label(info).startswith("nouez"):
+            continue
+        age = max(0, now - (info["start"] / 1e7 - FILETIME_UNIX))
+        row = group("other", process_label(info), [pid], age=age)
+        if row:
+            rows.append(row)
+    return {"rows": rows, "at": now}
+
+
+def read_session_report(now=None):
+    """The sessions page's data now (see session_report), or None off Windows."""
+    if os.name != "nt":
+        return None
+    sessions = claude_sessions()
+    procs = read_processes()
+    running, state = dispatcher_status()
+    dispatcher = (state.get("pid"), state.get("since")) if running and state else None
+    try:
+        agy = agy_running_turns()
+    except Exception as e:  # a bad record mustn't hide the rest
+        log("sessions: agy turns:", repr(e))
+        agy = []
+    return session_report(procs, sessions, dispatcher, agy, time.time() if now is None else now)
+
+
+def agy_running_turns():
+    """(consultant name, pid) of each Antigravity turn running now, nouez's own process."""
+    out = []
+    for rec in agy_consultants():
+        ids = agy_turn_ids(rec["id"])
+        if not ids:
+            continue
+        meta = read_json_file(os.path.join(agy_folder(rec["id"]), "turns", ids[0] + ".json")) or {}
+        if meta.get("stopped"):
+            continue
+        state, handle = agy_identity(meta)
+        close_handle(handle)
+        if state == "ours":
+            out.append((rec.get("name") or rec["id"][:8], meta["pid"]))
+    return out
+
+
+def bytes_text(n):
+    if n is None:
+        return "not known"
+    mb = n / (1 << 20)
+    if mb < 1:
+        return "<1 MB"
+    return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+
+
+def sessions_rows(report):
+    """The sessions page's lines, for the page, `top --once` and NouezStatus."""
+    if report is None:
+        return ["The sessions page reads Windows' processes, so it shows nothing on this system."]
+    lines = []
+    for row in report["rows"]:
+        size = bytes_text(row["memory"]) + (f" (+{row['unknown']} not read)" if row["unknown"] and row["memory"] else "")
+        committed = f", committed {bytes_text(row['committed'])}" if row["committed"] else ""
+        count = f"{row['processes']} process{'es' if row['processes'] != 1 else ''}"
+        if row["kind"] == "session":
+            head = (f"{row['title']} ({row['status']})" + (f" · started: {row['settings']}" if row["settings"] else "")
+                    + f" · {size}{committed} in {count} · {row['cwd']}")
+        elif row["kind"] == "other":
+            head = f"{row['title']}, outside every session, running {span_text(row['age'])} · {size} in {count}"
+        else:
+            head = f"{row['title']} · {size}{committed} in {count}"
+        lines.append(head)
+        if row["processes"] > 1:
+            parts = [f"{label}{f' ×{n}' if n > 1 else ''} {bytes_text(mem)}" for label, (n, mem) in row["parts"]]
+            lines.append("    " + ", ".join(parts[:6]) + (", …" if len(parts) > 6 else ""))
+    total = [r["memory"] for r in report["rows"] if r["memory"] is not None]
+    if not report["rows"]:
+        lines.append("No Claude Code session or nouez process is running.")
+    else:
+        lines.append(f"In all: {bytes_text(sum(total) if total else None)} in "
+                     f"{sum(r['processes'] for r in report['rows'])} processes.")
+    return lines
+
+
+class SessionsFeed:
+    """The sessions page's data, read in a thread of its own while the page is shown (every
+    TOP_SESSIONS_SECONDS, at once when it is opened or refresh() is called), so drawing never
+    waits for it. on_change() is called after each read."""
+
+    def __init__(self, on_change=lambda: None, read=None):
+        self.guard, self.wake, self.stop = threading.Lock(), threading.Event(), threading.Event()
+        self.report = self.error = None
+        self.shown, self.read, self.on_change = False, read or read_session_report, on_change
+
+    def state(self):
+        with self.guard:
+            return self.report, self.error
+
+    def show(self, shown):
+        with self.guard:
+            opened, self.shown = shown and not self.shown, shown
+        if opened:
+            self.wake.set()
+
+    def refresh(self):
+        self.wake.set()
+
+    def run(self):
+        while not self.stop.is_set():
+            with self.guard:
+                shown = self.shown
+            if shown:
+                try:
+                    report, error = self.read(), None
+                except Exception as e:  # a process that can't be read mustn't end the page
+                    log("sessions page:", repr(e))
+                    report, error = None, f"Couldn't read the processes: {e}"
+                with self.guard:
+                    if error is None:
+                        self.report = report
+                    self.error = error
+                self.on_change()
+            self.wake.wait(TOP_SESSIONS_SECONDS if shown else 1)
+            self.wake.clear()
+
+    def close(self, thread=None):
+        self.stop.set()
+        self.wake.set()
+        if thread is not None:
+            thread.join(5)
+
+
+def sessions_frame(scr, report, error, width, height, top, bottom):
+    """The sessions page as lines, at most `height`."""
+    if report is None and error is None and os.name == "nt":
+        body = ["Reading the processes…"]
+    else:
+        body = ([error] if error else []) + sessions_rows(report)
+    note = "memory: each process tree's private working set"
+    lines = [top] + panel(scr, heading(scr, "SESSIONS", note), body, min(width, TOP_PANEL)) + [bottom]
+    lines = [fit(line, width) for line in lines]
+    if height and len(lines) > height:
+        shown = lines[:max(0, height - 2)]
+        more = fit(f" … {len(lines) - 1 - len(shown)} more line(s): make the window taller, or run "
+                   "`server.py top --once`", width)
+        return shown + [more] + lines[-1:]
+    return lines
+
+
+def top_exit_code(days, given, page, given_page, legacy, supervisor_pages=None):
+    """The status screen's exit code when server.py changed: start again as it was given, or on
+    `page` with period `days` (reload_code). A supervisor from before 0.31 knows only the usage and
+    consultations pages' codes and takes any other for a crash, so the sessions page comes back
+    as the usage page under it; a supervisor from 0.31 on names its pages in NOUEZ_TOP_PAGES."""
+    if supervisor_pages is None:
+        supervisor_pages = (os.environ.get("NOUEZ_TOP_PAGES") or "usage,consultations").split(",")
+    if legacy or page not in supervisor_pages:
+        page = "usage"
+    if days == given and page == given_page:
         return TOP_RELOAD  # supervise_top starts it again
-    return reload_code(days, "usage" if legacy else page, given)
+    return reload_code(days, page, given)
 
 
 # --- MCP stdio server --------------------------------------------------------
@@ -11921,14 +12663,16 @@ INSTRUCTIONS_HEAD = (
 # second opinion pays, without being asked. Left out when no consultant CLI is installed, or with
 # NOUEZ_NO_AUTO_CONSULT=1. Kept short with the rest (a test sets the cap): the moments to consult,
 # and what to call; how each tool works is in its description. 0.28.6: the review is tied to the
-# diff being committed, the critique to a choice the request leaves open.
+# diff being committed, the critique to a choice the request leaves open. 0.31: that choice is told
+# by whether two sound implementations would differ, not by the files touched; a goal with
+# constraints ("make the change") still leaves it (the eval's "plan" case was missed 0/3 in 0.30.x).
 AUTO_CONSULT = (
     "Unless the user's own instructions say otherwise, also consult unasked:\n"
     "- before a commit whose diff changes behavior, even by one line, or is risky: a review of that "
     "diff (revision=true), then commit after its verdict;\n"
-    "- before the first edit, when the request leaves you a consequential choice (design, formula, "
-    "rule): a critique of your draft; build on it only after the verdict. Not when the request spells "
-    "the change out;\n"
+    "- before the first edit, when the request leaves you a consequential choice (two sound designs, "
+    "formulas or rules would differ), constraints or not: a critique of your plan; build after its "
+    "verdict. Not when the request spells the change out;\n"
     "- when a failure's cause isn't obvious after a first look: a bug hunt;\n"
     "- for research across sources (instead of searching the web yourself), an audit spanning many "
     "files, or a consequential claim still uncertain: hand it out, for a short answer.\n"
@@ -11977,7 +12721,129 @@ def server_instructions():
     and the user hasn't turned it off; in the phone dispatcher, the phone setup offered until it is done."""
     auto = not auto_consult_off() and (codex_installed() or bool(agy_command()))
     offer = PHONE_SETUP_OFFER if in_dispatcher() and not setup_done() else ""
-    return INSTRUCTIONS_HEAD + (AUTO_CONSULT if auto else "") + INSTRUCTIONS + offer + both_note()
+    consult = prompt_text("auto-consult") if auto else ""
+    return (INSTRUCTIONS_HEAD + (consult + "\n" if consult else "") + prompt_text("instructions") + offer
+            + both_note())
+
+
+# --- Editable prompts --------------------------------------------------------
+# 0.31: the user's own wording for nouez's prompts, in prompts.md in nouez's settings folder. A line
+# "## key" starts each one; text before the first is ignored. A key left out keeps nouez's text, so
+# later releases' wording still reaches it; a key left empty drops that text. The verdict line nouez
+# reads, the tools' descriptions and every protection stay in code.
+PROMPTS_FILE = "prompts.md"
+PROMPT_HEADING = re.compile(r"^##[ \t]+(\S+)[ \t]*$")
+_prompts_seen = {}  # path -> (what lstat said, (prompts, problem)): read again only when it changes
+
+
+def prompt_defaults():
+    """nouez's own text for each key a prompts file can replace."""
+    out = {"auto-consult": AUTO_CONSULT.rstrip("\n"), "instructions": INSTRUCTIONS,
+           "second-opinion": SECOND_OPINION}
+    out.update({f"note-{kind}": text for kind, text in CONSULT_NOTES.items()})
+    return out
+
+
+def prompts_path():
+    """Where the user's prompts file goes; OSError if its folder can't be used."""
+    return dispatcher_file(PROMPTS_FILE)
+
+
+def parse_prompts(text):
+    """({key: text}, [what was ignored]) from a prompts file's text."""
+    known, found, ignored, key, body = prompt_defaults(), {}, [], None, []
+
+    def keep():
+        if key is None:
+            return
+        if key not in known:
+            ignored.append(f"unknown key {key}")
+        elif key in found:
+            ignored.append(f"{key} given twice (the last is used)")
+        found[key] = "\n".join(body).strip()
+    for line in text.splitlines():
+        heading = PROMPT_HEADING.match(line)
+        if heading:
+            keep()
+            key, body = heading.group(1).lower(), []
+        elif key is not None:
+            body.append(line)
+    keep()
+    return {k: v for k, v in found.items() if k in known}, ignored
+
+
+def read_prompts():
+    """({key: text}, problem or None) from the user's prompts file: nothing when there is none or its
+    folder can't be used; a problem, and nouez's own text for every key, when it can't be read."""
+    try:
+        path = prompts_path()
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return {}, None
+    except OSError as e:
+        return {}, f"couldn't be read ({e}), so nouez's own text is used"
+    stamp = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_mode)
+    seen = _prompts_seen.get(path)
+    if seen and seen[0] == stamp:
+        return seen[1]
+    try:
+        data = read_regular_file(path)
+        found, ignored = parse_prompts((data or b"").decode("utf-8-sig"))
+        result = (found, ("ignored: " + "; ".join(ignored)) if ignored else None)
+    except (OSError, UnicodeDecodeError) as e:
+        result = ({}, f"couldn't be read ({e}), so nouez's own text is used")
+    _prompts_seen[path] = (stamp, result)
+    return result
+
+
+def prompt_text(key):
+    """The text in use for `key`: the user's from the prompts file, else nouez's own."""
+    found = read_prompts()[0]
+    return found[key] if key in found else prompt_defaults()[key]
+
+
+def prompts_summary():
+    """One line on the prompts file for doctor and NouezStatus: which keys it replaces, and what it
+    ignored; None when there is no file and nothing to say."""
+    found, problem = read_prompts()
+    try:
+        where = prompts_path()
+    except OSError:
+        return None
+    if not found and not problem:
+        return None
+    text = (f"{where} replaces nouez's text for " + ", ".join(sorted(found)) if found
+            else f"{where} replaces none of nouez's text")
+    if found:
+        text += " (it doesn't get nouez's newer wording for those)"
+    return text + (f"; {problem}" if problem else "")
+
+
+PROMPTS_USAGE = "usage: server.py prompts"
+
+
+def run_prompts(argv, out=print):
+    """`server.py prompts`: where the prompts file goes, what it replaces, and each prompt's text in
+    use, in the file's own form to copy from. Exit code."""
+    if argv:
+        out(PROMPTS_USAGE)
+        return 2
+    try:
+        where = prompts_path()
+    except OSError as e:
+        where = f"(its folder can't be used: {e})"
+    found, problem = read_prompts()
+    out(f"nouez's prompts. To use your own wording, put a section in {where}: a line \"## key\", then the "
+        "text. A key you leave out keeps nouez's text, and its newer wording after updates; an empty one "
+        "drops that text. Lines before the first section are ignored. auto-consult and instructions reach "
+        "conversations started after the change; the notes and second-opinion, the next ConsultantBudget. "
+        "The verdict line nouez reads, the tools' descriptions and every protection stay in nouez's code.")
+    if problem:
+        out(f"The file {problem}.")
+    for key, text in prompt_defaults().items():
+        mine = key in found
+        out(f"\n## {key}\n" + ("(yours, from the file)\n" if mine else "") + (found[key] if mine else text))
+    return 0
 
 
 def both_note():
@@ -12543,6 +13409,9 @@ def nouez_status(args, cancel=None, progress=None):
         except Exception as e:
             log("status consultants:", repr(e))
             lines.append("- Consultants: not known now (they couldn't be read).")
+        closed = auto_close_report(now)
+        if closed:
+            lines.append("  " + closed)
     try:
         sessions = claude_sessions()
         names = ", ".join(str(x.get("name")) for x in sessions[:8]) + (", …" if len(sessions) > 8 else "")
@@ -12550,6 +13419,13 @@ def nouez_status(args, cancel=None, progress=None):
     except Exception as e:
         log("status sessions:", repr(e))
         lines.append("- Claude Code sessions: not known now (they couldn't be listed).")
+    if os.name == "nt":
+        check_cancel(cancel)
+        try:  # the status screen's sessions page, as text: each one's processes and memory
+            lines += ["  " + line for line in sessions_rows(read_session_report(now))]
+        except Exception as e:
+            log("status processes:", repr(e))
+            lines.append("  Their processes and memory couldn't be read now.")
     try:
         running, state = dispatcher_status()
         if not running and not state:
@@ -12577,6 +13453,9 @@ def nouez_status(args, cancel=None, progress=None):
     roots = projects_text(dispatcher_roots_now() if in_dispatcher() else recorded_roots())
     lines.append(f"- {roots[:1].upper()}{roots[1:]}.")
     lines.append("- Phone setup: " + ("done." if value.get("setup_done") is True else "not done yet."))
+    prompts = prompts_summary()
+    if prompts:
+        lines.append(f"- Your prompts: {prompts}.")
     return with_login_warning("\n".join(lines))
 
 
@@ -12839,7 +13718,8 @@ TOOLS = [
             "window, or by switching the one already open. Its usage page shows each subscription's "
             "usage windows, the consultations logged and how much work was moved off Claude Code; its "
             "consultations page shows every consultant nouez started, across projects, the selected "
-            "one's latest turn as it runs, and the command that opens it in its own CLI. Use it only "
+            "one's latest turn as it runs, and the command that opens it in its own CLI; its sessions "
+            "page shows each Claude Code session's processes and memory. Use it only "
             "when the user asks to see it on the computer; it shows nowhere else. To tell a user who "
             "is away from the computer how their usage stands, use ConsultantBudget."
         ),
@@ -13585,6 +14465,8 @@ SWITCHES = {
                        "nouez doesn't check when Claude Code's sign-in ends"),
     "no_update_check": ("NOUEZ_NO_UPDATE_CHECK", "yes", False, "the next check",
                         "nouez doesn't ask GitHub for its latest release"),
+    "no_auto_close": ("NOUEZ_NO_AUTO_CLOSE", "1", False, "the next sweep",
+                      "nouez never closes idle consultants by itself"),
 }
 ROOT_SOURCES = ("default", "projects", "phone")  # where a projects folder came from
 _settings_seen = {}  # path -> (what lstat said, (settings, state)): read again only when it changes
@@ -15627,7 +16509,8 @@ def statusline_offer(dry_run, add, out=print, ask=None):
             return
         if entry is not None:
             out(f"\n{path} has a status line of your own; it is kept. To let nouez see Claude Code's usage, "
-                f"have it pass its input on to `{usage_command('statusline --quiet')}` (docs/consultants.md).")
+                f"have it pass its input on to `{usage_command('statusline --quiet')}` (how: "
+                f"{doc_link('consultants.md', 'choosing-a-consultant')}).")
             return
         offer = ("nouez's status line passes Claude Code's usage to nouez, so it can hand work to consultants "
                  "before Claude Code runs short, and shows the model and both usage windows")
@@ -15785,7 +16668,7 @@ def dispatcher_setup(folder, dry_run=False, out=print, projects=None, statusline
             f"none of its tools: `claude plugin enable {plugin_marker()['id']}`.")
     elif registered is False:
         out("Claude Code doesn't run nouez as `consultants` there, so the dispatcher has none of its tools: "
-            "register it for every project (README, Setup: `claude mcp add --scope user consultants ...`).")
+            f"register it for every project (`claude mcp add --scope user consultants ...`: {doc_link('setup.md', 'from-a-clone')}).")
     elif registered is None:
         out("Couldn't read Claude Code's settings to check that nouez is registered there.")
     trusted = dispatcher_trusted(folder)
@@ -16760,8 +17643,9 @@ def dispatcher_report(say):
     if (not ready and (installed == "no" or installed is None and not start_unknown_text())
             and not running and not problems):
         say(None, f"no dispatcher is set up (looked in {folder}), so the Claude phone app can reach this "
-                  "computer only through sessions you start here. `server.py dispatcher setup`, then "
-                  "`install`, sets one up (README, Setup).")
+                  "computer only through sessions you start here. " + (
+                      "`/nouez:setup` sets one up." if plugin_marker() else
+                      f"`server.py dispatcher setup`, then `install`, sets one up ({doc_link('setup.md', 'from-a-clone')})."))
         return
     say(True if ready else None, f"dispatcher folder {folder}" + ("" if ready else ": it has no CLAUDE.md; run "
                                                                        "`server.py dispatcher setup`"))
@@ -16884,7 +17768,7 @@ def clone_place_note(script=None):
             if inside_folder(path, box):
                 return (f"nouez runs from {path}, in {what} ({box}), which may be emptied: Claude Code, the "
                         "waiter and the dispatcher would then run a file that is gone. Move the clone to a "
-                        "folder of its own (~/nouez, say), then register it again from there (README, Setup).")
+                        f"folder of its own (~/nouez, say), then register it again from there ({doc_link('setup.md', 'from-a-clone')}).")
     return None
 
 
@@ -16958,7 +17842,7 @@ def script_paths_report(settings):
         names = list(dict.fromkeys(what for what, _ in places))
         listed = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
         return True, f"{listed} {'names' if len(names) == 1 else 'name'} this server.py"
-    repairs = {"the `consultants` registration": "register nouez again from here (README, Setup)",
+    repairs = {"the `consultants` registration": f"register nouez again from here ({doc_link('setup.md', 'from-a-clone')})",
                "the running dispatcher": "run `server.py dispatcher install` from here"}
     # No clone is registered with the plugin (that returned above), so setup takes out the waiter
     # rules of a clone that is still there (clone_waiter_rules).
@@ -17017,7 +17901,174 @@ def clone_waiter_rules(allow):
             and len(scripts_in(r)) == 1 and other(scripts_in(r)[0]) and nouez_script(scripts_in(r)[0])]
 
 
-SETUP_USAGE = "usage: server.py setup [--dry-run] [--statusline | --remove]"
+# 0.31: setup --auto-update. Claude Code updates a plugin from a marketplace not from Anthropic only
+# when that marketplace's auto-update is on, and it is off by default there. Which setting wins, per
+# Claude Code's docs (plugins, "Which marketplaces and plugins auto-update"): managed settings lock it;
+# DISABLE_UPDATES, DISABLE_AUTOUPDATER or CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC turn the whole pass
+# off unless FORCE_AUTOUPDATE_PLUGINS=1; then autoUpdate on the extraKnownMarketplaces entry in
+# settings.json; then the /plugin toggle's value in known_marketplaces.json; then the default.
+UPDATE_OFF_VARS = ("DISABLE_UPDATES", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+AUTO_UPDATE_KEY = "auto_update_set"  # nouez's settings file: what setup --auto-update changed
+AUTO_UPDATE_STEPS = ("In Claude Code, /plugin, then Marketplaces, pick {market} and turn on its auto-update "
+                     "(it updates every plugin from that marketplace).")
+
+
+def managed_settings_file():
+    """Where Claude Code reads its managed settings file on this system."""
+    if os.name == "nt":
+        return os.path.join(os.environ.get("ProgramFiles") or r"C:\Program Files", "ClaudeCode", "managed-settings.json")
+    if sys.platform == "darwin":
+        return "/Library/Application Support/ClaudeCode/managed-settings.json"
+    return "/etc/claude-code/managed-settings.json"
+
+
+def managed_settings():
+    """(the managed settings, problem): ({}, None) when there is no file; (None, why) when one is
+    there but can't be read, isn't JSON or isn't an object, or is a link, so nothing is assumed."""
+    path = managed_settings_file()
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return {}, None
+    except OSError as e:
+        return None, str(e)
+    value = read_json_file(path)
+    return (value, None) if value is not None else (None, "it can't be read as a settings object")
+
+
+def env_on(value):
+    """Whether an environment variable is set to on (1, true, yes or on), as Claude Code reads its
+    switches; 0, false or empty is off."""
+    return str(value if value is not None else "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def auto_update_state(data, market, known=None, managed=None, environ=None):
+    """(state, where) for the marketplace `market`'s auto-update, from Claude Code's user settings
+    `data`: state "on", "off", "locked on" or "locked off" (managed settings), "blocked" (a variable
+    turns updates off) or "unknown" (the managed settings can't be read). `known` is
+    known_marketplaces.json's object, `managed` managed_settings()'s pair, `environ` os.environ."""
+    managed, problem = managed if managed is not None else managed_settings()
+    if problem:
+        return "unknown", f"the managed settings file {managed_settings_file()} can't be read ({problem})"
+    environ = os.environ if environ is None else environ
+    entry = lambda d: ((d or {}).get("extraKnownMarketplaces") or {}).get(market) \
+        if isinstance((d or {}).get("extraKnownMarketplaces") or {}, dict) else None
+    envs = [("the environment", environ)] + [(f"{name}'s env", d.get("env")) for name, d in
+                                              (("managed settings", managed), ("settings.json", data))
+                                              if isinstance(d.get("env"), dict)]
+    forced = any(env_on(e.get("FORCE_AUTOUPDATE_PLUGINS")) for _, e in envs)
+    for var in UPDATE_OFF_VARS:
+        for where, e in envs:
+            if env_on(e.get(var)) and not forced:
+                return "blocked", f"{var} is set in {where}"
+    # Claude Code's docs: these variables turn the whole update pass off, so they come before any
+    # marketplace's own setting, managed ones included.
+    locked = entry(managed)
+    if isinstance(locked, dict) and isinstance(locked.get("autoUpdate"), bool):
+        return f"locked {'on' if locked['autoUpdate'] else 'off'}", f"managed settings ({managed_settings_file()})"
+    mine = entry(data)
+    if isinstance(mine, dict) and isinstance(mine.get("autoUpdate"), bool):
+        return ("on" if mine["autoUpdate"] else "off"), f"settings.json's extraKnownMarketplaces.{market}"
+    toggle = (known or {}).get(market) if isinstance(known, dict) else None
+    if isinstance(toggle, dict) and isinstance(toggle.get("autoUpdate"), bool):
+        return ("on" if toggle["autoUpdate"] else "off"), "the /plugin toggle"
+    return "off", "the default for a marketplace not from Anthropic"
+
+
+def doc_link(page, anchor):
+    """The web address of a section of nouez's docs (`page` in docs/, its heading's `anchor`), as
+    this version ships them, for a message that sends the user to the details."""
+    return DOC_PAGE.format(SERVER_VERSION, page, anchor)
+
+
+def plugin_market():
+    """The marketplace this plugin was installed from, or None for a clone."""
+    marker = plugin_marker()
+    return marker["id"].split("@", 1)[1] if marker else None
+
+
+def known_marketplaces(config):
+    """known_marketplaces.json under Claude Code's config folder `config`, or None."""
+    return read_json_file(os.path.join(config, "plugins", "known_marketplaces.json"))
+
+
+def market_entry(data, market):
+    """The marketplace's extraKnownMarketplaces entry in Claude Code's user settings `data`, or None."""
+    markets = (data or {}).get("extraKnownMarketplaces")
+    entry = markets.get(market) if isinstance(markets, dict) else None
+    return entry if isinstance(entry, dict) else None
+
+
+def auto_update_note(state, where, market, settable=True):
+    """setup's and doctor's line on the marketplace's auto-update; `settable`: whether
+    `setup --auto-update` can turn it on (settings.json has the marketplace's entry)."""
+    if state in ("on", "locked on"):
+        return f"Auto-update for the {market} marketplace is on ({where}): new nouez versions arrive by themselves."
+    if state == "blocked":
+        return (f"Auto-update for the {market} marketplace is off: {where}, which turns plugin updates off. "
+                "Update nouez with /plugin, or set FORCE_AUTOUPDATE_PLUGINS=1 to let plugins update anyway.")
+    if state == "locked off":
+        return f"Auto-update for the {market} marketplace is off and set by {where}; update nouez with /plugin."
+    if state == "unknown":
+        return f"Whether the {market} marketplace auto-updates isn't known: {where}."
+    if not settable:
+        return (f"Auto-update for the {market} marketplace is off ({where}), so new nouez versions wait for "
+                "/plugin. " + AUTO_UPDATE_STEPS.format(market=market) + " Turn it on only if you trust that "
+                "marketplace. More: " + doc_link("setup.md", "nouez-updates"))
+    return (f"Auto-update for the {market} marketplace is off ({where}), so new nouez versions wait for "
+            "/plugin. `setup --auto-update` turns it on; it updates every plugin from that marketplace, "
+            "without a review step, so turn it on only if you trust that marketplace. More: "
+            + doc_link("setup.md", "nouez-updates"))
+
+
+def auto_update_setup(data, config, market, turn_on, would):
+    """setup's part for the marketplace's auto-update, on Claude Code's user settings `data`: (the line
+    to show, the record to keep or None). With `turn_on` and auto-update off (by its default, the
+    toggle or the entry), sets autoUpdate on the marketplace's existing extraKnownMarketplaces entry
+    in `data`. A clone has no marketplace: --auto-update says so, and nothing else changes."""
+    if not market:
+        return ("--auto-update is for the Claude Code plugin; a clone updates with `git pull`." if turn_on
+                else None), None
+    state, where = auto_update_state(data, market, known_marketplaces(config))
+    note = auto_update_note(state, where, market, market_entry(data, market) is not None)
+    if not turn_on or state != "off":
+        if turn_on and state in ("locked off", "unknown"):
+            note += " " + AUTO_UPDATE_STEPS.format(market=market)
+        return note, None
+    markets = data.get("extraKnownMarketplaces")
+    entry = markets.get(market) if isinstance(markets, dict) else None
+    if not isinstance(entry, dict):
+        return (f"settings.json has no extraKnownMarketplaces entry for {market}, and setup doesn't make one. "
+                + AUTO_UPDATE_STEPS.format(market=market)), None
+    prior = entry.get("autoUpdate", "absent")
+    entry["autoUpdate"] = True
+    return (f"{would} turn on auto-update for the {market} marketplace (extraKnownMarketplaces.{market}.autoUpdate "
+            f"in settings.json): Claude Code then updates every plugin from {market} by itself. An update takes "
+            "effect in a new session or after /reload-plugins. A policy your organization sets from its "
+            "server, if any, can still turn it off."), {"config": config, "market": market, "prior": prior}
+
+
+def auto_update_undo(data, config, market):
+    """setup --remove's part: (the record, the line saying what changes or None) when nouez's settings
+    file records that setup turned on this marketplace's auto-update in these settings. While it is
+    still on there, puts back in `data` what was there before; changed since, it is left as it is."""
+    rec = read_settings()[0].get(AUTO_UPDATE_KEY)
+    if not (isinstance(rec, dict) and market and rec.get("market") == market and rec.get("config") == config):
+        return None, None
+    markets = data.get("extraKnownMarketplaces")
+    entry = markets.get(market) if isinstance(markets, dict) else None
+    if not (isinstance(entry, dict) and entry.get("autoUpdate") is True):
+        return rec, None
+    prior = rec.get("prior")
+    if isinstance(prior, bool):
+        entry["autoUpdate"] = prior
+    else:
+        del entry["autoUpdate"]
+    return rec, (f"put back the {market} marketplace's auto-update as it was before setup turned it on "
+                 f"({'autoUpdate ' + str(prior).lower() if isinstance(prior, bool) else 'no autoUpdate entry'}).")
+
+
+SETUP_USAGE = "usage: server.py setup [--dry-run] [--statusline] [--auto-update] | setup [--dry-run] --remove"
 
 
 def run_setup(argv, out=print):
@@ -17026,14 +18077,17 @@ def run_setup(argv, out=print):
     (only those), then nouez's status line into an empty slot (statusline_offer; --statusline adds
     it), and a line when a clone is registered too. --remove takes out those allow rules and a status
     line that runs this server.py, nothing else. --dry-run says what would change and changes
-    nothing. Exit code."""
+    nothing. 0.31: on the plugin, a line on its marketplace's auto-update; --auto-update turns it on
+    in that marketplace's settings entry (never making one), recorded in nouez's settings file so
+    --remove puts back what was there. Exit code."""
     flags = set(argv)
-    if not flags <= {"--dry-run", "--statusline", "--remove"} or len(flags) != len(argv) or \
-            {"--statusline", "--remove"} <= flags:
+    if not flags <= {"--dry-run", "--statusline", "--remove", "--auto-update"} or len(flags) != len(argv) or \
+            "--remove" in flags and flags & {"--statusline", "--auto-update"}:
         out(SETUP_USAGE)
         return 2
     dry_run, remove = "--dry-run" in flags, "--remove" in flags
     config = os.path.abspath(claude_config_dir())
+    market, auto_line, recorded = plugin_market(), None, None
     path = os.path.join(config, "settings.json")
     if dry_run:
         out("Dry run: nothing is changed.")
@@ -17080,8 +18134,11 @@ def run_setup(argv, out=print):
                     out(f"The status line in {path} runs this nouez but isn't the one setup adds (your own, which "
                         "passes its input on to it, say); it is kept. Take the part that runs `server.py "
                         "statusline` out of it yourself.")
-                changed = bool(gone or ours)
-                if not changed and not runs:
+                recorded, undo = auto_update_undo(data, config, market)
+                if undo:
+                    out(f"{would} {undo}")
+                changed = bool(gone or ours or undo)
+                if not changed and not runs and not recorded:
                     out(f"{path} has none of this nouez's allow rules and no status line that runs it.")
             else:
                 missing = [r for r in rules if r not in allow]
@@ -17098,23 +18155,38 @@ def run_setup(argv, out=print):
                         "it is reopened.")
                 if missing or stale:
                     data.setdefault("permissions", {})["allow"] = [r for r in allow if r not in stale] + missing
-                changed = bool(missing or stale)
+                auto_line, recorded = auto_update_setup(data, config, market, "--auto-update" in flags, would)
+                changed = bool(missing or stale or recorded)
             if changed and not dry_run:
                 try:  # the folder is there (checked above), so settings.json is written in it
                     write_settings(settings, data, raw, out)
                 except OSError as e:
                     out(f"Couldn't change {path}: {e}{sandbox_hint(e)}")
                     return 1
+            if recorded and not dry_run:
+                try:  # what was there before, for --remove; dropped once --remove has used it
+                    update_settings(lambda d: d.pop(AUTO_UPDATE_KEY, None) if remove
+                                    else d.update({AUTO_UPDATE_KEY: recorded}))
+                except BridgeError as e:
+                    out(f"nouez couldn't record what it changed ({e}); "
+                        + ("run `setup --remove` again to clear that record." if remove else
+                           "`setup --remove` won't turn the auto-update back off, so do that in /plugin if you want it off."))
+                    return 1
         finally:
             settings.close()
+    guide = doc_link("setup.md", "as-a-plugin" if market else "from-a-clone")
     if remove:
+        out(f"\nWhat setup and uninstalling change, in the setup guide: {guide}")
         return 0
     statusline_offer(dry_run, "--statusline" in flags, out)
+    if auto_line:
+        out("\n" + auto_line)
     if plugin_marker() and clone_registered():
         env = clone_env_note()
         out("\nA clone of nouez is registered as `consultants` too, so each session has both sets of tools. "
             "`claude mcp remove --scope user consultants` removes the clone's (its folder stays)."
             + (" " + env if env else ""))
+    out(f"\nEach step, what it's for and what setup changes, in the setup guide: {guide}")
     return 0
 
 
@@ -17149,10 +18221,10 @@ def usage_setup_report(settings):
              (None, f"no status line has passed Claude Code's usage to nouez in {USAGE_SETUP_DAYS} days, so its "
                     "pace isn't known. "
                     + ("Run /nouez:setup in a Claude Code session, which adds it when there is no status line, or "
-                       "add it yourself (or pass the input on from your own script, docs/consultants.md):\n    "
+                       f"add it yourself (or pass the input on from your own script, {doc_link('consultants.md', 'choosing-a-consultant')}):\n    "
                        if plugin_marker() else
                        "Add to the settings (or pass the input on from your own script, "
-                       "docs/consultants.md), or, with the phone dispatcher, run `server.py dispatcher setup` again "
+                       f"{doc_link('consultants.md', 'choosing-a-consultant')}), or, with the phone dispatcher, run `server.py dispatcher setup` again "
                        "with the options you set it up with and --statusline:\n    ")
                     + json.dumps({"statusLine": {"type": "command", "command": usage_command("statusline")}}))]
     hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
@@ -17222,8 +18294,16 @@ def run_doctor():
         paths = script_paths_report(data)
         if paths:
             say(*paths)
+        market = plugin_market()
+        if market:  # 0.31: whether new nouez versions arrive by themselves, and what decides it
+            state, where = auto_update_state(data, market, known_marketplaces(os.path.dirname(settings)))
+            say(True if state in ("on", "locked on") else None,
+                auto_update_note(state, where, market, market_entry(data, market) is not None))
     if clone_place_note():
         say(None, clone_place_note())
+    closed = auto_close_report()
+    if closed:
+        say(None, closed)
     backups = trust_backups_report()
     if backups:
         say(None, backups)
@@ -17241,6 +18321,10 @@ def run_doctor():
         if term and no_display():
             say(None, f"{no_display()}: terminal windows can't open, so OpenClaudeSession and "
                       "OpenStatusScreen can't")
+
+    prompts = prompts_summary()
+    if prompts:
+        say(None, "your prompts: " + prompts + " (`server.py prompts` shows each)")
 
     print("Phone dispatcher (README, Setup):")
     dispatcher_report(say)
@@ -17323,6 +18407,7 @@ def main():
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8")
     threading.Thread(target=tidy, daemon=True).start()  # old files go even when nothing new is saved
+    threading.Thread(target=auto_close_loop, name="nouez-auto-close", daemon=True).start()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -17336,6 +18421,7 @@ def main():
             route(msg)
         except Exception as e:  # one bad line must never end the loop
             log("bad message:", repr(e))
+    _sweep_stop.set()
 
 
 IDLE_METHOD = "nouez/idle"  # launch.py, the plugin's launcher, asks it before it moves to a newer nouez
@@ -17372,6 +18458,9 @@ def idle_reason():
         return "the home folder's warning waits for the user's answer"
     if any(t.is_alive() for t in _log_threads):
         return "the usage log is being written"
+    with _sweep_guard:
+        if _sweep["running"]:
+            return "idle consultants are being closed"
     if not _live_turns:
         return None
     try:
@@ -17472,6 +18561,9 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["settings"]:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.exit(run_settings(sys.argv[2:]))
+    if sys.argv[1:2] == ["prompts"]:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.exit(run_prompts(sys.argv[2:]))
     if sys.argv[1:2] == ["restore"]:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.exit(run_restore(sys.argv[2:]))
