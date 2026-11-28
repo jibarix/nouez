@@ -75,7 +75,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.31.0"
+SERVER_VERSION = "0.31.1"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -7788,7 +7788,7 @@ def window_level(used, resets_at, length, now, sampled=None):
     return {**judged, "level": "tight" if pct > 90 else "busy" if pct > 70 else "fine", "pct": pct, "basis": basis}
 
 
-def usage_outlook_detail(windows, now):
+def usage_outlook_detail(windows, now, week_may_run_out=False):
     """Where a subscription stands for one more consultation, from its (length, used, resets_at
     [, read at]) windows, as (state, percent or why, basis): ("blocked", why, None) when one is
     used up or runs out before its reset at this rate; otherwise by where the weekly window's pace
@@ -7797,7 +7797,9 @@ def usage_outlook_detail(windows, now):
     no reading. basis says how the weekly percent was found: "pace", where the current rate lands
     at the reset, or "first day", the same from a week's first FIRST_DAY (see window_pace); "old", a reading too old to project from, or "early", too little of the week
     gone to tell, where it is the share used so far, the least the week will reach (never
-    "spare", and "ok" with None); None without a weekly percent."""
+    "spare", and "ok" with None); None without a weekly percent. With `week_may_run_out` (a free
+    reset expires before the week resets), a weekly window on pace to run out doesn't block and
+    gives no percent; any other window, and a used-up one, still does."""
     week, seen = None, False
     for w in windows or ():
         length = w[0]
@@ -7810,6 +7812,8 @@ def usage_outlook_detail(windows, now):
             return ("blocked", (f"its {label} window is used up" if length else "its quota is used up")
                     + (" (an old reading)" if judged["basis"] == "old" else ""), None)
         if judged["level"] == "runs out":
+            if week_may_run_out and length and length >= 7 * 86400:
+                continue
             return ("blocked", f"its {label} window runs out before its reset at this rate"
                     + (" (a first-day estimate)" if judged["basis"] == "first day" else ""), None)
         if length and length >= 7 * 86400:
@@ -8050,17 +8054,21 @@ def suggest_consultant(kind, state, now, only=None, revision=False):
             blocked.append(f"{PROVIDER_TITLES[provider]} {got[0]}: a Claude model shares the author's blind spots")
             continue
         windows = provider_windows(provider, got[0], st)
-        *outlook, basis = usage_outlook_detail(windows, now)
+        # A free reset that expires before the week resets is usage that goes unused unless spent
+        # first: the subscription counts as spare however its week stands (0.31), a week on pace to
+        # run out before its reset included (0.31.1). A used-up window, or a shorter one running
+        # out, which a reset in the user's hands doesn't help, still blocks.
+        expiring = expiring_resets(st, windows, now)
+        *outlook, basis = usage_outlook_detail(windows, now, bool(expiring))
         outlook = tuple(outlook)
+        if outlook[0] == "unknown":
+            expiring = []
         if outlook[0] == "blocked":
             banked = max(number((st or {}).get("reset_count")) or 0, len((st or {}).get("reset_expiries") or ()))
             blocked.append(f"{PROVIDER_TITLES[provider]} {got[0] or 'default model'}: {outlook[1]}"
                            + (f" ({banked} free full reset(s) available; only the user decides to use one)"
                               if banked else ""))
             continue
-        # A free reset that expires before the week resets is usage that goes unused unless spent
-        # first: the subscription counts as spare however its week stands (0.31).
-        expiring = expiring_resets(st, windows, now) if outlook[0] != "unknown" else []
         if expiring:
             outlook = ("spare", outlook[1])
         notes = [got[2]] if got[2] else []
@@ -14257,7 +14265,8 @@ DISPATCHER_STEADY = 10 * 60         # a run this long was healthy: the wait goes
 DISPATCHER_CONNECT_WITHIN = 5 * 60  # not connected by then: most likely at a question no one can answer
 DISPATCHER_LOG_BYTES = 1_000_000    # a log this big moves to <name>.1, replacing the one before
 DISPATCHER_RECENT = 40              # lines remembered, to drop the status claude keeps redrawing
-DISPATCHER_STOP_WAIT = 40           # seconds install and uninstall wait for a supervisor to stop
+DISPATCHER_STOP_WAIT = 180          # seconds install and uninstall wait for a supervisor to stop (0.31.1: was 40;
+                                    # one that had run for hours took 58 s to end claude and its sessions)
 DISPATCHER_START_WAIT = 8           # seconds install waits, per try, to see the new supervisor run
 DISPATCHER_SIGN_IN_TRIES = 12       # looks at nouez's sign-in start, 5 s apart, before a supervisor it started gives up
 NOUEZ_HEAD = b'"""nouez: MCP server'  # how nouez's server.py starts: a sign-in start running another server.py isn't nouez's
@@ -17270,11 +17279,37 @@ def install_windows(argv, folder, config_dir, since, dry_run, out):
             remove_file(path)
     if not stop_running_supervisor(dry_run, out):
         return None
+    # 0.31.1: no supervisor holds the lock now, but the task's last run can still count as running
+    # (seen: its process stayed after logging "supervisor stopped"), and the task ignores or refuses
+    # a start until that run ends, so it is ended first. With nothing left this fails, which is
+    # fine. A sign-in start in the same seconds would be ended too, before it starts claude (it
+    # waits for install's lock), and the start below replaces it.
+    end = [schtasks, "/End", "/TN", DISPATCHER_TASK]
+    run = [schtasks, "/Run", "/TN", DISPATCHER_TASK]
+    ended = None
+
+    def end_last_run():
+        nonlocal ended
+        if dry_run:
+            run_steps([("end what is left of the task's last run", end, False)], dry_run, out)
+        else:
+            got = run_status(end, timeout=60)
+            if not ended or ended[0] == 0:  # a failure is kept for the report below
+                ended = got
 
     def start():
-        return None if run_steps([("start the task now", [schtasks, "/Run", "/TN", DISPATCHER_TASK], True)],
-                                 dry_run, out) else False
-    return start_new_supervisor(start, folder, config_dir, since, dry_run, out)
+        if not dry_run and run_status(run, timeout=60)[0] == 0:
+            return None
+        if not dry_run:  # refused: what is left of the last run is still ending; end it, once more
+            end_last_run()
+            time.sleep(2)
+        return None if run_steps([("start the task now", run, True)], dry_run, out) else False
+    end_last_run()
+    started = start_new_supervisor(start, folder, config_dir, since, dry_run, out)
+    if started is False and ended and ended[0] != 0:
+        out("Ending what was left of the task's last run said: "
+            + (ended[1].strip() or f"exit code {ended[0]}")[-400:])
+    return started
 
 
 def install_macos(argv, folder, config_dir, claude, since, dry_run, out):

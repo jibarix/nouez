@@ -6,6 +6,15 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-11-28
+
+Restarting the phone dispatcher after an update works again when the old one is slow to end, and free Codex resets about to expire now count when Codex's week is on pace to run out. With the plugin, update with `claude plugin update nouez@nouez` (or let auto-update bring it), then start a Claude Code session or run `/reload-plugins` in one, and run `/nouez:setup`, which offers to restart the dispatcher. With a clone, pull, then reconnect `consultants` with `/mcp` in each open Claude Code session, and run `server.py dispatcher install` again the way you first did.
+
+### Fixed
+
+- **The dispatcher restart no longer leaves the phone without one.** Robin's dispatcher had run all day. `/nouez:setup` restarted it after the update, but the old one took 58 s to end its sessions, `install` stopped waiting at 40 s and said the change would come at the next sign-in, and once the old one ended, nothing ran until then. Its process also stayed behind after it had logged that it stopped, and Windows ignored new starts of the task while it did. `install` and `uninstall` now wait up to 180 s, and on Windows `install` ends what is left of the task's last run before starting it, and once more if Windows refuses the start; if no dispatcher comes up, it shows what Windows said when that run was ended ([stopping the supervisor](docs/rules.md#rule-supervisor-stop)).
+- **Free resets about to expire count when the week is on pace to run out.** Pat has used 43% of his Codex week with four days left, a pace that runs out before the reset, and two free resets expire before it. 0.31.0 counted them only for a week that would last, so `ConsultantBudget` said no consultant had room for a review. Now Codex takes it at full strength, saying a reset would otherwise expire; a 5-hour window running out, or a limit Codex reports reached, still keeps it off; spending one stays his decision ([banked resets](docs/rules.md#rule-banked-resets)).
+
 ## [0.31.0] - 2026-11-27
 
 Idle consultants close by themselves, a sessions page shows what each Claude Code session runs and its memory, setup offers auto-update, and nouez's prompts can take your own wording. With the plugin, update with `claude plugin update nouez@nouez`, then start a Claude Code session or run `/reload-plugins` in one, and run `/nouez:setup` once to be asked about auto-update; the other open sessions then move to the new version by themselves once idle. With a clone, pull, then reconnect `consultants` with `/mcp` in each open Claude Code session, and run `server.py dispatcher install` again the way you first did, to restart the dispatcher.
@@ -944,7 +953,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.31.0...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.31.1...HEAD
+[0.31.1]: https://github.com/jibarix/nouez/compare/v0.31.0...v0.31.1
 [0.31.0]: https://github.com/jibarix/nouez/compare/v0.30.3...v0.31.0
 [0.30.3]: https://github.com/jibarix/nouez/compare/v0.30.2...v0.30.3
 [0.30.2]: https://github.com/jibarix/nouez/compare/v0.30.1...v0.30.2

@@ -5582,6 +5582,21 @@ class SuggestTest(unittest.TestCase):
         self.assertNotIn(server.EASED, got["why"])
         self.assertEqual((got["provider"], got["effort"]), ("codex", "high"))
         self.assertTrue(any("has 1 free full reset expiring before its week resets" in w for w in got["why"]), got)
+        # 0.31.1: a week on pace to run out before its reset counts as spare too (seen: 43% used with
+        # 4 days left, two resets expiring before it); "runs out" alone, without them, stays blocked.
+        racing = self.codex(used=90, days_left=3)
+        # Only the weekly forecast gives way: a five-hour window running out, or a limit Codex
+        # reports reached, still blocks with a reset expiring.
+        five = {**racing, "reset_expiries": [self.NOW + self.DAY],
+                "windows": [(5 * 3600, 90, self.NOW + 2.5 * 3600)] + list(racing["windows"])}
+        self.assertIn("5-hour", server.suggest_consultant("review", {"codex": five}, self.NOW).get("none", ""))
+        hit = {**racing, "reset_expiries": [self.NOW + self.DAY],
+               "windows": list(racing["windows"]) + [(None, 100, self.NOW + 1)]}
+        self.assertIn("used up", server.suggest_consultant("review", {"codex": hit}, self.NOW).get("none", ""))
+        self.assertIn("runs out", server.suggest_consultant("review", {"codex": racing}, self.NOW)["none"])
+        got = server.suggest_consultant("review", {"codex": {**racing, "reset_expiries": [self.NOW + self.DAY]}}, self.NOW)
+        self.assertEqual((got.get("provider"), got.get("effort")), ("codex", "high"), got)
+        self.assertTrue(any("free full reset expiring before its week resets" in w for w in got["why"]), got)
         later = {**tight, "reset_expiries": [self.NOW + 3 * self.DAY]}
         self.assertIn(server.EASED, server.suggest_consultant("review", {"codex": later}, self.NOW)["why"])
         spent = {**self.codex(used=100, days_left=1), "reset_expiries": [self.NOW + self.DAY / 2]}
@@ -11617,8 +11632,8 @@ class DispatcherTest(unittest.TestCase):
 
     def install(self, platform, osname="posix", force=False, dry_run=False, trusted=True, installed="no",
                 pythonw="C:\\Python\\pythonw.exe", config_dir=None, service=(113, "Could not find service"),
-                bootstrap=(), claude="/opt/bin/claude", projects=None):
-        bootstrap = list(bootstrap)
+                bootstrap=(), claude="/opt/bin/claude", projects=None, runs=()):
+        bootstrap, runs = list(bootstrap), list(runs)
         out, ran, real_command, is_trusted = [], [], server.dispatcher_command, trusted
 
         def command(python, folder, config_dir=None, projects=None):  # a macOS or Linux one, wherever the test runs
@@ -11632,6 +11647,8 @@ class DispatcherTest(unittest.TestCase):
             ran.append(argv)
             if argv[1:2] == ["bootstrap"] and bootstrap:
                 return bootstrap.pop(0)
+            if argv[1:2] == ["/Run"] and runs:
+                return runs.pop(0)
             if argv[1:2] != ["print"]:
                 return 0, ""
             return service.pop(0) if isinstance(service, list) else service
@@ -11677,9 +11694,17 @@ class DispatcherTest(unittest.TestCase):
             code, out, ran, _ = self.install("win32", "nt")
             self.assertEqual(code, 0, out)
             self.assertEqual(ran[0][:5], ["schtasks.exe", "/Create", "/TN", "nouez dispatcher", "/XML"])
-            self.assertEqual(ran[1], ["schtasks.exe", "/Run", "/TN", "nouez dispatcher"])
+            # a leftover of the task's last run is ended before the start (0.31.1)
+            self.assertEqual(ran[1], ["schtasks.exe", "/End", "/TN", "nouez dispatcher"])
+            self.assertEqual(ran[2], ["schtasks.exe", "/Run", "/TN", "nouez dispatcher"])
             self.assertRegex(os.path.basename(ran[0][5]), r"^dispatcher-task-.+\.xml$")
             self.assertFalse(os.path.exists(ran[0][5]), "the task's XML is deleted after")
+            # a refused start (its last run still ending) ends that run and starts once more
+            with mock.patch.object(server.time, "sleep", lambda s: None):
+                code, out, ran, _ = self.install("win32", "nt", runs=[(1, "ERROR: refused (0x800710E0)")])
+            self.assertEqual(code, 0, out)
+            self.assertEqual([argv[1] for argv in ran[1:]], ["/End", "/Run", "/End", "/Run"])
+            self.assertNotIn("Couldn't start", "\n".join(out))
         plist = os.path.join(self.home, "LA", "agent.plist")
         code, out, ran, _ = self.install("darwin")
         self.assertEqual(code, 0, out)

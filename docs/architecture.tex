@@ -86,7 +86,7 @@
 \newcommand{\nzname}{\textcolor{nz}{\textbf{nouez}}}
 \newcommand{\cxname}{\textcolor{cx}{\textbf{Codex}}}
 
-\title{\textbf{nouez} 0.31.0\\[0.3em]\large Architecture and message reference}
+\title{\textbf{nouez} 0.31.1\\[0.3em]\large Architecture and message reference}
 \date{November 26, 2026}
 \author{}
 
@@ -290,7 +290,7 @@ the folder the call names, never in a workspace above it.
   "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "capabilities": {"tools": {}}, "instructions": "Consultants are read-only second opinions ...",
   "ttlMs": 0, "cacheScope": "private",
-  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.31.0"}}}}
+  "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "nouez", "version": "0.31.1"}}}}
 \end{wire}
 
 Every 2026-07-28 result says \code{"resultType": "complete"} and names nouez in \code{\_meta};
@@ -842,7 +842,7 @@ user opened, because such a session keeps the user's sandbox and approval policy
 listed in the result. Every 10 minutes at most, nouez closes its own consultants idle for an hour,
 as \code{StopConsultant} would, except each project's main one (the one reuse picks), one with a
 turn running and one with a reply not read yet
-(\href{https://github.com/jibarix/nouez/blob/v0.31.0/docs/rules.md#rule-idle-close}{idle close}).
+(\href{https://github.com/jibarix/nouez/blob/v0.31.1/docs/rules.md#rule-idle-close}{idle close}).
 
 \begin{figure}[H]
 \centering
@@ -1431,7 +1431,7 @@ codex-nouez-77c2e0 was not started by StartConsultant. Close it from its own ter
 \code{ConsultantBudget} gathers the facts for choosing a consultant's model and effort, and changes
 nothing, except that a \code{kind} with a \code{provider} keeps nouez's pick for the next send of
 that kind to that provider on its models (see the
-\href{https://github.com/jibarix/nouez/blob/v0.31.0/docs/rules.md#rule-named-provider}{lifetime and scope of a named provider}). It makes two requests to the Codex daemon, reads one file the user's status line saves, and
+\href{https://github.com/jibarix/nouez/blob/v0.31.1/docs/rules.md#rule-named-provider}{lifetime and scope of a named provider}). It makes two requests to the Codex daemon, reads one file the user's status line saves, and
 asks Artificial Analysis for model scores about once a week. Each part fails on its own: an
 unreachable daemon or a missing file is reported in its place, and the rest still shows.
 
@@ -1517,7 +1517,7 @@ The suggestion comes from \code{suggest\_consultant}. \code{ConsultantBudget} ta
 \code{kind} (one of the usage log's kinds) and \code{provider}; without a kind it gives one line per
 kind, and with a provider it considers only that one. \code{CONSULT\_PICKS} lists, for each kind,
 the (provider, model, effort) options in order of preference. The rulebook gives the
-\href{https://github.com/jibarix/nouez/blob/v0.31.0/docs/rules.md#rule-starting-picks}{starting order by kind};
+\href{https://github.com/jibarix/nouez/blob/v0.31.1/docs/rules.md#rule-starting-picks}{starting order by kind};
 \code{docs/consultants.md} dates the benchmark rationale.
 
 \begin{itemize}
@@ -1527,25 +1527,25 @@ the (provider, model, effort) options in order of preference. The rulebook gives
   using its default. A substitution within a model family, a switch to the provider default
   for a missing model, or a change to an unavailable effort adds a note. Skipping a missing
   model in favor of another listed pick can be silent. See the
-  \href{https://github.com/jibarix/nouez/blob/v0.31.0/docs/rules.md#rule-catalogue-fallback}{model and effort fallbacks}.
+  \href{https://github.com/jibarix/nouez/blob/v0.31.1/docs/rules.md#rule-catalogue-fallback}{model and effort fallbacks}.
   Apply the named-provider restriction and exclude Claude models for work that requires an
-  \href{https://github.com/jibarix/nouez/blob/v0.31.0/docs/rules.md#rule-independent-review}{independent reviewer},
+  \href{https://github.com/jibarix/nouez/blob/v0.31.1/docs/rules.md#rule-independent-review}{independent reviewer},
   including any send with \code{revision: true}.
 \item Read the windows for the quota each remaining option spends. For Antigravity the
   \code{/usage} group lists identify the quota. Classify each option from those windows and
   discard blocked options. An old reading gives a lower bound on use. An Antigravity turn that
   failed on its quota marks its group used up until the reset it named
-  (\href{https://github.com/jibarix/nouez/blob/v0.31.0/docs/rules.md#rule-quota-hit}{quota failures}). The
-  \href{https://github.com/jibarix/nouez/blob/v0.31.0/docs/rules.md#rule-usage-forecast}{forecast rule}
+  (\href{https://github.com/jibarix/nouez/blob/v0.31.1/docs/rules.md#rule-quota-hit}{quota failures}). The
+  \href{https://github.com/jibarix/nouez/blob/v0.31.1/docs/rules.md#rule-usage-forecast}{forecast rule}
   specifies when a reading supports a pace.
 \item Start with the first remaining option and compare options on other quotas. An option whose
   usage is unknown yields to known room, after the spare-week and pace comparisons below. A tight week can move the choice or lower its effort.
   A busy week can yield to spare quota except for a fact check. For eligible research and quick
   checks, compare spare weeks by reset time, keeping the first choice on a tie, then consider
   how far a week is behind pace if the earlier rules left the pick in place. See the
-  \href{https://github.com/jibarix/nouez/blob/v0.31.0/docs/rules.md#rule-tight-week}{tight-week rule},
-  \href{https://github.com/jibarix/nouez/blob/v0.31.0/docs/rules.md#rule-spare-week}{spare-week rule}
-  and \href{https://github.com/jibarix/nouez/blob/v0.31.0/docs/rules.md#rule-behind-pace}{final pace comparison}.
+  \href{https://github.com/jibarix/nouez/blob/v0.31.1/docs/rules.md#rule-tight-week}{tight-week rule},
+  \href{https://github.com/jibarix/nouez/blob/v0.31.1/docs/rules.md#rule-spare-week}{spare-week rule}
+  and \href{https://github.com/jibarix/nouez/blob/v0.31.1/docs/rules.md#rule-behind-pace}{final pace comparison}.
 \end{itemize}
 
 The same judgment of each window serves the send, the prompt hook and the status screen. At send, a
@@ -1565,7 +1565,7 @@ for a fact check), the blind second opinion with the other provider's own sugges
 Gemini~4 Neon scores best on when Neon is listed, its group has room and the choice isn't already
 a Gemini model, and that a reused consultant keeps its last model and effort. The hand-out line can recommend sending code to write as kind \code{draft}; Claude checks and
 applies the returned text locally. Research advice can name a second provider for reading a
-page. See the \href{https://github.com/jibarix/nouez/blob/v0.31.0/docs/rules.md#rule-research-and-drafts}{research and draft advice}.
+page. See the \href{https://github.com/jibarix/nouez/blob/v0.31.1/docs/rules.md#rule-research-and-drafts}{research and draft advice}.
 \code{tests/consult\_eval.py} checks in fresh \code{claude -p} sessions that Claude calls it and
 follows it.
 
@@ -2740,7 +2740,7 @@ Daemon request timeout & 15 s & per Codex request and for the handshake \\
 \code{roots/list} timeout & 5 s & then nouez assumes no roots \\
 Dispatcher restart wait & 30 s to 15 min & doubles per exit; a 10-min run resets it \\
 Dispatcher connect wait & 5 min & then its \code{claude} is ended \\
-Dispatcher stop wait & 40 s & for a supervisor asked to stop \\
+Dispatcher stop wait & 180 s & for a supervisor asked to stop \\
 Dispatcher start wait & 8 s & for the one \code{install} starts \\
 Dispatcher log size & 1 MB & then moved to \code{.1} \\
 Default \code{wait} & 5 s / 0 s & SendConsultantMessage / GetConsultantReply \\
