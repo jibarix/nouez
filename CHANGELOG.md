@@ -6,6 +6,19 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.31.2] - 2026-11-28
+
+Codex consultants no longer reach your MCP servers, Codex plugins or ChatGPT apps, a pace forecast no longer keeps a subscription from consultations, and nouez tells you when it is time to spend a free Codex reset. With the plugin, update with `claude plugin update nouez@nouez` (or let auto-update bring it), then start a Claude Code session or run `/reload-plugins` in one. With a clone, pull, then reconnect `consultants` with `/mcp` in each open Claude Code session.
+
+### Fixed
+
+- **Consultants get none of your add-ons.** Ari's time tracker is an MCP server in his Codex settings, with tools that change and delete entries. A read-only Codex consultant could call them: the read-only sandbox covers Codex's own tools, not MCP servers, plugins or ChatGPT apps (connectors). nouez now switches each of those off for its consultants' sessions, read from Codex's settings for the folder (his and the project's), when one starts and again before each new message; his own Codex sessions keep them. When Codex's settings can't be read, nothing is started or sent ([no add-ons](docs/rules.md#rule-no-add-ons)).
+
+### Changed
+
+- **A pace is an indicator, not a refusal.** Lee worked hard on Monday, and Codex's week was on pace to run out before its reset, so `ConsultantBudget` offered no consultant, though the pace would drop as soon as he worked less. Now only a window used up, or a limit Codex reports reached, keeps a subscription off. A week on pace to run out counts as tight (another subscription with room first, or one effort level less), a shorter window's pace shows on the screen only, and a send adds no note for it ([tight week](docs/rules.md#rule-tight-week)).
+- **Time to spend a reset.** Pat's Codex week is 98% used and he has two free full resets. Every `ConsultantBudget` result now says it is time to spend one. nouez never spends a reset itself ([banked resets](docs/rules.md#rule-banked-resets)).
+
 ## [0.31.1] - 2026-11-28
 
 Restarting the phone dispatcher after an update works again when the old one is slow to end, and free Codex resets about to expire now count when Codex's week is on pace to run out. With the plugin, update with `claude plugin update nouez@nouez` (or let auto-update bring it), then start a Claude Code session or run `/reload-plugins` in one, and run `/nouez:setup`, which offers to restart the dispatcher. With a clone, pull, then reconnect `consultants` with `/mcp` in each open Claude Code session, and run `server.py dispatcher install` again the way you first did.
@@ -953,7 +966,8 @@ First public release. Tested with Claude Code 2.1.292, Codex CLI 0.160.1, Python
 - `StopConsultant`: archive a session started by `StartConsultant` and close its watch window; refuses user-opened sessions.
 - MCP request cancellation: a cancelled call stops waiting and sends no response. A message already delivered to Codex is not withdrawn.
 
-[Unreleased]: https://github.com/jibarix/nouez/compare/v0.31.1...HEAD
+[Unreleased]: https://github.com/jibarix/nouez/compare/v0.31.2...HEAD
+[0.31.2]: https://github.com/jibarix/nouez/compare/v0.31.1...v0.31.2
 [0.31.1]: https://github.com/jibarix/nouez/compare/v0.31.0...v0.31.1
 [0.31.0]: https://github.com/jibarix/nouez/compare/v0.30.3...v0.31.0
 [0.30.3]: https://github.com/jibarix/nouez/compare/v0.30.2...v0.30.3

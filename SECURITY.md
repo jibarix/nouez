@@ -40,6 +40,8 @@ Everything else goes through the CLIs you installed, as they would if you ran th
 
   With Codex's default settings a consultant can also use OpenAI's hosted web search, in its `cached` mode: it reads pages from OpenAI's index rather than fetching them live, but its queries go to OpenAI's search and can hold text from a file it read, and a page it finds can carry instructions. nouez doesn't change that setting. To turn web search off for all your Codex use, consultants included, put `web_search = "disabled"` at the top level of `~/.codex/config.toml` (in `CODEX_HOME` if you set it).
 
+  A consultant gets none of your Codex add-ons: nouez switches off, for its session only, every MCP server and plugin in Codex's settings for its folder (yours and the project's `.codex` ones) and the ChatGPT apps (connectors), when it starts and again before each new message. The read-only sandbox covers Codex's own tools, not these, and an MCP server can write wherever it is able to (a time tracker deleting entries, say). Codex sessions you opened yourself keep them. When Codex's settings can't be read, nouez starts and sends nothing.
+
   `doctor` runs `codex login status`. The status screen's consultations page reads each consultant’s latest turn and recent turns needed to verify continuations. It reads full details for the selection. The daemon answers locally.
 - **Antigravity** (`agy`): a consultant's messages go to Google. It can search the web (Google's summary of the results, with their sources) but can't open a page: agy has no page-reading tool in a headless run, and nouez denies commands, so it can't fetch one either. nouez runs `agy -p /usage` for your quota, which asks Google without a model turn:
   - once a minute in `top`;

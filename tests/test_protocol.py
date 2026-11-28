@@ -1816,6 +1816,8 @@ class FakeDaemon:
         # Codex's index (useStateDbOnly); no_state_db: an older Codex that refuses useStateDbOnly.
         self.listed, self.lists, self.read_ids = [], [], []
         self.no_state_db = self.stuck_cursor = False
+        self.config = {}  # what config/read gives: the effective Codex settings
+        self.resumed = []  # each thread/resume's params
 
     def __call__(self, on_spawn=None):  # as CodexClient(): a ConsultationFeed passes on_spawn
         return self
@@ -1851,7 +1853,10 @@ class FakeDaemon:
             self.threads[thread["id"]] = thread
             return {"thread": thread}
         if method == "thread/resume":
+            self.resumed.append(params)
             return {}
+        if method == "config/read":
+            return {"config": self.config}
         if method == "thread/turns/list":
             if self.fail_after_start and "turn/start" in self.calls:
                 raise server.BridgeError("thread/turns/list timed out after 15s.")
@@ -2269,7 +2274,7 @@ class HandlerTest(unittest.TestCase):
         out = server.send_consultant_message({"kind": "review", "to": thread["id"], "message": "hi", "wait": 0,
                                               "effort": "high"})
         self.assertIn("turn/start", daemon.calls)
-        self.assertIn("(Usage: Codex: its weekly window runs out before its reset at this rate.", out)
+        self.assertNotIn("Usage:", out)  # 0.31.2: a forecast adds nothing
 
     def test_a_send_with_no_pick_keeps_the_consultants_settings(self):
         """0.26.1: when the usage can't be read, or no subscription has room, a send of any kind goes
@@ -2456,9 +2461,47 @@ class HandlerTest(unittest.TestCase):
         out = server.send_consultant_message({"kind": "other", "to": mine["id"], "message": "hi", "wait": 0,
                                               "allow_user_session": True})
         self.assertTrue(out.startswith("Delivered to "))
-        # The user's own session keeps its own sandbox and approvals.
+        # The user's own session keeps its own sandbox and approvals, and its add-ons (0.31.2).
         self.assertNotIn("sandboxPolicy", daemon.started)
         self.assertNotIn("approvalPolicy", daemon.started)
+        self.assertNotIn("config", daemon.resumed[-1])
+        self.assertNotIn("config/read", daemon.calls)
+
+    def test_a_consultant_gets_no_add_ons(self):
+        """0.31.2: the read-only sandbox covers Codex's own tools only. A consultant's session starts,
+        and is resumed before each new message, with every MCP server and plugin in Codex's effective
+        settings for its folder switched off, and the ChatGPT apps; the user's other features stay. When
+        the settings can't be read, nothing is started or sent."""
+        settings = {"mcp_servers": {"dutemps": {"command": "dutemps"}, "a.b": {"url": "https://x"}},
+                    "plugins": {"github@openai-curated": {"enabled": True}}, "features": {"web_search": True}}
+        off = {"mcp_servers": {"dutemps": {"enabled": False}, "a.b": {"enabled": False}},
+               "plugins": {"github@openai-curated": {"enabled": False}}, "features.apps": False}
+        daemon = self.use(FakeDaemon([], answer="ok"))
+        daemon.config = settings
+        server.start_consultant({"cwd": ROOT, "new": True})
+        self.assertEqual(daemon.thread_started["config"], off)
+        started = daemon.threads["0199ffff-0000-0000-0000-000000new001"]
+        server.send_consultant_message({"kind": "other", "to": started["id"], "message": "hi", "wait": 0})
+        self.assertEqual(daemon.resumed[-1]["config"], off)
+        daemon.config = {}  # none set up: the apps still go off
+        server.send_consultant_message({"kind": "other", "to": started["id"], "message": "again", "wait": 0})
+        self.assertEqual(daemon.resumed[-1]["config"], {"features.apps": False})
+        turns = daemon.calls.count("turn/start")
+
+        def refuse(method, params, real=daemon.request):
+            if method == "config/read":
+                raise server.BridgeError("config/read failed: unknown method")
+            return real(method, params)
+        with mock.patch.object(daemon, "request", refuse):
+            with self.assertRaisesRegex(server.BridgeError, "switch off its MCP servers and plugins.*didn't use it"):
+                server.send_consultant_message({"kind": "other", "to": started["id"], "message": "x", "wait": 0})
+            with self.assertRaisesRegex(server.BridgeError, "didn't use it"):
+                server.start_consultant({"cwd": ROOT, "new": True})
+        self.assertEqual(daemon.calls.count("turn/start"), turns)
+        daemon.config = {"mcp_servers": [{"name": "dutemps"}]}  # a shape nouez doesn't know: not used either
+        with self.assertRaisesRegex(server.BridgeError, "form nouez doesn't know.*didn't use it"):
+            server.send_consultant_message({"kind": "other", "to": started["id"], "message": "x", "wait": 0})
+        self.assertEqual(daemon.calls.count("turn/start"), turns)
 
     def test_user_sessions_can_be_asked_about_or_turned_off(self):
         """0.26.0: NOUEZ_NO_USER_SESSIONS=1 never messages one; NOUEZ_ASK_USER_SESSION=1 asks the user in
@@ -4394,8 +4437,9 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(server.window_level(11.25, resets, week, now)["level"], "runs out")
         shown = server.window_state(11.25, resets, week, now)
         self.assertEqual((shown["long"], shown["short"]), ("runs out in ~5d 6h (first-day estimate)", "day 1: out"))
-        self.assertEqual(server.usage_outlook_detail([(week, 11.25, resets)], now)[1],
-                         "its weekly window runs out before its reset at this rate (a first-day estimate)")
+        judged = server.window_level(11.25, resets, week, now)
+        self.assertEqual(server.usage_outlook_detail([(week, 11.25, resets)], now),  # 0.31.2: tight, not blocked
+                         ("tight", judged["pct"], "first day"))
         # one pace from both sides of hour 16, and the plain pace after it
         at16 = server.window_pace(8, now + week - 16 * h, week, now)[1]
         self.assertAlmostEqual(at16, 8 * week / (16 * h))
@@ -4414,13 +4458,13 @@ class BudgetTest(unittest.TestCase):
         with mock.patch.object(server.time, "time", lambda: self.NOW):
             meta = server.usage_snapshot(None, live)["usage_meta"]["antigravity"]
         self.assertEqual(meta["AG Gemini"]["weekly"]["sampled"], self.NOW - 60)
-        # and routing and the screen judge it as of then: 7% 20 minutes into a 5-hour window runs out
+        # and the screen judges it as of then: 7% 20 minutes into a 5-hour window runs out (shown, not routed on)
         five = {"read_at": self.NOW - 80, "groups": [{"name": "Gemini Models", "buckets": [
             {"window": "5h", "remaining_fraction": 0.93, "reset_time": time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - 80 + 4 * 3600 + 40 * 60))}]}]}
         state = {}
         server.agy_budget(self.NOW, five, state)
-        self.assertEqual(server.usage_outlook(state["groups"]["Gemini Models"], self.NOW)[0], "blocked")
+        self.assertEqual(server.usage_outlook(state["groups"]["Gemini Models"], self.NOW)[0], "ok")
         (entry,) = server.agy_group(self.NOW, five)["entries"]
         self.assertEqual(entry[2]["level"], "runs out")
 
@@ -4522,6 +4566,12 @@ class BudgetTest(unittest.TestCase):
         self.assertIn("1 of them expires before the week resets, unused unless spent: "
                       + time.strftime("%a %b %d %H:%M", time.localtime(self.NOW + 86400)), text)
         self.assertEqual(state["reset_expiries"], [self.NOW + 86400, self.NOW + 9 * 86400])
+        # 0.31.2: resets listed without a count are counted, and at 98% the line to spend one shows here too
+        answers["account/rateLimits/read"]["rateLimitResetCredits"].pop("availableCount")
+        answers["account/rateLimits/read"]["rateLimits"]["secondary"]["usedPercent"] = 98
+        text = "\n".join(server.codex_budget(client, self.NOW, {}))
+        self.assertIn("2 free full reset(s) available", text)
+        self.assertIn("Codex's week is 98% used and 2 free full reset(s) are available", text)
         self.assertNotIn("m-hidden", text)
 
     def test_codex_budget_without_models(self):
@@ -5582,18 +5632,15 @@ class SuggestTest(unittest.TestCase):
         self.assertNotIn(server.EASED, got["why"])
         self.assertEqual((got["provider"], got["effort"]), ("codex", "high"))
         self.assertTrue(any("has 1 free full reset expiring before its week resets" in w for w in got["why"]), got)
-        # 0.31.1: a week on pace to run out before its reset counts as spare too (seen: 43% used with
-        # 4 days left, two resets expiring before it); "runs out" alone, without them, stays blocked.
+        # A week on pace to run out before its reset counts as spare too (seen: 43% used with 4 days
+        # left, two resets expiring before it). 0.31.2: without them it is tight, one level down, not
+        # blocked; a limit Codex reports reached still blocks with a reset expiring.
         racing = self.codex(used=90, days_left=3)
-        # Only the weekly forecast gives way: a five-hour window running out, or a limit Codex
-        # reports reached, still blocks with a reset expiring.
-        five = {**racing, "reset_expiries": [self.NOW + self.DAY],
-                "windows": [(5 * 3600, 90, self.NOW + 2.5 * 3600)] + list(racing["windows"])}
-        self.assertIn("5-hour", server.suggest_consultant("review", {"codex": five}, self.NOW).get("none", ""))
         hit = {**racing, "reset_expiries": [self.NOW + self.DAY],
                "windows": list(racing["windows"]) + [(None, 100, self.NOW + 1)]}
         self.assertIn("used up", server.suggest_consultant("review", {"codex": hit}, self.NOW).get("none", ""))
-        self.assertIn("runs out", server.suggest_consultant("review", {"codex": racing}, self.NOW)["none"])
+        got = server.suggest_consultant("review", {"codex": racing}, self.NOW)
+        self.assertEqual((got.get("provider"), got.get("effort")), ("codex", "medium"), got)
         got = server.suggest_consultant("review", {"codex": {**racing, "reset_expiries": [self.NOW + self.DAY]}}, self.NOW)
         self.assertEqual((got.get("provider"), got.get("effort")), ("codex", "high"), got)
         self.assertTrue(any("free full reset expiring before its week resets" in w for w in got["why"]), got)
@@ -5614,6 +5661,20 @@ class SuggestTest(unittest.TestCase):
         self.assertEqual(server.reset_expiries(listed, self.NOW), [self.NOW + 2, self.NOW + 9])
         self.assertEqual(server.reset_expiries({"availableCount": 2}, self.NOW), [])
         self.assertEqual(server.reset_expiries(None, self.NOW), [])
+
+    def test_the_user_is_told_to_spend_a_reset_at_98_percent(self):
+        """0.31.2: at 98% of Codex's week used with a free full reset available, ConsultantBudget tells
+        Claude to tell the user to spend one; nouez never spends it. Not at 97%, not without one, not
+        from a week that has reset."""
+        week = 7 * self.DAY
+        at = lambda used, **st: server.reset_alert({"windows": [(week, used, self.NOW + self.DAY)], **st}, self.NOW)
+        self.assertIn("Codex's week is 98% used and 2 free full reset(s) are available", at(98, reset_count=2))
+        self.assertIn("nouez never spends a reset", at(99.6, reset_expiries=[self.NOW + 60]))
+        self.assertEqual(at(97.9, reset_count=2), "")
+        self.assertEqual(at(100, reset_count=0), "")
+        self.assertEqual(server.reset_alert({"windows": [(week, 99, self.NOW - 1)], "reset_count": 1}, self.NOW), "")
+        self.assertEqual(server.reset_alert({"windows": [(5 * 3600, 99, self.NOW + 60)], "reset_count": 1}, self.NOW), "")
+        self.assertEqual(server.reset_alert(None, self.NOW), "")
 
     def test_revision_picks_keep_off_claude_models(self):
         """0.28.1: with revision=true any kind keeps off Claude models, in ConsultantBudget as at the
@@ -5801,15 +5862,36 @@ class SuggestTest(unittest.TestCase):
         named = server.suggestion_lines("review", {"claude": {}}, self.NOW, "antigravity")
         self.assertIn("Antigravity isn't installed", named[0])
 
-    def test_used_up_or_running_out(self):
+    def test_used_up_blocks_and_running_out_does_not(self):
         # used up: the other provider; both used up: none, with why
         both = {"codex": self.codex(used=100), "antigravity": self.agy()}
         self.assertEqual(self.pick("review", **both), ("antigravity", "gemini-4-neon", "high"))
         none = self.pick("review", codex=self.codex(used=100), antigravity=self.agy(gemini=100))
         self.assertIn("Codex gpt-6.2-astra: its weekly window is used up", none)
         self.assertIn("Antigravity gemini-4-neon", none)
-        # 2 of 7 days gone and 50% used: runs out before the reset
-        self.assertEqual(self.pick("review", codex=self.codex(used=50))[:5], "Codex")
+        # 2 of 7 days gone and 50% used: on pace to run out before the reset. 0.31.2: a pace is an
+        # indicator (it changes as soon as the user works less), never a refusal: tight, one level
+        # down with no other provider, and the reason gives the pace; a calm Gemini takes the work.
+        racing = server.suggest_consultant("review", {"codex": self.codex(used=50)}, self.NOW)
+        self.assertEqual((racing["provider"], racing["effort"]), ("codex", "medium"), racing)
+        self.assertIn("Codex on pace for about 175% of its week", racing["why"])
+        self.assertEqual(self.pick("review", codex=self.codex(used=50), antigravity=self.agy())[0], "antigravity")
+        # a five-hour window on pace to run out is shown, not routed on
+        five = {**self.codex(used=10), "windows": [(5 * 3600, 90, self.NOW + 2.5 * 3600)] + self.codex(used=10)["windows"]}
+        self.assertEqual(self.pick("review", codex=five), ("codex", "gpt-6.2-astra", "high"))
+        self.assertEqual(server.send_check("review", "codex", "gpt-6.2-astra", {"codex": self.codex(used=50)},
+                                           self.NOW), (None, ""))
+        # Claude Code's own five-hour window running out still means handing out more
+        claude_five = {"windows": [(5 * 3600, 90, self.NOW + 2.5 * 3600)] + self.codex(used=10)["windows"]}
+        state, at = server.claude_pace(claude_five, self.NOW)
+        self.assertEqual(state, "tight")
+        self.assertIn("on pace for about", at)
+        self.assertIn("; on pace to use up its 5-hour window in about", at)
+        # with the week too early to tell, the line still reads, here and in the prompt hook
+        early = {"windows": [(5 * 3600, 90, self.NOW + 2.5 * 3600), (7 * 86400, 2, self.NOW + 6.9 * 86400)]}
+        state, at = server.claude_pace(early, self.NOW)
+        self.assertEqual(state, "tight")
+        self.assertTrue(at.startswith("on pace to use up its 5-hour window in about"), at)
         # the Gemini group used up, the Claude and GPT one free: research moves there
         self.assertEqual(self.pick("research", antigravity=self.agy(gemini=100)),
                          ("antigravity", "claude-opus-5-5", "high"))
@@ -6587,7 +6669,7 @@ class AgyTest(unittest.TestCase):
 
     def test_a_forecast_never_stops_the_move_off_a_claude_model(self):
         """Codex 0.28.1 review: a review on a consultant left on Opus moves to Gemini even when Gemini's
-        week runs out at this rate, as the same send naming Gemini would go, with the usage note."""
+        week runs out at this rate, as the same send naming Gemini would go; since 0.31.2 with no note."""
         self.MODELS = self.MODELS + ["claude-opus-5-5"]
         _, name = self.start(model="claude-opus-5-5")
         now = time.time()
@@ -6600,7 +6682,7 @@ class AgyTest(unittest.TestCase):
             out = server.send_consultant_message({"to": name, "message": "x", "wait": 5, "kind": "review"})
         argv = self.runs[0][0]
         self.assertTrue(argv[argv.index("--model") + 1].startswith("gemini-"), argv)
-        self.assertIn("runs out before its reset at this rate", out)
+        self.assertNotIn("Usage:", out)
 
     def test_a_send_without_model_or_effort_takes_nouezs_pick(self):
         """0.26.0: on Antigravity too, a send naming neither runs on the kind's suggestion."""

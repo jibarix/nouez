@@ -75,7 +75,7 @@ except OSError:
     LOADED_STAMP = None
 
 SERVER_NAME = "nouez"
-SERVER_VERSION = "0.31.1"
+SERVER_VERSION = "0.31.2"
 # MCP protocol versions this server answers to, newest first. Nothing nouez uses changed
 # between them; a client asking for any other version is offered the newest.
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")  # legacy: chosen by initialize
@@ -703,12 +703,42 @@ def resolve(client, target, exact_only=False):
     raise BridgeError(f"No Codex session named '{target}'.{exact_note} ListConsultants shows each consultant's name.")
 
 
+def addons_off(client, cwd):
+    """The `config` overrides that switch off, for one consultant's session, every add-on Codex
+    would give it in `cwd`: each MCP server and plugin in its effective settings (the user's, and
+    the project's own .codex ones, as config/read gives them) and the ChatGPT apps (connectors).
+    The read-only sandbox covers Codex's own tools only, and these can write elsewhere (0.31.2).
+    Raises BridgeError when the settings can't be read: then nouez can't tell what to switch off."""
+    try:
+        cfg = (client.request("config/read", {"cwd": cwd} if cwd else {}) or {}).get("config")
+    except BridgeError as e:
+        raise BridgeError(f"Codex's settings couldn't be read to switch off its MCP servers and plugins for the "
+                          f"consultant ({e}), so nouez didn't use it. `codex update` may fix it.") from e
+    if not isinstance(cfg, dict):
+        raise BridgeError("Codex gave no settings to switch off its MCP servers and plugins for the consultant, "
+                          "so nouez didn't use it. `codex update` may fix it.")
+    if any(cfg.get(key) is not None and not isinstance(cfg.get(key), dict) for key in ("mcp_servers", "plugins")):
+        raise BridgeError("Codex's settings list its MCP servers or plugins in a form nouez doesn't know, so it "
+                          "couldn't switch them off for the consultant and didn't use it. Update nouez.")
+    tables = {key: cfg.get(key) or {} for key in ("mcp_servers", "plugins")}
+    # Each table whole, so a name with a dot in it stays one name; "features.apps" alone, so the
+    # user's other features stay as they are.
+    over = {key: {name: {"enabled": False} for name in table} for key, table in tables.items() if table}
+    over["features.apps"] = False
+    return over
+
+
 def ensure_loaded(client, thread):
     """(Re)load the session. Always resume rather than trust the loaded snapshot, which can go
-    stale if the daemon unloads it meanwhile. Resume keeps its saved sandbox and approval policy."""
+    stale if the daemon unloads it meanwhile. Resume keeps its saved sandbox and approval policy;
+    a consultant's add-ons are switched off again each time (addons_off), as they may have been
+    turned on since, or the session started before nouez switched them off."""
     resumed = {}
+    params = {"threadId": thread["id"], "excludeTurns": True}
+    if is_bridge(thread):
+        params["config"] = addons_off(client, thread.get("cwd"))
     try:
-        resumed = client.request("thread/resume", {"threadId": thread["id"], "excludeTurns": True}) or {}
+        resumed = client.request("thread/resume", params) or {}
     except BridgeError as e:
         # A session with no history can't be resumed; it is the freshly started, still-loaded one.
         if not any(s in str(e) for s in NO_HISTORY_ERRORS):
@@ -5827,7 +5857,7 @@ def start_consultant(args, cancel=None, progress=None):
             thread = existing[0]
             recent = list_turns(client, thread["id"], REPLY_LOOKBACK)
         else:
-            thread = client.request("thread/start", params)["thread"]
+            thread = client.request("thread/start", {**params, "config": addons_off(client, cwd)})["thread"]
             unmarked = mark_extra(thread["id"]) if new else None
             if unmarked:
                 title_note = (f"It couldn't be marked as a separate consultant ({unmarked}), so StartConsultant "
@@ -6538,7 +6568,7 @@ def send_check(kind, provider, model, usage, now, revision=False, blind=False, o
     (send_route's or send_usage's): (a refusal, or None; a note, or ""). Only a limit the provider
     reported reached refuses (a share at 100% alone is a note), and only when it reported no credits
     to go past it, as Codex does: Antigravity never says whether credits can be spent, so a turn
-    there is never refused. A forecast that a window runs out before its reset only adds a note.
+    there is never refused. A forecast that a window runs out before its reset adds nothing.
     A refusal names where the work can go; a note, where later turns can."""
     st = (usage or {}).get(provider)
     if not st:
@@ -6674,7 +6704,7 @@ def send_consultant_message(args, cancel=None, progress=None):
                 raise BridgeError(NOT_BLIND.format(name=name))
             busy = bool(current) and current.get("status") == "inProgress"
             # What Codex's own usage says about a new turn: a refusal only on a limit it reported with
-            # no credits; a note on a forecast. A message added to a running turn has its quota already:
+            # no credits; nothing on a forecast. A message added to a running turn has its quota already:
             # no usage is read before it goes, so a steer never waits for one.
             refusal, quota = (None, "") if busy else send_check(
                 kind, "codex", model_for, usage or send_usage("codex", client), time.time(), want_revision,
@@ -7358,6 +7388,24 @@ def expiring_resets(st, windows, now):
     return [t for t in (st or {}).get("reset_expiries") or () if week and now < t < week]
 
 
+RESET_ALERT_PCT = 98  # a Codex week this used is when a free reset is worth spending (the user, 0.31.2)
+
+
+def reset_alert(st, now):
+    """The line telling the user to spend a free full reset: Codex's weekly window at
+    RESET_ALERT_PCT or more used, with one available; "" otherwise. Only the user spends one:
+    nouez never does, though Codex's app-server could."""
+    st = st or {}
+    count = max(number(st.get("reset_count")) or 0, len(st.get("reset_expiries") or ()))
+    used = max((number(w[1]) for w in st.get("windows") or ()
+                if w[0] and w[0] >= 7 * 86400 and number(w[1]) is not None and (number(w[2]) or 0) > now),
+               default=None)
+    if not count or used is None or used < RESET_ALERT_PCT:
+        return ""
+    return (f"Codex's week is {used:.0f}% used and {count:g} free full reset(s) are available: tell the user it is "
+            "time to spend one. nouez never spends a reset.")
+
+
 def codex_budget(client, now, state=None):
     """Lines on the Codex account's usage windows and the models it offers. A `state` dict gets
     the same as data, for suggest_consultant: {"windows": [(length, used, resets_at)], "models":
@@ -7390,8 +7438,12 @@ def codex_budget(client, now, state=None):
     count = number(resets.get("availableCount")) if isinstance(resets, dict) else None
     state["reset_expiries"] = reset_expiries(resets, now)
     state["reset_count"] = count or 0
+    count = max(count or 0, len(state["reset_expiries"]))  # as reset_alert and the routing count them
     if count:
         lines.append(f"  - {count:g} free full reset(s) available (only the user decides to use one)")
+        alert = reset_alert(state, now)
+        if alert:
+            lines.append(f"  - {alert}")
         before = expiring_resets(state, state["windows"], now)
         if before:
             lines.append(f"  - {len(before)} of them expire{'s' if len(before) == 1 else ''} before the week resets, unused unless spent: "
@@ -7769,8 +7821,8 @@ def window_level(used, resets_at, length, now, sampled=None):
     ConsultantBudget, the hook and the status screen all take; None when it can't be used (no
     numbers, or it has reset). {"level": "used up", "runs out" (before its reset, at this rate),
     "tight" (past 90%), "busy" (past 70%) or "fine"; "pct": what it is judged by: where the current
-    rate lands at the reset, or, for a reading too old to project from or too early in the window,
-    the share used, the least it will reach; "basis": "pace", "first day" (a pace from a week's
+    rate lands at the reset (past 100 for "runs out"), or, for a reading too old to project from or
+    too early in the window, the share used, the least it will reach; "basis": "pace", "first day" (a pace from a week's
     first FIRST_DAY, see window_pace), "old" or "early"; "out": seconds until it runs out; "age":
     seconds since the reading}. A used-up reading counts however old it is."""
     used, resets_at, length = number(used), number(resets_at), number(length)
@@ -7783,23 +7835,24 @@ def window_level(used, resets_at, length, now, sampled=None):
         return {**judged, "level": "used up", "pct": 100.0}
     pace = None if old or not length else window_pace(used, resets_at, length, at)
     if pace and pace[0] == "runs out":
-        return {**judged, "level": "runs out", "out": at + pace[1] - now, "basis": "first day" if pace[2:] else "pace"}
+        return {**judged, "level": "runs out", "out": at + pace[1] - now, "basis": "first day" if pace[2:] else "pace",
+                "pct": used + (100 - used) * (resets_at - at) / pace[1]}
     pct, basis = (pace[1], "first day" if pace[2:] else "pace") if pace else (used, "old" if old else "early")
     return {**judged, "level": "tight" if pct > 90 else "busy" if pct > 70 else "fine", "pct": pct, "basis": basis}
 
 
-def usage_outlook_detail(windows, now, week_may_run_out=False):
+def usage_outlook_detail(windows, now):
     """Where a subscription stands for one more consultation, from its (length, used, resets_at
     [, read at]) windows, as (state, percent or why, basis): ("blocked", why, None) when one is
-    used up or runs out before its reset at this rate; otherwise by where the weekly window's pace
-    lands at its reset: "tight" past 90, "busy" past 70, "spare" under 60 with the reset within
+    used up; otherwise by where the weekly window's pace lands at its reset: "tight" past 90 (a
+    window on pace to run out before its reset included: a pace is an indicator, which changes as
+    soon as the user works less, never a reason to refuse, 0.31.2; a shorter window's pace is
+    shown, not routed on), "busy" past 70, "spare" under 60 with the reset within
     SPARE_DAYS (usage that would go unused), "ok" (percent or None); ("unknown", None, None) with
     no reading. basis says how the weekly percent was found: "pace", where the current rate lands
     at the reset, or "first day", the same from a week's first FIRST_DAY (see window_pace); "old", a reading too old to project from, or "early", too little of the week
     gone to tell, where it is the share used so far, the least the week will reach (never
-    "spare", and "ok" with None); None without a weekly percent. With `week_may_run_out` (a free
-    reset expires before the week resets), a weekly window on pace to run out doesn't block and
-    gives no percent; any other window, and a used-up one, still does."""
+    "spare", and "ok" with None); None without a weekly percent."""
     week, seen = None, False
     for w in windows or ():
         length = w[0]
@@ -7811,13 +7864,9 @@ def usage_outlook_detail(windows, now, week_may_run_out=False):
         if judged["level"] == "used up":
             return ("blocked", (f"its {label} window is used up" if length else "its quota is used up")
                     + (" (an old reading)" if judged["basis"] == "old" else ""), None)
-        if judged["level"] == "runs out":
-            if week_may_run_out and length and length >= 7 * 86400:
-                continue
-            return ("blocked", f"its {label} window runs out before its reset at this rate"
-                    + (" (a first-day estimate)" if judged["basis"] == "first day" else ""), None)
         if length and length >= 7 * 86400:
-            week = (judged["pct"], number(w[2]), judged["basis"], judged["level"])
+            week = (judged["pct"], number(w[2]), judged["basis"],
+                    "tight" if judged["level"] == "runs out" else judged["level"])
     if not seen:
         return ("unknown", None, None)
     if week is None:
@@ -8055,11 +8104,10 @@ def suggest_consultant(kind, state, now, only=None, revision=False):
             continue
         windows = provider_windows(provider, got[0], st)
         # A free reset that expires before the week resets is usage that goes unused unless spent
-        # first: the subscription counts as spare however its week stands (0.31), a week on pace to
-        # run out before its reset included (0.31.1). A used-up window, or a shorter one running
-        # out, which a reset in the user's hands doesn't help, still blocks.
+        # first: the subscription counts as spare however its week stands (0.31). A used-up
+        # window, which only a reset in the user's hands helps, still blocks.
         expiring = expiring_resets(st, windows, now)
-        *outlook, basis = usage_outlook_detail(windows, now, bool(expiring))
+        *outlook, basis = usage_outlook_detail(windows, now)
         outlook = tuple(outlook)
         if outlook[0] == "unknown":
             expiring = []
@@ -8166,13 +8214,20 @@ def claude_pace(claude_state, now):
     if state == "unknown":
         return ("unknown", "its usage isn't known")
     if state == "blocked":
-        return ("tight", pct)  # why: a window used up, or running out before its reset
-    at = pace_words(pct, basis) if pct is not None else "has room"
+        return ("tight", pct)  # why: a window used up
+    parts, out = [pace_words(pct, basis)] if pct is not None else [], False
     for w in windows or ():  # a shorter window past 90% shows amber on the screen: say so, though
         judged = window_level(w[1], w[2], w[0], now, w[3] if len(w) > 3 else None)  # handing out follows the week
-        if w[0] and w[0] < 7 * 86400 and judged and judged["level"] == "tight" and judged["basis"] == "pace":
-            at += f"; its {window_label(w[0])} window on pace for about {judged['pct']:.0f}%"
-    return ("ok" if state == "spare" else state, at)
+        if not (w[0] and w[0] < 7 * 86400 and judged):
+            continue
+        if judged["level"] == "runs out":  # Claude Code stops before that window resets: hand out more
+            state, out = "tight", True
+            parts.append(f"on pace to use up its {window_label(w[0])} window in about {span_text(judged['out'])}")
+        elif judged["level"] == "tight" and judged["basis"] == "pace":
+            parts.append(f"its {window_label(w[0])} window on pace for about {judged['pct']:.0f}%")
+    if pct is None and not out:
+        parts.insert(0, "has room")
+    return ("ok" if state == "spare" else state, "; ".join(parts))
 
 
 def claude_outlook(claude_state, now):
@@ -8325,6 +8380,7 @@ def consultant_budget(args, cancel=None, progress=None):
     brief = kind is not None and not flag(args, "details") and not flag(args, "refresh")
     if brief:
         warning = [line.strip() for line in logins if not line.startswith("  - ")]
+        warning += [a for a in [reset_alert(state.get("codex"), now)] if a]
         out = head + warning + ([""] if warning else [])
     else:
         cache, note = aa_scores(now, refresh=flag(args, "refresh"))

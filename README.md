@@ -106,7 +106,7 @@ The protocol between nouez and Codex is experimental, so this is the last combin
 
 | Component | Version |
 |---|---|
-| nouez | 0.31.1 |
+| nouez | 0.31.2 |
 | Claude Code | 2.1.332 |
 | Codex CLI | 0.172.0 |
 | Codex app-server daemon | 0.172.0 |

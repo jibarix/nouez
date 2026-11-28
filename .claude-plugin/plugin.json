@@ -1,6 +1,6 @@
 {
   "name": "nouez",
-  "version": "0.31.1",
+  "version": "0.31.2",
   "description": "Read-only second opinions from Codex and Gemini consultants, Claude Code sessions opened and listed from the phone, and usage-aware routing.",
   "author": {
     "name": "jibarix"
